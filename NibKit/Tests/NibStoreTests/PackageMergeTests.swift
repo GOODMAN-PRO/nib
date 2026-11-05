@@ -266,6 +266,7 @@ final class PackageMergeTests: XCTestCase {
         XCTAssertEqual(page.decodedElements, items.count - direct)
         XCTAssertEqual(try JSONDecoder().decode([Item].self, from: json), items)
         XCTAssertEqual(try PackageCodec.decodeItems(data), items)
+        XCTAssertEqual(LWW.fingerprint(try PackageCodec.itemMetadata(data)), LWW.fingerprint(items))
         // Only each item's own id and rev count, not keys nested in its data.
         let revisions = try XCTUnwrap(PageReader.revisions(json))
         XCTAssertEqual(revisions.map { $0.id }, items.map(\.id))
@@ -324,6 +325,7 @@ final class PackageMergeTests: XCTestCase {
                 let revisions = try PackageCodec.itemRevisions(file)
                 XCTAssertEqual(revisions.map { $0.id }, e.map(\.id), replacement)
                 XCTAssertEqual(revisions.map { $0.rev }, e.map(\.rev), replacement)
+                XCTAssertEqual(LWW.fingerprint(try PackageCodec.itemMetadata(file)), LWW.fingerprint(e), replacement)
             case (.failure, .failure): break
             default: XCTFail("\(replacement): JSONDecoder gave \(expected), the page reader \(actual)")
             }
@@ -484,6 +486,8 @@ final class PackageMergeTests: XCTestCase {
         XCTAssertEqual(store.contentRevision(doc, page: "NEVERWRITTEN"), .zero, "a page without files is empty")
         XCTAssertEqual(store.contentRevision(doc, page: page), Rev(wallMs: 1, counter: 0, device: 0))
         XCTAssertEqual(store.contentRevision(doc, page: page), try loaded())
+        XCTAssertEqual(store.contentFingerprint(doc, page: page),
+                       LWW.fingerprint(try lib.store("0000000c").loadItems(doc, page: page)))
 
         // Another device adds a stroke: its file is new, so the page is read again.
         let clock = HLCClock(device: 8)
@@ -494,6 +498,8 @@ final class PackageMergeTests: XCTestCase {
             .write(to: dir.appendingPathComponent("00000008.nibpage"))
         XCTAssertEqual(store.contentRevision(doc, page: page), stroke.rev)
         XCTAssertEqual(store.contentRevision(doc, page: page), try loaded())
+        XCTAssertEqual(store.contentFingerprint(doc, page: page),
+                       LWW.fingerprint(try lib.store("0000000c").loadItems(doc, page: page)))
 
         // A conflict copy deletes it with a revision two days ahead: that revision loses the merge, as in loadItems.
         var skewed = stroke
@@ -502,6 +508,8 @@ final class PackageMergeTests: XCTestCase {
         try PackageCodec.encodeItems([skewed]).write(to: dir.appendingPathComponent("00000008 2.nibpage"))
         XCTAssertEqual(store.contentRevision(doc, page: page), stroke.rev)
         XCTAssertEqual(store.contentRevision(doc, page: page), try loaded())
+        XCTAssertEqual(store.contentFingerprint(doc, page: page),
+                       LWW.fingerprint(try lib.store("0000000c").loadItems(doc, page: page)))
 
         // Changes not on disk yet count: a pending snapshot, and after a crash the write-ahead log.
         var pending = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 3, y: 3)]))
@@ -509,13 +517,97 @@ final class PackageMergeTests: XCTestCase {
         pending.rev = clock.tick()
         store.didChange(doc, head: nil, pages: [page: try store.loadItems(doc, page: page) + [pending]])
         XCTAssertEqual(store.contentRevision(doc, page: page), pending.rev)
+        let pendingFingerprint = LWW.fingerprint(try store.loadItems(doc, page: page))
+        XCTAssertEqual(store.contentFingerprint(doc, page: page), pendingFingerprint)
         store.waitForIO()
         let relaunched = lib.store("00000007")
         XCTAssertEqual(relaunched.contentRevision(doc, page: page), pending.rev, "replayed from the log")
+        XCTAssertEqual(relaunched.contentFingerprint(doc, page: page), pendingFingerprint, "metadata-only WAL replay")
         store.flush(doc)
         XCTAssertTrue(store.wal.read(doc).isEmpty)
         XCTAssertEqual(relaunched.contentRevision(doc, page: page), pending.rev, "now from the files")
+        XCTAssertEqual(relaunched.contentFingerprint(doc, page: page), pendingFingerprint)
         XCTAssertEqual(relaunched.contentRevision(doc, page: page), try loaded())
+    }
+
+    func testRealStoreValidatesUnchangedThumbnailFingerprintWithoutLoadingItems() throws {
+        let lib = TestLibrary()
+        let (head, pages) = Fixtures.sampleContent()
+        let doc = head.meta.id, page = Fixtures.page1
+        lib.package(doc)
+        let writer = lib.store("00000007")
+        writer.didChange(doc, head: head, pages: pages)
+        writer.flush(doc)
+        let thumbnailFingerprint = LWW.fingerprint(try XCTUnwrap(pages[page]))
+        // The decorator delegates fingerprinting to production, rather than supplying a fake fingerprint.
+        let observed = ObservedPackagePersistence(lib.store("00000007"))
+        let workspace = Workspace(clock: HLCClock(device: 7), persistence: observed, events: EventBus())
+        for _ in 0..<3 {
+            XCTAssertEqual(try workspace.contentFingerprint(doc, page: page), thumbnailFingerprint)
+            XCTAssertFalse(workspace.isPageCached(doc, page: page))
+            XCTAssertFalse(workspace.isLoaded(doc))
+        }
+        XCTAssertEqual(observed.itemLoads, 0)
+    }
+
+    func testRealStoreIntermediateRevisionInvalidatesThumbnailFingerprint() throws {
+        let lib = TestLibrary()
+        let (head, _) = Fixtures.sampleContent()
+        let doc = head.meta.id, page = Fixtures.page1
+        let pkg = lib.package(doc)
+        var high = Item.makeText(TextBoxItem(frame: Frame(x: 0, y: 0, w: 100, h: 30), text: RichText(plain: "High")))
+        high.id = "HIGH"
+        high.rev = Rev(wallMs: 100, counter: 0, device: 7)
+        var low = high
+        low.id = "LOW"
+        low.rev = Rev(wallMs: 10, counter: 0, device: 8)
+        let writer = lib.store("00000007")
+        writer.didChange(doc, head: head, pages: [page: [high, low]])
+        writer.flush(doc)
+        let store = lib.store("00000007")
+        let oldFingerprint = try XCTUnwrap(store.contentFingerprint(doc, page: page))
+        XCTAssertEqual(oldFingerprint, LWW.fingerprint([high, low]))
+        low.deleted = true
+        low.rev = Rev(wallMs: 50, counter: 0, device: 8)
+        // Direct external file write models a change while the app is stopped, without any commit event.
+        let remote = pkg.appendingPathComponent("pages/\(page.raw)/00000008.nibpage")
+        try PackageCodec.encodeItems([low]).write(to: remote)
+        for reader in [store, lib.store("00000007")] {
+            XCTAssertEqual(reader.contentRevision(doc, page: page), high.rev)
+            let observed = ObservedPackagePersistence(reader)
+            let workspace = Workspace(clock: HLCClock(device: 7), persistence: observed, events: EventBus())
+            let fingerprint = try workspace.contentFingerprint(doc, page: page)
+            XCTAssertNotEqual(fingerprint, oldFingerprint, "the old thumbnail key must be rejected")
+            XCTAssertEqual(fingerprint, LWW.fingerprint([high, low]))
+            XCTAssertEqual(observed.itemLoads, 0)
+            XCTAssertFalse(workspace.isPageCached(doc, page: page))
+        }
+    }
+
+    func testMetadataSkipsPayloadsAndPreservesLegacyDefaults() throws {
+        // An intentionally undecodable stroke is a sentinel: metadata must never invoke an Item/Stroke decoder.
+        let json = Data(#"[{"id":"SENTINEL","kind":"stroke","stroke":{"ptsB64":42}}]"#.utf8)
+        let data = try (json as NSData).compressed(using: .lzfse) as Data
+        XCTAssertThrowsError(try PackageCodec.decodeItems(data))
+        let metadata = try XCTUnwrap(PackageCodec.itemMetadata(data).first)
+        XCTAssertEqual(metadata.id, "SENTINEL")
+        XCTAssertEqual(metadata.rev, .zero)
+        XCTAssertFalse(metadata.deleted)
+        let lib = TestLibrary()
+        let doc = Fixtures.docID, page = Fixtures.page1
+        let directory = lib.package(doc).appendingPathComponent("pages/\(page.raw)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try data.write(to: directory.appendingPathComponent("00000007.nibpage"))
+        let store = lib.store("00000007")
+        XCTAssertEqual(store.contentFingerprint(doc, page: page), LWW.fingerprint([metadata]))
+        // The WAL path skips the same payload, and still includes the tombstone in its result.
+        let line = #"{"pages":{"FIXTUREPG001":[{"id":"SENTINEL","rev":"2.0.7","deleted":true,"kind":"stroke","stroke":{"ptsB64":42}}]}}"#
+        try FileManager.default.createDirectory(at: store.wal.directory, withIntermediateDirectories: true)
+        try Data(line.utf8).write(to: store.wal.url(doc))
+        var deleted = metadata
+        deleted.rev = Rev(wallMs: 2, counter: 0, device: 7)
+        deleted.deleted = true
+        XCTAssertEqual(store.contentFingerprint(doc, page: page), LWW.fingerprint([deleted]))
     }
 
     func testExpiredTombstonesAreDroppedOnWrite() {
@@ -572,4 +664,25 @@ final class PackageMergeTests: XCTestCase {
         c.audio.sort { $0.id < $1.id }
         return c
     }
+}
+
+/// Observe calls without replacing any production metadata logic.
+@MainActor
+private final class ObservedPackagePersistence: DocumentPersistence {
+    let base: PackagePersistence
+    var itemLoads = 0
+    init(_ base: PackagePersistence) { self.base = base }
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
+        itemLoads += 1
+        return try base.loadItems(doc, page: page)
+    }
+    func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? { base.contentRevision(doc, page: page) }
+    func contentFingerprint(_ doc: DocumentID, page: PageID) -> String? { base.contentFingerprint(doc, page: page) }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try base.fileURL(doc, relativePath: relativePath) }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
 }

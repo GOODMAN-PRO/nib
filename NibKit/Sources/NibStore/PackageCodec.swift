@@ -6,6 +6,35 @@ import NibContracts
 /// `doc.<dev>.json` holds `DocumentContent`, `pages/<pageId>/<dev>.nibpage` holds LZFSE-compressed `[Item]` JSON, both
 /// with stroke points in compact form. Every reader merges every device file last-writer-wins.
 enum PackageCodec {
+    /// The only fields thumbnail validation needs. Unknown payload keys are skipped by Codable, so neither
+    /// compact stroke points nor text/images are materialized, including for older JSON spellings.
+    struct ItemMetadata: LWWRecord {
+        var id: NibID
+        var rev: Rev
+        var deleted: Bool
+
+        init(_ item: Item) {
+            id = item.id
+            rev = item.rev
+            deleted = item.deleted
+        }
+
+        private enum CodingKeys: String, CodingKey { case id, rev, deleted }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            // Missing ids cannot produce a stable fingerprint; let the normal page reader handle that case.
+            id = try c.decode(NibID.self, forKey: .id)
+            rev = try c.decodeIfPresent(Rev.self, forKey: .rev) ?? .zero
+            deleted = try c.decodeIfPresent(Bool.self, forKey: .deleted) ?? false
+        }
+    }
+
+    static func itemMetadata(_ data: Data) throws -> [ItemMetadata] {
+        let json = try (data as NSData).decompressed(using: .lzfse) as Data
+        return try JSONDecoder().decode([ItemMetadata].self, from: json)
+    }
+
     /// Tombstones whose rev is older than this are dropped when this device writes its files.
     static let tombstoneLifetime: TimeInterval = 30 * 86_400
     /// Revs stamped further ahead than this come from a device with a wrong clock (`Rev.effective`).

@@ -70,6 +70,21 @@ final class WriteAheadLog {
         return data.split(separator: 0x0A).compactMap { try? decoder.decode(Entry.self, from: Data($0)) }
     }
 
+    /// The same append order and torn-line policy as replay, without decoding item payloads or document heads.
+    func metadata(_ doc: DocumentID, page: PageID) -> [[PackageCodec.ItemMetadata]] {
+        struct MetadataEntry: Decodable {
+            var pages: [String: [PackageCodec.ItemMetadata]]
+        }
+        lock.lock()
+        let data = try? Data(contentsOf: url(doc))
+        lock.unlock()
+        guard let data else { return [] }
+        let decoder = JSONDecoder()
+        return data.split(separator: 0x0A).compactMap {
+            (try? decoder.decode(MetadataEntry.self, from: Data($0)))?.pages[page.raw]
+        }
+    }
+
     /// Everything logged so far is in the package files now.
     func truncate(_ doc: DocumentID) {
         lock.lock()

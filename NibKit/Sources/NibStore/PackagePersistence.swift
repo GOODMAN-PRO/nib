@@ -144,10 +144,13 @@ final class ReadableWrites {
 ///   answer until one of those files changes.
 @MainActor
 final class PackagePersistence: DocumentPersistence {
-    /// The highest item revision of a page as its files hold it, and the stamps of those files by name.
+    /// Merged metadata of a page on disk, retained until a file or effective clock-skew ordering changes.
     private struct FileRevision {
         var stamps: [String: PackageFiles.Stamp]
+        var records: [PackageCodec.ItemMetadata]
         var rev: Rev
+        var fingerprint: String
+        var validUntil: UInt64
     }
 
     /// What this device has in memory: the merged head and the item revs of pages loaded or written through it.
@@ -479,26 +482,49 @@ final class PackagePersistence: DocumentPersistence {
     /// until one of them changes (stamps), so a library of thumbnails costs one folder listing per page. nil when the
     /// document has no package.
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
+        contentMetadata(doc, page: page)?.rev
+    }
+
+    func contentFingerprint(_ doc: DocumentID, page: PageID) -> String? {
+        contentMetadata(doc, page: page)?.fingerprint
+    }
+
+    private func contentMetadata(_ doc: DocumentID, page: PageID) -> (rev: Rev, fingerprint: String)? {
         guard NibID.isValid(page.raw), let pkg = try? files.package(doc),
               FileManager.default.fileExists(atPath: pkg.path) else { return nil }
         defer { retainReadCache(doc) }
-        // Same read ordering as `mergedPage`, without waiting on file coordination.
+        // Capture submitted writes before reading WAL/files, just like mergedPage. A concurrent completed
+        // write may retire its snapshot and truncate the WAL only after it has atomically replaced the files.
         let queued = readable.snapshot(doc)
-        let logged = wal.read(doc)
-        var unwritten = logged.compactMap { $0.pages[page.raw] }
-        if let kept = queued?.pages[page] { unwritten.append(kept) }
-        if let items = pending[doc]?.pages[page] { unwritten.append(items) }
+        var unwritten = wal.metadata(doc, page: page)
+        if let kept = queued?.pages[page] { unwritten.append(kept.map(PackageCodec.ItemMetadata.init)) }
+        if let items = pending[doc]?.pages[page] { unwritten.append(items.map(PackageCodec.ItemMetadata.init)) }
 
         guard let sources = try? files.pageSources(pkg, page: page) else { return nil }
         let stamps = Dictionary(sources.map { ($0.name, $0.stamp) }, uniquingKeysWith: { first, _ in first })
-        if unwritten.isEmpty, let cached = fileRevisions[doc]?[page], cached.stamps == stamps { return cached.rev }
         let now = PackageCodec.ms(Date())
-        var revs = files.revisions(sources, now: now)
-        fileRevisions[doc, default: [:]][page] = FileRevision(stamps: stamps, rev: revs.values.max() ?? .zero)
-        for items in unwritten {
-            PackageCodec.merge(items.map { ($0.id, $0.rev) }, into: &revs, now: now)
+        let disk: FileRevision
+        if let cached = fileRevisions[doc]?[page], cached.stamps == stamps, now < cached.validUntil {
+            disk = cached
+        } else {
+            let read = files.read(sources, in: PackageCodec.pageDirectory(page), decode: PackageCodec.itemMetadata) {
+                $0.contains { PackageCodec.isFuture($0.rev, now: now) }
+            }
+            report(doc, read)
+            guard read.ownFailures.isEmpty else { return nil }
+            let records: [PackageCodec.ItemMetadata] = read.values.reduce([]) { LWW.merge($0, $1) }
+            // Future revisions can start winning even without a file change. Re-merge then, including losers.
+            let validUntil = read.values.flatMap { $0 }.compactMap { record -> UInt64? in
+                guard PackageCodec.isFuture(record.rev, now: now) else { return nil }
+                return record.rev.wallMs - PackageCodec.futureSkewMs
+            }.min() ?? UInt64.max
+            disk = FileRevision(stamps: stamps, records: records, rev: records.map { $0.rev }.max() ?? .zero,
+                                fingerprint: LWW.fingerprint(records), validUntil: validUntil)
+            if read.failures.isEmpty { fileRevisions[doc, default: [:]][page] = disk }
         }
-        return revs.values.max() ?? .zero
+        if unwritten.isEmpty { return (disk.rev, disk.fingerprint) }
+        let records = unwritten.reduce(disk.records) { LWW.merge($0, $1) }
+        return (records.map { $0.rev }.max() ?? .zero, LWW.fingerprint(records))
     }
 
     // MARK: Package files, remote changes
