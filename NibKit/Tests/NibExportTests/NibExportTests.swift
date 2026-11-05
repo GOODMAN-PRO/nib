@@ -318,6 +318,29 @@ final class NibExportTests: XCTestCase {
         XCTAssertTrue(file["asset"]?.stringValue?.hasPrefix("tmp:") ?? false)
         XCTAssertFalse(FileManager.default.fileExists(atPath: big.path), "the exporter's file is cleaned up")
     }
+    func testExportDoesNotCloseADocumentOpenedByAnotherWindow() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        h.session.document = nil
+        for openedByWindow in [false, true] {
+            h.app.workspace.close(Fixtures.docID)
+            h.app.commands.register(CommandDescriptor(id: "test.documentUse", title: "Document use",
+                summary: "Exercise export lifetime.", effect: .read, exposure: .ui)) { _, ctx in
+                let use = ExportDocumentUse(Fixtures.docID, ctx: ctx)
+                _ = try ctx.workspace.content(Fixtures.docID)
+                let other = EditorSession()
+                if openedByWindow {
+                    other.document = Fixtures.docID
+                    ctx.services.sessions.add(other)
+                }
+                defer { ctx.services.sessions.remove(other) }
+                use.end()
+                XCTAssertEqual(ctx.workspace.isLoaded(Fixtures.docID), openedByWindow)
+                return .null
+            }
+            try await h.run("test.documentUse")
+        }
+    }
+
     func testCacheGuardPreservesPagesLoadedByTheCanvasDuringExport() throws {
         let h = Harness(features: [NibExportFeature.self])
         h.app.workspace.evictPages(Fixtures.docID, keeping: [])
@@ -352,6 +375,8 @@ final class NibExportTests: XCTestCase {
 
     func testFailedPDFExportRemovesEarlierFilesAndClosesDocuments() async throws {
         let h = Harness(features: [NibExportFeature.self])
+        // This export starts in the library; no editor owns the document it loads.
+        h.session.document = nil
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("nib-export")
         func folders() -> Set<String> { Set((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []) }
         let before = folders()

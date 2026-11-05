@@ -431,15 +431,21 @@ final class ExportDocumentUse {
     let doc: DocumentID
     private let workspace: Workspace
     private let wasLoaded: Bool
+    private let sessions: SessionRegistry
+    private weak var invokingSession: EditorSession?
 
     init(_ doc: DocumentID, ctx: CommandContext) {
         self.doc = doc
         self.workspace = ctx.workspace
         self.wasLoaded = ctx.workspace.isLoaded(doc)
+        self.sessions = ctx.services.sessions
+        self.invokingSession = ctx.session
     }
 
     func end() {
         guard !wasLoaded, workspace.isLoaded(doc) else { return }
+        guard invokingSession?.document != doc,
+              !sessions.sessions.contains(where: { $0.document == doc }) else { return }
         workspace.close(doc)
     }
 }
