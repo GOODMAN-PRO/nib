@@ -135,6 +135,32 @@ final class NibUI {
         return found
     }
 
+    /// The labelled SwiftUI row owns the value; its nested native switch owns the touch.
+    func setSwitch(_ element: XCUIElement, to enabled: Bool) throws {
+        guard element.exists else { throw Failure.message("Missing labelled switch: " + elementFacts(element)) }
+        let expected = enabled ? "1" : "0"
+        if element.value as? String != expected {
+            let native = element.descendants(matching: .switch).firstMatch
+            let hasNative = native.exists
+            let target = hasNative ? native : element
+            let facts = "row: " + elementFacts(element) + "\nthumb: " + elementFacts(target, includeOverlaps: true)
+            logQA("Switch before press", facts)
+            guard target.isEnabled && target.isHittable else {
+                throw Failure.message("Switch thumb must be enabled and visible\n" + facts)
+            }
+            target.coordinate(withNormalizedOffset: CGVector(dx: hasNative ? 0.5 : 0.92, dy: 0.5))
+                .press(forDuration: 0.05)
+        }
+        let changed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            element.exists && element.value as? String == expected
+        }, object: nil)
+        guard XCTWaiter.wait(for: [changed], timeout: 8) == .completed else {
+            let facts = elementFacts(element, includeOverlaps: true)
+            logQA("Switch value failed", "expected=\(expected) " + facts)
+            throw Failure.message("Switch must become \(enabled)\n" + facts)
+        }
+    }
+
     /// Waits for a target in its actual form, searching both directions until the visible rows stop changing.
     /// Existing callers pass lazy firstMatch queries; the closure overload also supports fresh section-scoped queries.
     func revealFormElement(_ element: XCUIElement) { revealFormElement { element } }

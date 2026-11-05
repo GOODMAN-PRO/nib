@@ -164,8 +164,8 @@ final class InkUITests: XCTestCase {
                 ui.revealFormElement(in: panel) { element }
             }
             XCTAssertTrue(target.isHittable, "\(label) switch thumb must be visible")
-            target.coordinate(withNormalizedOffset: CGVector(dx: native.exists ? 0.5 : 0.92, dy: 0.5)).tap()
         }
+        try ui.setSwitch(element, to: enabled)
         try wait("\(label) must become \(enabled)") { (element.value as? String == "1") == enabled }
         return element
     }

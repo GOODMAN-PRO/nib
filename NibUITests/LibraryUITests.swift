@@ -535,7 +535,7 @@ final class LibraryUITests: XCTestCase {
         XCTAssertFalse(button(folder).isHittable, "Cannot move a folder into itself")
         let allFolders = app.switches["All folders"]
         try visible(allFolders, "Move picker must offer recursive folder browsing")
-        allFolders.tap()
+        try ui.setSwitch(allFolders, to: true)
         XCTAssertFalse(button("Child").exists, "Cannot move a folder into its own descendant")
         try tap("Destination"); try tap("Move Here")
         try eventually("Moved folder must leave root") { !self.item(self.folder, folder: true).exists }
@@ -607,7 +607,7 @@ final class LibraryUITests: XCTestCase {
         let favourite = app.switches["Show in Favourites"]
         revealFormElement(favourite)
         try visible(favourite, "Folder style must offer favourite toggle")
-        favourite.tap()
+        try ui.setSwitch(favourite, to: true)
         try tap("Save Changes")
         try eventually("Folder style sheet must dismiss before reopening its context menu") { !self.app.textFields["Folder name"].exists }
         try context(folder, folder: true); try tap("Customise Folder")

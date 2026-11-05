@@ -157,12 +157,7 @@ final class ChromeUITests: XCTestCase {
         let target = ui.app.switches.matching(NSPredicate(format: "label == %@", name)).firstMatch
         _ = try reachable(name)
         XCTAssertTrue(target.exists, "Expected switch \(name)")
-        if (target.value as? String == "1") != on {
-            // DESIGN §10.13 uses the native iOS 26 switch. Its labelled row can contain
-            // a separate switch; the row's centre is not the switch's touch target.
-            let control = target.descendants(matching: .switch).firstMatch
-            if control.exists { control.tap() } else { target.tap() }
-        }
+        try ui.setSwitch(target, to: on)
         try wait("\(name) must become \(on)") { (target.value as? String == "1") == on }
     }
     private func settings(_ tool: String) throws {

@@ -404,7 +404,7 @@ final class CaptureUITests: XCTestCase {
             try self.tap("Tabs", scroll: true)
             let toggle = self.ui.app.switches.matching(NSPredicate(format: "label == 'Show document tabs'")).firstMatch
             guard toggle.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("Tab visibility setting missing") }
-            if toggle.value as? String != "1" { toggle.tap() }
+            try self.ui.setSwitch(toggle, to: true)
             self.ui.logQA("Capture tabs toggle", "value=\(String(describing: toggle.value)) frame=\(toggle.frame)")
             try self.ui.dismissSheets()
             // Open through the library, preserving the app's normal tab preference.
