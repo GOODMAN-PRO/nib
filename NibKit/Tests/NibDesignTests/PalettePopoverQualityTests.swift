@@ -39,7 +39,8 @@ final class PalettePopoverQualityTests: XCTestCase {
         let size = CGSize(width: 312, height: 520)
         XCTAssertEqual(NibBudPlacement.below.unobstructedAnchor(source, size: size, gap: 20,
                                                                in: bounds, avoiding: [palette]), source)
-        let tool = CGRect(x: 16, y: 220, width: 56, height: 44)
+        // Leave a real gap from the inflated obstacle, independent of edge-touch semantics.
+        let tool = CGRect(x: 24, y: 220, width: 56, height: 44)
         XCTAssertEqual(NibBudPlacement.trailing.unobstructedAnchor(tool, size: size, gap: 20,
                                                                   in: bounds, avoiding: [palette]), tool)
     }

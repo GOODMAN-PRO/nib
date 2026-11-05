@@ -496,14 +496,12 @@ struct NibSheetChrome: ViewModifier {
     }
 
     @ViewBuilder private func chrome(_ content: Content) -> some View {
+        // Sheets may contain bottom-pinned actions. Keep scroll cues on their scroll
+        // hosts; a root mask fades those actions and shared margins double local padding.
         if #available(iOS 26.0, *) {
             content
-                .contentMargins(.bottom, NibSpacing.l, for: .scrollContent)
-                .nibFadeBottomEdge()
         } else {
             content
-                .contentMargins(.bottom, NibSpacing.l, for: .scrollContent)
-                .nibFadeBottomEdge()
                 .presentationCornerRadius(NibRadius.sheet)
                 .presentationBackground(NibColor.backgroundSecondary)
         }

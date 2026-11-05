@@ -166,8 +166,7 @@ struct PenSettingsView: View {
             NibInspectorSection(String(localized: "Colour")) {
                 NibSwatchGrid(swatches: NibInk.allCases.map { NibSwatch(ink: $0) }, selection: model.swatch,
                               columns: typeSize.isAccessibilitySize ? 3 : 6)
-                ColorPicker(String(localized: "Custom…"), selection: model.customColour, supportsOpacity: false)
-                    .font(NibFont.body).foregroundStyle(NibColor.label).frame(minHeight: NibMetrics.hitTarget)
+                NibCustomColourPicker(String(localized: "Custom…"), selection: model.customColour)
                     .accessibilityLabel(String(localized: "Choose custom ink colour"))
             }
             slider(String(localized: "Pressure sensitivity"), key: PenSettings.pressure)

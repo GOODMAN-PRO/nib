@@ -530,9 +530,7 @@ struct HighlighterSettingsView: View {
             NibInspectorSection(String(localized: "Colour")) {
                 NibSwatchGrid(swatches: NibHighlighter.allCases.map { NibSwatch(highlighter: $0) },
                               selection: colourSelection, columns: typeSize.isAccessibilitySize ? 3 : 6)
-                ColorPicker(String(localized: "Custom…"), selection: customColour, supportsOpacity: false)
-                    .font(NibFont.body).foregroundStyle(NibColor.label).frame(minHeight: NibMetrics.hitTarget)
-                    .accessibilityLabel(String(localized: "Choose custom highlight colour"))
+                NibCustomColourPicker(String(localized: "Custom…"), selection: customColour)
             }
             NibStrokeWidthSlider(width: $widthMM, range: widthRange,
                                  presets: presets.widths.map(HighlighterUnits.millimetres))
