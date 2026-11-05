@@ -1446,7 +1446,25 @@ final class ChromeUITests: XCTestCase {
         }
         let status = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'MCP bridge'")).firstMatch
         status.tap(); try tap("Turn Off Bridge")
-        try wait("Turn Off Bridge must remove its enabled status pill") { !status.exists }
+        do {
+            try wait("Turn Off Bridge must remove its enabled status pill") { !status.exists }
+        } catch {
+            let popover = ui.app.scrollViews["MCP Bridge"].firstMatch
+            func evidence(_ stage: String) {
+                let facts = "pill: " + ui.elementFacts(status) + "\npopover: " + ui.elementFacts(popover)
+                ui.logQA("Bridge after Turn Off " + stage, facts)
+                ui.recordDiagnostics("Bridge after Turn Off " + stage, facts: facts, includeHierarchy: false)
+            }
+            evidence("first")
+            // Diagnostic separation only, after failure; never a success-path sleep or retry.
+            let firstRead = Date()
+            let separated = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                Date().timeIntervalSince(firstRead) >= 1
+            }, object: nil)
+            _ = XCTWaiter.wait(for: [separated], timeout: 2)
+            evidence("second")
+            throw error
+        }
         try sameContent(before)
     }
     func testPresenceDoesNotInventPeersAndTitleDetailsRetainLiveSession() throws {

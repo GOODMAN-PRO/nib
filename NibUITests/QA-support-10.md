@@ -101,3 +101,11 @@ Confirmed chrome-singles#2 correction: an identical drag passed in a sibling, so
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | Both Customise reorder tests | Toolbar reorder before / Toolbar reorder after | Was the initial ordering non-vacuous, and did the held drag change it? |
+
+### C7 - Bridge failure evidence only
+
+Confirmed chrome-singles#3 correction: the app logged off, AX retained the pill/popover, but the screenshot did not show the popover. No evidence identifies a NavBar rebuild defect. Kept the pill-disappearance expectation exactly. Only on failure, take screenshot plus pill/popover facts twice, separated by a bounded one-second diagnostic interval, then rethrow the original failure. CI must compare those observations with app turnOff/compactStatus logs; this does not claim an app fix. App status-provider/body instrumentation remains outside scope.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| BridgeStatusPillOpensDetailsAndTurnOffHasEffect | Bridge after Turn Off first / second | Do pixels and AX facts agree, and does the retained pill/popover disappear between failure observations? |
