@@ -1013,11 +1013,50 @@ final class FeatSearchUITests: XCTestCase {
             XCTAssertLessThanOrEqual(inputFrame.maxX, size.width - NibMetrics.chromeInset - NibMetrics.hitTarget,
                 "The query must leave room for the Close search control inside the window")
             let resultsFrame = results.convert(results.bounds, to: window)
-            let expectedWidth = size.width > size.height ? NibMetrics.searchWidth : size.width - 2 * NibMetrics.chromeInset
+            // V2:test01Library#2: follow the grid gutter, including compact widths.
+            // The document HUD's separate 560 pt width contract is unchanged.
+            let gutter = host.traitCollection.horizontalSizeClass == .compact ? NibSpacing.l : NibMetrics.libraryGutter
+            let expectedWidth = size.width - 2 * gutter
             XCTAssertEqual(resultsFrame.width, expectedWidth, accuracy: 1)
+            XCTAssertEqual(resultsFrame.minX, gutter, accuracy: 1)
+            XCTAssertEqual(resultsFrame.maxX, size.width - gutter, accuracy: 1)
             XCTAssertEqual(resultsFrame.midX, size.width / 2, accuracy: 1)
             XCTAssertGreaterThanOrEqual(resultsFrame.minX, NibMetrics.chromeInset - 1)
             XCTAssertLessThanOrEqual(resultsFrame.maxX, size.width - NibMetrics.chromeInset + 1)
+        }
+    }
+
+    func testCompactLibrarySearchUsesTheSameSixteenPointGutterAsTheGrid() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let state = SearchState()
+        state.scope = "lib"
+        state.query = "Hello notes"
+        state.matches = [hit()]
+        state.isPresented = true
+        state.instant = true
+        for width in [CGFloat(390), CGFloat(600)] {
+            let view = NibDropletContainer {
+                LibrarySearchFloatingContent(app: h.app, session: h.session, state: state)
+                    .environment(\.horizontalSizeClass, .compact)
+            }.nibLiquidMode(.off).ignoresSafeArea()
+            let host = UIHostingController(rootView: view)
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: width, height: 834))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            for _ in 0..<10 {
+                host.view.setNeedsLayout()
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            func scrolls(_ view: UIView) -> [UIScrollView] {
+                ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap(scrolls)
+            }
+            let results = try XCTUnwrap(scrolls(host.view).max { $0.bounds.height < $1.bounds.height })
+            let frame = results.convert(results.bounds, to: window)
+            XCTAssertEqual(frame.minX, NibSpacing.l, accuracy: 1)
+            XCTAssertEqual(frame.maxX, width - NibSpacing.l, accuracy: 1)
         }
     }
 

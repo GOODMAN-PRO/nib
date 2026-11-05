@@ -123,6 +123,7 @@ struct LibrarySearchOverlay: View {
 
 @MainActor
 struct LibrarySearchFloatingContent: View {
+    @Environment(\.horizontalSizeClass) private var sizeClass
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
@@ -142,8 +143,10 @@ struct LibrarySearchFloatingContent: View {
             let measuredColumn = belowBars ? nil : libraryContentBounds
             let bounds = SearchViewport.libraryContentBounds(hostBounds: hostBounds, column: measuredColumn,
                 hostOrigin: geometry.frame(in: .global).origin)
-            let width = SearchViewport.panelWidth(availableWidth: bounds.width - 2 * NibMetrics.chromeInset,
-                windowSize: viewport?.windowSize ?? geometry.size)
+            // This surface replaces the library column, so use its content gutter in either orientation.
+            // The document search HUD keeps SearchViewport.panelWidth's floating 560 pt cap.
+            let gutter = sizeClass == .compact ? NibSpacing.l : NibMetrics.libraryGutter
+            let width = max(0, bounds.width - 2 * gutter)
             let top = belowBars || measuredColumn != nil ? 0
                 : NibMetrics.barTopGap + NibMetrics.barHeight + NibMetrics.minimumRestingGap
             let height = SearchViewport.resultsHeight(availableHeight: min(bounds.height,
@@ -157,7 +160,7 @@ struct LibrarySearchFloatingContent: View {
                     .accessibilityHidden(true)
                 VStack(spacing: NibSpacing.l) {
                     HStack(spacing: NibSpacing.s) {
-                        SearchInput(app: app, session: session, state: state, style: .onDroplet)
+                        SearchInput(app: app, session: session, state: state, style: .filled)
                             .frame(minWidth: 0, maxWidth: .infinity)
                         NibIconButton(.xmark, label: String(localized: "Close search"), action: close)
                     }

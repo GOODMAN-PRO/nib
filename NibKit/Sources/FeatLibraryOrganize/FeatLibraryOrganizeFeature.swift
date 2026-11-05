@@ -16,18 +16,16 @@ public enum FeatLibraryOrganizeFeature: NibFeature {
                              summary: "Sort order of the Trash tab in the library: date (newest first), name or type.",
                              owner: id, schema: .str(choices: TrashSort.allCases.map { $0.rawValue }))
         // One index of bookmarked and trashed pages per app, shared by both tabs. It reads the library the first time
-        // a tab is shown and follows it from then on.
+        // a tab is visible, and stops when the final visible consumer leaves.
         let index = PageIndex(app: app)
         app.ui.panels.register(PanelDescriptor(
             id: PanelIDs.favourites, title: String(localized: "Favourites"), icon: NibSymbol.favorites.name,
             placement: .libraryTab, order: 100, owner: id) { ctx in
-                index.attach()
                 return AnyView(FavoritesPanel(window: OrganizeWindow(ctx), index: index))
             })
         app.ui.panels.register(PanelDescriptor(
             id: PanelIDs.trash, title: String(localized: "Trash"), icon: NibSymbol.trash.name,
             placement: .libraryTab, order: 900, owner: id) { ctx in
-                index.attach()
                 return AnyView(TrashPanel(window: OrganizeWindow(ctx), index: index))
             })
         FolderStyleSheet.register(app)
@@ -278,29 +276,45 @@ final class PageIndex: ObservableObject {
     private var readAt: [DocumentID: Double] = [:]
     private weak var app: NibApp?
     private let bag = SubscriptionBag()
-    private var isAttached = false
+    private var consumers: Set<UUID> = []
+    private var attachment = UUID()
+    private var commitAttachment = UUID()
     private var syncTask: Task<Void, Never>?
+    private var teardownTask: Task<Void, Never>?
     /// Heads read between yields to the main run loop while the library is read.
-    private static let chunk = 16
+    private static let chunk = 1
 
     init(app: NibApp) {
         self.app = app
     }
 
-    /// Starts following commits, document opens and library changes (once), and reads the library.
-    func attach() {
-        guard !isAttached, let app else { return }
-        isAttached = true
+    /// Each visible tab/window holds a token. Repeated appearances of the same view are idempotent.
+    @discardableResult
+    func attach(_ consumer: UUID = UUID()) -> UUID {
+        guard consumers.insert(consumer).inserted, consumers.count == 1, let app else { return consumer }
+        teardownTask?.cancel()
+        teardownTask = nil
+        bag.items.forEach { $0.cancel() }
+        bag.items.removeAll()
+        attachment = UUID()
+        let generation = attachment
+        commitAttachment = UUID()
+        let commitGeneration = commitAttachment
         bag.items.append(app.bus.observeCommits { [weak self] changes in
-            guard let self else { return }
-            for doc in changes.documents where changes.headChanged(doc) { self.read(doc) }
+            // Commit observers run synchronously on main. During a tab swap,
+            // invalidate changed heads without reading or publishing while hidden.
+            guard let self, self.commitAttachment == commitGeneration else { return }
+            for doc in changes.documents where changes.headChanged(doc) {
+                if self.consumers.isEmpty { self.readAt[doc] = nil }
+                else { self.read(doc) }
+            }
         })
         bag.items.append(app.events.subscribe { [weak self] event in
             let type = event.type
             let doc = event.doc
             guard type == NibEventType.libraryChanged || type == NibEventType.docOpened else { return }
             Task { @MainActor in
-                guard let index = self else { return }
+                guard let index = self, index.attachment == generation, !index.consumers.isEmpty else { return }
                 if type == NibEventType.libraryChanged {
                     index.scheduleSync()
                 } else if let doc {
@@ -309,6 +323,25 @@ final class PageIndex: ObservableObject {
             }
         })
         scheduleSync()
+        return consumer
+    }
+
+    func detach(_ consumer: UUID) {
+        guard consumers.remove(consumer) != nil, consumers.isEmpty else { return }
+        attachment = UUID() // Reject event callbacks already queued on the main actor.
+        syncTask?.cancel()
+        syncTask = nil
+        teardownTask = Task { [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled, let self, self.consumers.isEmpty else { return }
+            self.commitAttachment = UUID()
+            self.bag.items.forEach { $0.cancel() }
+            self.bag.items.removeAll()
+            // A same-turn replacement consumer keeps its cache. After a full
+            // departure, commits will no longer be observed and must be refreshed.
+            self.readAt.removeAll()
+            self.teardownTask = nil
+        }
     }
 
     var bookmarked: [PageEntry] { documents.values.flatMap { $0.bookmarked } }
@@ -317,7 +350,13 @@ final class PageIndex: ObservableObject {
     /// Reads one document's head again. False when it cannot be read (then its last known pages stay).
     @discardableResult
     func read(_ doc: DocumentID) -> Bool {
-        guard let app, let content = try? app.workspace.peekContent(doc) else { return false }
+        guard let app else { return false }
+        guard let node = app.services.library?.node(doc), Self.includesPages(node) else {
+            documents[doc] = nil
+            readAt[doc] = nil
+            return true
+        }
+        guard let content = try? app.workspace.peekContent(doc) else { return false }
         let pages = PageIndex.pages(of: content)
         let value: DocumentPages? = pages.bookmarked.isEmpty && pages.trashed.isEmpty ? nil : pages
         if documents[doc] != value { documents[doc] = value }
@@ -325,17 +364,19 @@ final class PageIndex: ObservableObject {
     }
 
     func scheduleSync() {
+        guard !consumers.isEmpty else { return }
         syncTask?.cancel()
         syncTask = Task { [weak self] in await self?.sync() }
     }
 
     /// Drops documents that left the library (trashed, deleted, another library folder) and reads the heads of
-    /// documents that are new or modified since they were read, yielding every few documents so a large library never
-    /// stalls the main thread.
+    /// documents that are new or modified since they were read, yielding after each head. A single unopened
+    /// head still requires the synchronous DocumentPersistence API; it needs an async contracts/store reader.
     func sync() async {
-        guard let app, let library = app.services.library else { return }
+        guard !Task.isCancelled, let app, let library = app.services.library else { return }
+        let generation = attachment
         var live: [DocumentID: Double] = [:]
-        for node in library.allNodes() where node.kind == .document && node.trashedAt == nil {
+        for node in library.allNodes() where Self.includesPages(node) {
             live[node.id] = node.modified
         }
         let gone = documents.keys.filter { live[$0] == nil }
@@ -343,12 +384,18 @@ final class PageIndex: ObservableObject {
         readAt = readAt.filter { live[$0.key] != nil }
         var count = 0
         for (doc, modified) in live where readAt[doc] != modified {
-            if Task.isCancelled { return }
-            readAt[doc] = modified
+            if Task.isCancelled || generation != attachment { return }
             read(doc)
+            readAt[doc] = modified // Failed heads retry only after modification, commit or open.
             count += 1
             if count % PageIndex.chunk == 0 { await Task.yield() }
         }
+    }
+
+    /// Unknown legacy kinds are still inspected; known page-less kinds never need a head read.
+    static func includesPages(_ node: LibraryNode) -> Bool {
+        node.kind == .document && node.trashedAt == nil
+            && node.documentKind != .textDocument && node.documentKind != .studySet
     }
 
     /// Bookmarked live pages and trashed pages of one document head.

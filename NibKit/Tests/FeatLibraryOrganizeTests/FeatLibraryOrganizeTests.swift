@@ -471,6 +471,109 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         model.stop()
     }
 
+    func testPageIndexSkipsPagelessHeadsInAMixedTwoThousandDocumentLibrary() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let persistence = CountingHeadPersistence(h.persistence)
+        h.app.workspace.persistence = persistence
+        let paragraph = TextBlock(kind: .paragraph, text: RichText(plain: String(repeating: "word ", count: 10_000)))
+        for number in 0..<2_000 {
+            let kind: DocumentKind = number < 1_800 ? .textDocument : number < 1_900 ? .studySet : .notebook
+            let content = DocumentContent(meta: DocumentMeta(id: NibID("MIXED\(number)"), kind: kind),
+                blocks: kind == .textDocument ? [paragraph] : [])
+            _ = try h.library.createDocument(content, title: "Mixed \(number)", in: nil)
+        }
+        let index = PageIndex(app: h.app)
+        let before = persistence.headReads
+        await index.sync()
+        // 100 generated notebooks plus the fixture notebook and whiteboard.
+        XCTAssertEqual(persistence.headReads - before, 102)
+        await index.sync()
+        XCTAssertEqual(persistence.headReads - before, 102, "Unchanged heads must not be rescanned")
+        XCTAssertTrue(index.read(Fixtures.textDocID))
+        XCTAssertTrue(index.read(Fixtures.studySetID))
+        XCTAssertEqual(persistence.headReads - before, 102, "Commit/open callbacks use the same kind gate")
+    }
+
+    func testPageIndexReusesHeadsAcrossSameTurnTabSwaps() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let persistence = CountingHeadPersistence(h.persistence)
+        h.app.workspace.persistence = persistence
+        let index = PageIndex(app: h.app)
+        var consumer = index.attach()
+        await index.sync()
+        let reads = persistence.headReads
+        for _ in 0..<3 {
+            // Queue an old-tab callback, then disappear before the replacement appears.
+            h.app.events.emit(NibEventType.docOpened, doc: Fixtures.docID)
+            index.detach(consumer)
+            consumer = index.attach()
+            await index.sync()
+            for _ in 0..<10 { await Task.yield() }
+            XCTAssertEqual(persistence.headReads, reads, "A tab swap must reuse unchanged heads and reject old callbacks")
+        }
+        index.detach(consumer)
+    }
+
+    func testPageIndexInvalidatesCommitsDuringTabSwapWithoutPublishingWhileHidden() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        h.app.commands.register(BookmarkStandIn.self)
+        let index = PageIndex(app: h.app)
+        let first = index.attach()
+        await index.sync()
+        try await h.run("test.bookmark", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        XCTAssertFalse(index.bookmarked.isEmpty)
+        index.detach(first)
+        // Undo is synchronous: this commit lands in the gap before the next main-actor turn.
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertFalse(index.bookmarked.isEmpty, "No head reads or publication while detached")
+        let second = index.attach()
+        await index.sync()
+        XCTAssertTrue(index.bookmarked.isEmpty, "The replacement tab must refresh the head changed during the gap")
+        index.detach(second)
+    }
+
+    func testPageIndexStopsAfterLastConsumerAndRejectsQueuedEvents() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        h.app.commands.register(BookmarkStandIn.self)
+        let persistence = CountingHeadPersistence(h.persistence)
+        h.app.workspace.persistence = persistence
+        let index = PageIndex(app: h.app)
+        let first = index.attach(), second = index.attach()
+        await index.sync()
+        index.detach(first)
+        try await h.run("test.bookmark", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        XCTAssertFalse(index.bookmarked.isEmpty)
+        h.app.events.emit(NibEventType.docOpened, doc: Fixtures.docID)
+        h.app.events.emit(NibEventType.libraryChanged)
+        index.detach(second)
+        let reads = persistence.headReads
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(persistence.headReads, reads, "The last departure cancels queued scans and callbacks")
+        XCTAssertFalse(index.bookmarked.isEmpty, "Detached commits must not mutate the index")
+        let resumed = index.attach()
+        await index.sync()
+        XCTAssertTrue(index.bookmarked.isEmpty, "Reattachment refreshes commits missed while hidden")
+        index.detach(resumed)
+    }
+
+    func testUnreadablePageHeadIsAttemptedOncePerCatalogueRevision() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let persistence = CountingHeadPersistence(h.persistence)
+        h.app.workspace.persistence = persistence
+        let missing: DocumentID = "MISSINGHEAD"
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: missing, kind: .notebook)),
+                                         title: "Missing", in: nil)
+        h.persistence.heads[missing] = nil
+        let index = PageIndex(app: h.app)
+        await index.sync()
+        let reads = persistence.headReads
+        await index.sync()
+        XCTAssertEqual(persistence.headReads, reads)
+        index.read(missing)
+        XCTAssertEqual(persistence.headReads, reads + 1, "Explicit commit/open reads can retry")
+    }
+
     func testPageIndexFollowsCommitsAndUndo() async throws {
         let h = Harness(features: [FeatLibraryOrganizeFeature.self])
         h.app.commands.register(BookmarkStandIn.self)

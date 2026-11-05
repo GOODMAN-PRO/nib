@@ -73,6 +73,17 @@ final class LibraryViewModel: ObservableObject {
     @Published var rows: [LibraryRow] = []
     @Published var visibleRows: [LibraryRow] = []
     @Published var allFolders: [LibraryRow] = []
+    @Published var foldersExpanded = false
+    func isSidebarPlaceSelected(_ place: LibrarySidebarPlace) -> Bool {
+        guard let collection = place.collection else { return tab?.id == place.id }
+        guard tab == nil, self.collection == collection else { return false }
+        // Only a visible folder row owns selection; collapsed/unlisted folders
+        // still belong to Documents, so navigation never loses its place.
+        return collection != .documents || !foldersExpanded || !allFolders.contains { $0.nodeID == folder }
+    }
+    func isSidebarFolderSelected(_ row: LibraryRow) -> Bool {
+        foldersExpanded && tab == nil && collection == .documents && folder == row.nodeID
+    }
     @Published var selection = LibrarySelection()
     @Published var tab: LibraryPanel?
     @Published var modal: LibraryPanel?
@@ -502,10 +513,25 @@ final class LibraryFloatingAdapter: FloatingHosting {
     }
 }
 
+/// Share in-flight work and permit at most one retry per controller, even if drawing fails.
+struct LibraryLiftWarmupBudget {
+    private var attempts = 0
+    private var reserved = false
+
+    mutating func begin() -> Bool {
+        guard !reserved, attempts < 2 else { return false }
+        attempts += 1
+        reserved = true
+        return true
+    }
+
+    mutating func finish(rendered: Bool) { reserved = rendered }
+}
+
 @MainActor
 final class LibraryRootViewController: UIViewController {
     let model: LibraryViewModel
-    private var warmedLiftRendering = false
+    private var liftWarmupBudget = LibraryLiftWarmupBudget()
     init(app: NibApp, navigator: SceneNavigator) {
         model = LibraryModels.get(app).model(navigator.session)
         super.init(nibName: nil, bundle: nil)
@@ -546,10 +572,20 @@ final class LibraryRootViewController: UIViewController {
         super.viewWillAppear(animated)
         model.session.floatingHost = model.floatingAdapter
     }
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        // The SwiftUI task may have populated rows before its host was attached to a window.
+        Task { [weak self] in await self?.warmLiftedCardRendering() }
+    }
     func warmLiftedCardRendering() async {
-        guard !warmedLiftRendering, viewIfLoaded?.window != nil,
-              let row = model.documentRows.first ?? model.folderRows.first else { return }
-        warmedLiftRendering = true
+        guard viewIfLoaded?.window != nil,
+              let row = model.documentRows.first ?? model.folderRows.first,
+              liftWarmupBudget.begin() else { return }
+        var rendered = false
+        defer { liftWarmupBudget.finish(rendered: rendered) }
+        #if DEBUG
+        NSLog("%@", "[Nib QA reflow] lifted card warmup began windowAttached=\(view.window != nil)")
+        #endif
         let size = NibMetrics.coverSize
         let warmup = NibReflowRenderingWarmup(size: size) {
             LibraryStackedCarrier(ref: row.ref, model: model)
@@ -569,14 +605,18 @@ final class LibraryRootViewController: UIViewController {
             host.removeFromParent()
         }
         host.view.layoutIfNeeded()
-        await Task.yield()
-        guard !Task.isCancelled, view.window != nil else { warmedLiftRendering = false; return }
+        // Give the carrier's geometry registration and drag driver separate rendering turns.
+        // One yield can resume before either the native glass or its lifted foreground exists.
+        for _ in 0..<3 {
+            do { try await Task.sleep(for: .milliseconds(32)) }
+            catch { return }
+            host.view.layoutIfNeeded()
+        }
+        guard !Task.isCancelled, view.window != nil else { return }
         host.view.layoutIfNeeded()
-        var rendered = false
         _ = UIGraphicsImageRenderer(size: host.view.bounds.size).image { _ in
             rendered = host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
         }
-        warmedLiftRendering = rendered
         #if DEBUG
         NSLog("%@", "[Nib QA reflow] lifted card warmup snapshotRendered=\(rendered)")
         #endif
@@ -848,16 +888,18 @@ struct LibraryRootView: View {
                             } else { model.setView(["panel": .string(place.id)]) }
                         } label: {
                             NibSidebarRow(place.title, symbol: place.symbol, count: model.sidebarCounts[place.id],
-                                          isSelected: place.collection.map { model.tab == nil && model.folder == nil && model.collection == $0 } ?? (model.tab?.id == place.id))
+                                          isSelected: model.isSidebarPlaceSelected(place))
+                                .libraryLayoutFrame("sidebar.place." + place.id, space: .global)
                         }
                         .accessibilityIdentifier("cmd.library.setView")
                         .libraryDropTarget(place.id == PanelIDs.trash ? "trash" : "card:tab:" + place.id)
                     }
-                    DisclosureGroup(String(localized: "Folders")) {
+                    DisclosureGroup(String(localized: "Folders"), isExpanded: $model.foldersExpanded) {
                         ForEach(model.allFolders) { row in
                             Button { model.setView(["folder": .string(row.ref), "sidebar": false]) } label: {
-                                NibSidebarRow(row.name, symbol: .folderFill, count: model.sidebarCounts[row.ref], isSelected: model.tab == nil && model.collection == .documents && model.folder == row.nodeID,
+                                NibSidebarRow(row.name, symbol: .folderFill, count: model.sidebarCounts[row.ref], isSelected: model.isSidebarFolderSelected(row),
                                               glyphTint: row.color.flatMap { RGBA(hex: $0) }.map { Color(uiColor: $0.uiColor) })
+                                    .libraryLayoutFrame("sidebar.folder." + row.ref, space: .global)
                             }
                             .accessibilityIdentifier("cmd.library.setView")
                             .libraryDropTarget("sidebarFolder:" + row.ref)
@@ -952,9 +994,16 @@ struct LibraryRootView: View {
     }
     @ViewBuilder var parentNavigation: some View {
         if let parent = model.parentNavigation {
-            NibButton(parent.title, symbol: .back, kind: .plain, size: .compact) {
+            Button {
                 model.setView(["folder": .string(parent.ref)])
+            } label: {
+                Label { Text(parent.title) } icon: { Image(nib: .back) }
+                    .font(NibFont.button)
+                    .foregroundStyle(NibColor.accent)
+                    .frame(minHeight: NibMetrics.hitTarget, alignment: .leading)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .accessibilityIdentifier("cmd.library.setView")
             .accessibilityLabel(String(localized: "Back to \(parent.title)"))
             .libraryDropTarget("breadcrumb:" + parent.ref)
@@ -1074,6 +1123,33 @@ extension View {
                 Color.clear.preference(key: LibraryChromeFrames.self, value: [id: geometry.frame(in: space)])
             }
         }
+    }
+}
+
+private struct LibraryLayoutDiagnosticsKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var libraryLayoutDiagnostics: Bool {
+        get { self[LibraryLayoutDiagnosticsKey.self] }
+        set { self[LibraryLayoutDiagnosticsKey.self] = newValue }
+    }
+}
+
+extension View {
+    func libraryLayoutFrame(_ id: String, space: CoordinateSpace) -> some View {
+        modifier(LibraryLayoutProbe(id: id, space: space))
+    }
+}
+
+private struct LibraryLayoutProbe: ViewModifier {
+    let id: String
+    let space: CoordinateSpace
+    @Environment(\.libraryLayoutDiagnostics) private var enabled
+    func body(content: Content) -> some View {
+        if enabled { content.libraryChromeFrame(id, space: space) }
+        else { content }
     }
 }
 
@@ -1401,11 +1477,22 @@ enum LibrarySyncPresentation {
 @MainActor
 final class LibraryCoverCache: ObservableObject {
     let images = NSCache<NSString, UIImage>()
-    private let subtitles = NSCache<NSString, NSString>()
+    private let subtitles: NSCache<NSString, NSString>
     @Published private(set) var revisions: [DocumentID: Int] = [:]
     private var keys: [DocumentID: Set<String>] = [:]
     private var subscription: EventSubscription?
-    init() {
+    private struct SubtitleWork {
+        let key: String
+        let task: Task<String, Never>
+    }
+    private var subtitleWork: [DocumentID: SubtitleWork] = [:]
+    private let countSubtitle: @Sendable (LibraryRow, DocumentContent) -> String
+    init(subtitleCache: NSCache<NSString, NSString> = NSCache(),
+         countSubtitle: @escaping @Sendable (LibraryRow, DocumentContent) -> String = { row, content in
+        row.subtitle(content: content)
+    }) {
+        self.countSubtitle = countSubtitle
+        self.subtitles = subtitleCache
         images.countLimit = NibMetrics.libraryCoverCacheCount
         images.totalCostLimit = NibMetrics.libraryCoverCacheBytes
         subtitles.countLimit = NibMetrics.libraryCoverCacheCount
@@ -1418,23 +1505,45 @@ final class LibraryCoverCache: ObservableObject {
     }
     deinit { subscription?.cancel() }
     func invalidate(_ doc: DocumentID) {
+        subtitleWork.removeValue(forKey: doc)?.task.cancel()
         for key in keys.removeValue(forKey: doc) ?? [] {
             images.removeObject(forKey: key as NSString)
             subtitles.removeObject(forKey: key as NSString)
         }
         revisions[doc, default: 0] += 1
     }
-    func subtitle(_ row: LibraryRow, app: NibApp) -> String? {
+    func subtitle(_ row: LibraryRow, app: NibApp) async -> String? {
         guard row.kind == "studySet" || row.kind == "textDocument",
               row.locked != true, app.services.lock?.isLocked(row.nodeID) != true else { return nil }
-        let key = row.ref + String(row.modified ?? 0)
+        let revision = revisions[row.nodeID] ?? 0
+        let key = row.ref + ":" + String(row.modified ?? 0) + ":" + String(revision)
         if let cached = subtitles.object(forKey: key as NSString) { return cached as String }
-        // Read only a visible item's head, without opening it or retaining its content in the workspace.
-        guard let content = try? app.workspace.peekContent(row.nodeID) else { return nil }
-        let subtitle = row.subtitle(content: content)
+        let work: SubtitleWork
+        if let pending = subtitleWork[row.nodeID], pending.key == key {
+            work = pending
+        } else {
+            // DocumentPersistence is main-actor isolated. Take its value snapshot here;
+            // enumerating every block/caption/table cell must not run on the scrolling actor.
+            guard let content = try? app.workspace.peekContent(row.nodeID) else { return nil }
+            let count = countSubtitle
+            let task = Task.detached(priority: .utility) { count(row, content) }
+            work = SubtitleWork(key: key, task: task)
+            subtitleWork[row.nodeID] = work
+        }
+        let subtitle = await work.task.value
+        // A cancelled/replaced revision must never clear newer work or populate its cache.
+        guard revision == revisions[row.nodeID] ?? 0,
+              app.services.lock?.isLocked(row.nodeID) != true else { return nil }
+        // Another cell awaiting the same work may already have published it.
+        if let cached = subtitles.object(forKey: key as NSString) {
+            return Task.isCancelled ? nil : cached as String
+        }
+        // A coalesced waiter may resume after publication and cache eviction. Its
+        // revision-validated local result is still valid; never clear newer work.
+        if subtitleWork[row.nodeID]?.key == key { subtitleWork[row.nodeID] = nil }
         keys[row.nodeID, default: []].insert(key)
         subtitles.setObject(subtitle as NSString, forKey: key as NSString)
-        return subtitle
+        return Task.isCancelled ? nil : subtitle
     }
     func thumbnail(_ row: LibraryRow, app: NibApp) async -> UIImage? {
         guard row.locked != true, app.services.lock?.isLocked(row.nodeID) != true else { return nil }
