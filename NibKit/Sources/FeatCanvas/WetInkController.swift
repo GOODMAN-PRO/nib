@@ -638,18 +638,18 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         let id = sample.touchID
         let track = Track(sample: sample, screenStart: screenPoint, route: route)
         tracks[id] = track
+        track.route = router?.begin(sample, route: route) ?? .rejected
         if !sample.isPencil, let pending = pendingTap,
            pending.sample.page == sample.page,
            sample.timestamp >= pending.sample.timestamp,
            sample.timestamp - pending.sample.timestamp <= 0.3,
            pending.screenPoint.distance(to: screenPoint) <= 24,
-           !isRejected(route) {
+           !isRejected(track.route) {
             // A double tap's interval ends at the second DOWN, not its lift. Keep the
             // provisional dot pending while that contact completes (or becomes a drag).
             secondTapID = id
             tapTask?.cancel()
         }
-        router?.begin(sample, route: route)
         let fingers = tracks.values.filter { !$0.sample.isPencil && !isRejectedOrClaimed($0.route) }
         if fingers.count > 1 {
             flushPendingTap()
@@ -662,7 +662,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                 finger.route = .navigation
             }
         }
-        if case .tool(let tool) = route, !navigating, tool.inputMode != .taps, host.isInkEnabled {
+        if case .tool(let tool) = track.route, !navigating, tool.inputMode != .taps, host.isInkEnabled {
             let style = tool.inkStyle(host) ?? .defaultPen
             if tool.inputMode == .pencilKit, !surfaces.contains(where: { $0.active && $0.page == sample.page }) {
                 // Pencil may start on another visible page before the scroll session chooses it.

@@ -62,6 +62,7 @@ final class BoardsModel: ObservableObject {
     private let bag = WhiteboardSubscriptions()
     private var documentChanges: AnyCancellable?
     private var editingBeforeRename: Bool?
+    private var renameBaseline: (doc: DocumentID, title: String, storedTitle: String)?
 
     init(app: NibApp, session: EditorSession) {
         self.app = app
@@ -82,6 +83,13 @@ final class BoardsModel: ObservableObject {
         boards = content.livePages.enumerated().map { i, page in
             BoardRow(id: page.id, number: i + 1, title: Self.title(page, number: i + 1),
                      paper: MinimapModel.paper(of: page.background), version: versions[page.id] ?? 0)
+        }
+        if let id = renaming, let baseline = renameBaseline {
+            if baseline.doc != doc || !boards.contains(where: { $0.id == id }) { cancelRename() }
+            else if renameText == baseline.title, let board = boards.first(where: { $0.id == id }) {
+                renameText = board.title
+                renameBaseline = (doc, board.title, content.livePages.first(where: { $0.id == id })?.title ?? "")
+            }
         }
         let live = Set(boards.map(\.id))
         if !selection.isSubset(of: live) { selection = selection.intersection(live) }
@@ -127,6 +135,8 @@ final class BoardsModel: ObservableObject {
     }
 
     func beginRename(_ board: BoardRow) {
+        guard let doc, let record = try? app.workspace.content(doc).page(board.id) else { return }
+        renameBaseline = (doc, board.title, record.title ?? "")
         if editingBeforeRename == nil { editingBeforeRename = session.isEditingText }
         session.isEditingText = true
         renameText = board.title
@@ -135,16 +145,18 @@ final class BoardsModel: ObservableObject {
 
     func cancelRename() {
         renaming = nil
+        renameBaseline = nil
         if let editingBeforeRename { session.isEditingText = editingBeforeRename }
         editingBeforeRename = nil
     }
 
     func commitRename() {
-        guard let id = renaming else { return }
-        cancelRename()
+        guard let id = renaming, let baseline = renameBaseline else { return }
         let title = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty, title != boards.first(where: { $0.id == id })?.title else { return }
-        perform(CommandIDs.boardRename, ["page": .string(ref(id)), "title": .string(title)])
+        cancelRename()
+        guard baseline.doc == doc, !title.isEmpty, title != baseline.title else { return }
+        perform(CommandIDs.boardRename, ["page": .string(NodeRef.page(baseline.doc, id).description),
+            "title": .string(title), "expectedTitle": .string(baseline.storedTitle)])
     }
 
     func reorder(from source: IndexSet, to destination: Int) {
