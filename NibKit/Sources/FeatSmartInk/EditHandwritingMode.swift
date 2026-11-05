@@ -504,11 +504,12 @@ final class EditHandwritingModel: ObservableObject {
         let width = layout.columns[c].box.width
         let left = layout.pageLeft(ofColumn: c)
         let group = NibID.make().raw
+        let removalRefs = JSONValue.array(word.ids.map { .string(NodeRef.item(t.doc, t.page, $0).description) })
         let reflow: JSONValue = ["refs": refs(columnIDs), "width": .number(width), "left": .number(left),
                                  "without": refs(word.ids)]
         guard await run(CommandIDs.handwritingReflow, reflow, group: group) != nil else { return }
         selectedWord = []
-        if await run(command, ["refs": refs(word.ids)], group: group) == nil,
+        if await run(command, ["refs": removalRefs], group: group) == nil,
            app.bus.history.entries(t.doc).last?.group == group {
             // The word could not be removed: put the column back as it was.
             app.bus.undo(t.doc)

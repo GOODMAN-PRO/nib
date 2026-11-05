@@ -53,8 +53,9 @@ final class FeatSmartInkTests: XCTestCase {
         h.app.commands.register(CommandDescriptor(id: CommandIDs.itemDelete, title: "Delete",
                                                   summary: "Test stand-in.", effect: .edit)) { params, ctx in
             try ctx.mutate { tx in
-                for value in params["refs"]?.arrayValue ?? [] {
-                    guard let s = value.stringValue, case let .item(d, p, id)? = NodeRef(s) else { continue }
+                let refs = ctx.refsOrSelection(params["refs"]?.arrayValue?.compactMap { $0.stringValue })
+                for ref in refs {
+                    guard case let .item(d, p, id)? = NodeRef(ref) else { continue }
                     try tx.delete(item: id, doc: d, page: p)
                 }
             }
@@ -518,6 +519,36 @@ final class FeatSmartInkTests: XCTestCase {
 
     /// Delete Word on the first word of a line: the column flows on at its width as if the word were gone (no false
     /// indent), then the word is deleted. One undo step that restores everything.
+    func testDeleteWordKeepsCapturedRefsWhenModeEndsDuringRecognition() async throws {
+        let h = Harness(features: [FeatSmartInkFeature.self])
+        installItemDelete(h)
+        let s = Synth.paragraph()
+        let (model, tool, host) = try await editMode(h, s)
+        let before = try h.snapshot()
+        let word = model.layout.lines[1].words[0]
+        model.tap(at: word.box.center, page: page, time: 100)
+        model.tap(at: word.box.center, page: page, time: 100.2)
+        var ended = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
+                                                  summary: "End the mode while reflow awaits recognition.", effect: .read)) { _, ctx in
+            // Ignore the mode's independent background hint request; only reflow's nested call ends the mode.
+            if ctx.depth > 0, !ended {
+                ended = true
+                model.finish()
+                tool.deactivate(host)
+            }
+            return [:]
+        }
+        await model.deleteWord()
+        XCTAssertTrue(ended)
+        XCTAssertNil(model.target)
+        let remaining = try h.app.workspace.items(doc, page: page).map { $0.id }
+        XCTAssertEqual(Set(remaining), Set(s.ids).subtracting(word.ids))
+        XCTAssertEqual(h.undoDepth(doc), 1)
+        h.app.bus.undo(doc)
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
     func testEditModeDeleteClosesTheHoleAndReflows() async throws {
         let h = Harness(features: [FeatSmartInkFeature.self])
         installItemDelete(h)
