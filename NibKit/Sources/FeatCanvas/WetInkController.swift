@@ -466,7 +466,8 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         canvas.accessibilityElementsHidden = true
         if highlighter { canvas.layer.compositingFilter = "multiplyBlendMode" }
         canvas.acceptsContact = { [weak self, weak surface, weak canvas] point, event in
-            func report(_ accepted: Bool, _ reason: String) -> Bool {
+            // A local function does not inherit this closure's main-actor isolation; the diagnostic reads host state.
+            @MainActor func report(_ accepted: Bool, _ reason: String) -> Bool {
                 #if DEBUG
                 let host = self?.host
                 let hit = event?.allTouches?.first?.view
