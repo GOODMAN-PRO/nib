@@ -568,6 +568,81 @@ final class NibIndexTests: XCTestCase {
         XCTAssertEqual(words[1].bbox.x, 30, accuracy: 0.001)
     }
 
+    func testRecognitionTimeoutDoesNotQueueLaterRequestsBehindAbandonedWork() async {
+        let pool = RecognitionWaitPool(limit: 2)
+        let blocked = DispatchSemaphore(value: 0)
+        defer { blocked.signal() }
+        let started = expectation(description: "blocking recognizer started")
+        let ended = expectation(description: "caller abandoned recognition")
+        let task = Task {
+            do {
+                let _: Int = try await pool.perform(timeout: 0.05) {
+                    started.fulfill()
+                    blocked.wait()
+                    return 1
+                }
+                XCTFail("late recognition must be discarded")
+            } catch RecognitionWaitPool.Failure.timedOut {
+            } catch { XCTFail("unexpected error: \(error)") }
+            ended.fulfill()
+        }
+        defer { task.cancel() }
+        await fulfillment(of: [started, ended], timeout: 1)
+        do {
+            let next = try await pool.perform(timeout: 0.1) { 2 }
+            XCTAssertEqual(next, 2, "an abandoned call must not serialise later callers")
+        } catch { XCTFail("later caller failed: \(error)") }
+    }
+
+    func testRecognitionCancellationReturnsBeforeBlockingWorkAndKeepsCapacityCapped() async {
+        let pool = RecognitionWaitPool(limit: 1)
+        let blocked = DispatchSemaphore(value: 0)
+        defer { blocked.signal() }
+        let started = expectation(description: "blocking recognizer started")
+        let cancelled = expectation(description: "caller cancelled promptly")
+        let task = Task {
+            do {
+                let _: Int = try await pool.perform(timeout: 30) {
+                    started.fulfill()
+                    blocked.wait()
+                    return 1
+                }
+                XCTFail("cancelled recognition must be discarded")
+            } catch is CancellationError {
+            } catch { XCTFail("unexpected error: \(error)") }
+            cancelled.fulfill()
+        }
+        await fulfillment(of: [started], timeout: 1)
+        task.cancel()
+        await fulfillment(of: [cancelled], timeout: 1)
+        do {
+            let _: Int = try await pool.perform(timeout: 0.1) {
+                XCTFail("abandoned operation still owns the only slot")
+                return 2
+            }
+            XCTFail("capacity must remain capped until Vision returns")
+        } catch RecognitionWaitPool.Failure.saturated {
+        } catch { XCTFail("unexpected error: \(error)") }
+    }
+
+    func testRecognitionCancelledBeforeStartDoesNotRunBlockingOperation() async {
+        let pool = RecognitionWaitPool(limit: 1)
+        let ended = expectation(description: "pre-cancelled caller returned")
+        let task = Task {
+            // Suspend on the actor so cancellation precedes the recognition wait.
+            do {
+                let _: Int = try await pool.perform(timeout: 1) {
+                    XCTFail("pre-cancelled work must not start")
+                    return 1
+                }
+            } catch is CancellationError {
+                ended.fulfill()
+            } catch { XCTFail("unexpected error: \(error)") }
+        }
+        task.cancel()
+        await fulfillment(of: [ended], timeout: 1)
+    }
+
     func testVisionReadsGeneratedImageAndOCRMakesImagesSearchable() async throws {
         let image = NibIndexTests.textImage("Quantum harbour 2026")
         let recognizer = VisionRecognizer()

@@ -35,7 +35,7 @@ final class VisionRecognizer: TextRecognizer {
 
     /// Text in an image; boxes (line and words) are in image pixels (top-left origin).
     func recognize(image: CGImage, language: String) async throws -> [TextRecognition] {
-        let observations = try VisionRecognizer.perform(image, languages: VisionRecognizer.languages(for: language),
+        let observations = try await VisionRecognizer.perform(image, language: language,
                                                         minimumTextPixels: 8)
         let w = Double(image.width), h = Double(image.height)
         func pixels(_ b: CGRect) -> Rect {
@@ -58,13 +58,12 @@ final class VisionRecognizer: TextRecognizer {
     func recognizeInk(_ items: [Item], language: String) async throws -> [InkLine] {
         let strokes = items.filter { $0.kind == .stroke && !($0.stroke?.points.isEmpty ?? true) }
         let plan = InkLayout.plan(strokes.map { InkRender.bounds(of: $0) })
-        let languages = VisionRecognizer.languages(for: language)
         var out: [InkLine] = []
         for group in plan.groups {
             try Task.checkCancellation()
             let members = group.map { strokes[$0] }
             guard let render = InkRender.make(members, scale: plan.scale) else { continue }
-            let observations = try VisionRecognizer.perform(render.image, languages: languages,
+            let observations = try await VisionRecognizer.perform(render.image, language: language,
                                                             minimumTextPixels: InkLayout.targetXHeight / 2)
             out += VisionRecognizer.lines(observations, render: render, strokes: members)
         }
@@ -128,7 +127,15 @@ final class VisionRecognizer: TextRecognizer {
         return supported.first { ($0.lowercased().split(separator: "-").first.map(String.init) ?? "") == base }
     }
 
-    static func perform(_ image: CGImage, languages: [String], minimumTextPixels: Double) throws -> [VNRecognizedTextObservation] {
+    private static let requests = RecognitionWaitPool(limit: 2)
+
+    static func perform(_ image: CGImage, language: String, minimumTextPixels: Double) async throws -> [VNRecognizedTextObservation] {
+        try await requests.perform(timeout: 2) {
+            try performBlocking(image, languages: languages(for: language), minimumTextPixels: minimumTextPixels)
+        }
+    }
+
+    private static func performBlocking(_ image: CGImage, languages: [String], minimumTextPixels: Double) throws -> [VNRecognizedTextObservation] {
         func run(_ level: VNRequestTextRecognitionLevel) throws -> [VNRecognizedTextObservation] {
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = level
@@ -420,5 +427,93 @@ enum InkLayout {
     static func recognize(_ strokes: [Item], language: String, recognizer: TextRecognizer) async throws -> [InkLine] {
         let lines = try await recognizer.recognize(strokes: strokes, language: language)
         return lines.map { line(from: $0, strokes: strokes) }
+    }
+}
+
+/// Blocking Vision calls never occupy Swift's cooperative executor. An abandoned call keeps its slot until the
+/// underlying operation returns: at most `limit` dispatch threads can be held, even if Vision never comes back.
+final class RecognitionWaitPool: @unchecked Sendable {
+    enum Failure: Error { case timedOut, saturated }
+    private let lock = NSLock()
+    private var outstanding = 0
+    private let limit: Int
+    private let queue = DispatchQueue(label: "app.nib.recognition", qos: .userInitiated, attributes: .concurrent)
+    private let deadlines = DispatchQueue(label: "app.nib.recognition.deadlines", qos: .userInitiated)
+
+    init(limit: Int) { self.limit = limit }
+
+    private func reserve() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard outstanding < limit else { return false }
+        outstanding += 1
+        return true
+    }
+
+    private func release() {
+        lock.lock()
+        outstanding -= 1
+        lock.unlock()
+    }
+
+    func perform<Value>(timeout: TimeInterval, operation: @escaping @Sendable () throws -> Value) async throws -> Value {
+        let wait = RecognitionWait<Value>()
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                guard wait.install(continuation) else { return }
+                guard reserve() else {
+                    wait.finish(.failure(Failure.saturated), abandoned: true)
+                    return
+                }
+                deadlines.asyncAfter(deadline: .now() + timeout) {
+                    wait.finish(.failure(Failure.timedOut), abandoned: true)
+                }
+                queue.async {
+                    defer { self.release() }
+                    guard wait.isPending else { return }
+                    wait.finish(Result { try operation() })
+                }
+            }
+        }, onCancel: {
+            wait.finish(.failure(CancellationError()), abandoned: true)
+        })
+    }
+}
+
+/// Resolves exactly once, including cancellation before the continuation has been installed.
+private final class RecognitionWait<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var result: Result<Value, Error>?
+
+    var isPending: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return result == nil
+    }
+
+    func install(_ continuation: CheckedContinuation<Value, Error>) -> Bool {
+        lock.lock()
+        if let result = result {
+            lock.unlock()
+            continuation.resume(with: result)
+            return false
+        }
+        self.continuation = continuation
+        lock.unlock()
+        return true
+    }
+
+    func finish(_ result: Result<Value, Error>, abandoned: Bool = false) {
+        lock.lock()
+        guard self.result == nil else { lock.unlock(); return }
+        self.result = result
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        #if DEBUG
+        if abandoned { NSLog("%@", "[Nib QA recognize] abandoned: \(String(describing: result))") }
+        #endif
+        continuation?.resume(with: result)
     }
 }
