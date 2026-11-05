@@ -706,6 +706,9 @@ final class FeatCommentsTests: XCTestCase {
         let h = harness()
         registerInk(h)
         registerAddPage(h)
+        // The canvas has loaded the active page. Cold index scans deliberately no longer populate the editing
+        // cache (8971b99); keeping page 1 during eviction cannot cache a page that was never loaded.
+        _ = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
         let counting = CountingPersistence(h.persistence)
         h.app.workspace.persistence = counting
         let model = CommentsListModel(app: h.app, session: h.session)
@@ -719,6 +722,7 @@ final class FeatCommentsTests: XCTestCase {
         counting.loads.removeAll()
         try await h.run("test.ink")
         XCTAssertEqual(model.sections.map(\.title), ["Page 1"])
+        XCTAssertEqual(counting.loads, [], "Ink on the cached active page must not make the index read pages")
 
         let added = try await h.run("comment.add", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "at": [10, 10],
                                                     "text": "Second page"])
@@ -736,15 +740,21 @@ final class FeatCommentsTests: XCTestCase {
         XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 2"])
         XCTAssertEqual(model.sections.first?.rows.first?.resolved, true)
         XCTAssertEqual(model.hiddenResolved, 0)
+        let readsBeforeUnrelatedCommits = counting.loads
 
         // A new page is read as it arrives (the PDF page before it has no threads, so it shows as page 4).
         try await h.run("test.addPage", ["id": "NEWPAGE00001", "text": "New page"])
         XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 2", "Page 4"])
+        XCTAssertEqual(counting.loads.filter { $0 != PageID("NEWPAGE00001") }, readsBeforeUnrelatedCommits,
+                       "Adding a page must not read existing pages")
+        let readsAfterAddingPage = counting.loads
 
         try await h.run("comment.deleteMessage", ["ref": .string(addedRef), "message": .string(addedMessage)])
         XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 4"])
+        XCTAssertEqual(counting.loads, readsAfterAddingPage, "Deleting a message must update the index from mutations")
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 2", "Page 4"])
+        XCTAssertEqual(counting.loads, readsAfterAddingPage, "Undo must update the index from mutations")
 
         XCTAssertFalse(counting.loads.contains(Fixtures.page1), "page 1 stayed cached and was never re-read")
         XCTAssertFalse(counting.loads.contains(Fixtures.pdfPage), "no commit touched the PDF page, so it was not read")

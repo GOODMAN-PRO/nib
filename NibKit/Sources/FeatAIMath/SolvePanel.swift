@@ -146,7 +146,8 @@ private struct SolvePanelContent: View {
     var body: some View {
         VStack(spacing: 0) {
             NibPanelHeader(title: model.state.mode == .solve ? String(localized: "Solve") : String(localized: "Teach Me"),
-                           subtitle: model.providerLabel, symbol: .math, onClose: {
+                           subtitle: model.providerLabel, symbol: .math,
+                           handlesEscape: context.presentation == .sheet || context.presentation == .fullScreen, onClose: {
                 model.cancel()
                 context.app.perform(CommandIDs.panelClose, ["id": .string(FeatAIMathFeature.panelID)], session: context.session)
             }) { EmptyView() }

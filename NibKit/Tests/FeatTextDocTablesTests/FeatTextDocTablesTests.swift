@@ -81,18 +81,22 @@ final class FeatTextDocTablesTests: XCTestCase {
         defer { withExtendedLifetime(mounted) {} }
         let gate = TableCommandGate()
         defer { gate.open = true }
-        let entry = try XCTUnwrap(h.app.commands.entry("table.edit"))
         var writes = 0
-        h.app.commands.register(entry.descriptor) { params, context in
+        // Typing uses bus.run(TableEdit.self), whose fast path bypasses replacement JSON handlers.
+        // A command hook intercepts both paths, so this really suspends the first write before mutation.
+        h.app.bus.hooks.register(CommandHookDescriptor(id: "test.suspendTableWrite", owner: "test",
+                                                       commands: ["table.edit"]) { _, _ in
             writes += 1
             if writes == 1 { try await gate.wait() }
-            return try await entry.handler(params, context)
-        }
+            return nil
+        })
         let active = try XCTUnwrap(h.app.services.get("tables.activeQueues", as: CurrentValueSubject<Set<UIView>, Never>.self))
         v.beginEditing(at: CellPosition(row: 0, column: 0))
         type("Older write", into: v)
         v.flushTyping()
         try await waitForTable { gate.started }
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(try table(h).rows[0][0].text.plainText, "A1", "The first write must still be suspended")
         v.endEditing()
         v.removeFromSuperview()
         XCTAssertTrue(active.value.contains(v), "The host must keep this view discoverable while detached")
@@ -100,6 +104,7 @@ final class FeatTextDocTablesTests: XCTestCase {
         v.beginEditing(at: CellPosition(row: 0, column: 0))
         type("Newest text", into: v)
         v.flushTyping()
+        XCTAssertEqual(writes, 1, "Newer typing must queue behind the suspended write")
         gate.open = true
         var flushed = false
         let flush = Task { await v.flushEdits(); flushed = true }
@@ -107,6 +112,7 @@ final class FeatTextDocTablesTests: XCTestCase {
         try await waitForTable { flushed }
         XCTAssertEqual(try table(h).rows[0][0].text.plainText, "Newest text")
         XCTAssertEqual(v.editor.text, "Newest text")
+        XCTAssertEqual(writes, 2)
         XCTAssertFalse(active.value.contains(v))
     }
 

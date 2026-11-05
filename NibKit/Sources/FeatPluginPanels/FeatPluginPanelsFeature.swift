@@ -88,8 +88,10 @@ final class PluginPanelFactoryService: PluginPanelFactory {
         let panelID = PanelIdentity.panelID(manifest: manifest, entry: entry, openPanels: context.session?.openPanels ?? [])
         let placement = manifest.contributes?.panels?.first { $0.id == panelID }?.placement
         let floating = PanelIdentity.usesFloatingChrome(presentation: context.presentation, placement: placement)
+        let presentation = context.presentation ?? PanelPresentation(rawValue: placement ?? "floating")
+        let handlesEscape = presentation == .sheet || presentation == .fullScreen
         let app = context.app
-        return AnyView(PluginPanelView(floating: floating) { [weak self] in
+        return AnyView(PluginPanelView(floating: floating, handlesEscape: handlesEscape) { [weak self] in
             PluginWebPanel(app: app, factory: self, manifest: manifest, panelID: panelID, folder: folder, entry: entry,
                            context: context)
         })

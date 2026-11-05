@@ -950,7 +950,8 @@ enum ScratchPaper {
     static func descriptor(owner: String) -> PanelDescriptor {
         var descriptor = PanelDescriptor(id: panelID, title: String(localized: "Scratch Paper"), icon: NibSymbol.quickNote.name,
                                          placement: .floating, order: 600, owner: owner, docKinds: [.studySet]) { context in
-            AnyView(ScratchPaperView(paper: ScratchPaper.paper(context.app), onClose: context.dismiss))
+            AnyView(ScratchPaperView(paper: ScratchPaper.paper(context.app), presentation: context.presentation,
+                                     onClose: context.dismiss))
         }
         descriptor.providesHeader = true
         return descriptor
@@ -993,13 +994,15 @@ struct ScratchCanvas: UIViewRepresentable {
 
 struct ScratchPaperView: View {
     let paper: RGBA
+    let presentation: PanelPresentation?
     let onClose: @MainActor () -> Void
     @StateObject private var pad = ScratchPad()
     @State private var tool: CardInkTool
     @Environment(\.dynamicTypeSize) private var typeSize
 
-    init(paper: RGBA, onClose: @escaping @MainActor () -> Void) {
+    init(paper: RGBA, presentation: PanelPresentation? = nil, onClose: @escaping @MainActor () -> Void) {
         self.paper = paper
+        self.presentation = presentation
         self.onClose = onClose
         _tool = State(initialValue: .pen(CardInk.quickInks(on: paper)[0]))
     }
@@ -1007,7 +1010,8 @@ struct ScratchPaperView: View {
     var body: some View {
         VStack(spacing: 0) {
             NibPanelHeader(title: String(localized: "Scratch Paper"), subtitle: String(localized: "Not saved"),
-                           symbol: .quickNote, onClose: { onClose() })
+                           symbol: .quickNote, handlesEscape: presentation == .sheet || presentation == .fullScreen,
+                           onClose: { onClose() })
             ScratchCanvas(pad: pad, tool: tool)
                 .background(Color(uiColor: paper.uiColor))
                 .clipShape(RoundedRectangle(cornerRadius: NibRadius.concentric(NibRadius.panel, inset: NibSpacing.l),

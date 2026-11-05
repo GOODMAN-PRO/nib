@@ -126,7 +126,7 @@ struct PluginListView: View {
     var body: some View {
         VStack(spacing: 0) {
             if showsHeader {
-                NibPanelHeader(title: String(localized: "Plugins"), symbol: .puzzle, onClose: {
+                NibPanelHeader(title: String(localized: "Plugins"), symbol: .puzzle, handlesEscape: true, onClose: {
                     app.perform(CommandIDs.panelClose, ["id": .string(ManagerCommands.managerPanel)])
                     close?()
                 }) { installMenu }
