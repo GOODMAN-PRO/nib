@@ -22,11 +22,11 @@ final class CollabMergeTests: XCTestCase {
         // Concurrent edits of the same record and of different records.
         var shapeA = try a.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
         shapeA.shape?.frame.x = 10
-        try await a.insert([shapeA, CollabPair.stroke("ONLYONA00001", x: 10)])
+        try await a.insertBounded([shapeA, CollabPair.stroke("ONLYONA00001", x: 10)])
         var shapeB = try b.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
         shapeB.shape?.frame.x = 20
-        try await b.insert([shapeB])
-        try await b.insert([CollabPair.stroke("ONLYONB00001", x: 20)], page: Fixtures.page2)
+        try await b.insertBounded([shapeB])
+        try await b.insertBounded([CollabPair.stroke("ONLYONB00001", x: 20)], page: Fixtures.page2)
         let fromA = patches.filter { $0.from === a }.map(\.patch)
         let fromB = patches.filter { $0.from === b }.map(\.patch)
         XCTAssertFalse(fromA.isEmpty)
@@ -55,10 +55,10 @@ final class CollabMergeTests: XCTestCase {
         }
         var threadA = try a.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.commentID)
         threadA.comment?.messages.append(CommentMessage(author: "Ada", text: "Reply from Ada"))
-        try await a.insert([threadA])
+        try await a.insertBounded([threadA])
         var threadB = try b.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.commentID)
         threadB.comment?.messages.append(CommentMessage(author: "Ben", text: "Reply from Ben"))
-        try await b.insert([threadB])
+        try await b.insertBounded([threadB])
         for p in fromB { a.app.bus.applyRemote(p, origin: "collab:b") }
         for p in fromA { b.app.bus.applyRemote(p, origin: "collab:a") }
         let onA = try a.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.commentID)
@@ -73,10 +73,10 @@ final class CollabMergeTests: XCTestCase {
     func testDigestDeltaHoldsOnlyWhatTheOtherSideLacks() async throws {
         let a = Harness(deviceID: 7)
         let b = Harness(deviceID: 8)
-        try await a.insert([CollabPair.stroke("NEWONA000001", x: 5)])
+        try await a.insertBounded([CollabPair.stroke("NEWONA000001", x: 5)])
         var textB = try b.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
         textB.text?.text = RichText(plain: "Newer on B")
-        try await b.insert([textB])
+        try await b.insertBounded([textB])
 
         let stateA = try state(a)
         let stateB = try state(b)

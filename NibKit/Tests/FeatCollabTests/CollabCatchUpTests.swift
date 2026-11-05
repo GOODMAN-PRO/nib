@@ -16,11 +16,10 @@ final class CollabCatchUpTests: XCTestCase {
         super.tearDown()
     }
 
-    private func makePair(timeout: TimeInterval = 20) -> CollabPair {
+    private func makePair(timeout: TimeInterval = 20, step: String = #function) -> CollabPair {
         let pair = CollabPair()
+        pair.stepTimeout = timeout
         for service in [pair.hostService, pair.guestService] {
-            service.timing.approvalTimeout = 1
-            service.timing.rejoinTimeout = 0.5
             service.timing.syncProgressInterval = 0.02
         }
         pairs.append(pair)
@@ -28,7 +27,7 @@ final class CollabCatchUpTests: XCTestCase {
             do { try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000)) }
             catch { return }
             guard pair.guestService.session != nil || pair.hostService.session != nil else { return }
-            XCTFail("collaboration test exceeded its \(timeout)-second deadline (including initial join)")
+            XCTFail("\(step) exceeded its \(timeout)-second deadline (including initial join)")
             pair.guestService.leave()
             pair.hostService.leave()
         })
@@ -50,7 +49,9 @@ final class CollabCatchUpTests: XCTestCase {
                 }
             }
         }
-        let state = try await CollabCatchUp.scan(Fixtures.docID, workspace: h.app.workspace, isCurrent: { true })
+        let state = try await withCollabDeadline("scan disk fixture") {
+            try await CollabCatchUp.scan(Fixtures.docID, workspace: h.app.workspace, isCurrent: { true })
+        }
         await fulfillment(of: [response], timeout: 1)
         XCTAssertTrue(respondedBetweenPages)
         XCTAssertEqual(state.digest.items.count, 500)
@@ -65,8 +66,10 @@ final class CollabCatchUpTests: XCTestCase {
             let patch = try state.pageDelta(page.id, doc: Fixtures.docID, workspace: h.app.workspace, against: empty)
             XCTAssertEqual(patch.items.count, 1, "each outgoing patch contains at most one page")
         }
-        try await state.validate(Fixtures.docID, workspace: h.app.workspace, isCurrent: { true },
-                                 excluding: Set(state.content.pages.map(\.id)))
+        try await withCollabDeadline("validate scanned disk fixture") {
+            try await state.validate(Fixtures.docID, workspace: h.app.workspace, isCurrent: { true },
+                                     excluding: Set(state.content.pages.map(\.id)))
+        }
         XCTAssertEqual(disk.loads, 1_000, "sent pages are fingerprint-checked with the delta read only")
         XCTAssertTrue(h.app.workspace.cachedPages(Fixtures.docID).isEmpty)
     }
@@ -76,7 +79,9 @@ final class CollabCatchUpTests: XCTestCase {
         let disk = try CatchUpDiskPersistence(count: 2)
         defer { try? FileManager.default.removeItem(at: disk.root) }
         h.app.workspace.persistence = disk
-        let state = try await CollabCatchUp.scan(Fixtures.docID, workspace: h.app.workspace, isCurrent: { true })
+        let state = try await withCollabDeadline("scan disk fixture") {
+            try await CollabCatchUp.scan(Fixtures.docID, workspace: h.app.workspace, isCurrent: { true })
+        }
         var items = try disk.loadItems(Fixtures.docID, page: Fixtures.page1)
         let maximum = items.map(\.rev).max()
         items[0].rev = Rev(wallMs: 50, counter: 0, device: 7)
@@ -88,7 +93,9 @@ final class CollabCatchUpTests: XCTestCase {
             XCTAssertEqual(($0 as? NibError)?.code, .conflict)
         }
         do {
-            try await state.validate(Fixtures.docID, workspace: h.app.workspace, isCurrent: { true })
+            try await withCollabDeadline("reject changed disk fixture") {
+                try await state.validate(Fixtures.docID, workspace: h.app.workspace, isCurrent: { true })
+            }
             XCTFail("stale digest published")
         } catch { XCTAssertEqual((error as? NibError)?.code, .conflict) }
     }
@@ -100,8 +107,10 @@ final class CollabCatchUpTests: XCTestCase {
         h.app.workspace.persistence = disk
         let visible = try h.app.workspace.allItems(Fixtures.docID, page: Fixtures.page1)
         do {
-            _ = try await CollabCatchUp.scan(Fixtures.docID, workspace: h.app.workspace,
-                                             isCurrent: { disk.loads < 3 })
+            _ = try await withCollabDeadline("reject invalidated disk scan") {
+                try await CollabCatchUp.scan(Fixtures.docID, workspace: h.app.workspace,
+                                           isCurrent: { disk.loads < 3 })
+            }
             XCTFail("invalidated scan continued")
         } catch { XCTAssertEqual((error as? NibError)?.code, .conflict) }
         XCTAssertEqual(disk.loads, 3)
@@ -132,8 +141,8 @@ final class CollabCatchUpTests: XCTestCase {
         pair.guestTransport.leave()
         let pages = try pair.host.app.workspace.content(Fixtures.docID).pages
         for page in pages {
-            try await pair.host.insert([CollabPair.stroke("DISKHOSTEDIT1", x: 40)], page: page.id)
-            try await pair.guest.insert([CollabPair.stroke("DISKGUESTEDIT1", x: 80)], page: page.id)
+            try await pair.host.insertBounded([CollabPair.stroke("DISKHOSTEDIT1", x: 40)], page: page.id)
+            try await pair.guest.insertBounded([CollabPair.stroke("DISKGUESTEDIT1", x: 80)], page: page.id)
             pair.host.app.workspace.evictPages(Fixtures.docID, keeping: [Fixtures.page1])
             pair.guest.app.workspace.evictPages(Fixtures.docID, keeping: [Fixtures.page1])
         }
@@ -154,7 +163,7 @@ final class CollabCatchUpTests: XCTestCase {
             peakGuest = max(peakGuest, pair.guest.app.workspace.cachedPages(Fixtures.docID).count)
         }
         defer { hostObserver.cancel(); guestObserver.cancel() }
-        await pair.guestService.resumeAfterSuspend()
+        try await pair.bounded("guest foreground resume") { await pair.guestService.resumeAfterSuspend() }
         XCTAssertEqual(pair.guestService.session?.synchronizationPending, false)
         XCTAssertGreaterThanOrEqual(hostMerges, 500)
         XCTAssertGreaterThanOrEqual(guestMerges, 500)
@@ -202,7 +211,7 @@ final class CollabCatchUpTests: XCTestCase {
             let session = try XCTUnwrap(pair.guestService.session)
             pair.guestService.didEnterBackground()
             pair.guestTransport.leave()
-            try await pair.host.insert([CollabPair.stroke("HOSTFAILRETRY", x: 40)], page: Fixtures.page2)
+            try await pair.host.insertBounded([CollabPair.stroke("HOSTFAILRETRY", x: 40)], page: Fixtures.page2)
             pair.host.app.workspace.evictPages(Fixtures.docID, keeping: [])
             _ = try pair.host.app.workspace.allItems(Fixtures.docID, page: Fixtures.page1)
             hostDisk.failNextLoad = true
@@ -236,7 +245,7 @@ final class CollabCatchUpTests: XCTestCase {
                     guard !Task.isCancelled, !session.isClosed else { return }
                     _ = pair.hostService.session?.sendPresence(["tick": .number(Double(tick))], to: nil)
                     _ = session.sendPresence(["tick": .number(Double(tick))], to: nil)
-                    try await pair.host.insert([CollabPair.stroke("DURINGFAIL001", x: Float(tick))])
+                    try await pair.host.insertBounded([CollabPair.stroke("DURINGFAIL001", x: Float(tick))])
                     try await Task.sleep(nanoseconds: 5_000_000)
                 }
                 trafficFinished = true
@@ -250,7 +259,9 @@ final class CollabCatchUpTests: XCTestCase {
             }
             defer { traffic.cancel(); watchdog.cancel() }
             do {
-                _ = try await pair.guestService.join(code: code, transportKey: nil)
+                _ = try await pair.bounded("guest rejoin and catch-up") {
+                    try await pair.guestService.join(code: code, transportKey: nil)
+                }
                 XCTFail("host read failure must fail this attempt")
             } catch {
                 XCTAssertEqual((error as? NibError)?.code, dropFailureReply ? .timeout : .unavailable)
@@ -259,7 +270,7 @@ final class CollabCatchUpTests: XCTestCase {
                 XCTAssertTrue(trafficFinished, "every host frame, even live traffic, resets the idle clock")
             }
             traffic.cancel()
-            _ = await traffic.result
+            _ = try await pair.bounded("stop background traffic") { await traffic.result }
             watchdog.cancel()
             XCTAssertFalse(watchdogFired, "silence after the bounded traffic must release the waiter")
             XCTAssertEqual(hostDisk.failedLoads, 1)
@@ -275,7 +286,9 @@ final class CollabCatchUpTests: XCTestCase {
             let afterFailure = try CollabPair.kinds(Array(pair.hostTransport.sent.dropFirst(failedAt)))
             XCTAssertFalse(afterFailure.contains(.syncProgress), "failed work must stop its heartbeat")
             pair.guestService.timing.syncIdleTimeout = 2
-            _ = try await pair.guestService.join(code: code, transportKey: nil)
+            _ = try await pair.bounded("guest rejoin and catch-up") {
+                try await pair.guestService.join(code: code, transportKey: nil)
+            }
             XCTAssertTrue(pair.guestService.session === session)
             XCTAssertFalse(session.synchronizationPending)
             XCTAssertFalse(session.hasUnsentChanges)
@@ -310,7 +323,9 @@ final class CollabCatchUpTests: XCTestCase {
         }
         pair.guestService.timing.syncIdleTimeout = 0.1
         do {
-            _ = try await pair.guestService.join(code: code, transportKey: nil)
+            _ = try await pair.bounded("guest rejoin and catch-up") {
+                try await pair.guestService.join(code: code, transportKey: nil)
+            }
             XCTFail("disconnected catch-up must fail")
         } catch { XCTAssertEqual((error as? NibError)?.code, .timeout) }
         XCTAssertTrue(disconnected)
@@ -341,7 +356,9 @@ final class CollabCatchUpTests: XCTestCase {
         disk.onLoad = { _ in session.end(reason: nil, notify: false) }
         pair.guestService.timing.syncIdleTimeout = 0.01
         do {
-            _ = try await pair.guestService.join(code: code, transportKey: nil)
+            _ = try await pair.bounded("guest rejoin and catch-up") {
+                try await pair.guestService.join(code: code, transportKey: nil)
+            }
             XCTFail("ending must release the waiter")
         } catch { XCTAssertEqual((error as? NibError)?.code, .unavailable) }
         try await Task.sleep(nanoseconds: 30_000_000)
@@ -372,16 +389,16 @@ final class CollabCatchUpTests: XCTestCase {
         pair.guestService.didEnterBackground()
         pair.guestTransport.leave()
         for page in try pair.host.app.workspace.content(Fixtures.docID).pages {
-            try await pair.host.insert([CollabPair.stroke("SLOWHOSTEDIT1", x: 40)], page: page.id)
+            try await pair.host.insertBounded([CollabPair.stroke("SLOWHOSTEDIT1", x: 40)], page: page.id)
         }
-        try await pair.guest.insert([CollabPair.stroke("SLOWGUESTEDIT1", x: 80)], page: Fixtures.page2)
+        try await pair.guest.insertBounded([CollabPair.stroke("SLOWGUESTEDIT1", x: 80)], page: Fixtures.page2)
         let session = try XCTUnwrap(pair.guestService.session)
         pair.guestService.timing.rejoinTimeout = 0.05
         pair.guestService.timing.syncIdleTimeout = 0.5
         transport.minimumSendInterval = 0.06
         transport.shouldThrottle = { [weak session] in session?.synchronizationPending == true }
         let start = Date()
-        await pair.guestService.resumeAfterSuspend()
+        try await pair.bounded("guest foreground resume") { await pair.guestService.resumeAfterSuspend() }
         XCTAssertGreaterThan(Date().timeIntervalSince(start), 0.5)
         XCTAssertTrue(pair.guestService.session === session)
         XCTAssertFalse(session.synchronizationPending)
@@ -402,12 +419,14 @@ final class CollabCatchUpTests: XCTestCase {
         let session = try XCTUnwrap(pair.guestService.session)
         pair.guestService.didEnterBackground()
         pair.guestTransport.leave()
-        try await pair.host.insert([CollabPair.stroke("IDLEHOSTEDIT1", x: 40)])
+        try await pair.host.insertBounded([CollabPair.stroke("IDLEHOSTEDIT1", x: 40)])
         pair.guestService.timing.syncIdleTimeout = 0.1
         transport.minimumSendInterval = 60
         transport.shouldThrottle = { [weak session] in session?.synchronizationPending == true }
         do {
-            _ = try await pair.guestService.join(code: code, transportKey: nil)
+            _ = try await pair.bounded("guest rejoin and catch-up") {
+                try await pair.guestService.join(code: code, transportKey: nil)
+            }
             XCTFail("a stalled catch-up must time out")
         } catch { XCTAssertEqual((error as? NibError)?.code, .timeout) }
         XCTAssertTrue(pair.guestService.session === session)
@@ -415,7 +434,9 @@ final class CollabCatchUpTests: XCTestCase {
         XCTAssertTrue(session.synchronizationPending)
         transport.shouldThrottle = nil
         pair.guestService.timing.syncIdleTimeout = 2
-        _ = try await pair.guestService.join(code: code, transportKey: nil)
+        _ = try await pair.bounded("guest rejoin and catch-up") {
+            try await pair.guestService.join(code: code, transportKey: nil)
+        }
         XCTAssertFalse(session.synchronizationPending)
         XCTAssertTrue(CollabPair.hasItem(pair.guest, "IDLEHOSTEDIT1"))
     }
@@ -434,7 +455,7 @@ final class CollabCatchUpTests: XCTestCase {
         // Incompressible text forces a real multi-frame JSON page patch, unlike many small pages.
         let contents = (0..<60_000).map { _ in UUID().uuidString }.joined()
         text.text?.text = RichText(plain: contents)
-        try await pair.host.insert([text])
+        try await pair.host.insertBounded([text])
         let receive = pair.guestTransport.onMessage
         let inspector = CollabFrames.Assembler()
         var fragments = 0
@@ -476,7 +497,9 @@ final class CollabCatchUpTests: XCTestCase {
         let watchdog = catchUpWatchdog(session, timeout: 4)
         defer { watchdog.cancel() }
         do {
-            _ = try await pair.guestService.join(code: code, transportKey: nil)
+            _ = try await pair.bounded("guest rejoin and catch-up") {
+                try await pair.guestService.join(code: code, transportKey: nil)
+            }
         } catch {
             let idle = lastFragment.map { Date().timeIntervalSince($0) } ?? -1
             XCTFail("fragment catch-up failed: \(error); fragments=\(fragments), completedPatch=\(patchFragments), lastFragmentAge=\(idle)")
@@ -522,7 +545,9 @@ final class CollabCatchUpTests: XCTestCase {
         let watchdog = catchUpWatchdog(session)
         defer { watchdog.cancel() }
         do {
-            _ = try await pair.guestService.join(code: code, transportKey: nil)
+            _ = try await pair.bounded("guest rejoin and catch-up") {
+                try await pair.guestService.join(code: code, transportKey: nil)
+            }
         } catch {
             XCTFail("empty-delta catch-up failed: \(error); hostReads=\(hostDisk.loads - before), elapsed=\(Date().timeIntervalSince(start))")
             throw error
@@ -562,7 +587,7 @@ final class CollabCatchUpTests: XCTestCase {
         let session = try XCTUnwrap(pair.guestService.session)
         pair.guestService.didEnterBackground()
         pair.guestTransport.leave()
-        try await pair.host.insert([CollabPair.stroke("LATEREPLY001", x: 90)])
+        try await pair.host.insertBounded([CollabPair.stroke("LATEREPLY001", x: 90)])
         pair.guestService.timing.syncIdleTimeout = 0.2
         let receive = pair.guestTransport.onMessage
         let inspector = CollabFrames.Assembler()
@@ -591,7 +616,9 @@ final class CollabCatchUpTests: XCTestCase {
         }
         defer { noise.cancel() }
         do {
-            _ = try await pair.guestService.join(code: code, transportKey: nil)
+            _ = try await pair.bounded("guest rejoin and catch-up") {
+                try await pair.guestService.join(code: code, transportKey: nil)
+            }
             XCTFail("a silent peer must fail")
         } catch { XCTAssertEqual((error as? NibError)?.code, .timeout) }
         let idle = Date().timeIntervalSince(lastReceived)
@@ -606,11 +633,12 @@ final class CollabCatchUpTests: XCTestCase {
         XCTAssertTrue(session.hasUnsentChanges)
     }
 
-    private func catchUpWatchdog(_ session: CollabSession, timeout: TimeInterval = 3) -> Task<Void, Never> {
+    private func catchUpWatchdog(_ session: CollabSession, timeout: TimeInterval = 3,
+                                 step: String = #function) -> Task<Void, Never> {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            XCTFail("catch-up exceeded its bounded test wait")
+            XCTFail("\(step) catch-up exceeded its bounded test wait")
             session.end(reason: "test watchdog", notify: false)
         }
     }
@@ -648,7 +676,7 @@ final class CollabCatchUpTests: XCTestCase {
         let session = try XCTUnwrap(pair.guestService.session)
         pair.guestService.didEnterBackground()
         pair.guestTransport.leave()
-        try await pair.host.insert([CollabPair.stroke("OLDPEEREDIT1", x: 40)])
+        try await pair.host.insertBounded([CollabPair.stroke("OLDPEEREDIT1", x: 40)])
         let receive = pair.guestTransport.onMessage
         var ignored = 0
         pair.guestTransport.onMessage = { peer, frame in
@@ -664,7 +692,9 @@ final class CollabCatchUpTests: XCTestCase {
         }
         let watchdog = catchUpWatchdog(session)
         defer { watchdog.cancel() }
-        _ = try await pair.guestService.join(code: code, transportKey: nil)
+        _ = try await pair.bounded("guest rejoin and catch-up") {
+            try await pair.guestService.join(code: code, transportKey: nil)
+        }
         XCTAssertGreaterThan(ignored, 0)
         XCTAssertEqual(CollabMessage.protocolVersion, 1)
         XCTAssertEqual(CollabFrames.formatVersion, 2)
@@ -691,15 +721,17 @@ final class CollabCatchUpTests: XCTestCase {
             let session = try XCTUnwrap(pair.guestService.session)
             pair.guestService.didEnterBackground()
             pair.guestTransport.leave()
-            try await pair.host.insert([CollabPair.stroke("RETRYHOST001", x: 40)])
-            try await pair.guest.insert([CollabPair.stroke("RETRYGUEST01", x: 80)], page: Fixtures.page2)
+            try await pair.host.insertBounded([CollabPair.stroke("RETRYHOST001", x: 40)])
+            try await pair.guest.insertBounded([CollabPair.stroke("RETRYGUEST01", x: 80)], page: Fixtures.page2)
             pair.guest.app.workspace.evictPages(Fixtures.docID, keeping: [])
             disk.failNextLoad = true
             if automatic {
-                await pair.guestService.resumeAfterSuspend()
+                try await pair.bounded("guest foreground resume") { await pair.guestService.resumeAfterSuspend() }
             } else {
                 do {
-                    _ = try await pair.guestService.join(code: code, transportKey: nil)
+                    _ = try await pair.bounded("guest rejoin and catch-up") {
+                        try await pair.guestService.join(code: code, transportKey: nil)
+                    }
                     XCTFail("injected read failure should fail the first catch-up")
                 } catch { XCTAssertEqual((error as? NibError)?.code, .unavailable) }
                 XCTAssertTrue(pair.guestService.session === session)
@@ -707,7 +739,9 @@ final class CollabCatchUpTests: XCTestCase {
                 XCTAssertTrue(session.isConnectedToHost)
                 XCTAssertTrue(session.synchronizationPending)
                 XCTAssertTrue(session.hasUnsentChanges)
-                _ = try await pair.guestService.join(code: code, transportKey: nil)
+                _ = try await pair.bounded("guest rejoin and catch-up") {
+                    try await pair.guestService.join(code: code, transportKey: nil)
+                }
             }
             XCTAssertEqual(disk.failedLoads, 1)
             XCTAssertTrue(pair.guestService.session === session)
