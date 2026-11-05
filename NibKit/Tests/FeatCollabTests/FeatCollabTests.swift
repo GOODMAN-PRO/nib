@@ -110,6 +110,49 @@ final class CollabPair {
     }
 }
 
+/// Injects transient relay failures without changing the in-memory transport's synchronous delivery semantics.
+@MainActor
+final class InterruptedCollabTransport: CollabTransport {
+    let base: InMemoryCollabTransport
+    var busyAt: Set<Int> = []
+    var alwaysBusy = false
+    var busyCount = 0
+    var accepted = 0
+    var hostFailures = 0
+    var hostAttempts = 0
+    init(_ base: InMemoryCollabTransport) { self.base = base }
+    var id: String { base.id }
+    var displayName: String { base.displayName }
+    var peers: [CollabPeer] { base.peers }
+    var maxPeers: Int { base.maxPeers }
+    var onMessage: ((CollabPeer, Data) -> Void)? {
+        get { base.onMessage }
+        set { base.onMessage = newValue }
+    }
+    var onPeersChanged: (([CollabPeer]) -> Void)? {
+        get { base.onPeersChanged }
+        set { base.onPeersChanged = newValue }
+    }
+    func host(code: String, displayName: String) async throws {
+        hostAttempts += 1
+        if hostFailures > 0 {
+            hostFailures -= 1
+            throw NibError(.unavailable, "Network is reconnecting")
+        }
+        try await base.host(code: code, displayName: displayName)
+    }
+    func join(code: String, displayName: String) async throws { try await base.join(code: code, displayName: displayName) }
+    func send(_ data: Data, to peers: [CollabPeer]?) throws {
+        if alwaysBusy || busyAt.remove(accepted) != nil {
+            busyCount += 1
+            throw NibError(.timeout, "Relay queue is full", hint: "relay-busy")
+        }
+        try base.send(data, to: peers)
+        accepted += 1
+    }
+    func leave() { base.leave() }
+}
+
 /// A library that keeps packages on disk, so the host sends the zipped package (the production snapshot path): a
 /// package is a folder holding the document as JSON, and `importPackage` reads one back.
 @MainActor
@@ -611,6 +654,49 @@ final class FeatCollabTests: XCTestCase {
     }
 
     // MARK: Files travel with their records
+
+    func testRelayBackpressureRetriesOnlyUnacceptedFramesOfTwentyMiBAsset() async throws {
+        let pair = CollabPair()
+        let transport = InterruptedCollabTransport(pair.hostTransport)
+        pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+        let code = try await pair.share()
+        try await pair.join(code)
+        let start = pair.hostTransport.sent.count
+        // Fail at the header and in the middle of several batches, after earlier frames were accepted.
+        transport.busyAt = Set([0, 7, 41, 109, 207].map { transport.accepted + $0 })
+        let bytes = Data(repeating: 0xA7, count: 20 * 1024 * 1024)
+        let ref = try pair.host.assets.put(bytes, ext: "png", doc: Fixtures.docID)
+        try await pair.host.insert([CollabPair.image("LARGERELAY01", asset: ref)])
+        try await waitUntil(timeout: 20) { CollabPair.hasItem(pair.guest, "LARGERELAY01") }
+        XCTAssertEqual(try pair.guest.assets.data(ref, doc: Fixtures.docID), bytes)
+        XCTAssertEqual(transport.busyCount, 5)
+        let frames = Array(pair.hostTransport.sent.dropFirst(start))
+        let blobs = frames.filter { $0.count >= 3 && $0[2] == CollabFrames.blobFlag }
+        XCTAssertEqual(blobs.count, CollabFrames.blobPartCount(bytes.count))
+        XCTAssertEqual(Set(blobs).count, blobs.count, "accepted blob frames must never be resent")
+        XCTAssertEqual(try CollabPair.kinds(frames).filter { $0 == .asset || $0 == .patch }, [.asset, .patch])
+        XCTAssertEqual(pair.guestService.session?.phase, .active)
+    }
+
+    func testLeavingCancelsBusyTransfersAndTheirQueuedPatches() async throws {
+        let pair = CollabPair()
+        let transport = InterruptedCollabTransport(pair.hostTransport)
+        pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+        let code = try await pair.share()
+        try await pair.join(code)
+        transport.alwaysBusy = true
+        let bytes = Data(repeating: 7, count: 128_000)
+        let ref = try pair.host.assets.put(bytes, ext: "png", doc: Fixtures.docID)
+        try await pair.host.insert([CollabPair.image("CANCELRELAY1", asset: ref)])
+        try await waitUntil { transport.busyCount > 0 }
+        pair.hostService.leave()
+        let attempts = transport.busyCount
+        try await Task.sleep(nanoseconds: 120_000_000)
+        XCTAssertEqual(transport.busyCount, attempts, "no retries after leaving")
+        XCTAssertEqual(try pair.host.assets.data(ref, doc: Fixtures.docID), bytes)
+        XCTAssertTrue(CollabPair.hasItem(pair.host, "CANCELRELAY1"))
+        XCTAssertNil(pair.hostService.state.message, "explicit leave must not report a failed transfer")
+    }
 
     func testAssetBytesTravelWithTheRecordsThatNeedThem() async throws {
         let pair = CollabPair()
