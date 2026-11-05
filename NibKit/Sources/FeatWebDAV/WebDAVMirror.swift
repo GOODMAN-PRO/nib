@@ -758,7 +758,13 @@ final class WebDAVMirrorRun {
             var remainingRemote = Set(tree.files.values.map { $0.path })
             var deletedRemote: [String] = []
             var applied = 0
+            var copyFailed = false
             for phase in [copies, deletions] {
+                // A move is copies followed by deletions. Keep the old copies until every new copy is safe.
+                if copyFailed {
+                    report.pending += deletions.count
+                    break
+                }
                 try await execute(phase, scan: scan, tree: tree, scratch: scratch) { outcome in
                     for (key, entry) in outcome.updates { state.entries[key] = entry }
                     if let counter = outcome.counter { report.count(counter) }
@@ -770,6 +776,7 @@ final class WebDAVMirrorRun {
                     }
                     if let path = outcome.deletedLocalPath { deletedLocal.append(path) }
                     if let error = outcome.error {
+                        copyFailed = true
                         report.pending += 1
                         if case .changedDuringSync = error {} else { report.errors.append(error.message) }
                     }
