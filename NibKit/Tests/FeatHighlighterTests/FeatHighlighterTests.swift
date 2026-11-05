@@ -482,6 +482,56 @@ final class FeatHighlighterTests: XCTestCase {
         XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
     }
 
+    func testFailedShapeCreationKeepsSamplesDrawnAfterRecognition() async throws {
+        final class Box { var snapped = false; var creates = 0 }
+        let box = Box()
+        let h = Harness(features: [FeatHighlighterFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeRecognize, title: "Recognise",
+            summary: "Recognised line.", effect: .read)) { _, _ in
+            try JSONValue.parse(#"{"shape":"line","points":[[10,10],[110,10]]}"#)
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeCreate, title: "Shape",
+            summary: "Failing shape commit.", effect: .edit)) { _, _ in
+            box.creates += 1
+            throw NibError(.internalError, "Could not save shape")
+        }
+        let subscription = h.app.events.subscribe { event in
+            if event.decode(ShapeSnappedPayload.self) != nil { box.snapped = true }
+        }
+        defer { subscription.cancel() }
+        let host = FakeCanvasHost(h)
+        let tool = HighlighterTool()
+        let stroke = Stroke(style: .defaultHighlighter, points: points([(10, 10), (60, 13), (110, 10)]), t0: 0)
+        XCTAssertTrue(tool.strokeHeld(stroke, page: Fixtures.page1, host: host))
+        for _ in 0..<200 where !box.snapped { try await Task.sleep(nanoseconds: 5_000_000) }
+        XCTAssertTrue(box.snapped, "Movement must happen after recognition")
+        tool.touchesMoved([
+            CanvasSample(page: Fixtures.page1, location: Point(120, 20), force: 0.2, timestamp: 1),
+            CanvasSample(page: Fixtures.page1, location: Point(130, 30), force: 0.7, timestamp: 1.1),
+            CanvasSample(page: Fixtures.page1, location: Point(999, 999), isPredicted: true)
+        ], host: host)
+        let end = Point(140, 40)
+        let convertedEnd = try XCTUnwrap(host.convert(end, from: Fixtures.page2, to: Fixtures.page1))
+        tool.touchesEnded(CanvasSample(page: Fixtures.page2, location: end, timestamp: 1.2), host: host)
+        for _ in 0..<200 where host.committed.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
+        let kept = try XCTUnwrap(host.committed.first?.stroke)
+        XCTAssertEqual(box.creates, 1)
+        XCTAssertEqual(host.committed.count, 1)
+        XCTAssertEqual(kept.style, stroke.style)
+        XCTAssertEqual(kept.t0, stroke.t0)
+        XCTAssertEqual(Array(kept.points.prefix(stroke.points.count)), stroke.points)
+        XCTAssertEqual(kept.points.count, stroke.points.count + 3, "Predicted samples are never saved")
+        XCTAssertEqual(Array(kept.polyline.suffix(3).prefix(2)), [Point(120, 20), Point(130, 30)])
+        let keptEnd = try XCTUnwrap(kept.polyline.last)
+        XCTAssertEqual(keptEnd.x, convertedEnd.x, accuracy: 0.001)
+        XCTAssertEqual(keptEnd.y, convertedEnd.y, accuracy: 0.001)
+        XCTAssertEqual(kept.points[stroke.points.count].force, 0.2, accuracy: 0.001)
+        XCTAssertTrue(kept.points.suffix(3).allSatisfy { $0.width > 0 && $0.height > 0 })
+        XCTAssertEqual(try XCTUnwrap(kept.points.last).t, try XCTUnwrap(stroke.points.last).t + 0.2, accuracy: 0.001)
+        XCTAssertEqual(host.renderWaits, [Fixtures.page1])
+        XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
+    }
+
     func testFailedHeldInkCommitKeepsPreviewAndReportsError() async throws {
         let h = Harness(features: [FeatHighlighterFeature.self])
         h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeRecognize, title: "Recognise",

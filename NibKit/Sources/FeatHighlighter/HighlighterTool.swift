@@ -107,17 +107,17 @@ final class HighlighterTool: CanvasTool {
         h.current = host.convert(sample.location, from: sample.page, to: h.page) ?? h.current
         if let r = h.recognised {
             h.shape = HeldShape.adjusted(r, from: h.holdPoint, to: h.current)
-        } else {
-            for sample in samples where !sample.isPredicted {
-                guard let point = host.convert(sample.location, from: sample.page, to: h.page) else { continue }
-                let elapsed = max(0, sample.timestamp - (h.lastTimestamp ?? sample.timestamp))
-                var segment = [StrokePoint(x: Float(point.x), y: Float(point.y),
-                    t: (h.stroke.points.last?.t ?? 0) + Float(elapsed), force: Float(sample.force),
-                    azimuth: Float(sample.azimuth), altitude: Float(sample.altitude), roll: Float(sample.roll))]
-                InkModel.fillSizes(&segment, style: h.stroke.style)
-                h.stroke.points.append(contentsOf: segment)
-                h.lastTimestamp = sample.timestamp
-            }
+        }
+        // Keep the real ink even after snapping, in case shape.create fails or the hold is cancelled.
+        for sample in samples where !sample.isPredicted {
+            guard let point = host.convert(sample.location, from: sample.page, to: h.page) else { continue }
+            let elapsed = max(0, sample.timestamp - (h.lastTimestamp ?? sample.timestamp))
+            var segment = [StrokePoint(x: Float(point.x), y: Float(point.y),
+                t: (h.stroke.points.last?.t ?? 0) + Float(elapsed), force: Float(sample.force),
+                azimuth: Float(sample.azimuth), altitude: Float(sample.altitude), roll: Float(sample.roll))]
+            InkModel.fillSizes(&segment, style: h.stroke.style)
+            h.stroke.points.append(contentsOf: segment)
+            h.lastTimestamp = sample.timestamp
         }
         hold = h
         refreshPreview(host)

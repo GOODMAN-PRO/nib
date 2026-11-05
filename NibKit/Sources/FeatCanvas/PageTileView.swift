@@ -313,6 +313,7 @@ final class PageTileView: UIView {
             slot.layer.removeFromSuperlayer()
             slot.placeholder.removeFromSuperlayer()
             slots[key] = nil
+            if failedSlots.remove(key) != nil { recoveryPending = true }
         }
         for key in wanted where slots[key] == nil {
             let slot = Slot()
@@ -375,7 +376,9 @@ final class PageTileView: UIView {
             slot.layer.removeFromSuperlayer()
             slot.placeholder.removeFromSuperlayer()
             slots[key] = nil
+            if failedSlots.remove(key) != nil { recoveryPending = true }
         }
+        notifyIfSettled()
     }
 
     /// Try Again after a failed render.
@@ -491,6 +494,8 @@ final class PageTileView: UIView {
     private func moveTilesToFallback() {
         for (key, slot) in slots {
             slot.task?.cancel()
+            // Retired zoom levels cannot block recovery of the current coverage.
+            if failedSlots.remove(key) != nil { recoveryPending = true }
             slot.placeholder.removeFromSuperlayer()
             if slot.hasImage {
                 slot.layer.removeFromSuperlayer()
