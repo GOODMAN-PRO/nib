@@ -108,8 +108,48 @@ public struct NibBarGroup<Content: View>: View {
         .frame(height: min(max(scaledHeight, NibMetrics.barHeight), NibMetrics.barHeightMax))
         .nibChromeTypeCap()
         .droplet(id, style: .bar)
+        .background {
+            GeometryReader { proxy in
+                NibBarGeometryMarker(id: id, frame: proxy.frame(in: NibLiquid.space))
+            }
+            .allowsHitTesting(false)
+        }
         .accessibilityElement(children: .contain)
     }
+}
+
+/// Final SwiftUI bar frames, scoped to a window's view tree, for sibling floating chrome.
+@MainActor
+public enum NibBarGeometry {
+    public static let didChange = Notification.Name("NibBarGeometry.didChange")
+
+    public static func frame(_ id: String, in root: UIView) -> CGRect? {
+        if let marker = root as? NibBarGeometryView, marker.id == id { return marker.barFrame }
+        for child in root.subviews {
+            if let frame = frame(id, in: child) { return frame }
+        }
+        return nil
+    }
+}
+
+private struct NibBarGeometryMarker: UIViewRepresentable {
+    let id: String
+    let frame: CGRect
+    func makeUIView(context: Context) -> NibBarGeometryView { NibBarGeometryView() }
+    func updateUIView(_ view: NibBarGeometryView, context: Context) {
+        view.id = id
+        guard view.barFrame != frame else { return }
+        view.barFrame = frame
+        Task { @MainActor [weak view] in
+            guard let view else { return }
+            NotificationCenter.default.post(name: NibBarGeometry.didChange, object: view)
+        }
+    }
+}
+
+private final class NibBarGeometryView: UIView {
+    var id = ""
+    var barFrame: CGRect = .zero
 }
 
 public struct NibToolbarItem: View {

@@ -1427,6 +1427,21 @@ final class FeatWindowsTests: XCTestCase {
         }
     }
 
+    func testDocumentTabsReserveMeasuredActionsAndTheFullActiveTitle() {
+        let bounds = CGRect(x: 0, y: 0, width: 834, height: 1194)
+        let menu = CGRect(x: 228, y: 32, width: 44, height: 44)
+        let trailing = CGRect(x: 630, y: 32, width: 188, height: 44)
+        let slot = TabStripLayout.documentSlot(control: menu, bounds: bounds, compact: false,
+                                               rightToLeft: false, trailingFrame: trailing)
+        XCTAssertEqual(trailing.minX - slot.maxX, NibMetrics.minimumRestingGap)
+        let plan = TabStripLayout.documentPlan(count: 3, active: 2, width: slot.width,
+                                               compact: false, activeTitleWidth: 130)
+        XCTAssertTrue(plan.shown.contains(2))
+        XCTAssertLessThan(plan.shown.count, 3)
+        XCTAssertGreaterThanOrEqual(plan.tabWidth, 130 + NibSpacing.m + NibMetrics.hitTarget)
+        XCTAssertLessThanOrEqual(plan.dropletWidth, slot.width)
+    }
+
     func testDocumentTabsFitOnlyTheSpaceBetweenTheBars() {
         let safeBounds = CGRect(x: 24, y: 24, width: 1146, height: 780)
         let menu = CGRect(x: 308, y: 32, width: 44, height: 44)

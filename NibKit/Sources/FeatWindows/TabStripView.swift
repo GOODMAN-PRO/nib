@@ -43,34 +43,36 @@ enum TabStripLayout {
     }
 
     /// The after-title Tabs menu measures the actual end of the leading bar, including title/status width.
-    /// Reserve the complete §14.2 trailing group (six 44 pt controls, separator, padding, assistant and gap),
-    /// even when some actions are unavailable. Compact chrome has three controls and no separate assistant.
-    /// This conservative envelope avoids coupling F018 to another feature's live action model.
-    static func documentSlot(control: CGRect, bounds: CGRect, compact: Bool, rightToLeft: Bool) -> CGRect {
+    /// Use the trailing bar's final adaptive frame, including its padding; the fixed envelope is only a fallback
+    /// before its first layout. The assistant sits outside that bar, so its space is already accounted for.
+    static func documentSlot(control: CGRect, bounds: CGRect, compact: Bool, rightToLeft: Bool,
+                             trailingFrame: CGRect? = nil) -> CGRect {
         let trailingWidth = compact
             ? 3 * NibMetrics.hitTarget + 2 * NibSpacing.xs
             : 7 * NibMetrics.hitTarget + separatorWidth + 2 * NibSpacing.xs + NibSpacing.l
         let controlEdge = rightToLeft ? control.minX : control.maxX
         let start = rightToLeft
-            ? bounds.minX + NibMetrics.chromeInset + trailingWidth + NibSpacing.l
+            ? (trailingFrame?.maxX ?? (bounds.minX + NibMetrics.chromeInset + trailingWidth)) + NibSpacing.l
             : controlEdge + NibSpacing.xs + NibSpacing.l
         let end = rightToLeft
             ? controlEdge - NibSpacing.xs - NibSpacing.l
-            : bounds.maxX - NibMetrics.chromeInset - trailingWidth - NibSpacing.l
+            : (trailingFrame?.minX ?? (bounds.maxX - NibMetrics.chromeInset - trailingWidth)) - NibSpacing.l
         return CGRect(x: start, y: control.midY - stripHeight / 2,
                       width: max(0, end - start), height: stripHeight)
     }
 
     /// Document chrome already supplies Library and the Tabs menu. Spend only the measured gap on capsules;
     /// when none fit, every document stays reachable through that menu, without squeezing a tab below its minimum.
-    static func documentPlan(count: Int, active: Int?, width: CGFloat, compact: Bool) -> Plan {
+    static func documentPlan(count: Int, active: Int?, width: CGFloat, compact: Bool,
+                             activeTitleWidth: CGFloat = 0) -> Plan {
         let widths = tabWidths(compact: compact)
         let available = max(0, width - 2 * inset)
-        let slots = min(max(0, count), maxTabs, Int(available / widths.lowerBound))
+        let minimum = max(widths.lowerBound, activeTitleWidth > 0 ? activeTitleWidth + NibSpacing.m + NibMetrics.hitTarget : 0)
+        let slots = min(max(0, count), maxTabs, Int(available / minimum))
         var shown = Array(0..<slots)
         if let active, active >= slots, active < count, slots > 0 { shown[slots - 1] = active }
         let hidden = (0..<max(0, count)).filter { !shown.contains($0) }
-        let tabWidth = slots == 0 ? 0 : min(widths.upperBound, available / CGFloat(slots))
+        let tabWidth = slots == 0 ? 0 : min(max(widths.upperBound, minimum), available / CGFloat(slots))
         return Plan(shown: shown, hidden: hidden, tabWidth: tabWidth,
                     dropletWidth: slots == 0 ? 0 : 2 * inset + CGFloat(slots) * tabWidth)
     }
@@ -350,7 +352,7 @@ struct TabCapsule: View {
             .accessibilityShowsLargeContentViewer { Text(tab.title) }
             if isSelected {
                 NibIconButton(.xmark, label: String(localized: "Close Tab"), size: .bar) { model.close(tab) }
-                    .frame(width: TabStripLayout.closeWidth, height: TabStripLayout.tabHeight)
+                    .frame(width: NibMetrics.hitTarget, height: TabStripLayout.tabHeight)
             }
         }
         .frame(width: width, height: TabStripLayout.tabHeight)
@@ -436,6 +438,7 @@ final class TabStripDocumentPresentation: ObservableObject {
     private var anchorFrame: CGRect?
     private var containerFrame: CGRect?
     private var rightToLeft = false
+    private var geometryObserver: NSObjectProtocol?
     private(set) var model: TabStripModel?
     @Published private(set) var slot: CGRect = .zero
     @Published private(set) var compact = false
@@ -443,6 +446,14 @@ final class TabStripDocumentPresentation: ObservableObject {
     init(controller: UIViewController, host: FloatingHosting) {
         self.controller = controller
         self.host = host
+        geometryObserver = NotificationCenter.default.addObserver(forName: NibBarGeometry.didChange,
+                                                                  object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.refreshGeometry() }
+        }
+    }
+
+    deinit {
+        if let geometryObserver { NotificationCenter.default.removeObserver(geometryObserver) }
     }
 
     func present(_ model: TabStripModel) {
@@ -482,7 +493,8 @@ final class TabStripDocumentPresentation: ObservableObject {
         }
         let bounds = container.inset(by: view.safeAreaInsets)
         let value = TabStripLayout.documentSlot(control: anchor, bounds: bounds, compact: compact,
-                                               rightToLeft: rightToLeft)
+                                               rightToLeft: rightToLeft,
+                                               trailingFrame: NibBarGeometry.frame("chrome.bar.trailing", in: view))
         if slot != value { slot = value }
     }
 
@@ -495,11 +507,13 @@ final class TabStripDocumentPresentation: ObservableObject {
 private struct TabStripDocumentView: View {
     @ObservedObject var model: TabStripModel
     @ObservedObject var placement: TabStripDocumentPresentation
+    @State private var titleWidth: CGFloat = 0
 
     var body: some View {
         let slot = placement.slot
+        let activeTitle = model.tabs.first(where: { $0.index == model.activeIndex })?.title ?? ""
         let plan = TabStripLayout.documentPlan(count: model.tabs.count, active: model.activeIndex,
-                                               width: slot.width, compact: placement.compact)
+                                               width: slot.width, compact: placement.compact, activeTitleWidth: titleWidth)
         // Keep the measurement surface mounted even while the first layout has no slot. Otherwise the
         // menu-only state cannot recover when the floating layer attaches or the window gains enough room.
         ZStack(alignment: .topLeading) {
@@ -513,6 +527,15 @@ private struct TabStripDocumentView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background {
+            Text(activeTitle)
+                .font(NibFont.barTitle)
+                .fixedSize()
+                .onGeometryChange(for: CGFloat.self) { ceil($0.size.width) } action: { titleWidth = $0 }
+                .hidden()
+                .accessibilityHidden(true)
+        }
+        .nibChromeTypeCap()
         .onGeometryChange(for: CGRect.self) { proxy in
             proxy.frame(in: NibLiquid.space)
         } action: { frame in
