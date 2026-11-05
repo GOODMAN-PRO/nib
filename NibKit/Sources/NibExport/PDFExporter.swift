@@ -3,6 +3,7 @@ import UIKit
 import PDFKit
 import PencilKit
 import CoreText
+import ImageIO
 import NibContracts
 
 // MARK: - Plan and snapshots
@@ -77,6 +78,7 @@ final class ExportPlan {
     private let numbers: [PageID: Int]
     private let cache: PageCacheGuard
     private let backgrounds = BackgroundCache()
+    private(set) var checkedImageBackgrounds = Set<URL>()
     private var recognized: [PageID: [TextRecognition]] = [:]
 
     /// Space around a board's content.
@@ -227,8 +229,16 @@ final class ExportPlan {
             guard backgrounds.pdfPage(url, index: record.background.pdfPage ?? 0) != nil else {
                 throw ExportAssets.unavailable(ref.name)
             }
-        } else if ExportImages.decode(url: url, maxPixel: 4096) == nil {
-            throw ExportAssets.unavailable(ref.name)
+        } else if !checkedImageBackgrounds.contains(url) {
+            // Snapshotting runs on the main actor. Read the container metadata only; the worker's
+            // BackgroundCache decodes pixels once and reuses them while drawing repeated backgrounds.
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+                  CGImageSourceGetStatus(source) == .statusComplete,
+                  CGImageSourceGetCount(source) > 0,
+                  CGImageSourceCopyPropertiesAtIndex(source, 0, nil) != nil else {
+                throw ExportAssets.unavailable(ref.name)
+            }
+            checkedImageBackgrounds.insert(url)
         }
         return url
     }

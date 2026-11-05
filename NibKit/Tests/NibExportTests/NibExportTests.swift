@@ -312,6 +312,28 @@ final class NibExportTests: XCTestCase {
         }
     }
 
+    func testRepeatedImageBackgroundSnapshotsProbeOneContainerWithoutDecodingPixels() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        h.app.commands.register(CommandDescriptor(id: "test.repeatedBackground", title: "Background", summary: "Repeated image background.",
+            effect: .edit, exposure: .ui)) { _, ctx in
+            try ctx.mutate { tx in
+                for var page in try tx.content(Fixtures.docID).livePages {
+                    page.background = .ofImage(Fixtures.pngAsset)
+                    try tx.put(page, doc: Fixtures.docID)
+                }
+            }
+            let plan = try await ExportPlan.make(Fixtures.docID, request: ExportRequest(documents: [Fixtures.docID]),
+                                                options: ExportOptions([:]), ctx: ctx, recognizeText: false)
+            defer { plan.evict() }
+            for _ in 0..<10 {
+                for i in plan.pages.indices { XCTAssertNotNil(try plan.snapshot(i).backgroundURL) }
+            }
+            XCTAssertEqual(plan.checkedImageBackgrounds.count, 1)
+            return .null
+        }
+        try await h.run("test.repeatedBackground")
+    }
+
     func testUnreadableImageBackgroundFailsInsteadOfExportingBlankPaper() async throws {
         let h = Harness(features: [NibExportFeature.self])
         h.assets.install(Data("broken image".utf8), as: Fixtures.pngAsset, doc: Fixtures.docID)
