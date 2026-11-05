@@ -581,28 +581,102 @@ final class ConnectorEditor: CanvasAttachment {
                 e.accessibilityLabel = start ? String(localized: "Connector start") : String(localized: "Connector end")
                 let side = end.side.flatMap { ConnectorSide(rawValue: $0) }
                 e.accessibilityValue = end.item == nil ? String(localized: "Not attached") : side.map { ConnectorEditor.attachedText($0) }
-                e.accessibilityHint = String(localized: "Drag onto a shape to attach this end.")
-                e.accessibilityCustomActions = end.item == nil ? [] : ConnectorSide.allCases.filter { $0 != side }.map { other in
+                e.accessibilityHint = String(localized: "Use actions to move or attach this end.")
+                var actions = movementActions(s, t)
+                actions.append(UIAccessibilityCustomAction(name: String(localized: "Attach to Nearest Object")) { [weak self] _ in
+                    self?.attachNearest(start: start, t) ?? false
+                })
+                if end.item != nil { actions += ConnectorSide.allCases.filter { $0 != side }.map { other in
                     UIAccessibilityCustomAction(name: ConnectorEditor.attachAction(other)) { [weak self] _ in
                         self?.commitSide(other, start: start, t)
                         return true
                     }
-                }
+                } }
+                e.accessibilityCustomActions = actions
                 list.append(e)
             case .bend(let i):
                 let e = element("bend\(i)", at: s.view)
                 e.accessibilityLabel = String(localized: "Bend \(i + 1)")
-                e.accessibilityHint = String(localized: "Drag to move this bend.")
-                e.accessibilityCustomActions = [UIAccessibilityCustomAction(name: String(localized: "Remove Bend")) { [weak self] _ in
+                e.accessibilityHint = String(localized: "Use actions to move or remove this bend.")
+                e.accessibilityCustomActions = movementActions(s, t) + [UIAccessibilityCustomAction(name: String(localized: "Remove Bend")) { [weak self] _ in
                     self?.removeBend(i, t)
                     return true
                 }]
                 list.append(e)
-            case .insert, .segment:
-                continue
+            case .insert(let i):
+                let e = element("insert\(i)", at: s.view)
+                e.accessibilityLabel = String(localized: "Add Bend \(i + 1)")
+                e.onActivate = { [weak self] in self?.moveHandle(s, by: Point(0, 0), t) }
+                e.accessibilityCustomActions = movementActions(s, t)
+                list.append(e)
+            case .segment(let i):
+                let e = element("segment\(i)", at: s.view)
+                e.accessibilityLabel = String(localized: "Connector Segment \(i + 1)")
+                e.accessibilityHint = String(localized: "Use actions to move this segment.")
+                e.accessibilityCustomActions = movementActions(s, t)
+                list.append(e)
             }
         }
         kit.view.accessibilityElements = list.isEmpty ? nil : list
+    }
+
+    private func movementActions(_ spot: Spot, _ t: Target) -> [UIAccessibilityCustomAction] {
+        let moves: [(String, Point)] = [
+            (String(localized: "Move Left"), Point(-10, 0)), (String(localized: "Move Right"), Point(10, 0)),
+            (String(localized: "Move Up"), Point(0, -10)), (String(localized: "Move Down"), Point(0, 10))
+        ]
+        return moves.map { name, delta in
+            UIAccessibilityCustomAction(name: name) { [weak self] _ in
+                guard let self else { return false }
+                self.moveHandle(spot, by: delta, t)
+                return true
+            }
+        }
+    }
+
+    private func moveHandle(_ spot: Spot, by delta: Point, _ t: Target) {
+        var changes: [String: JSONValue] = [:]
+        switch spot.handle {
+        case .end(let start):
+            changes[start ? "from" : "to"] = EndParam.free(spot.page + delta)
+        case .bend(let i):
+            guard t.connector.bends.indices.contains(i) else { return }
+            var bends = t.connector.bends
+            bends[i] = spot.page + delta
+            changes["bends"] = Self.json(bends)
+        case .insert(let i):
+            var bends = t.connector.bends
+            bends.insert(spot.page + delta, at: min(i, bends.count))
+            changes["bends"] = Self.json(bends)
+        case .segment(let i):
+            let c = t.connector
+            let frame = ConnectorRouter.elbowFrame(from: c.from.point, side: c.from.side,
+                                                   to: c.to.point, side: c.to.side, bends: c.bends)
+            changes["bends"] = Self.json(Self.movedSegment(frame, index: i, delta: delta))
+        }
+        commitAccessible(changes, t)
+    }
+
+    private func attachNearest(start: Bool, _ t: Target) -> Bool {
+        guard let host = kit.host else { return false }
+        let end = start ? t.connector.from : t.connector.to
+        let items = (try? host.app.workspace.items(t.doc, page: t.page)) ?? []
+        let candidates = items.filter { Anchoring.canAnchor($0) && $0.id != t.item.id && $0.id != end.item }
+        let nearest = candidates.compactMap { item -> (Item, ConnectorSide, Double, Double)? in
+            guard let anchor = Anchoring.nearest(on: item, to: end.point) else { return nil }
+            return (item, anchor.side, anchor.t, anchor.distance)
+        }.min { $0.3 < $1.3 }
+        guard let nearest else { return false }
+        commitAccessible([start ? "from" : "to": EndParam.attached(nearest.0.id, side: nearest.1, t: nearest.2)], t)
+        return true
+    }
+
+    private func commitAccessible(_ changes: [String: JSONValue], _ t: Target) {
+        var params = changes
+        params["ref"] = .string(NodeRef.item(t.doc, t.page, t.item.id).description)
+        params["expected"] = try? JSONValue.from(t.connector)
+        let call = JSONValue.object(params)
+        Task { [kit] in await kit.perform(CommandIDs.connectorSetPath, call) }
     }
 
     private func element(_ key: String, at p: CGPoint) -> OverlayElement {
@@ -632,18 +706,13 @@ final class ConnectorEditor: CanvasAttachment {
     }
 
     private func commitSide(_ side: ConnectorSide, start: Bool, _ t: Target) {
-        var params: [String: JSONValue] = ["ref": .string(NodeRef.item(t.doc, t.page, t.item.id).description)]
-        params[start ? "from" : "to"] = .object(["side": .string(side.name)])
-        let call = JSONValue.object(params)
-        Task { [kit] in await kit.perform(CommandIDs.connectorSetPath, call) }
+        commitAccessible([start ? "from" : "to": .object(["side": .string(side.name)])], t)
     }
 
     private func removeBend(_ i: Int, _ t: Target) {
         guard t.connector.bends.indices.contains(i) else { return }
         var bends = t.connector.bends
         bends.remove(at: i)
-        let params: JSONValue = ["ref": .string(NodeRef.item(t.doc, t.page, t.item.id).description),
-                                 "bends": ConnectorEditor.json(bends)]
-        Task { [kit] in await kit.perform(CommandIDs.connectorSetPath, params) }
+        commitAccessible(["bends": ConnectorEditor.json(bends)], t)
     }
 }

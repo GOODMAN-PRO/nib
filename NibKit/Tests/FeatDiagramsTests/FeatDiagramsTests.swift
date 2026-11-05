@@ -623,6 +623,47 @@ final class FeatDiagramsTests: XCTestCase {
         XCTAssertEqual(try connector(h, Fixtures.connectorID).bends, [Point(300, 300), Point(380, 380)])
     }
 
+    func testConnectorAccessibilityMovesAttachesAndInsertsWithUndo() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let ref = NodeRef.item(Fixtures.docID, Fixtures.page1, Fixtures.connectorID).description
+        try await h.run(CommandIDs.connectorSetPath, ["ref": .string(ref), "route": "straight",
+                                                     "from": EndParam.free(Point(50, 50)),
+                                                     "to": EndParam.free(Point(550, 550)), "bends": [[300, 300]]])
+        let host = FakeCanvasHost(h)
+        let editor = ConnectorEditor(host: host)
+        editor.attach(to: host)
+        defer { editor.detach(from: host) }
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.connectorID])
+        func element(_ label: String) throws -> OverlayElement {
+            editor.canvasDidChange(host)
+            let elements = host.canvasView.subviews.flatMap { $0.accessibilityElements ?? [] }
+            return try XCTUnwrap(elements.compactMap { $0 as? OverlayElement }.first { $0.accessibilityLabel == label })
+        }
+        func run(_ name: String, on element: OverlayElement) throws {
+            let action = try XCTUnwrap(element.accessibilityCustomActions?.first { $0.name == name })
+            XCTAssertTrue(action.actionHandler?(action) == true)
+        }
+        try run(String(localized: "Move Right"), on: element(String(localized: "Connector start")))
+        await settle { (try? self.connector(h, Fixtures.connectorID).from.point) == Point(60, 50) }
+        XCTAssertEqual(try connector(h, Fixtures.connectorID).from.point, Point(60, 50))
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try connector(h, Fixtures.connectorID).from.point, Point(50, 50))
+        try run(String(localized: "Move Down"), on: element(String(localized: "Bend \(1)")))
+        await settle { (try? self.connector(h, Fixtures.connectorID).bends) == [Point(300, 310)] }
+        XCTAssertEqual(try connector(h, Fixtures.connectorID).bends, [Point(300, 310)])
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        let insertion = try element(String(localized: "Add Bend \(1)"))
+        XCTAssertTrue(insertion.accessibilityActivate())
+        await settle { (try? self.connector(h, Fixtures.connectorID).bends.count) == 2 }
+        XCTAssertEqual(try connector(h, Fixtures.connectorID).bends.count, 2)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        try run(String(localized: "Attach to Nearest Object"), on: element(String(localized: "Connector start")))
+        await settle { (try? self.connector(h, Fixtures.connectorID).from.item) != nil }
+        XCTAssertNotNil(try connector(h, Fixtures.connectorID).from.item)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertNil(try connector(h, Fixtures.connectorID).from.item)
+    }
+
     func testConnectorEditorDragsAnEndOntoAnotherItem() async throws {
         let h = Harness(features: [FeatDiagramsFeature.self])
         let host = FakeCanvasHost(h)
