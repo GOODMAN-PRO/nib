@@ -5,7 +5,7 @@ import SwiftUI
 import PDFKit
 import NibContracts
 import NibTesting
-import NibDesign
+@testable import NibDesign
 @testable import FeatExportUI
 
 @MainActor
@@ -171,6 +171,48 @@ final class FeatExportUITests: XCTestCase {
             XCTAssertLessThanOrEqual(size.width, width + 1)
             XCTAssertLessThanOrEqual(size.height, NibMetrics.hitTarget + 1,
                                      "Format choices must not push selected boards below the popover viewport")
+        }
+    }
+
+    func testProductionPagesSegmentsSpanPopoverOptionsColumn() async throws {
+        let (h, presenter, _) = harness()
+        _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"]])
+        let selection = try XCTUnwrap(presenter.selection)
+        let draft = try XCTUnwrap(presenter.draft)
+        let titles = selection.pageScopes.map { $0.title(board: selection.isBoard) }
+        XCTAssertGreaterThan(titles.count, 1, "The production Pages picker must be present")
+        for scheme in [ColorScheme.light, .dark] {
+            var frames: [String: CGRect] = [:]
+            let dialog = ExportDialog(selection: selection, printing: false, app: h.app, session: h.session,
+                                      dismiss: {}, draft: draft, scrollsOptions: true)
+            let content = NibPopoverPanel(title: "Share & Export", onClose: {}, scrollsContent: false) { dialog }
+                .environment(\.dynamicTypeSize, .large)
+                .environment(\.colorScheme, scheme)
+                .environment(\.nibMeasuresSegmentFrames, true)
+                .onPreferenceChange(NibSegmentFrames.self) { frames = $0 }
+            let host = UIHostingController(rootView: content)
+            host.safeAreaRegions = []
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: NibMetrics.popoverWidth, height: 520))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            for _ in 0..<10 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            let segments = try titles.map { try XCTUnwrap(frames[$0], $0) }
+            let row = segments.reduce(CGRect.null) { $0.union($1) }
+            let inset = NibSpacing.l + 2 // Popover content padding and track inset.
+            let available = NibMetrics.popoverWidth - 2 * inset
+            XCTAssertEqual(row.minX, inset, accuracy: 1)
+            XCTAssertEqual(row.maxX, NibMetrics.popoverWidth - inset, accuracy: 1)
+            XCTAssertEqual(row.width, available, accuracy: 1,
+                           "Pages must fill the options column, not just its intrinsic labels")
+            for segment in segments {
+                XCTAssertEqual(segment.width, available / CGFloat(titles.count), accuracy: 1)
+                XCTAssertEqual(segment.minY, row.minY, accuracy: 1)
+                XCTAssertEqual(segment.height, NibMetrics.hitTarget, accuracy: 1)
+            }
+            // Reverting d08965d to intrinsic sizing leaves a shorter, unequal row;
+            // measuring the surrounding InspectorSection would miss that defect.
         }
     }
 

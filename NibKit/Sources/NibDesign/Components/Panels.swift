@@ -70,7 +70,7 @@ public struct NibPopoverPanel<Content: View>: View {
     }
 
     private func scrollingContent(isPresented: Bool) -> some View {
-        ScrollView {
+        NibScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.m) {
                 header
                 content
@@ -95,11 +95,6 @@ public struct NibPopoverPanel<Content: View>: View {
         .scrollBounceBehavior(.basedOnSize)
         .frame(width: min(width, viewport.width))
         .frame(height: min(contentHeight, maxHeight, NibMetrics.popoverMaxHeight, viewport.height))
-        // Fade the scrolling viewport, not its glass. The content's 16 pt bottom inset
-        // lets the final control scroll fully above the fade without changing scroll identity.
-        .nibFadeBottomEdge()
-        .scrollIndicators(.visible)
-        .scrollIndicatorsFlash(trigger: isPresented)
     }
 
     private var viewport: CGSize {
@@ -754,7 +749,7 @@ public struct NibPluginPanelChrome<Content: View>: View {
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: NibMetrics.panelWidth(typeSize))
+        .frame(maxWidth: NibMetrics.panelWidth(typeSize))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "panels.plugin.label", defaultValue: "\(name) plugin", bundle: .module))
     }

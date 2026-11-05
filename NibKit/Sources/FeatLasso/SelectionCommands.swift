@@ -430,14 +430,34 @@ struct SelectionOutput: Codable, Equatable {
 // MARK: - Commands
 
 struct SelectionSet: NibCommand {
+    /// Optional invocation snapshot, independent of the page containing the selected refs. Omitted IDs
+    /// mean nil in the session. Cancellation invalidates this snapshot even after A -> B -> A navigation.
+    struct ExpectedSession: Codable {
+        var document: DocumentID?
+        var page: PageID?
+
+        @MainActor
+        func validate(_ session: EditorSession) throws {
+            guard !Task.isCancelled, session.document == document, session.page == page else {
+                throw NibError(.conflict, String(localized: "The page changed before the items could be selected."),
+                               path: "$.expectedSession")
+            }
+        }
+    }
+
     struct Params: Codable {
         var refs: [String]
+        var expectedSession: ExpectedSession? = nil
     }
 
     static let descriptor = CommandDescriptor(
         id: "selection.set", title: "Select Items",
         summary: "Select items by ref (all on one page; locked items too). An empty list clears the selection.",
-        params: .obj(["refs": .arr(.ref, "item refs item:D/P/I on one page")], required: ["refs"]),
+        params: .obj(["refs": .arr(.ref, "item refs item:D/P/I on one page"),
+                      "expectedSession": .obj(["document": .str("expected session document ID; omitted means nil"),
+                                               "page": .str("expected session page ID; omitted means nil")],
+                                              "Optional navigation precondition; also rejects a cancelled invocation.")],
+                     required: ["refs"]),
         examples: [try! JSONValue.parse(#"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"]}"#)],
         effect: .session)
 
@@ -458,6 +478,7 @@ struct SelectionSet: NibCommand {
             ids.append(id)
         }
         guard let t = target else {
+            try p.expectedSession?.validate(session)
             session.selection = Selection()
             return SelectionOutput(refs: [], count: 0, bounds: nil)
         }
@@ -467,6 +488,8 @@ struct SelectionSet: NibCommand {
         if let missing = wanted.subtracting(items.map { $0.id }).sorted().first {
             throw NibError.notFound("item \(missing.raw) on page \(t.page.raw)")
         }
+        // No suspension between this check and the session write: hooks and authorization ran in the bus.
+        try p.expectedSession?.validate(session)
         return SelectionSupport.apply(items, doc: t.doc, page: t.page, outline: nil, session: session)
     }
 }

@@ -515,7 +515,7 @@ final class CalendarEventCache {
     // MARK: Private (call with the lock held)
 
     /// Drops events more than `horizon` from `now` and clips every synced range to the horizon, so coverage never
-    /// claims a span whose events were dropped (a later page of `calendar.events` then reads the calendar again).
+    /// claims a span whose events were dropped. Command paging keeps its own complete snapshot.
     private func prune(now: Date) {
         let oldest = now.addingTimeInterval(-Self.horizon), newest = now.addingTimeInterval(Self.horizon)
         byID = byID.filter { $0.value.end >= oldest && $0.value.start <= newest }
@@ -720,6 +720,7 @@ enum CalendarReminderNames {
     static let takeNotesAction = "calendar.takeNotes"
     static let identifierPrefix = "calendar.reminder."
     static let eventKey = "calendarEvent"
+    static let stableEventKey = "calendarEventKey"
 }
 
 struct PlannedReminder: Equatable {
@@ -728,6 +729,7 @@ struct PlannedReminder: Equatable {
     var fireDate: Date
     var title: String
     var body: String
+    var eventKey: String? = nil
 }
 
 /// Which reminders to schedule. Pure, so it is unit-tested.
@@ -755,7 +757,7 @@ enum CalendarReminderPlanner {
             let e = item.event
             let title = e.title.isEmpty ? String(localized: "Event") : e.title
             out.append(PlannedReminder(identifier: CalendarReminderNames.identifierPrefix + e.id, eventID: e.id,
-                                       fireDate: item.fire, title: title, body: describe(e, minutesBefore)))
+                                       fireDate: item.fire, title: title, body: describe(e, minutesBefore), eventKey: e.key))
         }
         return out
     }
@@ -776,8 +778,8 @@ protocol NotificationScheduling: AnyObject {
     func authorization() async -> NotificationAuthorization
     /// Shows the system prompt; call only for a user action.
     func requestAuthorization() async -> Bool
-    /// Removes pending notifications whose id starts with `prefix` and schedules `reminders`.
-    func replace(prefix: String, with reminders: [PlannedReminder]) async
+    /// Replaces desired identifiers before removing obsolete requests. Failures preserve existing requests.
+    func replace(prefix: String, with reminders: [PlannedReminder]) async throws
 }
 
 final class NoNotifications: NotificationScheduling {
@@ -786,11 +788,30 @@ final class NoNotifications: NotificationScheduling {
     func replace(prefix: String, with reminders: [PlannedReminder]) async {}
 }
 
+/// Injectable request operations; tests never need the system notification service.
+@MainActor
+protocol CalendarNotificationRequests: AnyObject {
+    func pendingRequests() async -> [UNNotificationRequest]
+    func add(_ request: UNNotificationRequest) async throws
+    func remove(_ identifiers: [String])
+}
+
+@MainActor
+private final class SystemCalendarNotificationRequests: CalendarNotificationRequests {
+    let center: UNUserNotificationCenter
+    init(_ center: UNUserNotificationCenter) { self.center = center }
+    func pendingRequests() async -> [UNNotificationRequest] { await center.pendingNotificationRequests() }
+    func add(_ request: UNNotificationRequest) async throws { try await center.add(request) }
+    func remove(_ identifiers: [String]) { center.removePendingNotificationRequests(withIdentifiers: identifiers) }
+}
+
 /// `UNUserNotificationCenter`: reminders carry the "Take Notes" action (category `calendar.event`). Main-actor
-/// isolated, so `categoryRegistered` and the remove-then-add in `replace` never run on two threads at once.
+/// isolated; CalendarStore serializes complete rebuilds, including their suspensions.
 @MainActor
 final class UserNotificationScheduler: NotificationScheduling {
     private var categoryRegistered = false
+    private let requests: CalendarNotificationRequests?
+    init(requests: CalendarNotificationRequests? = nil) { self.requests = requests }
 
     func authorization() async -> NotificationAuthorization {
         let settings = await UNUserNotificationCenter.current().notificationSettings()
@@ -811,12 +832,22 @@ final class UserNotificationScheduler: NotificationScheduling {
         }
     }
 
-    func replace(prefix: String, with reminders: [PlannedReminder]) async {
-        let center = UNUserNotificationCenter.current()
-        await registerCategory(center)
-        let pending = await center.pendingNotificationRequests()
-        let stale = pending.map { $0.identifier }.filter { $0.hasPrefix(prefix) }
-        if !stale.isEmpty { center.removePendingNotificationRequests(withIdentifiers: stale) }
+    func replace(prefix: String, with reminders: [PlannedReminder]) async throws {
+        let requests: CalendarNotificationRequests
+        if let injected = self.requests { requests = injected }
+        else {
+            let center = UNUserNotificationCenter.current()
+            await registerCategory(center)
+            requests = SystemCalendarNotificationRequests(center)
+        }
+        let pending = await requests.pendingRequests()
+        let desired = Set(reminders.map(\.identifier))
+        let stale = pending.filter { $0.identifier.hasPrefix(prefix) && !desired.contains($0.identifier) }
+        let existing = Set(pending.map(\.identifier))
+        let hasUnmatchedLegacy = stale.contains { $0.content.userInfo[CalendarReminderNames.stableEventKey] as? String == nil }
+        var added = [String]()
+        var failures = 0
+        var failedKeys = Set<String>()
         let calendar = Calendar.current
         for r in reminders {
             let content = UNMutableNotificationContent()
@@ -826,14 +857,35 @@ final class UserNotificationScheduler: NotificationScheduling {
             content.categoryIdentifier = CalendarReminderNames.category
             content.threadIdentifier = CalendarReminderNames.category
             content.userInfo = [CalendarReminderNames.eventKey: r.eventID]
+            if let key = r.eventKey { content.userInfo[CalendarReminderNames.stableEventKey] = key }
             let when = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: r.fireDate)
             let request = UNNotificationRequest(identifier: r.identifier, content: content,
                                                 trigger: UNCalendarNotificationTrigger(dateMatching: when, repeats: false))
             do {
-                try await center.add(request)
+                try await requests.add(request)
+                if !existing.contains(r.identifier) { added.append(r.identifier) }
             } catch {
+                failures += 1
+                if let key = r.eventKey { failedKeys.insert(key) }
                 calendarLog.error("reminder not scheduled: \(error.localizedDescription, privacy: .public)")
             }
+        }
+        if failures > 0 && hasUnmatchedLegacy {
+            // A moved legacy event cannot be matched to its replacement. Roll back new identifiers
+            // and keep all old requests, including keyed ones whose replacements were rolled back.
+            if !added.isEmpty { requests.remove(added) }
+            throw NibError(.unavailable, String(localized: "Some event reminders could not be scheduled. Try scheduling reminders again."))
+        }
+        let obsolete = stale.filter { request in
+            if let key = request.content.userInfo[CalendarReminderNames.stableEventKey] as? String {
+                return !failedKeys.contains(key)
+            }
+            // Older notifications have no stable key. Keep them on failure until a successful rebuild.
+            return failures == 0
+        }.map(\.identifier)
+        if !obsolete.isEmpty { requests.remove(obsolete) }
+        if failures > 0 {
+            throw NibError(.unavailable, String(localized: "Some event reminders could not be scheduled. Try scheduling reminders again."))
         }
     }
 
@@ -943,6 +995,7 @@ final class CalendarStore: ObservableObject {
 
     weak var app: NibApp?
     let cache: CalendarEventCache
+    let eventPages = CalendarEventPages()
 
     @Published private(set) var access: CalendarAccess = .notDetermined
     /// Today and the next six days, from the cache after every read that touches them.
@@ -962,7 +1015,13 @@ final class CalendarStore: ObservableObject {
     /// `begin()`'s first work (queued Take Notes, then a refresh); tests await it.
     private(set) var startTask: Task<Void, Never>?
 
+    private var activeReads: [UUID: DateInterval] = [:]
+    private var readSequences: [UUID: Int] = [:]
+    private var nextReadSequence = 0
+    private var supersededReads = Set<UUID>()
+    private var accessGeneration = 0
     private var providerStorage: CalendarProvider?
+    @Published private(set) var reminderError: String?
     private var notifierStorage: NotificationScheduling?
     private var observers: [NSObjectProtocol] = []
     private var providerToken: AnyObject?
@@ -998,6 +1057,8 @@ final class CalendarStore: ObservableObject {
             return p
         }
         set {
+            supersededReads.formUnion(activeReads.keys)
+            eventPages.clear()
             providerStorage = newValue
             access = newValue.access
         }
@@ -1163,9 +1224,27 @@ final class CalendarStore: ObservableObject {
             throw NibError(.unavailable, "Nib does not have full access to Calendars",
                            hint: "turn on Full Access for Nib in Settings › Privacy & Security › Calendars")
         }
+        let request = UUID()
+        let interval = DateInterval(start: from, end: to)
+        nextReadSequence += 1
+        let sequence = nextReadSequence
+        readSequences[request] = sequence
+        activeReads[request] = interval
         isSyncing = true
-        defer { isSyncing = false }
+        defer {
+            activeReads[request] = nil
+            readSequences[request] = nil
+            supersededReads.remove(request)
+            isSyncing = !activeReads.isEmpty
+        }
         let source = provider
+        let generation = accessGeneration
+        func lostAccess() -> Bool {
+            generation != accessGeneration || source.access != .granted || provider.access != .granted
+        }
+        func isCurrent() -> Bool {
+            !supersededReads.contains(request) && source === provider && !lostAccess()
+        }
         let events: [CalendarEvent]
         let calendars: [CalendarInfo]
         do {
@@ -1173,9 +1252,21 @@ final class CalendarStore: ObservableObject {
                 (try source.events(from: from, to: to), source.calendars())
             }.value
         } catch {
+            try Task.checkCancellation()
+            if lostAccess() { return [] }
             let e = NibError.wrap(error)
-            lastError = e
+            if isCurrent() { lastError = e }
             throw e
+        }
+        try Task.checkCancellation()
+        if lostAccess() { return [] }
+        // Accept a cache miss for any uncovered part of a superseded wide read: publishing
+        // it whole would overwrite the newer overlapping interval. Its caller keeps its own result.
+        guard isCurrent() else { return events }
+        // Only a published success supersedes older overlapping reads. A failed/cancelled
+        // newer request must leave an older successful read free to refresh the cache.
+        for (id, range) in activeReads where range.start < to && range.end > from {
+            if let older = readSequences[id], older < sequence { supersededReads.insert(id) }
         }
         lastError = nil
         var names: [String] = []
@@ -1221,6 +1312,9 @@ final class CalendarStore: ObservableObject {
 
     /// Calendar access went away: forget every cached event (privacy) and redraw planner pages.
     private func forgetEvents() {
+        accessGeneration += 1
+        eventPages.clear()
+        supersededReads.formUnion(activeReads.keys)
         guard cache.latestSync != nil || !upcoming.isEmpty else { return }
         cache.clear()
         upcoming = []
@@ -1275,7 +1369,11 @@ final class CalendarStore: ObservableObject {
         do {
             _ = try await load(from: window.start, to: window.end, session: session)
             upcomingLoaded = true
+        } catch is CancellationError {
+            return
         } catch {
+            // The command bus may wrap cancellation before it reaches this UI boundary.
+            guard !Task.isCancelled else { return }
             lastError = NibError.wrap(error)
             refreshAccess()
         }
@@ -1370,15 +1468,24 @@ final class CalendarStore: ObservableObject {
         let notifier = self.notifier
         let status = await notifier.authorization()
         notifications = status
-        guard status == .authorized else { return }
-        guard minutes > 0, access == .granted else {
-            await notifier.replace(prefix: CalendarReminderNames.identifierPrefix, with: [])
+        guard status == .authorized else {
+            reminderError = nil
             return
         }
-        let now = Date()
-        let events = cache.events(overlapping: now, now.addingTimeInterval(CalendarReminderPlanner.window))
-        let plan = CalendarReminderPlanner.plan(events, minutesBefore: minutes, now: now)
-        await notifier.replace(prefix: CalendarReminderNames.identifierPrefix, with: plan)
+        let plan: [PlannedReminder]
+        if minutes > 0, access == .granted {
+            let now = Date()
+            let events = cache.events(overlapping: now, now.addingTimeInterval(CalendarReminderPlanner.window))
+            plan = CalendarReminderPlanner.plan(events, minutesBefore: minutes, now: now)
+        } else { plan = [] }
+        do {
+            try await notifier.replace(prefix: CalendarReminderNames.identifierPrefix, with: plan)
+            reminderError = nil
+        } catch {
+            let message = NibError.wrap(error).message
+            if reminderError != message { report(error, command: CalendarEvents.descriptor.id) }
+            reminderError = message
+        }
     }
 
     /// Settings and the Calendar tab's "Remind Me" menu: asks for notification permission (a user action) before

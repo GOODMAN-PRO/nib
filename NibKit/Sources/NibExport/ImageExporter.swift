@@ -203,7 +203,8 @@ final class BackgroundCache {
         if let r = raster, r.url == url {
             decoded = (r.image, r.size)
         } else {
-            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+            guard ExportImages.hasCompleteContainer(url),
+                  let source = CGImageSourceCreateWithURL(url as CFURL, nil),
                   let d = ExportImages.decode(source, maxPixel: 4096),
                   CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete else {
                 throw ExportAssets.unavailable(record.background.asset?.name ?? url.lastPathComponent)
@@ -229,6 +230,25 @@ final class BackgroundCache {
 
 /// Decodes images (EXIF orientation applied, downsampled to `maxPixel`) with the upright size of the original.
 enum ExportImages {
+    /// ImageIO can report complete and synthesise pixels for a PNG truncated after IHDR.
+    /// Check chunk boundaries and the terminal chunk before trusting its tolerant decoder.
+    static func hasCompleteContainer(_ url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return false }
+        let signature: [UInt8] = [137, 80, 78, 71, 13, 10, 26, 10]
+        guard data.starts(with: signature) else { return true } // Other formats use ImageIO's status checks.
+        var offset = signature.count
+        var hasPixels = false
+        while data.count - offset >= 12 {
+            let length = (0..<4).reduce(0) { ($0 << 8) | Int(data[offset + $1]) }
+            guard length <= data.count - offset - 12 else { return false }
+            let type = Array(data[(offset + 4)..<(offset + 8)])
+            if type == [73, 68, 65, 84], length > 0 { hasPixels = true } // IDAT
+            if type == [73, 69, 78, 68] { return hasPixels && length == 0 } // IEND
+            offset += length + 12
+        }
+        return false
+    }
+
     static func decode(_ ref: AssetRef, doc: DocumentID, assets: AssetStore?, maxPixel: Int) -> (image: CGImage, size: PageSize)? {
         guard let data = try? assets?.data(ref, doc: doc),
               let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }

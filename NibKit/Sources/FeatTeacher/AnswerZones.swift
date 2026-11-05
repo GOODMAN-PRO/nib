@@ -520,8 +520,9 @@ final class AnswerZoneModel: ObservableObject {
         run(CommandIDs.answerZoneScore, ["ref": .string(ref), "score": 0, "points": 0])
     }
 
-    func setHints(_ hints: [String]) {
-        run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": .array(hints.map { JSONValue.string($0) })])
+    func setHints(_ hints: [String], expected: [String], completion: @escaping () -> Void) {
+        run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": .array(hints.map { JSONValue.string($0) }),
+                                           "expectedHints": .array(expected.map { JSONValue.string($0) })]) { _ in completion() }
     }
 
     func resetUsage() {
@@ -1437,6 +1438,25 @@ struct AnswerZoneInspector: View {
 struct AnswerZoneHintDraft: Identifiable, Equatable {
     let id = UUID()
     var text: String
+
+    static func editedHints(_ drafts: [Self], baseline: [String]) -> [String]? {
+        let hints = drafts.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        return hints == baseline ? nil : hints
+    }
+
+    static func reconcile(_ drafts: inout [Self], baseline: inout [String], hints: [String], focused: UUID?) {
+        guard hints != baseline else { return }
+        let blank = drafts.first { $0.id == focused && $0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let existing = drafts.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        drafts = hints.enumerated().map { index, text in
+            var draft = index < existing.count ? existing[index] : Self(text: text)
+            draft.text = text
+            return draft
+        }
+        if let blank { drafts.append(blank) }
+        baseline = hints
+    }
+
 }
 
 /// Everything about one zone: the score box, the hints (edited in place, saved when a field loses focus), and the
@@ -1445,6 +1465,7 @@ struct AnswerZoneHintDraft: Identifiable, Equatable {
 struct AnswerZoneEditor: View {
     @StateObject private var model: AnswerZoneModel
     @State private var drafts: [AnswerZoneHintDraft] = []
+    @State private var hintBaseline: [String] = []
     @State private var showsUnopenedHints = false
     @State private var confirmsReset = false
     @FocusState private var focused: UUID?
@@ -1480,13 +1501,13 @@ struct AnswerZoneEditor: View {
                     .foregroundStyle(NibColor.labelSecondary)
             }
         }
-        .onAppear { drafts = (model.zone?.hints ?? []).map { AnswerZoneHintDraft(text: $0) } }
+        .onAppear { loadHints(model.zone?.hints ?? []) }
         .onChange(of: focused) { old, new in
             if old != nil && new != old { commitHints() }
         }
         .onChange(of: model.zone?.hints ?? []) { _, hints in
             // Undo, another window or the assistant changed them: show theirs unless a field is being edited.
-            if focused == nil && hints != cleaned(drafts) { drafts = hints.map { AnswerZoneHintDraft(text: $0) } }
+            if focused == nil && cleaned(drafts) == hintBaseline { reconcileHints(hints) }
         }
         .onDisappear { commitHints() }
     }
@@ -1585,11 +1606,22 @@ struct AnswerZoneEditor: View {
         commitHints()
     }
 
+    private func loadHints(_ hints: [String]) {
+        hintBaseline = hints
+        drafts = hints.map { AnswerZoneHintDraft(text: $0) }
+    }
+
     private func commitHints() {
         guard let zone = model.zone else { return }
-        let hints = cleaned(drafts)
-        guard hints != zone.hints else { return }
-        model.setHints(hints)
+        guard let hints = AnswerZoneHintDraft.editedHints(drafts, baseline: hintBaseline) else {
+            reconcileHints(zone.hints)
+            return
+        }
+        model.setHints(hints, expected: hintBaseline) { hintBaseline = hints }
+    }
+
+    private func reconcileHints(_ hints: [String]) {
+        AnswerZoneHintDraft.reconcile(&drafts, baseline: &hintBaseline, hints: hints, focused: focused)
     }
 }
 
