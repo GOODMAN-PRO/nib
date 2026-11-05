@@ -743,27 +743,30 @@ struct DocConvertToWhiteboard: NibCommand {
                 record.bookmarked = boardSlots.contains { bookmarked.contains($0.page) }
                 let board = try tx.put(record, doc: doc)
                 created.append(board.id)
+                for slot in boardSlots { boardOf[slot.page] = board.id }
+            }
+            // Build the entire page map before moving content: links can target a later board.
+            for (boardSlots, boardID) in zip(plan, created) {
                 // Balanced keys stay a few characters long however many items a board takes.
                 let count = boardSlots.reduce(0) { $0 + 1 + (items[$1.page]?.count ?? 0) }
                 var zs = FractionalIndex.balanced(count: count)[...]
                 var used = Set<ElementID>()
                 for slot in boardSlots {
-                    boardOf[slot.page] = board.id
                     if var card = cards[slot.page] {
                         card.z = zs.popFirst() ?? ""
                         used.insert(card.id)
-                        try tx.put(card, doc: doc, page: board.id)
+                        try tx.put(card, doc: doc, page: boardID)
                     }
                     let sources = items[slot.page] ?? []
                     for (source, moved) in zip(sources, NotebookLayout.rehome(sources, transform: slot.transform, used: &used)) {
-                        var item = moved
+                        var item = NotebookLayout.remappingPageLinks(in: moved, doc: doc, boards: boardOf)
                         item.z = zs.popFirst() ?? ""
                         if item.id == source.id {
                             // The same record on its board: whoever wrote it still did (the AI converting a notebook
                             // does not become the author of the user's handwriting).
-                            try tx.put(item, doc: doc, page: board.id, keepingProvenanceFrom: slot.page)
+                            try tx.put(item, doc: doc, page: boardID, keepingProvenanceFrom: slot.page)
                         } else {
-                            try tx.put(item, doc: doc, page: board.id)
+                            try tx.put(item, doc: doc, page: boardID)
                         }
                     }
                 }
@@ -812,6 +815,28 @@ struct ConversionSnapshot: Equatable {
 }
 
 extension NotebookLayout {
+    /// Only links within this notebook follow the converted pages; external documents and URLs stay intact.
+    static func remappingPageLinks(in item: Item, doc: DocumentID, boards: [PageID: PageID]) -> Item {
+        func remap(_ text: RichText) -> RichText {
+            var text = text
+            for p in text.paragraphs.indices {
+                for r in text.paragraphs[p].runs.indices {
+                    guard var link = text.paragraphs[p].runs[r].attrs.link, link.document == doc,
+                          let page = link.page, let board = boards[page] else { continue }
+                    link.page = board
+                    text.paragraphs[p].runs[r].attrs.link = link
+                }
+            }
+            return text
+        }
+        var item = item
+        if var text = item.text { text.text = remap(text.text); item.text = text }
+        if var sticky = item.sticky { sticky.text = remap(sticky.text); item.sticky = sticky }
+        if var shape = item.shape { shape.text = shape.text.map(remap); item.shape = shape }
+        if var connector = item.connector { connector.label = connector.label.map(remap); item.connector = connector }
+        return item
+    }
+
     /// A page's items moved onto its board slot. An id already used on the board (the cards, earlier pages) gets a
     /// fresh one, and the page's own attachments and connector anchors follow the new id.
     static func rehome(_ items: [Item], transform: Affine, used: inout Set<ElementID>) -> [Item] {

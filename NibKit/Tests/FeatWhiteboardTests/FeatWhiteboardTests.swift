@@ -410,6 +410,49 @@ final class FeatWhiteboardTests: XCTestCase {
                       "the late write survives")
     }
 
+    func testConvertRemapsEveryItemTextLinkAndUndoes() async throws {
+        let h = harness()
+        h.app.services.renderer = FakeRenderer()
+        let internalLink = TextLink(document: Fixtures.docID, page: Fixtures.pdfPage)
+        let externalLink = TextLink(document: Fixtures.whiteboardID, page: Fixtures.boardID)
+        let webLink = TextLink(url: "https://example.com")
+        let audioLink = TextLink(document: Fixtures.docID, audioClip: Fixtures.audioID, audioTime: 12)
+        let text = RichText(paragraphs: [
+            Paragraph(runs: [TextRun("Later page", TextAttributes(bold: true, link: internalLink)),
+                             TextRun("Other document", TextAttributes(link: externalLink))]),
+            Paragraph(runs: [TextRun("Web", TextAttributes(link: webLink)),
+                             TextRun("Recording", TextAttributes(link: audioLink))])
+        ])
+        var sources = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        for i in sources.indices {
+            if sources[i].text != nil { sources[i].text?.text = text }
+            if sources[i].sticky != nil { sources[i].sticky?.text = text }
+            if sources[i].shape != nil { sources[i].shape?.text = text }
+            if sources[i].connector != nil { sources[i].connector?.label = text }
+        }
+        try await h.insert(sources)
+        let before = try h.snapshot()
+        try await h.run("doc.convertToWhiteboard", ["doc": "doc:FIXTUREDOC01"])
+        let board = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).livePages.first)
+        let moved = try h.app.workspace.items(Fixtures.docID, page: board.id)
+        let texts = moved.flatMap { [$0.text?.text, $0.sticky?.text, $0.shape?.text, $0.connector?.label].compactMap { $0 } }
+        XCTAssertEqual(texts.count, 4)
+        var expected = text
+        expected.paragraphs[0].runs[0].attrs.link?.page = board.id
+        for actual in texts { XCTAssertEqual(actual, expected) }
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testPageLinksCanTargetADifferentConvertedBoard() {
+        let link = TextLink(document: Fixtures.docID, page: Fixtures.pdfPage)
+        let item = Item.makeSticky(StickyItem(frame: Frame(x: 0, y: 0, w: 100, h: 100),
+                                              text: RichText(plain: "Next board", attrs: TextAttributes(link: link))))
+        let moved = NotebookLayout.remappingPageLinks(in: item, doc: Fixtures.docID,
+                                                       boards: [Fixtures.page1: "BOARD1", Fixtures.pdfPage: "BOARD2"])
+        XCTAssertEqual(moved.sticky?.text.paragraphs.first?.runs.first?.attrs.link?.page, "BOARD2")
+    }
+
     func testConvertGivesACollidingItemIDANewIDAndRewiresItsConnector() async throws {
         let h = harness()
         h.app.services.renderer = FakeRenderer()
