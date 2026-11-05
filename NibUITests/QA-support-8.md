@@ -198,3 +198,11 @@ D:keyboard-and-state#2 correction identifies the inner page waiter only on a tra
 ## C13 - observe library template sheet
 
 D:keyboard-and-state#6 confirms the visible Notebook Templates sheet while the library probe openPanels remains empty. Only the App Menu route now waits for Notebook Templates and Import Template UI; document shortcut probe checks remain. Expected ManageTemplatesShortcutAndAppMenuDisplayBuiltinAndCustomEntries reaches its Covers assertions. CI must show both title and action after the library route.
+
+## C14 - Go to Page focus observation
+
+D:app-round-4#10 / keyboard-and-state#9 show repeated typing without focus on the fourth route; cause remains unknown. go logs native focus, preserves existing autofocus, waits on the actual field-focus predicate, retaps at most once on absence and refuses unfocused typing. Decision on the brief's ambiguous 'do not type when autofocus already holds it': preserve autofocus without another tap, and skip typing only when the requested value is already present; omitting the page number merely because focus exists would prevent navigation. All Go/page assertions remain. CI must distinguish initial/retap focus and reach RotateAllPages' exact scope/undo checks.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Canvas Go to Page callers | Go to Page focus / focus retap / focus failed | Was autofocus present, did one tap acquire focus, or was one bounded retap needed? Failure includes screenshot. |
