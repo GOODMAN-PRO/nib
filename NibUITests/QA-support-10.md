@@ -85,3 +85,11 @@ Confirmed chrome-state-pdf#2 correction: fixed canvas y=671 was on Page 2 while 
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | PageScrollCollapsesOptionsAndChoosingToolRestoresThem | Page scroll ink geometry / State step (Page scroll wet ink) | Which page/visible rectangle received the stroke and which native wet-ink facts bracket it? |
+
+### C5 - ruler callers and unchanged outcomes
+
+Completed ruler callers through H3/H5 for chrome-singles#0/#1. Position fields share one alert batch; confirmation geometry must agree on two bounded reads before the real tap. Angle/position dismissal is required before any later ruler interaction. Rotation completion now also logs raw state and baseline stroke count on failure, distinguishing misplaced pen contacts from no ruler action. All 0/45/90-degree, 4/5-position, 45-degree gesture, content-invariance and constrained-ink Undo/Redo assertions remain. CI must prove confirmation actions and two-finger ruler delivery; the unknown interruption trigger is not declared fixed.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| RulerTwoFingerRotation | State step (Ruler rotation ink invariants) | Did a failed rotation instead add pen ink? |

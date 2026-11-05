@@ -1060,7 +1060,13 @@ final class ChromeUITests: XCTestCase {
         try ui.prepareCoveredControl(title)
         let alert = ui.app.alerts.firstMatch
         let button = alert.buttons[title].firstMatch
-        try wait("Ruler confirmation must be enabled and hittable") { button.exists && button.isEnabled && button.isHittable }
+        var previousFrame: CGRect?
+        try wait("Ruler confirmation must be enabled, hittable and stable") {
+            guard button.exists, button.isEnabled, button.isHittable else { previousFrame = nil; return false }
+            let frame = button.frame
+            defer { previousFrame = frame }
+            return previousFrame == frame
+        }
         ui.logQA("Ruler alert confirm", "action=\(title) " + ui.elementFacts(button))
         button.tap()
         ui.logQA("Ruler alert after tap", "action=\(title) alerts=\(ui.app.alerts.count)")
@@ -1091,7 +1097,10 @@ final class ChromeUITests: XCTestCase {
     func testRulerTwoFingerRotationSnapsToFortyFiveWithoutEditing() throws {
         try showRuler(); let before = try ui.state()
         try rulerMenu("Set Angle…"); try replace("Angle in degrees", "0"); try confirmRulerAlert("Set Angle")
-        defer { ui.recordDiagnostics("Ruler rotation completion", facts: ui.elementFacts(ruler), includeHierarchy: false) }
+        defer {
+            ui.recordDiagnostics("Ruler rotation completion", facts: ui.elementFacts(ruler), includeHierarchy: false)
+            ui.logStateStep("Ruler rotation ink invariants; baseline strokes=\(before.strokeCountOnPage)")
+        }
         try wait("Set Angle panel must be gone before rotation") { !self.ui.app.textFields["Angle in degrees"].exists }
         ui.recordDiagnostics("Ruler rotation before", facts: ui.elementFacts(ruler), includeHierarchy: false)
         let frame = ruler.frame, radius = min(frame.width * 0.3, 90)
@@ -1117,7 +1126,8 @@ final class ChromeUITests: XCTestCase {
         try rulerMenu("Options"); try tap("Hide Digits")
         XCTAssertNotEqual(ui.canvas.screenshot().pngRepresentation, withDigits, "Hide Digits must change the rendered ruler")
         try rulerMenu("Set Position…")
-        try replace("Horizontal position", "4"); try replace("Vertical position", "5"); try confirmRulerAlert("Move Ruler")
+        try ui.fillNativeForm([("Horizontal position", "4"), ("Vertical position", "5")])
+        try confirmRulerAlert("Move Ruler")
         try rulerMenu("Set Position…")
         XCTAssertEqual(try require("Horizontal position").value as? String, "4")
         XCTAssertEqual(try require("Vertical position").value as? String, "5")
