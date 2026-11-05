@@ -241,7 +241,7 @@ final class PagesUITests: XCTestCase {
         let before = try ids()
         try pages(window: true)
         let source = try require(thumb(1)), target = try require(thumb(3))
-        source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8, thenDragTo: target.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.8)))
+        try dragThumbnail(source, to: target, offset: CGVector(dx: 0.95, dy: 0.8))
         try wait("Dragging thumbnail into a gap must change page order") { (try? self.ids()) != before }
         XCTAssertEqual(Set(try ids()), Set(before))
         try closeNavigator(); try ui.tapCommand("edit.undo")
@@ -272,8 +272,7 @@ final class PagesUITests: XCTestCase {
         let before = try ids()
         try pages(window: true); try beginSelection(); try tapThumb(1); try tapThumb(2)
         let source = try require(thumb(1)), target = try require(thumb(4))
-        source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8,
-            thenDragTo: target.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.85)))
+        try dragThumbnail(source, to: target, offset: CGVector(dx: 0.98, dy: 0.85))
         try wait("Dragging a selection must reorder its stack") { (try? self.ids()) != before }
         let after = try ids(), first = try XCTUnwrap(try ids().firstIndex(of: before[0]))
         XCTAssertLessThan(first + 1, after.count)
@@ -670,6 +669,19 @@ final class PagesUITests: XCTestCase {
             }
         }
     }
+    private func dragThumbnail(_ source: XCUIElement, to target: XCUIElement, offset: CGVector) throws {
+        // Baseline session startup took 1.7-1.9s after touch-down. Keep the original lift/travel
+        // and add 1.5s of contact at the destination for startup and move-proposal acceptance.
+        source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8,
+            thenDragTo: target.coordinate(withNormalizedOffset: offset),
+            withVelocity: XCUIGestureVelocity(rawValue: 500), thenHoldForDuration: 1.5)
+        let menus = ui.app.menus.count
+        let preview = ui.app.otherElements["Preview"].firstMatch.exists
+        let actions = ui.app.buttons["cmd.page.duplicate"].firstMatch.exists
+        ui.logQA("Thumbnail drag result", "menus=\(menus) preview=\(preview) pageMenuAction=\(actions) contextMenu=\(menus > 0 || preview || actions)")
+        ui.logStateStep("thumbnail drag completed")
+    }
+
     private func thumb(_ number: Int) -> XCUIElement {
         ui.app.collectionViews.matching(NSPredicate(format: "label == 'Page thumbnails'")).buttons.matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", "Page \(number)", "Page \(number),")).firstMatch
     }

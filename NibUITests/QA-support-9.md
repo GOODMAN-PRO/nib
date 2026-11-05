@@ -182,3 +182,13 @@ Current QAStateProbe now exposes keyWindowState.isKey/dimensions/sceneActivation
 | --- | --- | --- |
 | Selection external Safari / Library external Files | Window top controls / Window control hierarchy / Window control hover | What labels and identifiers exist in the top 100pt, and does pointer hover expose controls? |
 | Same | Window scene probe / Window scene count | Which AX windows carry document probes and report isKey, and is more than one scene observable? |
+
+### C1 - thumbnail drag destination contact
+
+Confirmed P:pages-drag-select#0/#1 and corrections: reorder's touch ended before the session replied; stack reached a proposal but never performDrop. The source of the 1.7-1.9s startup latency and operation=0 remains unproven. Both tests now use one helper with the original 0.8s lift and explicit 500pt/s travel, plus 1.5s destination hold (continuous gesture contact, not a sleep or allowance change). Reorder previously lasted about 1.85s, so this leaves about 1.45s after the latest observed startup; stack previously had only 0.55s after startup and now has about 2.05s. This is enough to test the timing hypothesis, not proof of proposal acceptance. Every reorder, adjacent-stack and whole-stack Undo assertion remains.
+
+Next CI must pair the runner result with app dragSessionWillBegin, move proposal and performDrop (two items for stack); operation=0 with the dwell keeps the cause unresolved, and the earlier split-stack symptom must still fail its assertion.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Pages reorder / selected-stack drag | Thumbnail drag result / State step (thumbnail drag completed) | Did a native context menu survive the gesture, and what selection/page/responder state followed? |
