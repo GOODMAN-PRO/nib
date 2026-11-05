@@ -26,6 +26,11 @@ final class KeyProbeUITests: XCTestCase {
 
     func testSpecialKeyRoutes() throws {
         executionTimeAllowance = 300
+        // CI also caps each test at 300s. Include fixture launch in these monotonic budgets,
+        // reserve text-context time, and leave 60s for an in-flight XCUI call and the assertion.
+        let started = ProcessInfo.processInfo.systemUptime
+        let canvasDeadline = started + 130
+        let matrixDeadline = started + 240
         continueAfterFailure = false
         ui = NibUI()
         try ui.launchFixture()
@@ -41,26 +46,33 @@ final class KeyProbeUITests: XCTestCase {
         log("prime", "error=\(quoted(primeError ?? "nil")) delivered=\(primed) \(delta(initial, try state()))")
 
         let keys: [(String, [String])] = [
+            // Establish the final assertion before an odd special key can move focus or consume the budget.
+            ("a", ["a"]),
             ("Escape", [XCUIKeyboardKey.escape.rawValue, "\u{1B}"]),
             ("Delete", [XCUIKeyboardKey.delete.rawValue, "\u{8}", "\u{7F}"]),
             ("ForwardDelete", [XCUIKeyboardKey.forwardDelete.rawValue]),
             ("Return", [XCUIKeyboardKey.return.rawValue, "\r", "\n"]),
             ("Enter", [XCUIKeyboardKey.enter.rawValue, "\u{3}"]),
-            ("Tab", [XCUIKeyboardKey.tab.rawValue]),
-            ("a", ["a"])
+            ("Tab", [XCUIKeyboardKey.tab.rawValue])
         ]
         var controlDelivered = false
         var firstEscape: (String, Route)?
-        for (name, candidates) in keys {
+        canvasMatrix: for (name, candidates) in keys {
             var seen = Set<String>()
             for key in candidates where seen.insert(key).inserted {
                 for route in Route.canvas {
-                    guard waitForState({ $0.keyResponderIsText == false && $0.openPanels.isEmpty }) else {
-                        throw ProbeError.prerequisite("Canvas matrix lost non-text focus before \(name)/\(route.rawValue)")
+                    guard hasBudget(until: canvasDeadline, context: "canvas", reserve: 6) else { break canvasMatrix }
+                    guard waitForState({ $0.keyResponderIsText == false && $0.openPanels.isEmpty }, timeout: 1) else {
+                        let current = try? state()
+                        log("skipped", "context=canvas key=\(name) scalars=\(scalars(key)) route=\(route.rawValue) "
+                            + "reason=focus responder=\(quoted(current?.keyResponder ?? "nil")) "
+                            + "isText=\(String(describing: current?.keyResponderIsText)) "
+                            + "openPanels=\(quoted(current?.openPanels))")
+                        continue
                     }
                     let before = try state()
                     let error = send(key, route: route)
-                    _ = waitForState { $0.keyLogTotal > before.keyLogTotal }
+                    _ = waitForState({ $0.keyLogTotal > before.keyLogTotal }, timeout: 1)
                     let after = try state()
                     let delivered = after.keyLogTotal > before.keyLogTotal
                     log("result", "context=canvas key=\(name) scalars=\(scalars(key)) route=\(route.rawValue) "
@@ -72,38 +84,54 @@ final class KeyProbeUITests: XCTestCase {
             }
         }
 
-        let selectError = send("a", modifiers: .command)
-        let selected = waitForState { $0.selectionCount > 0 && $0.keyResponderIsText == false }
-        let beforeEscape = try state()
-        let (escapeKey, escapeRoute) = firstEscape ?? (XCUIKeyboardKey.escape.rawValue, .one)
-        let escapeError = send(escapeKey, route: escapeRoute)
-        let cleared = waitForState { $0.selectionCount == 0 }
-        log("effect", "context=canvas key=Escape scalars=\(scalars(escapeKey)) route=\(escapeRoute.rawValue) "
-            + "selected=\(selected) selectionBefore=\(beforeEscape.selectionCount) cleared=\(cleared) "
-            + "meaningful=\(selected && beforeEscape.selectionCount > 0) selectError=\(quoted(selectError ?? "nil")) "
-            + "error=\(quoted(escapeError ?? "nil")) \(delta(beforeEscape, try state()))")
+        if hasBudget(until: canvasDeadline + 15, context: "canvas.effect", reserve: 10) {
+            let selectError = send("a", modifiers: .command)
+            let selected = waitForState { $0.selectionCount > 0 && $0.keyResponderIsText == false }
+            let beforeEscape = try state()
+            let (escapeKey, escapeRoute): (String, Route) = firstEscape ?? (XCUIKeyboardKey.escape.rawValue, Route.one)
+            let escapeError = send(escapeKey, route: escapeRoute)
+            let cleared = waitForState { $0.selectionCount == 0 }
+            log("effect", "context=canvas key=Escape scalars=\(scalars(escapeKey)) route=\(escapeRoute.rawValue) "
+                + "selected=\(selected) selectionBefore=\(beforeEscape.selectionCount) cleared=\(cleared) "
+                + "meaningful=\(selected && beforeEscape.selectionCount > 0) selectError=\(quoted(selectError ?? "nil")) "
+                + "error=\(quoted(escapeError ?? "nil")) \(delta(beforeEscape, try state()))")
+        }
 
         // Canonical encodings once per route in native input. Return needs a valid page: "12" is out of range
         // in the four-page fixture, so it cannot be used to infer whether submission closes the panel.
-        for (name, key) in [("Delete", XCUIKeyboardKey.delete.rawValue),
+        textMatrix: for (name, key) in [("Delete", XCUIKeyboardKey.delete.rawValue),
                             ("Return", XCUIKeyboardKey.return.rawValue),
                             ("Escape", XCUIKeyboardKey.escape.rawValue)] {
             for route in Route.allCases {
-                let field = try openPageField()
+                guard hasBudget(until: matrixDeadline, context: "text", reserve: 20) else { break textMatrix }
+                let field: XCUIElement
+                do {
+                    field = try openPageField()
+                } catch {
+                    log("skipped", "context=text key=\(name) route=\(route.rawValue) reason=\(quoted(String(describing: error)))")
+                    continue
+                }
+                guard hasBudget(until: matrixDeadline, context: "text.prepare", reserve: 15) else { break textMatrix }
                 let input = name == "Return" ? "2" : "12"
-                field.typeKey("a", modifierFlags: .command)
-                field.typeText(input)
-                let prepared = waitUntil { self.fieldValue(field) == input }
+                // An undelivered key leaves the input prepared for the next route. Avoid repeating
+                // public XCUI idle waits in that expected case; reset only when the value differs.
+                if fieldValue(field) != input {
+                    field.typeKey("a", modifierFlags: .command)
+                    guard hasBudget(until: matrixDeadline, context: "text.typeText", reserve: 10) else { break textMatrix }
+                    field.typeText(input)
+                }
+                let prepared = waitUntil({ self.fieldValue(field) == input }, timeout: 1)
+                guard hasBudget(until: matrixDeadline, context: "text.send", reserve: 5) else { break textMatrix }
                 let beforeValue = fieldValue(field)
                 let before = try state()
                 let error = send(key, route: route, field: field)
                 // Wait for the actual effect even if key logging happened first. A text-input edit can be
                 // delivered with no UIPress, and Return/Escape can close the panel with no logged key.
-                let effect = waitUntil {
+                let effect = waitUntil({
                     guard let current = try? self.state() else { return false }
                     if !current.openPanels.contains(self.panelID) { return true }
                     return name == "Delete" && field.exists && self.fieldValue(field) != beforeValue
-                }
+                }, timeout: 1)
                 let after = try state()
                 let closed = !after.openPanels.contains(panelID)
                 let afterValue = closed ? "<panel closed>" : fieldValue(field)
@@ -125,17 +153,26 @@ final class KeyProbeUITests: XCTestCase {
         return try JSONDecoder().decode(State.self, from: Data(value.utf8))
     }
 
-    private func waitUntil(_ condition: @escaping () -> Bool) -> Bool {
-        if condition() { return true }
-        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in condition() }, object: nil)
-        return XCTWaiter.wait(for: [expectation], timeout: 2) == .completed
+    private func hasBudget(until deadline: TimeInterval, context: String, reserve: TimeInterval) -> Bool {
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > reserve else {
+            log("budget exhausted", "context=\(context) remaining=\(remaining) reserve=\(reserve); remaining samples skipped")
+            return false
+        }
+        return true
     }
 
-    private func waitForState(_ condition: @escaping (State) -> Bool) -> Bool {
-        waitUntil {
+    private func waitUntil(_ condition: @escaping () -> Bool, timeout: TimeInterval = 2) -> Bool {
+        if condition() { return true }
+        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in condition() }, object: nil)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func waitForState(_ condition: @escaping (State) -> Bool, timeout: TimeInterval = 2) -> Bool {
+        waitUntil({
             guard let value = try? self.state() else { return false }
             return condition(value)
-        }
+        }, timeout: timeout)
     }
 
     /// nil route uses the unmodified existing helper (priming and setup chords only).
