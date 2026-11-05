@@ -289,24 +289,47 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(), before)
     }
 
-    func testDeleteRejectsHiddenSelectedOrAttachedContentWithoutWriting() async throws {
+    func testDeleteProtectsHiddenTargetsButHandlesHiddenDependantsWithNotice() async throws {
         for hiddenTarget in [true, false] {
             let h = Harness(features: [FeatObjectMenuFeature.self])
             edit(h, Fixtures.imageID) { image in
                 image.layer = 2
                 if !hiddenTarget { image.attachedTo = Fixtures.shapeID }
             }
+            edit(h, Fixtures.connectorID) { $0.layer = 2 }
+            edit(h, Fixtures.commentID) { $0.layer = 2; $0.attachedTo = Fixtures.shapeID }
+            edit(h, Fixtures.textID) { $0.layer = 2; $0.attachedTo = Fixtures.shapeID; $0.locked = true }
+            let host = FakeFloatingHost()
+            h.session.floatingHost = host
             h.session.hiddenLayers = [2]
             select(h, [hiddenTarget ? Fixtures.imageID : Fixtures.shapeID])
             let before = try h.snapshot()
-            do {
-                try await h.run("item.delete")
-                XCTFail("hidden selected items and hidden attached children must be protected")
-            } catch let error as NibError {
-                XCTAssertEqual(error.code, .invalidParams)
+            if hiddenTarget {
+                do {
+                    try await h.run("item.delete")
+                    XCTFail("explicit hidden targets must be protected")
+                } catch let error as NibError {
+                    XCTAssertEqual(error.code, .invalidParams)
+                }
+                XCTAssertEqual(try h.snapshot(), before)
+                XCTAssertEqual(h.undoDepth(doc), 0)
+                XCTAssertTrue(host.toasts.isEmpty)
+            } else {
+                let out = try await h.run("item.delete")
+                XCTAssertTrue(out["deleted"]?.arrayValue?.contains(ref(Fixtures.imageID)) == true)
+                XCTAssertThrowsError(try item(h, Fixtures.shapeID))
+                XCTAssertThrowsError(try item(h, Fixtures.imageID))
+                XCTAssertNil(try item(h, Fixtures.connectorID).connector?.from.item)
+                XCTAssertEqual(try item(h, Fixtures.connectorID).connector?.to.item, Fixtures.stickyID)
+                XCTAssertNil(try item(h, Fixtures.commentID).attachedTo)
+                XCTAssertNil(try item(h, Fixtures.textID).attachedTo)
+                XCTAssertTrue(try item(h, Fixtures.textID).locked)
+                XCTAssertEqual(host.toasts.count, 1)
+                XCTAssertTrue(host.toasts[0].contains("hidden layers"))
+                XCTAssertEqual(h.undoDepth(doc), 1)
+                XCTAssertTrue(h.app.bus.undo(doc))
+                XCTAssertEqual(try h.snapshot(), before)
             }
-            XCTAssertEqual(try h.snapshot(), before)
-            XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
         }
     }
 

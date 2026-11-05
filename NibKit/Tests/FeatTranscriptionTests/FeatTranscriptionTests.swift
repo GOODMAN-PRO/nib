@@ -54,6 +54,44 @@ final class FeatTranscriptionTests: XCTestCase {
         XCTAssertNil(live.errors[ref])
     }
 
+    func testDocumentRemovalEndsLiveJobQuietlyButExistingDocumentReadFailureIsReported() async throws {
+        for removed in [true, false] {
+            let h = Harness(features: [FeatTranscriptionFeature.self])
+            try writeAudio(h, duration: 61)
+            let live = try XCTUnwrap(h.app.services.get(LiveTranscriber.serviceKey, as: LiveTranscriber.self))
+            let speech = TestSpeechBackend()
+            live.speech = speech
+            var statuses: [JSONValue] = []
+            let subscription = h.app.events.subscribe { event in
+                if event.type == LiveTranscriber.statusEvent, let payload = event.payload,
+                   payload["clip"]?.stringValue == self.ref { statuses.append(payload) }
+            }
+            defer { subscription.cancel() }
+            speech.onFinish = {
+                h.app.workspace.close(Fixtures.docID)
+                if removed { try h.library.deletePermanently(Fixtures.docID) }
+                h.app.workspace.persistence = FailingTranscriptPersistence(base: h.persistence)
+            }
+            h.app.settings.set(TranscriptSettings.live, true)
+            live.recording(AudioRecordingPayload(clip: ref, state: "recording", duration: 0))
+            live.recording(AudioRecordingPayload(clip: ref, state: "stopped", duration: 61))
+            await live.waitForRecording(ref)
+            XCTAssertFalse(speech.sessions.isEmpty, "the document disappears during transcription")
+            XCTAssertTrue(speech.sessions.allSatisfy(\.cancelled))
+            XCTAssertNil(live.jobs[ref])
+            XCTAssertNil(live.previews[ref])
+            if removed {
+                XCTAssertNil(live.errors[ref])
+                XCTAssertFalse(statuses.contains { $0["error"] != nil })
+            } else {
+                XCTAssertNotNil(h.library.node(Fixtures.docID))
+                XCTAssertEqual(live.errors[ref]?.code, .unavailable)
+                XCTAssertEqual(live.errors[ref]?.message, "Document read failed")
+                XCTAssertTrue(statuses.contains { $0["error"] != nil })
+            }
+        }
+    }
+
     func testTerminalEmptyWindowsDoNotBackOff() async throws {
         for disabled in [false, true] {
             for complete in [false, true] {
@@ -671,4 +709,19 @@ private final class UploadAI: AIService {
     func messages(chatID: String) -> [AIMessage] { [] }
     func deleteChat(_ chatID: String) {}
     func generateImage(prompt: String) async throws -> Data { try await fake.generateImage(prompt: prompt) }
+}
+
+/// The library can still know a document whose package cannot currently be read.
+@MainActor
+private final class FailingTranscriptPersistence: DocumentPersistence {
+    let base: InMemoryPersistence
+    init(base: InMemoryPersistence) { self.base = base }
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { throw NibError(.unavailable, "Document read failed") }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] { try base.loadItems(doc, page: page) }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try base.fileURL(doc, relativePath: relativePath) }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { nil }
 }

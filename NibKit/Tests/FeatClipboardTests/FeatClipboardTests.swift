@@ -6,6 +6,18 @@ import NibTesting
 import NibDesign
 @testable import FeatClipboard
 
+private final class VisibilityChangingRenderer: PageRenderer {
+    let before: @MainActor () -> Void
+    init(before: @escaping @MainActor () -> Void) { self.before = before }
+    func render(_ request: RenderRequest) async throws -> RenderResult {
+        await before()
+        return try await FakeRenderer().render(request)
+    }
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { nil }
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
+    func purgeCaches() {}
+}
+
 /// Exercises the same provider reader as the system board without contacting the simulator's pasteboard.
 @MainActor
 private final class ProviderClipboardBoard: ClipboardBoard {
@@ -201,6 +213,62 @@ final class FeatClipboardTests: XCTestCase {
             XCTAssertEqual(e.code, .invalidParams)
         }
         XCTAssertTrue(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).contains { $0.id == Fixtures.imageID })
+    }
+
+    func testCopyOmitsHiddenAttachedItemsFromEveryRepresentation() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        var child = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        child.attachedTo = Fixtures.shapeID
+        child.layer = 2
+        try await h.insert([child])
+        h.session.hiddenLayers = [2]
+        let renderer = FakeRenderer()
+        h.app.services.renderer = renderer
+        let before = try h.snapshot()
+        let depth = h.undoDepth(Fixtures.docID)
+        let out = try await h.run("clipboard.copy", ClipboardCut.example)
+        XCTAssertEqual(out["count"], 1)
+        let data = try XCTUnwrap(board.items.first?[NibFragment.typeIdentifier] as? Data)
+        XCTAssertEqual(try NibFragment.decode(data).items.map(\.id), [Fixtures.shapeID])
+        XCTAssertTrue(renderer.requests.first?.hidden.contains(child.id) == true)
+        XCTAssertTrue(board.strings.isEmpty, "hidden attached text must not leak into the text flavour")
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+    }
+
+    func testCutProtectsHiddenExpandedItemsAndReleasedConnectorsBeforeAndAfterExport() async throws {
+        defer { restoreBoard() }
+        for attachedChild in [true, false] {
+            for hideDuringExport in [false, true] {
+                let board = useMemoryBoard()
+                board.write([UTType.utf8PlainText.identifier: "keep clipboard"])
+                let h = Harness(features: [FeatClipboardFeature.self])
+                let id = attachedChild ? Fixtures.imageID : Fixtures.connectorID
+                var dependant = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: id)
+                dependant.layer = 2
+                if attachedChild { dependant.attachedTo = Fixtures.shapeID }
+                try await h.insert([dependant])
+                if hideDuringExport {
+                    h.app.services.renderer = VisibilityChangingRenderer { h.session.hiddenLayers = [2] }
+                } else {
+                    h.session.hiddenLayers = [2]
+                }
+                let before = try h.snapshot()
+                let depth = h.undoDepth(Fixtures.docID)
+                do {
+                    try await h.run("clipboard.cut", ClipboardCut.example)
+                    XCTFail("cut must protect hidden removed and released items")
+                } catch let error as NibError {
+                    XCTAssertEqual(error.code, .invalidParams)
+                }
+                XCTAssertEqual(try h.snapshot(), before)
+                XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+                XCTAssertEqual(board.strings, ["keep clipboard"])
+                XCTAssertFalse(board.contains([NibFragment.typeIdentifier]))
+            }
+        }
     }
 
     func testPasteImagesRichTextAndMatchStyle() async throws {

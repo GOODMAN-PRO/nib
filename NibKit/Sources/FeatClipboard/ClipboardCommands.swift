@@ -233,6 +233,26 @@ enum ClipboardCore {
         return record
     }
 
+    static func hiddenLayers(_ doc: DocumentID, _ ctx: CommandContext) -> Set<Int> {
+        guard ctx.principal.isUser, let session = ctx.activeSession, session.document == doc else { return [] }
+        return session.hiddenLayers
+    }
+
+    /// Cut must protect both the expanded contents and the objects that would be detached from them.
+    static func ensureCutVisible(_ sel: ClipSelection, items: [Item], _ ctx: CommandContext) throws {
+        let hidden = hiddenLayers(sel.doc, ctx)
+        let cut = Set(sel.items.map(\.id))
+        let affectedHiddenItem = items.contains { item in
+            guard hidden.contains(item.layer) else { return false }
+            let anchors = [item.attachedTo, item.connector?.from.item, item.connector?.to.item].compactMap { $0 }
+            return cut.contains(item.id) || anchors.contains { cut.contains($0) }
+        }
+        if affectedHiddenItem {
+            throw NibError(.invalidParams, String(localized: "This cut would change content on a hidden layer."),
+                           path: "$.refs", hint: String(localized: "Show the layer before cutting this selection."))
+        }
+    }
+
     static func ensureUnlocked(_ doc: DocumentID, _ ctx: CommandContext) throws {
         if ctx.services.lock?.isLocked(doc) == true {
             throw NibError(.locked, "document \(doc.raw) is locked", hint: "ask the user to unlock it (doc.unlock)")
@@ -343,11 +363,19 @@ struct ClipboardCopy: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         guard let sel = try ClipboardCore.selection(p.refs, ctx) else { return Output(count: 0, types: [], text: nil) }
-        let export = await ClipboardCore.export(sel, ctx)
+        let hidden = ClipboardCore.hiddenLayers(sel.doc, ctx)
+        let visible = ClipSelection(doc: sel.doc, page: sel.page,
+                                    items: sel.items.filter { !hidden.contains($0.layer) }, pageItems: sel.pageItems)
+        guard !visible.items.isEmpty else { return Output(count: 0, types: [], text: nil) }
+        let export = await ClipboardCore.export(visible, ctx)
+        let nowHidden = ClipboardCore.hiddenLayers(sel.doc, ctx)
+        if visible.items.contains(where: { nowHidden.contains($0.layer) }) {
+            throw NibError(.conflict, String(localized: "Layer visibility changed while copying. Copy the selection again."))
+        }
         // ponytail: every caller writes the system clipboard (the summary says so), which is what lets an AI's copy
         // then paste work; return the fragment in Output instead if callers other than the user must leave it alone.
         if !ctx.dryRun { Clipboard.board.write(export.representations) }
-        return Output(count: sel.items.count, types: export.types, text: export.text.isEmpty ? nil : export.text)
+        return Output(count: visible.items.count, types: export.types, text: export.text.isEmpty ? nil : export.text)
     }
 }
 
@@ -431,11 +459,19 @@ struct ClipboardCut: NibCommand {
             return Output(count: 0, types: [], text: nil, removed: [])
         }
         try ClipboardCore.ensureWritable(sel.doc, ctx, path: "$.refs")
+        try ClipboardCore.ensureCutVisible(sel, items: sel.pageItems, ctx)
         if let locked = sel.items.first(where: { $0.locked }) {
             throw NibError(.invalidParams, "item \(locked.id.raw) is locked and cannot be cut", path: "$.refs",
                            hint: "unlock it with item.setLocked, or copy it with clipboard.copy")
         }
         let export = await ClipboardCore.export(sel, ctx)
+        try ClipboardCore.ensureUnlocked(sel.doc, ctx)
+        try ClipboardCore.ensureWritable(sel.doc, ctx, path: "$.refs")
+        let current = try ctx.workspace.items(sel.doc, page: sel.page)
+        try ClipboardCore.ensureCutVisible(sel, items: current, ctx)
+        guard !ClipboardCore.windowIsReadOnly(ctx), current == sel.pageItems else {
+            throw NibError(.conflict, String(localized: "The page changed while copying. Nothing was cut. Try again."))
+        }
         let representations = export.representations
         // Without the fragment the items could not be pasted back as items: nothing is deleted then.
         guard representations[NibFragment.typeIdentifier] != nil else {
