@@ -661,6 +661,7 @@ final class InsertUITests: XCTestCase {
             try menu("Connector Style", route)
             XCTAssertEqual(try item("connector")["route"] as? String, route.lowercased())
         }
+        ui.recordDiagnostics("Connector end before lookup", facts: ui.elementFacts(query("Connector end", .other).firstMatch, includeOverlaps: true))
         let handle = try control("Connector end", .other)
         let previous = try item("connector")
         handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.1, thenDragTo: ui.coordinate(CGPoint(x: 0.68, y: 0.85)))

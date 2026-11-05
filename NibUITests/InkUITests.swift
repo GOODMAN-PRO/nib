@@ -679,6 +679,7 @@ final class InkUITests: XCTestCase {
 
     func testHighlighterCustomColourPersistsAndDrawsTranslucentInk() throws {
         try settings("highlighter"); try tap("Custom…")
+        ui.recordDiagnostics("Colour Spectrum before lookup", facts: ui.elementFacts(ui.app.buttons["Spectrum"].firstMatch, includeOverlaps: true))
         try tap("Spectrum")
         // The system colour field is a real two-dimensional control, selected by its accessibility label.
         let spectrum = try colourSpectrum()

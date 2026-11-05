@@ -74,7 +74,13 @@ final class LibraryUITests: XCTestCase {
         try ui.timedAction("Library tap \(label)") { try self.performTap(label, file: file, line: line) }
     }
     private func performTap(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        let diagnose = ["Move to Trash", "Save to Files"].contains(label)
+        var firstPoll = true
         func candidate() -> XCUIElement? {
+            if diagnose && firstPoll {
+                firstPoll = false
+                ui.recordDiagnostics("Library action first poll", facts: "action=\(label)", includeHierarchy: false)
+            }
             let query = app.buttons.matching(matching(label))
             for index in 0..<min(query.count, 8) {
                 let element = query.element(boundBy: index)
@@ -85,7 +91,19 @@ final class LibraryUITests: XCTestCase {
         if candidate() == nil {
             ui.revealFormElement { self.app.buttons.matching(self.matching(label)).firstMatch }
         }
-        try eventually("Action is not enabled and hittable: \(label)", file: file, line: line) { candidate() != nil }
+        do {
+            try eventually("Action is not enabled and hittable: \(label)", file: file, line: line) { candidate() != nil }
+        } catch {
+            if diagnose {
+                let matches = app.buttons.matching(matching(label)).allElementsBoundByIndex
+                ui.logQA("Library action timeout", "action=\(label) matches=\(matches.count) popovers=\(app.popovers.count) menus=\(app.menus.count) sheets=\(app.sheets.count)")
+                for (index, element) in matches.enumerated() {
+                    ui.logQA("Library action timeout", "match=\(index) " + ui.elementFacts(element, includeOverlaps: true))
+                }
+                ui.recordDiagnostics("Library action timeout screenshot", facts: "action=\(label)", includeHierarchy: false)
+            }
+            throw error
+        }
         guard let target = candidate() else { throw NibUI.Failure.message("Cannot activate \(label)") }
         target.tap()
     }

@@ -248,3 +248,13 @@ S:singles-insert#5 correction leaves toast timing, posting and exposure unresolv
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Insert GIFLocalInvalidLinkReportsErrorAndFilesCancelInsertsNothing | Invalid GIF immediately after Add | Was any error text exposed immediately after submission, and where? |
+
+## X3 - unresolved control facts
+
+D:controls-forms#12/#16/#15 verifiers leave Connector end, Spectrum, and Library Move to Trash/Save to Files causes unknown. Added facts/AX centre overlaps plus screenshot before connector/Spectrum lookup; Library performTap records the first poll screenshot, then every button match and popover/menu/sheet counts at timeout. No guessed coordinate actions, retries or visibility fixes. CI must distinguish absent surfaces, retained copies and non-hittable live controls.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Insert ConnectorDragAnchorRoutesBendsAndUndo | Connector end before lookup | What exists/frame/hittability/overlap evidence describes the handle? |
+| Ink HighlighterCustomColourPersistsAndDrawsTranslucentInk | Colour Spectrum before lookup | Is Spectrum covered, missing, or otherwise non-hittable? |
+| Library TrashPageBrowsingSelectionAndRecovery / ExternalFilesDropImportsIntoCurrentFolder | Library action first poll / action timeout | Was a menu/share surface present before polling, and which matches survived at timeout? |
