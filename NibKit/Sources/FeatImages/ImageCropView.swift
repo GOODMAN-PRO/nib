@@ -57,6 +57,23 @@ enum CropEditing {
     }
 }
 
+/// A gesture owns its preview only. The gesture-lifetime reset discards it on cancellation;
+/// completed geometry lives separately.
+struct CropGestureDraft {
+    var rectangle: Rect?
+    var points: [Point] = []
+
+    mutating func move(from committed: Rect, handle: CropHandle?, dx: Double, dy: Double) {
+        rectangle = CropEditing.drag(committed, handle: handle, dx: dx, dy: dy)
+    }
+
+    mutating func append(_ point: Point) {
+        points.append(Point(min(max(point.x, 0), 1), min(max(point.y, 0), 1)))
+    }
+
+    func outline(or committed: [Point]) -> [Point] { points.count >= 3 ? points : committed }
+}
+
 enum CropMode: CaseIterable {
     case rectangle, freehand
 
@@ -106,8 +123,8 @@ struct ImageCropSheet: View {
     @State private var mode: CropMode
     @State private var rect: Rect
     @State private var outline: [Point]
-    @State private var drawing: [Point] = []
-    @State private var dragStart: Rect?
+    @State private var draft = CropGestureDraft()
+    @GestureState private var gestureActive = false
     @State private var aspect: CropAspect?
 
     init(image: UIImage, rect: Rect, mask: [Point]?, onCancel: @escaping () -> Void,
@@ -150,6 +167,9 @@ struct ImageCropSheet: View {
         }
         .padding(.bottom, NibSpacing.l)
         .background(NibColor.backgroundSecondary)
+        .onChange(of: gestureActive) { _, active in
+            if !active { draft = CropGestureDraft() }
+        }
     }
 
     private func fitted(in space: CGSize) -> CGSize {
@@ -159,8 +179,9 @@ struct ImageCropSheet: View {
     }
 
     private func rectangleOverlay(_ size: CGSize) -> some View {
-        let r = CGRect(x: rect.x * Double(size.width), y: rect.y * Double(size.height),
-                       width: rect.width * Double(size.width), height: rect.height * Double(size.height))
+        let preview = draft.rectangle ?? rect
+        let r = CGRect(x: preview.x * Double(size.width), y: preview.y * Double(size.height),
+                       width: preview.width * Double(size.width), height: preview.height * Double(size.height))
         return ZStack(alignment: .topLeading) {
             Path { p in
                 p.addRect(CGRect(origin: .zero, size: size))
@@ -205,20 +226,23 @@ struct ImageCropSheet: View {
 
     private func drag(_ handle: CropHandle?, _ size: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 0)
+            .updating($gestureActive) { _, active, _ in active = true }
             .onChanged { g in
-                let start = dragStart ?? rect
-                if dragStart == nil { dragStart = rect }
-                rect = CropEditing.drag(start, handle: handle, dx: Double(g.translation.width / max(size.width, 1)),
+                draft.move(from: rect, handle: handle, dx: Double(g.translation.width / max(size.width, 1)),
+                           dy: Double(g.translation.height / max(size.height, 1)))
+            }
+            .onEnded { g in
+                rect = CropEditing.drag(rect, handle: handle, dx: Double(g.translation.width / max(size.width, 1)),
                                         dy: Double(g.translation.height / max(size.height, 1)))
                 aspect = nil
+                draft = CropGestureDraft()
             }
-            .onEnded { _ in dragStart = nil }
     }
 
     private func freehandOverlay(_ size: CGSize) -> some View {
-        let source = drawing.isEmpty ? outline : drawing
+        let source = draft.points.isEmpty ? outline : draft.points
         let pts = source.map { CGPoint(x: $0.x * Double(size.width), y: $0.y * Double(size.height)) }
-        let closed = drawing.isEmpty && outline.count >= 3
+        let closed = draft.points.isEmpty && outline.count >= 3
         return ZStack(alignment: .topLeading) {
             if closed {
                 Path { p in
@@ -240,13 +264,14 @@ struct ImageCropSheet: View {
             Color.clear
                 .contentShape(Rectangle())
                 .gesture(DragGesture(minimumDistance: 0)
+                    .updating($gestureActive) { _, active, _ in active = true }
                     .onChanged { g in
-                        drawing.append(Point(min(max(Double(g.location.x / max(size.width, 1)), 0), 1),
-                                             min(max(Double(g.location.y / max(size.height, 1)), 0), 1)))
+                        draft.append(Point(Double(g.location.x / max(size.width, 1)),
+                                           Double(g.location.y / max(size.height, 1))))
                     }
                     .onEnded { _ in
-                        if drawing.count >= 3 { outline = drawing }
-                        drawing = []
+                        outline = draft.outline(or: outline)
+                        draft = CropGestureDraft()
                     })
         }
         .frame(width: size.width, height: size.height)

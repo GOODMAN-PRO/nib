@@ -41,6 +41,30 @@ final class ImageAssetSpy: AssetStore {
 
 @MainActor
 final class ImageImportRegressionTests: XCTestCase {
+    func testCancelledRectanglePreviewCannotBecomeTheNextDragOrigin() {
+        let committed = Rect(x: 0.2, y: 0.2, width: 0.5, height: 0.5)
+        var draft = CropGestureDraft()
+        draft.move(from: committed, handle: nil, dx: 0.2, dy: 0.1)
+        XCTAssertNotEqual(draft.rectangle, committed)
+        draft = CropGestureDraft() // The GestureState lifetime reset discards the preview on cancellation.
+        XCTAssertEqual(draft.rectangle ?? committed, committed)
+        draft.move(from: committed, handle: .topLeft, dx: 0.1, dy: 0.1)
+        XCTAssertEqual(draft.rectangle, CropEditing.drag(committed, handle: .topLeft, dx: 0.1, dy: 0.1))
+    }
+
+    func testCancelledFreehandPreviewCannotJoinTheNextOutline() {
+        let committed = [Point(0, 0), Point(1, 0), Point(1, 1)]
+        var draft = CropGestureDraft()
+        draft.append(Point(0.9, 0.9))
+        draft.append(Point(0.8, 0.9))
+        draft = CropGestureDraft()
+        XCTAssertEqual(draft.outline(or: committed), committed)
+        let fresh = [Point(0.1, 0.1), Point(0.3, 0.1), Point(0.2, 0.3)]
+        fresh.forEach { draft.append($0) }
+        XCTAssertEqual(draft.outline(or: committed), fresh)
+        XCTAssertEqual(draft.points.count, 3)
+    }
+
     func testCropRejectsImageReplacedOrFlippedWhileSheetOpen() async throws {
         for command in ["image.replace", "image.flip"] {
             let h = Harness(features: [FeatImagesFeature.self])
