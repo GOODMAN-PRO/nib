@@ -9,6 +9,19 @@ import NibTesting
 
 @MainActor
 final class FeatLibraryUITests: XCTestCase {
+    func testEscapeClosesOneTransientSurfaceAndLeavesRenameToItsOwner() {
+        XCTAssertEqual(LibraryEscapeTarget.resolve(hasMenu: true, isRenaming: false,
+            hasSearch: true, isSelecting: true), .menu)
+        XCTAssertNil(LibraryEscapeTarget.resolve(hasMenu: false, isRenaming: true,
+            hasSearch: true, isSelecting: true))
+        XCTAssertEqual(LibraryEscapeTarget.resolve(hasMenu: false, isRenaming: false,
+            hasSearch: true, isSelecting: true), .search)
+        XCTAssertEqual(LibraryEscapeTarget.resolve(hasMenu: false, isRenaming: false,
+            hasSearch: false, isSelecting: true), .selection)
+        XCTAssertNil(LibraryEscapeTarget.resolve(hasMenu: false, isRenaming: false,
+            hasSearch: false, isSelecting: false))
+    }
+
     private var controllers: [UIViewController] = []
     private func harness() -> Harness {
         let h = Harness(features: [FeatLibraryUIFeature.self])

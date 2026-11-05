@@ -54,27 +54,33 @@ public extension View {
     /// Register the very same closure as Cancel. Disabled owners consume Escape
     /// without cancelling, so an underlying surface cannot handle it instead.
     func nibEscapeCancellation(isEnabled: Bool = true, onCancel: @escaping () -> Void) -> some View {
-        background(NibEscapeCancellationBridge(isEnabled: isEnabled, onCancel: onCancel))
+        background(NibEscapeCancellationBridge(onEscape: {
+            if isEnabled { onCancel() }
+            return true
+        }))
+    }
+
+    /// An owner with conditional state can decline Escape and allow the next
+    /// owner to handle it. This is also used by the library's transient chrome.
+    func nibEscapeHandler(_ onEscape: @escaping () -> Bool) -> some View {
+        background(NibEscapeCancellationBridge(onEscape: onEscape))
     }
 }
 
 private struct NibEscapeCancellationBridge: UIViewRepresentable {
-    let isEnabled: Bool
-    let onCancel: () -> Void
+    let onEscape: () -> Bool
     func makeUIView(context: Context) -> NibEscapeCancellationView { NibEscapeCancellationView() }
     func updateUIView(_ view: NibEscapeCancellationView, context: Context) {
-        view.onCancel = isEnabled ? onCancel : {}
+        view.onEscape = onEscape
     }
-    static func dismantleUIView(_ view: NibEscapeCancellationView, coordinator: ()) { view.onCancel = nil }
+    static func dismantleUIView(_ view: NibEscapeCancellationView, coordinator: ()) { view.onEscape = nil }
 }
 
 final class NibEscapeCancellationView: UIView, NibEscapeHandling {
-    var onCancel: (() -> Void)?
+    var onEscape: (() -> Bool)?
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
     func handleEscape() -> Bool {
-        guard let onCancel else { return false }
-        onCancel()
-        return true
+        onEscape?() ?? false
     }
 }
 

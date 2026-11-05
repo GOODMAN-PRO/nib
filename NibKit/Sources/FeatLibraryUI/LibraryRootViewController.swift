@@ -565,6 +565,18 @@ enum LibraryPresentation {
     }
 }
 
+enum LibraryEscapeTarget: Equatable {
+    case menu, search, selection
+
+    static func resolve(hasMenu: Bool, isRenaming: Bool, hasSearch: Bool, isSelecting: Bool) -> Self? {
+        if hasMenu { return .menu }
+        // The rename field owns its draft and its saving guard.
+        if isRenaming { return nil }
+        if hasSearch { return .search }
+        return isSelecting ? .selection : nil
+    }
+}
+
 struct LibraryRootView: View {
     @ObservedObject var model: LibraryViewModel
     // Keep the device input explicit so previews and layout checks use their intended idiom.
@@ -705,6 +717,7 @@ struct LibraryRootView: View {
                 if model.searchContentBounds != contentBounds { model.searchContentBounds = contentBounds }
             }
             .nibLiquidMode(model.liquidMode)
+            .nibEscapeHandler(handleEscape)
             .nibSheet(item: sheetBinding) { panel in LibraryPanelView(panel: panel, model: model) }
             .fullScreenCover(item: fullScreenBinding) { panel in LibraryPanelView(panel: panel, model: model) }
             .confirmationDialog(model.confirmation?.title ?? "", isPresented: Binding(get: { model.confirmation != nil }, set: { if !$0 { model.confirmation = nil } }), titleVisibility: .visible) {
@@ -740,6 +753,21 @@ struct LibraryRootView: View {
             .task { await model.appear() }
             .onDisappear { model.isVisible = false }
         }
+    }
+    private func handleEscape() -> Bool {
+        guard model.modal == nil, model.confirmation == nil, model.floating.presentedIDs.isEmpty,
+              let target = LibraryEscapeTarget.resolve(hasMenu: model.menu != nil,
+                isRenaming: model.renaming != nil, hasSearch: !searchText.isEmpty || !model.search.isEmpty,
+                isSelecting: model.selection.isSelecting) else { return false }
+        switch target {
+        case .menu: model.setView(["menu": "none"])
+        case .search:
+            searchText = ""
+            model.setView(["search": ""])
+            model.controller?.view.endEditing(true)
+        case .selection: model.setView(["selection": "clear"])
+        }
+        return true
     }
     private var sheetBinding: Binding<LibraryPanel?> {
         Binding(get: { model.modal?.presentation == .sheet ? model.modal : nil }, set: { if $0 == nil, let modal = model.modal { model.setView(["panel": .string(modal.id), "close": true]) } })

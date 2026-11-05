@@ -588,12 +588,16 @@ struct LibraryRenameField: View {
                     .accessibilityLabel(String(localized: "Rename \(row.name)"))
                 NibIconButton(.checkmark, label: String(localized: "Save Name"), action: save)
                     .accessibilityIdentifier("cmd.library.rename")
-                NibIconButton(.xmark, label: String(localized: "Cancel Rename")) { model.setView(["rename": ""]) }
+                NibIconButton(.xmark, label: String(localized: "Cancel Rename"), shortcut: .cancelAction) { model.setView(["rename": ""]) }
                 .accessibilityIdentifier("cmd.library.setView")
             }.frame(minHeight: NibMetrics.hitTarget)
             .disabled(saving)
             if let error { Text(error).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
         }.onAppear { text = row.name; focused = true }
+            .nibEscapeCancellation(isEnabled: !saving) {
+                focused = false
+                model.setView(["rename": ""])
+            }
     }
     private func save() {
         guard !saving else { return }

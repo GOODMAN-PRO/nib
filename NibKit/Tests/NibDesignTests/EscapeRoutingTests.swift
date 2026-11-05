@@ -36,8 +36,8 @@ final class EscapeRoutingTests: XCTestCase {
         var presented = true
         var draft = "Unsaved title"
         var cancelled = 0
-        underlying.onCancel = { XCTFail("Underlying owner must not run") }
-        sheet.onCancel = { presented = false; draft = ""; cancelled += 1 }
+        underlying.onEscape = { XCTFail("Underlying owner must not run"); return true }
+        sheet.onEscape = { presented = false; draft = ""; cancelled += 1; return true }
         root.addSubview(underlying)
         root.addSubview(sheet)
         XCTAssertTrue(NibEscapeRouting.cancel(in: root))
