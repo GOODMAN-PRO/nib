@@ -1341,7 +1341,7 @@ final class InsertUITests: XCTestCase {
             try self.wait("Seek reaches one quarter") { guard let t = try? self.playbackTimes() else { return false }; return abs(t.position - t.duration * 0.25) < 1.5 }
         }
         for speed in ["0.5×", "2×", "1×"] {
-            try tap("Playback Options"); try tap("Speed", scroll: true); try tap(speed, scroll: true)
+            try tap("Playback Options"); try tap(speed, scroll: true)
             XCTAssertTrue((try control("Playback Options").value as? String)?.contains(speed) == true)
         }
         try tap("Playback Options"); try tap("Skip Silence")

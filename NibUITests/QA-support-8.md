@@ -146,3 +146,7 @@ D:controls-forms#7 confirms Button label Preset, Anthropic and a separate non-ac
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Insert/Selection provider setup | Provider custom preset selected | Did the next previously unobserved menu choice complete? Facts and screenshot retained. |
+
+## C3 - inline playback speeds
+
+D:controls-forms#8 shows inline 0.5x/2x/1x actions and no Speed submenu. Removed only the nonexistent intermediate tap in AudioPlayPauseSeekSkipSettingsAndClose. Each speed still checks Playback Options value. CI must reach all three speed assertions and the remaining playback settings/close checks.
