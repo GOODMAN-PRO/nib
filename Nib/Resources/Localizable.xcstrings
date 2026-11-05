@@ -23095,6 +23095,95 @@
         }
       }
     },
+    "A new window could not be opened." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ein neues Fenster konnte nicht geöffnet werden."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se pudo abrir una ventana nueva."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossible d’ouvrir une nouvelle fenêtre."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile aprire una nuova finestra."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新しいウインドウを開けませんでした。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "새로운 윈도우를 열 수 없습니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Er kon geen nieuw venster worden geopend."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nie można otworzyć nowego okna."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não foi possível abrir uma nova janela."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось открыть новое окно."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Det gick inte att öppna ett nytt fönster."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Yeni pencere açılamadı."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法打开新窗口。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法開啟新視窗。"
+          }
+        }
+      }
+    },
     "A notification before each timed event in the next week, with Take Notes to open its note. Reminders cover the events Nib read when it was last open, so open Nib now and then to pick up new meetings." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -23447,6 +23536,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "外掛程式只會在你授予權限的範圍內存取網路或你的資料庫。橋接器在你開啟之前都是關閉的，而助理、外掛程式和橋接器在執行任何無法復原的操作前都會先詢問。"
+          }
+        }
+      }
+    },
+    "A plugin's command hooks stopped responding and were disabled. Reload the plugin in Settings to try again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Befehls-Hooks eines Plug-ins haben nicht mehr reagiert und wurden deaktiviert. Lade das Plug-in in den Einstellungen neu, um es erneut zu versuchen."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Los ganchos de comandos de un plugin dejaron de responder y se desactivaron. Vuelve a cargar el plugin en Ajustes para intentarlo de nuevo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Les crochets de commande d’un module ont cessé de répondre et ont été désactivés. Rechargez le module dans Réglages pour réessayer."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gli hook dei comandi di un plugin hanno smesso di rispondere e sono stati disattivati. Ricarica il plugin in Impostazioni per riprovare."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プラグインのコマンドフックが応答しなくなり、無効になりました。もう一度試すには、設定でプラグインを再読み込みしてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "플러그인의 명령 훅이 응답하지 않아 비활성화되었습니다. 다시 시도하려면 설정에서 플러그인을 다시 불러오십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De opdrachthooks van een plug-in reageerden niet meer en zijn uitgeschakeld. Laad de plug-in opnieuw in Instellingen om het nog eens te proberen."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Haki poleceń wtyczki przestały odpowiadać i zostały wyłączone. Załaduj wtyczkę ponownie w Ustawieniach, aby spróbować jeszcze raz."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Os ganchos de comando de um plugin pararam de responder e foram desativados. Recarregue o plugin em Ajustes para tentar novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Хуки команд плагина перестали отвечать и были отключены. Перезагрузите плагин в Настройках, чтобы попробовать снова."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kommandokrokarna i ett tillägg slutade svara och inaktiverades. Läs in tillägget igen i Inställningar för att försöka på nytt."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bir eklentinin komut kancaları yanıt vermeyi bıraktı ve devre dışı bırakıldı. Yeniden denemek için eklentiyi Ayarlar’da yeniden yükleyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "某个插件的命令钩子停止响应并已被停用。请在设置中重新载入该插件以重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "某個外掛程式的指令掛鉤已停止回應並遭停用。請在設定中重新載入該外掛程式以再試一次。"
           }
         }
       }
@@ -87721,6 +87899,95 @@
         }
       }
     },
+    "Could not render this page. Try again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Diese Seite konnte nicht dargestellt werden. Versuche es erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se pudo renderizar esta página. Inténtalo de nuevo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossible d’afficher cette page. Réessayez."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile eseguire il rendering di questa pagina. Riprova."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このページを描画できませんでした。もう一度お試しください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 페이지를 렌더링할 수 없습니다. 다시 시도하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deze pagina kon niet worden weergegeven. Probeer het opnieuw."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nie można wyrenderować tej strony. Spróbuj ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não foi possível renderizar esta página. Tente novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось отобразить эту страницу. Попробуйте снова."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sidan kunde inte renderas. Försök igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bu sayfa oluşturulamadı. Yeniden deneyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法渲染此页面。请重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法渲染此頁面。請再試一次。"
+          }
+        }
+      }
+    },
     "Couldn't combine the QuickNote" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -88785,6 +89052,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "無法讀取此頁面"
+          }
+        }
+      }
+    },
+    "Couldn't read this selection. Copy it as an image or text and try again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Diese Auswahl konnte nicht gelesen werden. Kopiere sie als Bild oder Text und versuche es erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se pudo leer esta selección. Cópiala como imagen o texto e inténtalo de nuevo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossible de lire cette sélection. Copiez-la sous forme d’image ou de texte, puis réessayez."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile leggere questa selezione. Copiala come immagine o testo e riprova."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この選択範囲を読み取れませんでした。画像またはテキストとしてコピーして、もう一度お試しください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 선택 항목을 읽을 수 없습니다. 이미지 또는 텍스트로 복사한 후 다시 시도하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deze selectie kon niet worden gelezen. Kopieer haar als afbeelding of tekst en probeer het opnieuw."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nie można odczytać tego zaznaczenia. Skopiuj je jako obraz lub tekst i spróbuj ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não foi possível ler esta seleção. Copie-a como imagem ou texto e tente novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось прочитать выбранное. Скопируйте это как изображение или текст и попробуйте снова."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Markeringen kunde inte läsas. Kopiera den som bild eller text och försök igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bu seçim okunamadı. Görüntü veya metin olarak kopyalayıp yeniden deneyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法读取此所选内容。请将其拷贝为图像或文本后重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法讀取此所選內容。請將其拷貝為影像或文字後再試一次。"
           }
         }
       }
@@ -107626,6 +107982,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "關閉"
+          }
+        }
+      }
+    },
+    "Dismiss error" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fehler schließen"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Descartar error"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ignorer l’erreur"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ignora errore"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "エラーを閉じる"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오류 닫기"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Foutmelding sluiten"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zamknij błąd"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dispensar erro"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Закрыть ошибку"
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stäng fel"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hatayı Kapat"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭错误"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "關閉錯誤"
           }
         }
       }
@@ -159596,6 +160041,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "增加縮排"
+          }
+        }
+      }
+    },
+    "Increase Max output tokens in Settings > AI and try again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erhöhe „Maximale Ausgabe-Tokens“ unter Einstellungen > KI und versuche es erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aumenta «Máximo de tokens de salida» en Ajustes > IA e inténtalo de nuevo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Augmentez « Nombre maximal de jetons en sortie » dans Réglages > IA, puis réessayez."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aumenta “Token di output massimi” in Impostazioni > IA e riprova."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "設定 > AIで「最大出力トークン数」を増やして、もう一度お試しください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 > AI에서 '최대 출력 토큰'을 늘린 후 다시 시도하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verhoog 'Maximaal aantal uitvoertokens' in Instellingen > AI en probeer het opnieuw."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zwiększ „Maksymalna liczba tokenów wyjściowych” w Ustawieniach > AI i spróbuj ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aumente “Máximo de tokens de saída” em Ajustes > IA e tente novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Увеличьте «Максимум токенов вывода» в Настройки > ИИ и попробуйте снова."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Öka ”Maximalt antal utdatatokens” i Inställningar > AI och försök igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ayarlar > Yapay Zekâ içinde “Maksimum çıktı belirteci” değerini artırın ve yeniden deneyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请在设置 > AI中增大“最大输出令牌数”，然后重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "請在設定 > AI中提高「輸出權杖上限」，然後再試一次。"
           }
         }
       }
@@ -334695,6 +335229,95 @@
         }
       }
     },
+    "Template pages must have each side between 36 and 14400 points. Resize the image or PDF page and import it again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bei Vorlagenseiten muss jede Seite zwischen 36 und 14400 Punkt lang sein. Ändere die Größe des Bildes oder der PDF-Seite und importiere sie erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cada lado de las páginas de plantilla debe medir entre 36 y 14400 puntos. Cambia el tamaño de la imagen o de la página del PDF e impórtala de nuevo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chaque côté des pages de modèle doit mesurer entre 36 et 14400 points. Redimensionnez l’image ou la page PDF, puis importez-la de nouveau."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ogni lato delle pagine modello deve essere compreso tra 36 e 14400 punti. Ridimensiona l’immagine o la pagina PDF e importala di nuovo."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "テンプレートページの各辺は36～14400ポイントにする必要があります。画像またはPDFページのサイズを変更して、もう一度読み込んでください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "템플릿 페이지의 각 변은 36~14400포인트여야 합니다. 이미지 또는 PDF 페이지의 크기를 조절한 후 다시 가져오십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Elke zijde van sjabloonpagina's moet tussen 36 en 14400 punten zijn. Wijzig het formaat van de afbeelding of pdf-pagina en importeer hem opnieuw."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Każdy bok stron szablonu musi mieć od 36 do 14400 punktów. Zmień rozmiar obrazu lub strony PDF i zaimportuj ją ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cada lado das páginas de modelo deve ter entre 36 e 14400 pontos. Redimensione a imagem ou a página do PDF e importe novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Каждая сторона страниц шаблона должна быть от 36 до 14400 пунктов. Измените размер изображения или страницы PDF и импортируйте снова."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mallsidor måste ha en sidlängd på mellan 36 och 14400 punkter. Ändra storlek på bilden eller PDF-sidan och importera den igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Şablon sayfalarının her kenarı 36 ile 14400 punto arasında olmalıdır. Görüntünün veya PDF sayfasının boyutunu değiştirip yeniden içe aktarın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模板页面的每条边必须介于 36 到 14400 点之间。请调整图像或 PDF 页面的大小，然后重新导入。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "範本頁面的每一邊必須介於 36 到 14400 點之間。請調整影像或 PDF 頁面的大小，然後重新輸入。"
+          }
+        }
+      }
+    },
     "Template title" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -338330,6 +338953,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "該位址未指向 WebDAV 檔案夾"
+          }
+        }
+      }
+    },
+    "The answer was cut off because the model reached its output limit." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Antwort wurde abgeschnitten, weil das Modell sein Ausgabelimit erreicht hat."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La respuesta se cortó porque el modelo alcanzó su límite de salida."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La réponse a été tronquée, car le modèle a atteint sa limite de sortie."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La risposta è stata interrotta perché il modello ha raggiunto il limite di output."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "モデルが出力の上限に達したため、回答が途中で切れました。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모델이 출력 한도에 도달하여 답변이 잘렸습니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Het antwoord is afgebroken omdat het model zijn uitvoerlimiet heeft bereikt."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Odpowiedź została ucięta, ponieważ model osiągnął limit wyjścia."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A resposta foi cortada porque o modelo atingiu o limite de saída."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ответ был обрезан, потому что модель достигла предела вывода."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Svaret avbröts eftersom modellen nådde sin utdatagräns."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model çıktı sınırına ulaştığı için yanıt yarıda kesildi."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "由于模型达到输出上限，回答被截断。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "由於模型已達輸出上限，回答遭到截斷。"
           }
         }
       }
@@ -343486,6 +344198,95 @@
         }
       }
     },
+    "The model declined to answer this request." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Modell hat es abgelehnt, diese Anfrage zu beantworten."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El modelo rechazó responder a esta solicitud."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le modèle a refusé de répondre à cette demande."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il modello ha rifiutato di rispondere a questa richiesta."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "モデルがこのリクエストへの回答を拒否しました。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모델이 이 요청에 대한 답변을 거부했습니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Het model heeft geweigerd dit verzoek te beantwoorden."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model odmówił odpowiedzi na to żądanie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O modelo recusou-se a responder a esta solicitação."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модель отказалась отвечать на этот запрос."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellen avböjde att svara på den här begäran."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model bu isteği yanıtlamayı reddetti."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型拒绝回答此请求。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型拒絕回答此要求。"
+          }
+        }
+      }
+    },
     "The notebook was created with a cover: %@" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -344372,6 +345173,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "頁面會加入「%@」。"
+          }
+        }
+      }
+    },
+    "The pairing link needs a valid bridge token. Copy a new pairing link from Settings > Bridge." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Kopplungslink benötigt ein gültiges Bridge-Token. Kopiere unter Einstellungen > Bridge einen neuen Kopplungslink."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El enlace de emparejamiento necesita un token de puente válido. Copia un nuevo enlace de emparejamiento en Ajustes > Puente."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le lien d’association nécessite un jeton de passerelle valide. Copiez un nouveau lien d’association depuis Réglages > Passerelle."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il link di abbinamento richiede un token bridge valido. Copia un nuovo link di abbinamento da Impostazioni > Bridge."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ペアリングリンクには有効なブリッジトークンが必要です。設定 > ブリッジで新しいペアリングリンクをコピーしてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "페어링 링크에는 유효한 브리지 토큰이 필요합니다. 설정 > 브리지에서 새 페어링 링크를 복사하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De koppelingslink heeft een geldig bridge-token nodig. Kopieer een nieuwe koppelingslink via Instellingen > Bridge."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Łącze parowania wymaga prawidłowego tokenu mostka. Skopiuj nowe łącze parowania w Ustawieniach > Mostek."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O link de pareamento precisa de um token da ponte válido. Copie um novo link de pareamento em Ajustes > Ponte."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Для ссылки сопряжения нужен действительный токен моста. Скопируйте новую ссылку сопряжения в Настройки > Мост."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Parkopplingslänken behöver en giltig bryggtoken. Kopiera en ny parkopplingslänk från Inställningar > Brygga."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eşleştirme bağlantısı için geçerli bir köprü belirteci gerekir. Ayarlar > Köprü bölümünden yeni bir eşleştirme bağlantısı kopyalayın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "配对链接需要有效的桥接令牌。请从设置 > 桥接中拷贝新的配对链接。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "配對連結需要有效的橋接權杖。請從設定 > 橋接拷貝新的配對連結。"
           }
         }
       }
@@ -351759,6 +352649,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "此文件位於垃圾桶中。請先復原再打開連結。"
+          }
+        }
+      }
+    },
+    "This document is locked." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Dokument ist gesperrt."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Este documento está bloqueado."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ce document est verrouillé."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Questo documento è bloccato."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この書類はロックされています。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 문서는 잠겨 있습니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dit document is vergrendeld."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ten dokument jest zablokowany."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Este documento está bloqueado."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Этот документ заблокирован."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Det här dokumentet är låst."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bu belge kilitli."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此文稿已锁定。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此文件已鎖定。"
           }
         }
       }
@@ -361375,6 +362354,95 @@
         }
       }
     },
+    "Try again, or open the document in this window." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Versuche es erneut oder öffne das Dokument in diesem Fenster."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inténtalo de nuevo o abre el documento en esta ventana."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Réessayez ou ouvrez le document dans cette fenêtre."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Riprova oppure apri il documento in questa finestra."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "もう一度お試しいただくか、この書類をこのウインドウで開いてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 시도하거나 이 윈도우에서 문서를 여십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Probeer het opnieuw of open het document in dit venster."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Spróbuj ponownie lub otwórz dokument w tym oknie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tente novamente ou abra o documento nesta janela."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Попробуйте снова или откройте документ в этом окне."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Försök igen eller öppna dokumentet i det här fönstret."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Yeniden deneyin veya belgeyi bu pencerede açın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请重试，或在此窗口中打开该文稿。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "請再試一次，或在此視窗中開啟該文件。"
+          }
+        }
+      }
+    },
     "Try another name." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -361994,6 +363062,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "自己試試看"
+          }
+        }
+      }
+    },
+    "Try rephrasing your request." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Formuliere deine Anfrage anders."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prueba a reformular tu solicitud."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Essayez de reformuler votre demande."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prova a riformulare la richiesta."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リクエストの言い方を変えてみてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요청을 다르게 표현해 보십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Probeer je verzoek anders te formuleren."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Spróbuj sformułować prośbę inaczej."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tente reformular sua solicitação."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Попробуйте переформулировать запрос."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Försök formulera din begäran på ett annat sätt."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "İsteğinizi farklı ifade etmeyi deneyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请尝试换一种方式表述你的请求。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "請嘗試換個方式表達你的要求。"
           }
         }
       }
@@ -366533,6 +367690,184 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "解鎖文件"
+          }
+        }
+      }
+    },
+    "Unlock the document before playing its audio." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entsperre das Dokument, bevor du seine Audioinhalte wiedergibst."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desbloquea el documento antes de reproducir su audio."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Déverrouillez le document avant de lire son audio."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sblocca il documento prima di riprodurne l’audio."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オーディオを再生する前に、書類のロックを解除してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오디오를 재생하기 전에 문서의 잠금을 해제하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ontgrendel het document voordat je de audio afspeelt."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Odblokuj dokument przed odtworzeniem jego dźwięku."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desbloqueie o documento antes de reproduzir seu áudio."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разблокируйте документ, прежде чем воспроизводить его аудио."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lås upp dokumentet innan du spelar upp dess ljud."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sesini çalmadan önce belgenin kilidini açın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请先解锁文稿，再播放其音频。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "請先解鎖文件，再播放其音訊。"
+          }
+        }
+      }
+    },
+    "Unlock the document in the library, then open the link again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entsperre das Dokument in der Bibliothek und öffne dann den Link erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desbloquea el documento en la biblioteca y vuelve a abrir el enlace."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Déverrouillez le document dans la bibliothèque, puis rouvrez le lien."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sblocca il documento nella libreria, poi apri di nuovo il link."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ライブラリで書類のロックを解除してから、もう一度リンクを開いてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "라이브러리에서 문서의 잠금을 해제한 다음 링크를 다시 여십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ontgrendel het document in de bibliotheek en open de link daarna opnieuw."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Odblokuj dokument w bibliotece, a następnie otwórz łącze ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desbloqueie o documento na biblioteca e abra o link novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разблокируйте документ в библиотеке, затем снова откройте ссылку."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lås upp dokumentet i biblioteket och öppna sedan länken igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Belgenin kilidini kitaplıkta açın, ardından bağlantıyı yeniden açın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请在资料库中解锁该文稿，然后再次打开链接。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "請在資料庫中解鎖該文件，然後再次開啟連結。"
           }
         }
       }
