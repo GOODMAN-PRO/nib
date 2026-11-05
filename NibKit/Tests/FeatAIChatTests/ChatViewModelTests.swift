@@ -6,6 +6,24 @@ import NibTesting
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testArchiveInterleavesReceiptsWithoutReorderingListedMessages() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let messages = [("USER1", "user", 1.0), ("ANSWER1", "assistant", 2.0),
+                        ("USER2", "user", 4.0), ("ANSWER2", "assistant", 5.0)].map {
+            StoredChatEntry(ChatEntry(id: $0.0, role: $0.1, text: $0.0, at: Date(timeIntervalSince1970: $0.2)))
+        }
+        let receipts = [("APPLIED", 2.0), ("INSERTED", 3.0)].map {
+            StoredChatEntry(ChatEntry(id: $0.0, role: "assistant", text: $0.0, group: $0.0,
+                                      at: Date(timeIntervalSince1970: $0.1), isReceipt: true))
+        }
+        try await ChatArchive.save(chat: "RECEIPTS", device: h.app.deviceHex,
+            records: receipts.map { ChatArchive.Record(message: $0, rev: h.app.clock.tick()) },
+            metadata: h.library.metadataURL, assets: h.app.services.assets, doc: Fixtures.docID)
+        let restored = try await ChatArchive.restore(chat: "RECEIPTS", listed: messages, metadata: h.library.metadataURL)
+        XCTAssertEqual(restored.map(\.id), ["USER1", "ANSWER1", "APPLIED", "INSERTED", "USER2", "ANSWER2"])
+        XCTAssertEqual(restored.filter { $0.receipt == true }.map(\.group), ["APPLIED", "INSERTED"])
+    }
+
     func testContextAndSendFollowWindowDocumentChanges() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         h.app.commands.register(CommandDescriptor(id: CommandIDs.queryContext, title: "Context", summary: "Read context.", effect: .read)) { _, _ in

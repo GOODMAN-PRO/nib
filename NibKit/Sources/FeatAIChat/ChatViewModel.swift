@@ -846,8 +846,12 @@ actor ChatArchive {
             return result
         }
         let ids = Set(restored.map(\.id))
-        restored += presentation.values.map(\.message).filter { $0.receipt == true && !ids.contains($0.id) }
+        let receipts = presentation.values.map(\.message).filter { $0.receipt == true && !ids.contains($0.id) }
             .sorted { ($0.at ?? 0, $0.id) < ($1.at ?? 0, $1.id) }
+        for receipt in receipts {
+            let index = restored.lastIndex(where: { ($0.at ?? 0) <= (receipt.at ?? 0) }).map { $0 + 1 } ?? 0
+            restored.insert(receipt, at: index)
+        }
         return restored
     }
     private func write(chat: String, device: String, records incoming: [Record], metadata: URL, assets: AssetStore?, doc: DocumentID?) throws {
