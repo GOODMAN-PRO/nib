@@ -213,6 +213,7 @@ final class NibPageRenderer: PageRenderer {
     let rasters = RasterBackgroundCache()
     let inks = PKStrokeCache()
     private var commitSubscription: EventSubscription?
+    private var lifetimeSubscription: EventSubscription?
     private var observers: [NSObjectProtocol] = []
 
     @MainActor
@@ -227,6 +228,13 @@ final class NibPageRenderer: PageRenderer {
         disk.maxConcurrentOperationCount = 1
         disk.qualityOfService = .utility
         commitSubscription = app.bus.observeCommits { [weak self] cs in self?.invalidate(after: cs) }
+        lifetimeSubscription = app.events.subscribe { [weak self] event in
+            if event.type == NibEventType.docClosed ||
+                (event.type == NibEventType.libraryChanged && event.payload?["root"]?.boolValue == true) {
+                // Advance the tile epoch as well: workers from the old library cannot repopulate caches.
+                self?.purgeCaches()
+            }
+        }
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil,
                                             queue: nil) { [weak self] _ in self?.purgeCaches() })
@@ -242,6 +250,7 @@ final class NibPageRenderer: PageRenderer {
     deinit {
         for o in observers { NotificationCenter.default.removeObserver(o) }
         commitSubscription?.cancel()
+        lifetimeSubscription?.cancel()
     }
 
     // MARK: PageRenderer

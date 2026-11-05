@@ -504,6 +504,27 @@ final class NibRenderTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: partialFile.path))
     }
 
+    func testReopenedDocumentDoesNotReuseTilesFromItsPreviousLifetime() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+        let (doc, page) = try makePage(h, items: [])
+        let request = RenderRequest(doc: doc, page: page, scale: 0.5)
+        let before = try await renderer.render(request)
+        let key = TileCache.pageKey(doc, page)
+        let generation = renderer.tiles.generation(key)
+        XCTAssertGreaterThan(renderer.tiles.count(page: key), 0)
+        h.app.workspace.close(doc)
+        XCTAssertNotEqual(renderer.tiles.generation(key), generation)
+        XCTAssertEqual(renderer.tiles.count(page: key), 0)
+        XCTAssertFalse(renderer.tiles.insert(before.image, key: "old-worker", page: key,
+                                             rect: Rect(x: 0, y: 0, width: 100, height: 100), generation: generation))
+        h.persistence.pageItems[doc] = [page: [shortStroke()]]
+        let reopened = try await renderer.render(request)
+        XCTAssertNotEqual(bitmap(reopened.image).bytes, bitmap(before.image).bytes)
+        h.app.events.emit(NibEventType.libraryChanged, payload: ["root": true])
+        XCTAssertEqual(renderer.tiles.count(page: key), 0)
+    }
+
     func testThumbnailDiskHitDoesNotLoadThePageWhenPersistenceKnowsItsRevision() async throws {
         let h = Harness(features: [NibRenderFeature.self])
         let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
