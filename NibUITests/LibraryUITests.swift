@@ -986,7 +986,7 @@ final class LibraryUITests: XCTestCase {
         ui.logQA("SpringBoard before Files multitasking", XCUIApplication(bundleIdentifier: "com.apple.springboard").debugDescription)
         let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         screenshot.name = "Files before multitasking"; screenshot.lifetime = .keepAlways; add(screenshot)
-        let multitasking = files.buttons.matching(NSPredicate(format: "label CONTAINS[cd] 'multitasking'")).firstMatch
+        let multitasking = ui.systemWindowControls(in: files)
         try visible(multitasking, "External drop setup requires iPad multitasking controls")
         multitasking.tap()
         let split = files.buttons.matching(NSPredicate(format: "label CONTAINS[cd] 'Split View'")).firstMatch

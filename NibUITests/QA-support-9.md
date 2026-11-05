@@ -171,3 +171,14 @@ Next CI must show menu opening/item/dismissed in seconds without any 60-second i
 | --- | --- | --- |
 | Native menu callers (Pages outline/thumbnail/template) | Native menu opening / item / dismissed | Which stable frame and named path received contacts, and how long did dismissal take? |
 | Same, on failure | Native menu missing / dismissal failed | Was the item absent after the single press, and what target/probe/tree remained? |
+
+### H3 - system window control evidence
+
+Confirmed S:selection-timeouts-and-ink#3 and L:#4 with the latter verifier rejecting a proven simulator-capability limit. Current selectors only recognize the old labels. Selection external Safari drag and Library external Files drop now use one bounded lookup, retaining both tests' control/Split View/drag/import expectations. A miss inventories every top-100pt button from snapshots of Nib, SpringBoard and (for Library) Files, logs full trees and per-window raw probes, hovers the visible window's top-leading +16pt point, then inventories again. Pointer support is checked; absence is logged, never skipped. No new window-management flow is guessed.
+
+Current QAStateProbe now exposes keyWindowState.isKey/dimensions/sceneActivation, but no UIScene identifier or authoritative keyboard-focus scene. Multiple probe-bearing AX windows are logged as evidence of multiple scenes; raw window count alone is not scene count. Missing scene ownership is explicit, not manufactured. Next CI must show the actual iOS 26 controls before/after hover and the original transfer/persistence assertions if the expected flow is available. Hover API verified against Apple's [XCUICoordinate documentation](https://developer.apple.com/documentation/xcuiautomation/xcuicoordinate).
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Selection external Safari / Library external Files | Window top controls / Window control hierarchy / Window control hover | What labels and identifiers exist in the top 100pt, and does pointer hover expose controls? |
+| Same | Window scene probe / Window scene count | Which AX windows carry document probes and report isKey, and is more than one scene observable? |

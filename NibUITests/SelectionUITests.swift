@@ -1105,11 +1105,7 @@ final class SelectionUITests: XCTestCase {
         ui.app.activate()
         try pasteImage(); let source = try ui.state()
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let windowPredicate = NSPredicate(format: "label CONTAINS[c] 'Multitasking' OR label == 'Window Controls'")
-        let appControls = ui.app.buttons.matching(windowPredicate).firstMatch
-        let systemControls = springboard.buttons.matching(windowPredicate).firstMatch
-        let windowMenu = appControls.exists ? appControls : systemControls
-        ui.diagnoseWindowControls()
+        let windowMenu = ui.systemWindowControls()
         XCTAssertTrue(windowMenu.waitForExistence(timeout: 5), "Cross-app drag requires real system multitasking controls")
         windowMenu.tap()
         let split = ui.app.buttons["Split View"].exists ? ui.app.buttons["Split View"] : springboard.buttons["Split View"]

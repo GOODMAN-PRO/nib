@@ -2127,6 +2127,81 @@ final class NibUI {
         }
     }
 
+    /// AX windows are not UIScenes (keyboard/overlay windows also appear). Log each probe's own
+    /// keyWindowState, not an inferred key scene from window ordering or the global responder class.
+    func logWindowScenes(_ step: String) {
+        let windows = app.windows.allElementsBoundByIndex
+        var probeWindows = 0
+        for (index, window) in windows.enumerated() {
+            let probes = window.otherElements["nib.qa.state"].allElementsBoundByIndex
+            if !probes.isEmpty { probeWindows += 1 }
+            logQA("Window scene probe", "step=\(step) axWindow=\(index) " + elementFacts(window))
+            for (probeIndex, stateProbe) in probes.enumerated() {
+                let raw = stateProbe.value
+                logQA("Window scene probe", "step=\(step) axWindow=\(index) probe=\(probeIndex) raw=\(String(describing: raw))")
+            }
+        }
+        let evidence = probeWindows > 1 ? "multiple probe-bearing windows observed" : "not established by AX"
+        logQA("Window scene count", "step=\(step) axWindows=\(windows.count) probeWindows=\(probeWindows) moreThanOneScene=\(evidence); scene IDs and keyboard-focus owner scene are not exposed")
+    }
+
+    /// Keep the caller's missing-control assertion. A miss gathers evidence before/after pointer hover.
+    func systemWindowControls(in application: XCUIApplication? = nil) -> XCUIElement {
+        let primary = application ?? app
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let predicate = NSPredicate(format: "label CONTAINS[c] 'multitasking' OR label == 'Window Controls' OR identifier CONTAINS[c] 'window-controls'")
+        func candidate() -> XCUIElement? {
+            for source in [primary, springboard] {
+                let button = source.buttons.matching(predicate).firstMatch
+                if button.exists, button.isHittable { return button }
+            }
+            return nil
+        }
+        var found: XCUIElement?
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            found = candidate(); return found != nil
+        }, object: nil)
+        if XCTWaiter.wait(for: [ready], timeout: 5) == .completed, let found { return found }
+        var sources: [(String, XCUIApplication)] = [("Nib", app), ("SpringBoard", springboard)]
+        if application != nil { sources.append(("Foreground app", primary)) }
+        func inventory(_ stage: String) {
+            for (name, source) in sources {
+                guard let snapshot = try? source.snapshot() else {
+                    logQA("Window top controls", "stage=\(stage) source=\(name) snapshot unavailable"); continue
+                }
+                func visit(_ node: XCUIElementSnapshot, top: CGFloat) {
+                    let windowTop = node.elementType == .window ? node.frame.minY : top
+                    if node.elementType == .button, node.frame.maxY > windowTop, node.frame.minY < windowTop + 100 {
+                        let identity = "id=\(node.identifier) label=\(node.label)"
+                        logQA("Window top controls", "stage=\(stage) source=\(name) \(identity) frame=\(node.frame)")
+                    }
+                    for child in node.children { visit(child, top: windowTop) }
+                }
+                visit(snapshot, top: snapshot.frame.minY)
+                logQA("Window control hierarchy " + name + " " + stage, source.debugDescription)
+            }
+            logWindowScenes(stage)
+        }
+        inventory("before hover")
+        for (name, source) in sources where name != "SpringBoard" {
+            let window = source.windows.firstMatch
+            guard window.exists, window.isHittable, window.frame.width > 24, window.frame.height > 24 else {
+                logQA("Window control hover", "source=\(name) no visible hittable window"); continue
+            }
+            if XCUIDevice.shared.supportsPointerInteraction {
+                window.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 16, dy: 16)).hover()
+                logQA("Window control hover", "source=\(name) top-leading +16pt")
+            } else { logQA("Window control hover", "pointer interaction unavailable") }
+        }
+        let appeared = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            found = candidate(); return found != nil
+        }, object: nil)
+        _ = XCTWaiter.wait(for: [appeared], timeout: 3)
+        inventory("after hover")
+        recordDiagnostics("Window controls after hover", includeHierarchy: false)
+        return found ?? primary.buttons.matching(predicate).firstMatch
+    }
+
     func diagnoseWindowControls() {
         let predicate = NSPredicate(format: "label CONTAINS[c] 'multitasking' OR label CONTAINS[c] 'Window Controls' OR identifier CONTAINS[c] 'window-controls' OR label CONTAINS[c] 'Split View'")
         for (name, source) in [("Nib", app), ("SpringBoard", XCUIApplication(bundleIdentifier: "com.apple.springboard"))] {
