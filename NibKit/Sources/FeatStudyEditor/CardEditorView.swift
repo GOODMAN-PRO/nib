@@ -624,7 +624,6 @@ struct CardEditorPane: View {
                     .padding(NibSpacing.xxl)
                 }
                 .scrollBounceBehavior(.basedOnSize)
-                .scrollDisabled(mode == .ink)
                 .scrollDismissesKeyboard(.interactively)
             } else {
                 NibEmptyState(symbol: .studySets, title: String(localized: "No card selected"),
