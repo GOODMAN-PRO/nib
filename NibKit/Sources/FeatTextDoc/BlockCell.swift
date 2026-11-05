@@ -953,12 +953,16 @@ final class BlockCell: UICollectionViewCell {
         aiButton.configuration = c
         // An embedded view belongs to its block, not to this cell: give it back, so the cell that shows the block
         // next attaches it and this one never keeps a stale reference.
+        detachEmbeddedView()
+        proposalView.isHidden = true
+    }
+
+    func detachEmbeddedView() {
         if mediaIsEmbedded {
             if let content = mediaContent, content.superview === media { content.removeFromSuperview() }
             mediaContent = nil
             mediaIsEmbedded = false
         }
-        proposalView.isHidden = true
     }
 
     // MARK: Accessories

@@ -856,6 +856,38 @@ final class FeatTextDocTests: XCTestCase {
         XCTAssertEqual(tables, 1)
     }
 
+    func testDetachedTableViewsAreBoundedAndReconstructedOnRevisit() throws {
+        let h = harness()
+        var made = 0
+        h.app.ui.blockViews.register(BlockViewDescriptor(kind: .table, owner: "tables") { context in
+            made += 1
+            context.heightChanged(180)
+            return UIView()
+        })
+        let editor = openEditor(h)
+        let firstBlock = TextBlock(id: "CACHEFIRST", kind: .table)
+        weak var first: UIView?
+        autoreleasepool { first = editor.embeddedView(for: firstBlock) }
+        XCTAssertNotNil(first)
+        let holder = UIView()
+        defer { withExtendedLifetime(holder) {} }
+        let activeBlock = TextBlock(id: "CACHEACTIVE", kind: .table)
+        let active = try XCTUnwrap(editor.embeddedView(for: activeBlock))
+        holder.addSubview(active)
+        for i in 0..<40 {
+            autoreleasepool {
+                _ = editor.embeddedView(for: TextBlock(id: NibID("CACHE\(i)"), kind: .table))
+            }
+            XCTAssertLessThanOrEqual(editor.retainedEmbeddedViewCount, TextDocViewController.detachedTableLimit + 1)
+        }
+        XCTAssertNil(first)
+        XCTAssertEqual(editor.embeddedHeight(for: firstBlock.id), 180)
+        XCTAssertTrue(editor.embeddedView(for: activeBlock) === active)
+        let previous = made
+        XCTAssertNotNil(editor.embeddedView(for: firstBlock))
+        XCTAssertEqual(made, previous + 1)
+    }
+
     func testARegistryChangeRemakesOnlyTheViewsOfTheEntriesThatChanged() async throws {
         let h = harness()
         var tables = 0

@@ -35,6 +35,21 @@ final class FeatTextDocTablesTests: XCTestCase {
         XCTAssertEqual(v.selection, .rows(0...0))
         XCTAssertEqual(h.undoDepth(doc), depth)
     }
+
+    func testDetachedTableRetainsItselfUntilPendingTypingIsSaved() async throws {
+        let h = harness()
+        var tableView: TableBlockView? = try view(h)
+        weak var released = tableView
+        let mounted = mount(try XCTUnwrap(tableView))
+        defer { withExtendedLifetime(mounted) {} }
+        tableView?.beginEditing(at: CellPosition(row: 0, column: 0))
+        type("Keep these edits", into: try XCTUnwrap(tableView))
+        tableView?.removeFromSuperview()
+        tableView = nil
+        for _ in 0..<1000 where released != nil { await Task.yield() }
+        XCTAssertEqual(try table(h).rows[0][0].text.plainText, "Keep these edits")
+        XCTAssertNil(released)
+    }
     private func view(_ h: Harness, heightChanged: @escaping @MainActor (CGFloat) -> Void = { _ in }) throws -> TableBlockView {
         let b = try XCTUnwrap(h.app.workspace.content(doc).liveBlocks.first { $0.id == Fixtures.tableBlockID })
         return TableBlockView(context: BlockViewContext(app: h.app, session: h.session, doc: doc,

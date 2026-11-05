@@ -65,6 +65,9 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     private var linkProviders: [String: LPMetadataProvider] = [:]
     /// `ui.blockViews` views, one per block, kept while the block keeps its kind (and, for custom blocks, its payload).
     private var embedded: [NibID: EmbeddedView] = [:]
+    static let detachedTableLimit = 4
+    private var embeddedRecency: [NibID] = []
+    var retainedEmbeddedViewCount: Int { embedded.count }
     private var embeddedHeights: [NibID: CGFloat] = [:]
 
     private var autoTitle = false
@@ -323,6 +326,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
 
     private func pruneCaches() {
         for id in Array(embedded.keys) where byID[id] == nil { dropEmbedded(id) }
+        embeddedHeights = embeddedHeights.filter { byID[$0.key] != nil }
         aiRunning = aiRunning.filter { byID[$0] != nil }
         proposals = proposals.filter { byID[$0.key] != nil }
     }
@@ -1120,6 +1124,21 @@ final class TextDocViewController: UIViewController, DocumentEditing {
 // MARK: - Collection view
 
 extension TextDocViewController: UICollectionViewDelegate {
+    func collectionView(_ collectionView: UICollectionView, willDisplay cell: UICollectionViewCell,
+                        forItemAt indexPath: IndexPath) {
+        // UIKit may redisplay a prepared cell without calling its registration/provider again.
+        guard let cell = cell as? BlockCell, let block = cell.block,
+              Self.embeddedKey(block) != nil, !Self.hasFirstResponder(cell) else { return }
+        configure(cell, id: block.id)
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didEndDisplaying cell: UICollectionViewCell,
+                        forItemAt indexPath: IndexPath) {
+        guard let cell = cell as? BlockCell, !Self.hasFirstResponder(cell) else { return }
+        cell.detachEmbeddedView()
+        trimDetachedTables()
+    }
+
     func collectionView(_ collectionView: UICollectionView, contextMenuConfigurationForItemsAt indexPaths: [IndexPath],
                         point: CGPoint) -> UIContextMenuConfiguration? {
         guard indexPaths.count == 1, let id = dataSource.itemIdentifier(for: indexPaths[0]), let block = byID[id] else { return nil }
@@ -1204,6 +1223,9 @@ extension TextDocViewController: BlockCellHost {
 
     func embeddedView(for block: TextBlock) -> UIView? {
         guard let key = TextDocViewController.embeddedKey(block) else { return dropEmbedded(block.id) }
+        embeddedRecency.removeAll { $0 == block.id }
+        embeddedRecency.append(block.id)
+        defer { trimDetachedTables() }
         if let cached = embedded[block.id] {
             // Tables observe commits themselves. A custom block's view shows the payload it was made from, so it is
             // made again once `custom` changes (undo, sync, a plugin's update); another kind drops the old view.
@@ -1216,19 +1238,38 @@ extension TextDocViewController: BlockCellHost {
                                        heightChanged: { [weak self] height in self?.embeddedHeightChanged(id, height) })
         let view = descriptor.make(context)
         embedded[id] = EmbeddedView(key: key, view: view, custom: block.custom)
+        embeddedRecency.removeAll { $0 == id }
+        embeddedRecency.append(id)
         return view
     }
 
     /// Forgets a block's embedded view (and its reported height); always returns nil.
     @discardableResult
     private func dropEmbedded(_ id: NibID) -> UIView? {
+        embeddedRecency.removeAll { $0 == id }
+        embeddedHeights[id] = nil
         guard let entry = embedded.removeValue(forKey: id) else { return nil }
         entry.view.removeFromSuperview()
-        embeddedHeights[id] = nil
         return nil
     }
 
     func embeddedHeight(for block: NibID) -> CGFloat? { embeddedHeights[block] }
+
+    private static func hasFirstResponder(_ view: UIView) -> Bool {
+        view.isFirstResponder || view.subviews.contains { Self.hasFirstResponder($0) }
+    }
+
+    /// Keep the visible/active editors and a few recently detached tables. Heights remain cheap to retain.
+    func trimDetachedTables() {
+        let detached = embeddedRecency.filter { id in
+            guard let entry = embedded[id] else { return false }
+            return entry.key == BlockKind.table.rawValue && entry.view.superview == nil && !Self.hasFirstResponder(entry.view)
+        }
+        for id in detached.prefix(max(0, detached.count - Self.detachedTableLimit)) {
+            embedded[id] = nil
+            embeddedRecency.removeAll { $0 == id }
+        }
+    }
 
     private func embeddedHeightChanged(_ id: NibID, _ height: CGFloat) {
         let h = max(height, NibMetrics.hitTarget)

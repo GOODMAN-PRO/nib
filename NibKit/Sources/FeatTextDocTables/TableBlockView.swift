@@ -965,6 +965,11 @@ final class TableBlockView: UIView {
         }
     }
 
+    override func didMoveToSuperview() {
+        super.didMoveToSuperview()
+        if superview == nil { flushTyping() }
+    }
+
     private func traitsChanged(_ previous: UITraitCollection) {
         if previous.preferredContentSizeCategory != traitCollection.preferredContentSizeCategory {
             style = TableCellStyle()
@@ -1634,9 +1639,11 @@ final class TableBlockView: UIView {
     @discardableResult
     private func enqueue(_ operation: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
         let previous = tail
-        let task = Task { @MainActor in
+        let task = Task { @MainActor [self] in
             await previous?.value
             await operation()
+            // A detached table can leave the editor's bounded cache while commands are queued.
+            withExtendedLifetime(self) {}
         }
         tail = task
         return task
