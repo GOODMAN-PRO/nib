@@ -168,3 +168,11 @@ For insert-timeouts-state#3, insert-singles#3 and insert-pickers-audio#4, cause 
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | NativeTextInputRetainsUnicode; ObjectCommentCopiesDeepLink; TranscriptSearch; all chord/native-key callers | Key before delivery / Key after delivery | Which route, responder, keyboard presence and raw key-window/log state bracketed delivery? |
+
+### I4 - Elements system drag destination contact
+
+Confirmed insert-timeouts-state#4 correction: proposal operation 1 at 22.880, release at 23.036, cancelled operation 0, no performDrop. Timing is proven; the cancellation mechanism is inferred. Extracted the **existing Pages round-9b gesture unchanged** into shared dragWithHold (0.8 lift, velocity 500, 1.5 destination contact) and used it for Elements. Pages retains its result diagnostics and gesture parameters. No sleep or allowance change. CI must show ElementDragInsertsAtDropPoint reaches count 5 and the original drop-position assertion; app proposal/performDrop logs must distinguish cancellation from actual insertion. Current CanvasDragDrop still has no DEBUG sessionDidUpdate/performDrop instrumentation. That requested app-side evidence is outside NibUITests scope; existing DragUI logs and runner count/position checks remain available.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| ElementDragInsertsAtDropPoint; Pages thumbnail drags | System drag contact | Did the shared held contact run before the existing result/probe checks? |

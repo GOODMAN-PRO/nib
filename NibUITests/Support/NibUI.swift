@@ -2259,6 +2259,13 @@ final class NibUI {
         try pressWithoutIdle(element, duration: 0.05)
     }
 
+    /// Round 9b system-drag contact: retain lift/travel, then dwell while UIKit accepts the proposal.
+    func dragWithHold(from start: XCUICoordinate, to end: XCUICoordinate) {
+        logQA("System drag contact", "lift=0.8 velocity=500 destinationHold=1.5")
+        start.press(forDuration: 0.8, thenDragTo: end,
+                    withVelocity: XCUIGestureVelocity(rawValue: 500), thenHoldForDuration: 1.5)
+    }
+
     /// Continuous coordinate path for a partial row swipe; caller verifies the revealed action.
     func dragWithoutIdle(from start: XCUICoordinate, to end: XCUICoordinate,
                          duration: TimeInterval) throws {

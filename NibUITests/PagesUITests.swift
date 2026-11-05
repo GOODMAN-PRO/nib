@@ -691,9 +691,8 @@ final class PagesUITests: XCTestCase {
     private func dragThumbnail(_ source: XCUIElement, to target: XCUIElement, offset: CGVector) throws {
         // Baseline session startup took 1.7-1.9s after touch-down. Keep the original lift/travel
         // and add 1.5s of contact at the destination for startup and move-proposal acceptance.
-        source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8,
-            thenDragTo: target.coordinate(withNormalizedOffset: offset),
-            withVelocity: XCUIGestureVelocity(rawValue: 500), thenHoldForDuration: 1.5)
+        ui.dragWithHold(from: source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
+                        to: target.coordinate(withNormalizedOffset: offset))
         let menus = ui.app.menus.count
         let preview = ui.app.otherElements["Preview"].firstMatch.exists
         let actions = ui.app.buttons["cmd.page.duplicate"].firstMatch.exists
