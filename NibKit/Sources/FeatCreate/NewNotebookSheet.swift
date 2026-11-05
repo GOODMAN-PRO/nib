@@ -1246,6 +1246,15 @@ struct NewNotebookSheet: View {
                 }
                 .scrollTargetLayout()
                 .padding(NibStroke.ring + NibStroke.ringOutset)
+                // Let the final name clear the fade when scrolled all the way to the end.
+                .padding(.trailing, NibSpacing.l)
+            }
+            .mask {
+                HStack(spacing: 0) {
+                    Rectangle()
+                    LinearGradient(colors: [NibColor.label, .clear], startPoint: .leading, endPoint: .trailing)
+                        .frame(width: NibSpacing.l)
+                }
             }
             .scrollTargetBehavior(.viewAligned)
             .scrollIndicators(.visible)
