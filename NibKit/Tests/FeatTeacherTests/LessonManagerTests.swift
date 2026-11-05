@@ -255,7 +255,8 @@ final class LessonManagerTests: XCTestCase {
         let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
         let blocked = expectation(description: "second save is writing")
         let reported = failFirst ? expectation(description: "first save reports on main while second is blocked") : nil
-        let writer = BlockingPrivateSave(started: blocked, failFirst: failFirst)
+        let firstStarted = expectation(description: "first edit reached the writer")
+        let writer = BlockingPrivateSave(started: blocked, firstStarted: firstStarted, failFirst: failFirst)
         defer { writer.release() }
         let store = PrivateLessonPersistence(base: h.persistence,
             root: h.persistence.root.appendingPathComponent("blocked-private-save"),
@@ -265,6 +266,8 @@ final class LessonManagerTests: XCTestCase {
         try store.seed(LessonSnapshot(content: head, items: [:]))
         head.meta.layers[0].name = "First edit"
         store.didChange(doc, head: head, pages: [:])
+        // Pending edits intentionally coalesce. Start one write before enqueuing its successor.
+        await fulfillment(of: [firstStarted], timeout: 1)
         head.meta.layers[0].name = "Second edit"
         store.didChange(doc, head: head, pages: [:])
         var waiting = [blocked]
@@ -838,23 +841,27 @@ private final class PrivateSaveFailureSwitch {
     func write(_ snapshot: LessonSnapshot, url: URL) throws {
         lock.lock(); let fail = failing; lock.unlock()
         if fail { throw NibError.unavailable("disk full") }
-        try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+        try PrivateLessonFiles.write(snapshot, to: url)
     }
 }
 
 private final class BlockingPrivateSave {
     let started: XCTestExpectation
     let failFirst: Bool
+    let firstStarted: XCTestExpectation
     private let gate = DispatchSemaphore(value: 0)
     private let lock = NSLock()
     private var writes = 0
     private var didTimeOut = false
     var timedOut: Bool { lock.lock(); defer { lock.unlock() }; return didTimeOut }
-    init(started: XCTestExpectation, failFirst: Bool) { self.started = started; self.failFirst = failFirst }
+    init(started: XCTestExpectation, firstStarted: XCTestExpectation, failFirst: Bool) {
+        self.started = started; self.firstStarted = firstStarted; self.failFirst = failFirst
+    }
     func release() { gate.signal() }
     func write(_ snapshot: LessonSnapshot, url: URL) throws {
         // Seed and saves all run on the same serial writer queue.
         writes += 1
+        if writes == 2 { firstStarted.fulfill() }
         if writes == 2 && failFirst { throw NibError.unavailable("first save failed") }
         if writes == 3 {
             started.fulfill()
@@ -862,6 +869,6 @@ private final class BlockingPrivateSave {
                 lock.lock(); didTimeOut = true; lock.unlock()
             }
         }
-        try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+        try PrivateLessonFiles.write(snapshot, to: url)
     }
 }

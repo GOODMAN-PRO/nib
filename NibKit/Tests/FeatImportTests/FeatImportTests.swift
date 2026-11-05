@@ -957,6 +957,46 @@ final class FeatImportTests: XCTestCase {
         }
     }
 
+    func testPickerAcceptsLatePresentationAndKeepsItsDelegateUntilPicking() async throws {
+        let root = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 1000))
+        window.rootViewController = root
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        let navigator = StubNavigator()
+        navigator.root = root
+        let requested = expectation(description: "presentation requested")
+        let finished = expectation(description: "picked after late presentation")
+        var picker: UIDocumentPickerViewController?
+        var complete: (@MainActor () -> Void)?
+        var returned = false
+        let url = URL(fileURLWithPath: "/late.pdf")
+        Task { @MainActor in
+            do {
+                let urls = try await DocumentPicker.pick(types: [.pdf], navigator: navigator) { _, controller, completion in
+                    picker = controller as? UIDocumentPickerViewController
+                    XCTAssertNil(controller.presentingViewController, "Presentation has not been reported yet")
+                    complete = completion
+                    requested.fulfill()
+                }
+                XCTAssertEqual(urls, [url])
+            } catch { XCTFail("Late presentation must not fail: \(error)") }
+            returned = true
+            finished.fulfill()
+        }
+        await fulfillment(of: [requested], timeout: 2)
+        await Task.yield()
+        XCTAssertFalse(returned)
+        let controller = try XCTUnwrap(picker)
+        XCTAssertNotNil(controller.delegate)
+        complete?()
+        await Task.yield()
+        XCTAssertFalse(returned, "Completion reports presentation, not a user choice")
+        controller.delegate?.documentPicker?(controller, didPickDocumentsAt: [url])
+        controller.delegate?.documentPickerWasCancelled?(controller) // a late duplicate is ignored
+        await fulfillment(of: [finished], timeout: 2)
+    }
+
     // MARK: Dialog model from the library
 
     func testDialogOffersTheOpenNotebookOnlyForPageFormats() throws {
@@ -993,7 +1033,8 @@ private final class StubNavigator: SceneNavigator {
     let session = EditorSession()
     var openDocuments: [DocumentID] { [] }
     var activeDocument: DocumentID? { nil }
-    var rootViewController: UIViewController? { nil }
+    var root: UIViewController?
+    var rootViewController: UIViewController? { root }
     func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {}
     func closeDocument(_ doc: DocumentID) {}
     func showLibrary(folder: FolderID?) {}

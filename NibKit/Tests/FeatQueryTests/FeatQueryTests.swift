@@ -414,6 +414,58 @@ final class FeatQueryTests: XCTestCase {
         XCTAssertEqual(tape.points.map { $0.height }, [36, 36])
     }
 
+    func testItemUpdateChecksExpectedRichTextForTextBoxesAndStickyNotes() async throws {
+        for id in [Fixtures.textID, NibID("FIXTURESTY01")] {
+            let h = harness()
+            let ref = NodeRef.item(Fixtures.docID, Fixtures.page1, id).description
+            let old = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: id)
+            let baseline = try XCTUnwrap(old.text?.text ?? old.sticky?.text)
+            let replacement = RichText(plain: "Saved draft", attrs: TextAttributes(bold: true))
+            let result = try await h.run("item.update", ["ref": .string(ref),
+                "patch": ["text": try JSONValue.from(replacement)], "expectedText": try JSONValue.from(baseline)])
+            XCTAssertEqual(result["changed"], true)
+            let saved = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: id)
+            XCTAssertEqual(saved.text?.text ?? saved.sticky?.text, replacement)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            let restored = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: id)
+            XCTAssertEqual(restored.text?.text ?? restored.sticky?.text, baseline)
+        }
+    }
+
+    func testItemUpdateRejectsStaleTextAndFormattingWithoutAnyChanges() async throws {
+        for id in [Fixtures.textID, NibID("FIXTURESTY01")] {
+            let h = harness()
+            let ref = NodeRef.item(Fixtures.docID, Fixtures.page1, id).description
+            let old = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: id)
+            let current = try XCTUnwrap(old.text?.text ?? old.sticky?.text)
+            let baselines = [RichText(plain: "Stale draft"),
+                             RichText(plain: current.plainText, attrs: TextAttributes(bold: true))]
+            let before = try h.snapshot()
+            let depths = h.undoDepths()
+            for baseline in baselines {
+                let error = await nibError {
+                    _ = try await h.run("item.update", ["ref": .string(ref),
+                        "patch": ["text": "Overwrite", "frame": ["w": 999]],
+                        "expectedText": try JSONValue.from(baseline)])
+                }
+                XCTAssertEqual(error?.code, .conflict)
+                XCTAssertFalse(error?.message.isEmpty ?? true)
+                XCTAssertEqual(try h.snapshot(), before)
+                XCTAssertEqual(h.undoDepths(), depths)
+            }
+        }
+    }
+
+    func testItemUpdateWithoutExpectedTextStillWrites() async throws {
+        let h = harness()
+        let result = try await h.run("item.update", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01",
+                                                    "patch": ["text": "Unconditional edit"]])
+        XCTAssertEqual(result["changed"], true)
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+            .text?.text.plainText, "Unconditional edit")
+    }
+
     func testItemUpdateRoutesPayloadFieldsAndMergesThem() async throws {
         let h = harness()
         let r = try await h.run("item.update", json(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "patch": {"text": "Updated text", "frame": {"w": 320}}}"#))
@@ -624,6 +676,17 @@ final class FeatQueryTests: XCTestCase {
         }
     }
 
+    func testAssetDeliveryStorageFailureDoesNotReportMissingSource() async throws {
+        let h = harness()
+        h.app.services.assets = FailingDeliveryAssets(base: h.assets)
+        let error = await nibError {
+            try await h.run("asset.get", ["doc": "doc:FIXTUREDOC01", "asset": "fixture-image.png"])
+        }
+        XCTAssertEqual(error?.code, .unavailable)
+        XCTAssertNotNil(error?.hint)
+        XCTAssertEqual(try h.assets.data(AssetRef("fixture-image.png"), doc: Fixtures.docID), Fixtures.pngData)
+    }
+
     func testAssetPutIsAnEditThatIsNotUndoable() async throws {
         let h = harness()
         let d = try XCTUnwrap(h.app.commands.descriptor("asset.put"))
@@ -652,4 +715,16 @@ private final class TabsNavigator: SceneNavigator {
     func showLibrary(folder: FolderID?) {}
     func showSettings(page: String?) {}
     func presentModal(_ viewController: UIViewController) {}
+}
+
+private final class FailingDeliveryAssets: AssetStore {
+    let base: AssetStore
+    init(base: AssetStore) { self.base = base }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { try base.put(data, ext: ext, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef {
+        throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)
+    }
+    func temporaryURL(_ ref: AssetRef) -> URL? { nil }
 }

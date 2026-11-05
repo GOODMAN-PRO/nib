@@ -17,7 +17,7 @@ enum IndexKeys {
     static let service = "index.indexer"
     /// Device setting: OCR inserted images and text-less PDF pages for search.
     static let ocrImages = SettingKey("search.ocrImages", default: false)
-    static let schema = 1
+    static let schema = 2
 }
 
 extension String {
@@ -41,8 +41,36 @@ enum StableHash {
 struct DocReader {
     let workspace: Workspace
 
+    /// Pass-local: no heads survive a sweep or pin closed documents in the workspace.
+    struct HeadCache {
+        var doc: DocumentID?
+        var head: DocumentContent?
+        var stamp: String?
+        var persistence: ObjectIdentifier?
+    }
+
     func head(_ doc: DocumentID) throws -> DocumentContent {
         try workspace.peekContent(doc)
+    }
+
+    /// A nil stamp certifies only this synchronous actor turn; callers must flag every intervening suspension.
+    func head(_ doc: DocumentID, cache: inout HeadCache, afterSuspension: Bool) throws -> DocumentContent {
+        if workspace.isLoaded(doc) {
+            cache = HeadCache()
+            return try head(doc)
+        }
+        let persistence = workspace.persistence
+        let identity = ObjectIdentifier(persistence)
+        let stamp = persistence.headReadStamp(doc)
+        if (stamp != nil || !afterSuspension), cache.doc == doc, cache.stamp == stamp, cache.persistence == identity,
+           let head = cache.head { return head }
+        cache = HeadCache()
+        let fresh = try head(doc)
+        // A background writer can replace files during the read. Never certify that snapshot with a later stamp.
+        if persistence.headReadStamp(doc) == stamp {
+            cache = HeadCache(doc: doc, head: fresh, stamp: stamp, persistence: identity)
+        }
+        return fresh
     }
 
     /// All items of a page, tombstones included.
@@ -523,8 +551,8 @@ final class SweepProgress {
 ///   so unchanged pages are never recognised twice.
 /// - Each document carries a stamp (settings + head revs + package files), so a sweep skips an unchanged document
 ///   after reading only its head; open documents and documents committed to are always checked page by page.
-/// - Walks yield after every page and document and check for cancellation / pause per page, so they never hold the
-///   main actor.
+/// - Walks yield between pages (in bounded batches for legacy persistence without head stamps) and documents,
+///   and check for cancellation / pause per page.
 /// - A unit is extracted by one caller at a time (`inFlight`), so an older extraction never overwrites a newer one
 ///   and a removed unit never comes back.
 @MainActor
@@ -532,6 +560,10 @@ final class Indexer {
     let app: NibApp
     /// Quiet period after the last commit before dirty pages are indexed.
     var debounce: TimeInterval = 5
+    /// Injectable cooperative suspension for deterministic tests of changes between unchanged pages.
+    var yieldAfterPage: (@MainActor (DocumentID, PageID) async -> Void)?
+    /// Elapsed synchronous work before yielding even when a legacy provider has no cheap head stamp.
+    var pageBatchTimeLimit: TimeInterval = 0.008
     private var database: SearchDatabase?
     private var databaseFailed = false
     private var dirtyPages: [DocumentID: Set<PageID>] = [:]
@@ -641,8 +673,7 @@ final class Indexer {
         guard let record = head.page(page), !record.deleted else { return nil }
         let all = try reader.allItems(doc, page: page)
         let live = all.filter { !$0.deleted }
-        let maxRev = all.map { $0.rev }.max() ?? .zero
-        let version = ["p\(IndexKeys.schema)", record.rev.description, maxRev.description, String(live.count),
+        let version = ["p\(IndexKeys.schema)", record.rev.description, LWW.fingerprint(all), String(live.count),
                        head.meta.language, pageFlags(record, items: live, includeInk: includeInk)].joined(separator: "|")
         return PageSnapshot(doc: doc, page: record, pageIndex: head.pageIndex(page) ?? 0, docKind: head.meta.kind,
                             language: head.meta.language, items: live, version: version)
@@ -656,15 +687,17 @@ final class Indexer {
             transcripts[clip.id] = TranscriptFiles.urls(in: legacy.deletingLastPathComponent(),
                                                         base: legacy.deletingPathExtension().lastPathComponent)
         }
-        let revs: [Rev] = [head.meta.rev] + head.outline.map { $0.rev } + head.blocks.map { $0.rev }
-            + head.cards.map { $0.rev } + head.audio.map { $0.rev }
-        let counts = "\(head.outline.count).\(head.blocks.count).\(head.cards.count).\(head.audio.count)"
-        let version = ["d\(IndexKeys.schema)", (revs.max() ?? .zero).description, counts, head.meta.language,
+        let version = ["d\(IndexKeys.schema)", documentRecordsVersion(head), head.meta.language,
                        docFlags(head, includeInk: indexInk), TranscriptFiles.stamp(transcripts.values.flatMap { $0 })]
             .joined(separator: "|")
         return DocSnapshot(doc: doc, kind: head.meta.kind, language: head.meta.language, outline: head.liveOutline,
                            blocks: head.liveBlocks, cards: head.liveCards, clips: head.liveAudio, transcripts: transcripts,
                            version: version)
+    }
+
+    private func documentRecordsVersion(_ head: DocumentContent) -> String {
+        [head.meta.rev.description, LWW.fingerprint(head.outline), LWW.fingerprint(head.blocks),
+         LWW.fingerprint(head.cards), LWW.fingerprint(head.audio)].joined(separator: "|")
     }
 
     /// Fingerprint of what a sweep pass over a document depends on: the settings, the head (every record's rev) and
@@ -676,10 +709,7 @@ final class Indexer {
         guard let files = files else { return nil }
         var parts = [head.meta.rev.description, head.meta.language, head.meta.kind.rawValue]
         parts += head.pages.map { $0.id.raw + ":" + $0.rev.description + ($0.deleted ? "d" : "") }.sorted()
-        let records: [Rev] = head.outline.map { $0.rev } + head.blocks.map { $0.rev } + head.cards.map { $0.rev }
-            + head.audio.map { $0.rev }
-        parts.append((records.max() ?? .zero).description)
-        parts.append("\(head.outline.count).\(head.blocks.count).\(head.cards.count).\(head.audio.count)")
+        parts.append(documentRecordsVersion(head))
         return ["s\(IndexKeys.schema)", globalFlags(), StableHash.hex(parts.joined(separator: ",")), files].joined(separator: "|")
     }
 
@@ -724,9 +754,11 @@ final class Indexer {
         return blocks
     }
 
-    private func removeUnit(_ doc: DocumentID, key: String) async {
-        await waitForUnit(unitKey(doc, key))
+    @discardableResult
+    private func removeUnit(_ doc: DocumentID, key: String) async -> Bool {
+        let waited = await waitForUnit(unitKey(doc, key))
         try? db?.removeUnit(doc: doc, key: key)
+        return waited
     }
 
     private func removeDocument(_ doc: DocumentID) async throws {
@@ -739,13 +771,22 @@ final class Indexer {
     /// Indexes one page when its version changed (or `force`). Returns true when it was (re)indexed.
     @discardableResult
     func indexPage(_ doc: DocumentID, _ page: PageID, head: DocumentContent, force: Bool = false) async -> Bool {
+        var currentHead = head
+        return await indexPage(doc, page, currentHead: &currentHead, force: force)
+    }
+
+    @discardableResult
+    private func indexPage(_ doc: DocumentID, _ page: PageID, currentHead: inout DocumentContent, force: Bool = false,
+                           onSuspension: () -> Void = {}) async -> Bool {
         guard let db = db else { return false }
         let key = unitKey(doc, page.raw)
-        var head = head
-        // Someone else indexed this page meanwhile: read the head again so an older one can never win.
-        if await waitForUnit(key), let fresh = try? reader.head(doc) { head = fresh }
+        if await waitForUnit(key) {
+            onSuspension()
+            guard let fresh = try? reader.head(doc) else { return false }
+            currentHead = fresh
+        }
         let ink = indexInk
-        guard let snapshot = (try? pageSnapshot(doc, page, head: head, includeInk: ink)) ?? nil else {
+        guard let snapshot = (try? pageSnapshot(doc, page, head: currentHead, includeInk: ink)) ?? nil else {
             try? db.removeUnit(doc: doc, key: page.raw)
             return false
         }
@@ -756,6 +797,7 @@ final class Indexer {
             Indexer.store(snapshot, blocks, db)
             return blocks
         }
+        onSuspension()
         return true
     }
 
@@ -771,11 +813,21 @@ final class Indexer {
 
     @discardableResult
     func indexDocUnit(_ doc: DocumentID, head: DocumentContent, force: Bool = false) async -> Bool {
+        var currentHead = head
+        return await indexDocUnit(doc, currentHead: &currentHead, force: force)
+    }
+
+    @discardableResult
+    private func indexDocUnit(_ doc: DocumentID, currentHead: inout DocumentContent, force: Bool = false,
+                              onSuspension: () -> Void = {}) async -> Bool {
         guard let db = db else { return false }
         let key = unitKey(doc, IndexKeys.docUnit)
-        var head = head
-        if await waitForUnit(key), let fresh = try? reader.head(doc) { head = fresh }
-        let snapshot = docSnapshot(doc, head: head)
+        if await waitForUnit(key) {
+            onSuspension()
+            guard let fresh = try? reader.head(doc) else { return false }
+            currentHead = fresh
+        }
+        let snapshot = docSnapshot(doc, head: currentHead)
         if !force, db.version(doc: doc, key: IndexKeys.docUnit) == snapshot.version { return false }
         let env = self.env(includeInk: indexInk)
         _ = await extract(key, priority: .utility) {
@@ -789,6 +841,7 @@ final class Indexer {
             }
             return blocks
         }
+        onSuspension()
         return true
     }
 
@@ -823,31 +876,58 @@ final class Indexer {
                                progress: SweepProgress?) async -> DocumentPass {
         var pass = DocumentPass()
         guard let db = db else { return pass }
-        indexTitle(doc, kind: head.meta.kind)
-        if await indexDocUnit(doc, head: head, force: force) {
+        var headCache = DocReader.HeadCache()
+        var currentHead = head
+        var suspended = false
+        @MainActor func refreshHead() -> Bool {
+            defer { suspended = false }
+            guard let fresh = try? reader.head(doc, cache: &headCache, afterSuspension: suspended) else {
+                pass.completed = false
+                return false
+            }
+            currentHead = fresh
+            return true
+        }
+        guard refreshHead() else { return pass }
+        indexTitle(doc, kind: currentHead.meta.kind)
+        if await indexDocUnit(doc, currentHead: &currentHead, force: force, onSuspension: { suspended = true }) {
             pass.units += 1
             progress?.unitIndexed()
         }
-        let live = head.livePages
+        guard refreshHead() else { return pass }
+        let live = currentHead.livePages
         let liveKeys = Set(live.map { $0.id.raw })
         // Pages that are gone, including ones whose extraction is still running (it finishes before the removal).
         let stale = Set(db.keys(doc: doc)).union(inFlightKeys(doc)).filter { !$0.hasPrefix("#") && !liveKeys.contains($0) }
         for key in stale.sorted() {
-            await removeUnit(doc, key: key)
+            if await removeUnit(doc, key: key) { suspended = true }
         }
-        for page in live {
+        if !stale.isEmpty, !refreshHead() { return pass }
+        var batchStart = Date()
+        for (position, page) in live.enumerated() {
             if shouldStop(pausable: pausable) {
                 pass.completed = false
                 break
             }
-            if await indexPage(doc, page.id, head: head, force: force) {
+            if await indexPage(doc, page.id, currentHead: &currentHead, force: force, onSuspension: { suspended = true }) {
                 pass.units += 1
                 progress?.unitIndexed()
             }
-            // An unchanged page returns without suspending: yield so a long walk never holds the main actor.
-            await Task.yield()
+            // Without stamps, batch only synchronous unchanged pages: reusing a head is safe until suspension.
+            // Bound both batch size and elapsed work. Test hooks can suspend after any individual page.
+            if let yieldAfterPage {
+                await yieldAfterPage(doc, page.id)
+                suspended = true
+            } else if headCache.stamp != nil || (position + 1) % 32 == 0 || position == live.count - 1 ||
+                        Date().timeIntervalSince(batchStart) >= pageBatchTimeLimit {
+                await Task.yield()
+                suspended = true
+            }
+            if suspended { batchStart = Date() }
+            // Also revalidate after the final suspension before updating positions.
+            guard refreshHead() else { return pass }
         }
-        updatePageIndexes(doc, head: head)
+        updatePageIndexes(doc, head: currentHead)
         return pass
     }
 
@@ -989,7 +1069,7 @@ final class Indexer {
         subscriptions.append(app.bus.observeCommits { [weak self] cs in self?.noteChanges(cs) })
         subscriptions.append(app.events.subscribe { [weak self] e in
             guard e.type == NibEventType.libraryChanged, let indexer = self else { return }
-            Task { @MainActor in indexer.libraryChanged() }
+            Task { @MainActor in indexer.libraryChanged(e.payload) }
         })
         settingsToken = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings,
                                                                queue: nil) { [weak self] note in
@@ -1040,7 +1120,7 @@ final class Indexer {
         }
     }
 
-    private func processDirty() async {
+    func processDirty() async {
         guard !processing else { return }
         processing = true
         let pages = dirtyPages, docs = dirtyDocs, whole = wholeDocs, moved = reorderedDocs, titles = titlesDirty
@@ -1066,14 +1146,15 @@ final class Indexer {
             done += 1
         }
         for (doc, set) in pages where !whole.contains(doc) {
-            guard let head = try? reader.head(doc) else {
+            guard var head = try? reader.head(doc) else {
                 done += set.count
                 continue
             }
             for page in set {
-                await indexPage(doc, page, head: head)
+                let indexed = await indexPage(doc, page, currentHead: &head)
                 done += 1
                 emitProgress(running: true, done: done, total: total)
+                if indexed, let fresh = try? reader.head(doc) { head = fresh }
             }
             if moved.contains(doc) { updatePageIndexes(doc, head: (try? reader.head(doc)) ?? head) }
         }
@@ -1096,15 +1177,27 @@ final class Indexer {
                 await indexDocument(doc)
                 continue
             }
-            guard docLevel || moved || !pages.isEmpty, let head = try? reader.head(doc) else { continue }
-            if docLevel { await indexDocUnit(doc, head: head) }
-            for page in pages { await indexPage(doc, page, head: head) }
+            guard docLevel || moved || !pages.isEmpty, var head = try? reader.head(doc) else { continue }
+            if docLevel, await indexDocUnit(doc, currentHead: &head), let fresh = try? reader.head(doc) { head = fresh }
+            for page in pages {
+                if await indexPage(doc, page, currentHead: &head), let fresh = try? reader.head(doc) { head = fresh }
+            }
             if moved { updatePageIndexes(doc, head: (try? reader.head(doc)) ?? head) }
         }
     }
 
-    private func libraryChanged() {
+    func libraryChanged(_ payload: JSONValue?) {
         titlesDirty = true
+        let refs = payload?["refs"]?.arrayValue
+        // Broad refreshes use the stamp-aware sweep. Routine library metadata events only refresh titles.
+        if payload?["root"]?.boolValue == true || (refs?.count ?? 0) >= 500 {
+            startSweep(after: 2)
+        } else if payload?["refresh"]?.boolValue == true, let refs, !refs.isEmpty {
+            let docs = Set(refs.compactMap { $0.stringValue.flatMap { NodeRef($0)?.documentID } })
+            for doc in docs where app.services.library?.node(doc)?.trashedAt == nil {
+                wholeDocs.insert(doc)
+            }
+        }
         scheduleDebounce()
     }
 
@@ -1200,8 +1293,9 @@ final class Indexer {
             indexTitle(doc, kind: head.meta.kind)
             return DocumentPass()
         }
+        guard let currentHead = checkPages ? head : (try? reader.head(doc)) else { return DocumentPass() }
         let committed = committedDocs.remove(doc) != nil
-        var pass = await indexDocument(doc, head: head, force: false, pausable: pausable, progress: progress)
+        var pass = await indexDocument(doc, head: currentHead, force: false, pausable: pausable, progress: progress)
         // Cancellation can land during the final extraction or its trailing yield. Background sweeps can also
         // outlive a rebuild without owning sweepTask, so reject their old generation as well.
         if Task.isCancelled || generation != rebuildGeneration { pass.completed = false }

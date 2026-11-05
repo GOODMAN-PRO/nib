@@ -776,10 +776,12 @@ struct PanelWebViewHost: UIViewRepresentable {
 struct PluginPanelView: View {
     @StateObject private var panel: PluginWebPanel
     private let floating: Bool
+    private let handlesEscape: Bool
     @Environment(\.horizontalSizeClass) private var sizeClass
 
-    init(floating: Bool, make: @escaping () -> PluginWebPanel) {
+    init(floating: Bool, handlesEscape: Bool = false, make: @escaping () -> PluginWebPanel) {
         self.floating = floating
+        self.handlesEscape = handlesEscape
         _panel = StateObject(wrappedValue: make())
     }
 
@@ -793,7 +795,8 @@ struct PluginPanelView: View {
                 }
             } else {
                 VStack(spacing: 0) {
-                    NibPanelHeader(title: panel.title, symbol: panel.symbol, badge: .plugin, onClose: { panel.close() }) {
+                    NibPanelHeader(title: panel.title, symbol: panel.symbol, badge: .plugin,
+                                   handlesEscape: handlesEscape, onClose: { panel.close() }) {
                         PanelMoreMenu(panel: panel)
                     }
                     Rectangle()

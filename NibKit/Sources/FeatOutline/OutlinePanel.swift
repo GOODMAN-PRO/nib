@@ -534,9 +534,10 @@ struct OutlinePanelHeader: View {
     @ObservedObject var model: OutlinePanelModel
     let dismiss: @MainActor () -> Void
     var title = String(localized: "Outline")
+    var handlesEscape = false
 
     var body: some View {
-        NibPanelHeader(title: title, symbol: .outline, onClose: dismiss) {
+        NibPanelHeader(title: title, symbol: .outline, handlesEscape: handlesEscape, onClose: dismiss) {
             OutlineOptionsMenu(model: model)
         }
     }
@@ -546,16 +547,18 @@ struct OutlinePanel: View {
     @StateObject private var model: OutlinePanelModel
     @Environment(\.horizontalSizeClass) private var sizeClass
     private let dismiss: @MainActor () -> Void
+    private let handlesEscape: Bool
 
     init(context: PanelContext) {
         let session = context.session ?? context.app.services.sessions.active
         _model = StateObject(wrappedValue: OutlinePanelModel(app: context.app, session: session))
         dismiss = context.dismiss
+        handlesEscape = context.presentation == .sheet || context.presentation == .fullScreen
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            OutlinePanelHeader(model: model, dismiss: dismiss)
+            OutlinePanelHeader(model: model, dismiss: dismiss, handlesEscape: handlesEscape)
             if !model.sections.isEmpty {
                 addEntryButton
             }

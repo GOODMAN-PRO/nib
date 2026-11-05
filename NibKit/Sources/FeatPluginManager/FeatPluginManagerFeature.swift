@@ -29,7 +29,8 @@ public enum FeatPluginManagerFeature: NibFeature {
         app.ui.panels.register(manager)
         var console = PanelDescriptor(id: ManagerCommands.consolePanel, title: String(localized: "Developer Console"),
             icon: NibSymbol.command.name, placement: .floating, order: 0, owner: id) { context in
-            AnyView(DevConsoleView(app: context.app, initialPlugin: context.params["plugin"]?.stringValue, close: context.dismiss))
+            AnyView(DevConsoleView(app: context.app, initialPlugin: context.params["plugin"]?.stringValue,
+                                  presentation: context.presentation, close: context.dismiss))
         }
         console.providesHeader = true
         app.ui.panels.register(console)

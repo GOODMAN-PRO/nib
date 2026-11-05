@@ -468,10 +468,10 @@ final class ImportDialogSession {
         host.modalPresentationStyle = .formSheet
         host.isModalInPresentation = true
         ImportUI.applySheetChrome(host)
-        navigator.presentModal(host)
-        guard host.presentingViewController != nil else { return false }
         controller = host
-        return true
+        let shown = await ImportUI.present(host, navigator: navigator)
+        if !shown { controller = nil }
+        return shown
     }
 
     func choose() async -> ImportDialogOutcome {
@@ -489,11 +489,12 @@ final class ImportDialogSession {
             host.modalPresentationStyle = .formSheet
             host.isModalInPresentation = true
             ImportUI.applySheetChrome(host)
-            navigator.presentModal(host)
             controller = host
-            if host.presentingViewController == nil {
-                controller = nil
-                resolve(.notShown)
+            Task { @MainActor in
+                if !(await ImportUI.present(host, navigator: navigator)) {
+                    self.controller = nil
+                    self.resolve(.notShown)
+                }
             }
         }
     }
@@ -581,10 +582,17 @@ final class ImportDialogSession {
 final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
     private static var active: DocumentPicker?
     private var continuation: CheckedContinuation<[URL], Error>?
+    private var finishing = false
+    private weak var controller: UIDocumentPickerViewController?
+    private var presentationTask: Task<Void, Never>?
+    private var disconnectObserver: NSObjectProtocol?
 
-    static func pick(types: [UTType], navigator: SceneNavigator) async throws -> [URL] {
+    static func pick(types: [UTType], navigator: SceneNavigator,
+                     presentationTimeoutNanoseconds: UInt64 = 3_000_000_000,
+                     presentation: ImportUI.Presentation? = nil) async throws -> [URL] {
         await ImportUI.waitUntilPresentable(navigator)
-        guard navigator.rootViewController?.viewIfLoaded?.window != nil else {
+        try Task.checkCancellation()
+        guard active == nil, navigator.rootViewController?.viewIfLoaded?.window != nil else {
             throw NibError(.unavailable,
                 String(localized: "Couldn't open the Files picker. Choose Import Files again."))
         }
@@ -593,15 +601,29 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
         picker.shouldShowFileExtensions = true
         let delegate = DocumentPicker()
         picker.delegate = delegate
+        delegate.controller = picker
         active = delegate
-        defer { if active === delegate { active = nil } }
-        let urls = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[URL], Error>) in
-            delegate.continuation = continuation
-            navigator.presentModal(picker)
-            if picker.presentingViewController == nil {
-                delegate.finish(.failure(NibError(.unavailable,
-                    String(localized: "Couldn't open the Files picker. Choose Import Files again."))))
+        defer {
+            delegate.stopWatchingScene()
+            delegate.presentationTask?.cancel()
+            if active === delegate { active = nil }
+        }
+        let urls = try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[URL], Error>) in
+                delegate.continuation = continuation
+                delegate.watchScene(of: navigator)
+                delegate.presentationTask = Task { @MainActor in
+                    let shown = await ImportUI.present(picker, navigator: navigator,
+                        timeoutNanoseconds: presentationTimeoutNanoseconds, presentation: presentation)
+                    if !shown {
+                        delegate.finish(.failure(NibError(.unavailable,
+                            String(localized: "Couldn't open the Files picker. Choose Import Files again."))))
+                    }
+                }
             }
+        } onCancel: {
+            Task { @MainActor in delegate.cancel() }
         }
         await ImportUI.waitUntilPresentable(navigator)             // the picker finishes dismissing first
         return urls
@@ -624,8 +646,43 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
     }
 
     private func finish(_ result: Result<[URL], Error>) {
-        continuation?.resume(with: result)
+        guard !finishing else { return }
+        finishing = true
+        stopWatchingScene()
+        presentationTask?.cancel()
+        presentationTask = nil
+        let pending = continuation
         continuation = nil
+        // UIKit dismisses on delegate callbacks. The local delegate survives the trailing transition wait;
+        // a second dismiss here can lose its completion and strand every later import.
+        pending?.resume(with: result)
+    }
+
+    private func cancel() {
+        guard !finishing else { return }
+        if let controller, controller.presentingViewController != nil, !controller.isBeingDismissed {
+            controller.dismiss(animated: true)
+        }
+        finish(.failure(CancellationError()))
+    }
+
+    private func watchScene(of navigator: SceneNavigator) {
+        guard let scene = navigator.rootViewController?.viewIfLoaded?.window?.windowScene else { return }
+        disconnectObserver = NotificationCenter.default.addObserver(forName: UIScene.didDisconnectNotification,
+                                                                    object: scene, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.sceneDisconnected() }
+        }
+    }
+
+    func sceneDisconnected() {
+        controller = nil
+        finish(.failure(NibError(.unavailable,
+            String(localized: "Couldn't open the Files picker. Choose Import Files again."))))
+    }
+
+    private func stopWatchingScene() {
+        if let disconnectObserver { NotificationCenter.default.removeObserver(disconnectObserver) }
+        disconnectObserver = nil
     }
 }
 
@@ -633,6 +690,108 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
 
 @MainActor
 enum ImportUI {
+    typealias Presentation = @MainActor (UIViewController, UIViewController, @escaping @MainActor () -> Void) -> Void
+
+    /// Completion, timeout, cancellation and scene loss race through one main-actor outcome.
+    @MainActor
+    private final class PresentationOutcome {
+        var continuation: CheckedContinuation<Bool, Never>?
+        var timeout: Task<Void, Never>?
+        var disconnectObserver: NSObjectProtocol?
+        private(set) var result: Bool?
+        private var latePresentation: Task<Void, Never>?
+
+        func resolve(_ shown: Bool) {
+            guard let continuation else { return }
+            self.continuation = nil
+            result = shown
+            timeout?.cancel()
+            timeout = nil
+            if let disconnectObserver { NotificationCenter.default.removeObserver(disconnectObserver) }
+            disconnectObserver = nil
+            continuation.resume(returning: shown)
+        }
+
+        /// A timed-out request can still attach during UIKit's deferred transition. Do not leave a picker
+        /// on screen after its caller released the delegate. Completion also checks after this grace period.
+        func watchForLatePresentation(_ controller: UIViewController, presenter: UIViewController) {
+            latePresentation = Task { @MainActor [weak controller, weak presenter] in
+                for _ in 0..<30 {
+                    do { try await Task.sleep(nanoseconds: 100_000_000) } catch { return }
+                    guard let controller, let presenter else { return }
+                    if Self.dismissIfAttached(controller, presenter: presenter) { return }
+                }
+            }
+        }
+
+        func complete(_ controller: UIViewController, presenter: UIViewController) {
+            if result == false {
+                // Keep the follow-up alive if even the completion precedes UIKit's relationship update.
+                if Self.dismissIfAttached(controller, presenter: presenter) { latePresentation?.cancel() }
+            } else {
+                resolve(true)
+            }
+        }
+
+        private static func dismissIfAttached(_ controller: UIViewController, presenter: UIViewController) -> Bool {
+            guard controller.presentingViewController != nil || presenter.presentedViewController === controller
+                    || controller.viewIfLoaded?.window != nil else { return false }
+            if !controller.isBeingDismissed { controller.dismiss(animated: false) }
+            return true
+        }
+    }
+
+    /// Prefer UIKit's completion. If it never arrives, inspect the relationship only after a bounded grace period.
+    /// All preflight checks and the call run together on the main actor; an ongoing transition is not presented over.
+    static func present(_ controller: UIViewController, navigator: SceneNavigator,
+                        timeoutNanoseconds: UInt64 = 3_000_000_000,
+                        presentation: Presentation? = nil) async -> Bool {
+        await waitUntilPresentable(navigator)
+        guard !Task.isCancelled, let root = navigator.rootViewController,
+              root.viewIfLoaded?.window != nil else { return false }
+        var top = root
+        while let next = top.presentedViewController { top = next }
+        guard !top.isBeingPresented, !top.isBeingDismissed, top.viewIfLoaded?.window != nil else { return false }
+        controller.overrideUserInterfaceStyle = root.traitCollection.userInterfaceStyle
+        let outcome = PresentationOutcome()
+        return await withTaskCancellationHandler {
+            guard !Task.isCancelled else { return false }
+            return await withCheckedContinuation { continuation in
+                outcome.continuation = continuation
+                if let scene = root.viewIfLoaded?.window?.windowScene {
+                    outcome.disconnectObserver = NotificationCenter.default.addObserver(
+                        forName: UIScene.didDisconnectNotification, object: scene, queue: .main) { _ in
+                            Task { @MainActor in outcome.resolve(false) }
+                        }
+                }
+                outcome.timeout = Task { @MainActor in
+                    do { try await Task.sleep(nanoseconds: timeoutNanoseconds) } catch { return }
+                    let shown = controller.presentingViewController != nil
+                        || top.presentedViewController === controller || controller.viewIfLoaded?.window != nil
+                    #if DEBUG
+                    let presented = String(describing: top.presentedViewController)
+                    let presenting = String(describing: controller.presentingViewController)
+                    NSLog("%@", "[Nib QA import] presentation deadline presentedViewController=\(presented) isBeingDismissed=\(controller.isBeingDismissed) presentingViewController=\(presenting)")
+                    #endif
+                    if !shown { outcome.watchForLatePresentation(controller, presenter: top) }
+                    outcome.resolve(shown)
+                }
+                let complete: @MainActor () -> Void = {
+                    #if DEBUG
+                    let presented = String(describing: top.presentedViewController)
+                    let presenting = String(describing: controller.presentingViewController)
+                    NSLog("%@", "[Nib QA import] presentation completed presentedViewController=\(presented) isBeingDismissed=\(controller.isBeingDismissed) presentingViewController=\(presenting)")
+                    #endif
+                    outcome.complete(controller, presenter: top)
+                }
+                if let presentation { presentation(top, controller, complete) }
+                else { top.present(controller, animated: true, completion: complete) }
+            }
+        } onCancel: {
+            Task { @MainActor in outcome.resolve(false) }
+        }
+    }
+
     /// The window that asks the user, waiting briefly for it: an Open In at launch arrives before the window is active.
     /// The shell makes the window the user works in the active one (key window, Open In, key commands), so that is
     /// `ctx.navigator`; a call from another window (a drop into a window that is not key, in Split View or Stage
@@ -672,6 +831,7 @@ enum ImportUI {
         defer { NSLog("%@", "[Nib QA import] waitUntilPresentable returned") }
         #endif
         for _ in 0..<30 {
+            if Task.isCancelled { return }
             guard let root = navigator.rootViewController else { return }
             var top = root
             while let presented = top.presentedViewController { top = presented }

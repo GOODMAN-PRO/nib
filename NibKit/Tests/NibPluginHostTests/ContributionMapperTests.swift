@@ -315,6 +315,140 @@ final class ContributionMapperTests: XCTestCase {
         XCTAssertThrowsError(try PluginPaths.resolve("/etc/hosts", in: empty, path: "$"))
     }
 
+    func testCompactBoundedNumberFitsOptionsBarAtLargeTypeAndNarrowWidth() async throws {
+        let field = SchemaField.field(key: "thickness", schema: [
+            "type": "number", "title": "Stroke thickness", "minimum": 0, "maximum": 1, "default": 0.57
+        ])
+        for type in [DynamicTypeSize.xxxLarge, .accessibility1] {
+            // Measure the uncompressed control too: a clipped 44-point host alone could
+            // hide the old vertical label/slider stack and falsely pass this regression.
+            let control = UIHostingController(rootView:
+                SchemaFieldControl(field: field, value: .number(0.57), compact: true, commit: { _, _ in })
+                    .environment(\.dynamicTypeSize, type).fixedSize())
+            let ideal = control.sizeThatFits(in: CGSize(width: 288, height: 1000))
+            XCTAssertGreaterThan(ideal.height, 0)
+            XCTAssertLessThanOrEqual(ideal.height, 44, "The entire control must fit without vertical clipping")
+
+            let host = UIHostingController(rootView:
+                SchemaFormView(fields: [field], values: ["thickness": .number(0.57)], style: .bar, commit: { _, _ in })
+                    .environment(\.dynamicTypeSize, type))
+            host.safeAreaRegions = []
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 288, height: 44))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            func scrollView(in view: UIView) -> UIScrollView? {
+                if let scroll = view as? UIScrollView { return scroll }
+                for child in view.subviews {
+                    if let found = scrollView(in: child) { return found }
+                }
+                return nil
+            }
+            // SwiftUI can defer its first layout; keep the wait bounded.
+            for _ in 0..<100 {
+                host.view.layoutIfNeeded()
+                if let scroll = scrollView(in: host.view), scroll.contentSize.width > 288 { break }
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            let scroll = try XCTUnwrap(scrollView(in: host.view))
+            XCTAssertLessThanOrEqual(scroll.contentSize.height, 44)
+            XCTAssertEqual(scroll.bounds.width, 288, accuracy: 1)
+            XCTAssertGreaterThan(scroll.contentSize.width, scroll.bounds.width)
+            XCTAssertTrue(scroll.isScrollEnabled)
+            let end = scroll.contentSize.width - scroll.bounds.width
+            scroll.setContentOffset(CGPoint(x: end, y: 0), animated: false)
+            XCTAssertEqual(scroll.contentOffset.x, end, accuracy: 1, "The trailing value must remain reachable")
+        }
+    }
+
+    func testPluginBlockResizeKeepsRightHandMarkerReachableByScrolling() throws {
+        let h = Harness(features: [])
+        var block = TextBlock(kind: .custom)
+        block.custom = CustomBlock(owner: Self.pid, type: "marker", height: 120,
+            display: DisplayList(ops: [DisplayOp(op: .rect, rect: Rect(x: 500, y: 20, width: 20, height: 20),
+                                               fill: RGBA(255, 0, 0))]))
+        let context = BlockViewContext(app: h.app, session: h.session, doc: Fixtures.docID, block: block,
+                                       heightChanged: { _ in })
+        let view = PluginBlockView(context: context, command: "test.edit", title: "Marker", defaultHeight: 120)
+        view.frame = CGRect(x: 0, y: 0, width: 640, height: 120)
+        view.layoutIfNeeded()
+        XCTAssertTrue(try containsRedMarker(view))
+        view.frame.size.width = 288
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertGreaterThanOrEqual(view.contentSize.width, 520)
+        XCTAssertEqual(view.contentSize.height, 120)
+        XCTAssertFalse(try containsRedMarker(view), "The marker starts outside the narrow viewport")
+        XCTAssertTrue(view.accessibilityScroll(.left), "Scrolling must expose the preserved drawing width")
+        view.layoutIfNeeded()
+        XCTAssertGreaterThan(view.contentOffset.x, 0)
+        XCTAssertTrue(try containsRedMarker(view), "The actual drawing, not just contentSize, must survive resizing")
+        view.frame.size.width = 640
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertEqual(view.contentOffset.x, 0, accuracy: 0.5)
+        XCTAssertTrue(try containsRedMarker(view))
+    }
+
+    private func containsRedMarker(_ view: UIView) throws -> Bool {
+        func display(_ child: UIView) {
+            child.setNeedsDisplay()
+            child.layer.displayIfNeeded()
+            child.subviews.forEach(display)
+        }
+        display(view)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { context in
+            view.layer.render(in: context.cgContext)
+        }
+        let cgImage = try XCTUnwrap(image.cgImage)
+        let width = cgImage.width, height = cgImage.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        try pixels.withUnsafeMutableBytes { bytes in
+            let bitmap = try XCTUnwrap(CGContext(data: bytes.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue))
+            bitmap.draw(cgImage, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+        }
+        return stride(from: 0, to: pixels.count, by: 4).contains {
+            pixels[$0] > 200 && pixels[$0 + 1] < 30 && pixels[$0 + 2] < 30 && pixels[$0 + 3] > 200
+        }
+    }
+
+    func testSliderDisplayHidesFloatingPointNoiseWithoutRoundingDrafts() {
+        let us = Locale(identifier: "en_US")
+        let de = Locale(identifier: "de_DE")
+        XCTAssertEqual(PluginNumberField.display(0.5700000000000001, integer: false, locale: us), "0.57")
+        XCTAssertEqual(PluginNumberField.display(0.30000000000000004, integer: false, locale: us), "0.3")
+        XCTAssertEqual(PluginNumberField.display(0.5700000000000001, integer: false, locale: de), "0,57")
+        XCTAssertEqual(PluginNumberField.display(42.6, integer: true, locale: us), "43")
+        for locale in [us, de] {
+            let n = 0.5700000000000001
+            let draft = PluginNumberField.format(n, integer: false, locale: locale)
+            XCTAssertEqual(PluginNumberField.parse(draft, min: nil, max: nil, integer: false, locale: locale), .number(n))
+        }
+    }
+
+    func testNumberFieldsParseFullLocalizedNumbers() {
+        let us = Locale(identifier: "en_US")
+        let de = Locale(identifier: "de_DE")
+        XCTAssertEqual(PluginNumberField.parse("1,234", min: nil, max: nil, integer: false, locale: us), .number(1234))
+        XCTAssertEqual(PluginNumberField.parse("1,234", min: nil, max: nil, integer: true, locale: us), .number(1234))
+        XCTAssertEqual(PluginNumberField.parse("1,234", min: nil, max: nil, integer: false, locale: de), .number(1.234))
+        XCTAssertEqual(PluginNumberField.parse("1,234", min: nil, max: nil, integer: true, locale: de), .number(1))
+        for value in ["12,34", "1,234junk", "1,234.5.6", "1,,234", "1e", "1e2x"] {
+            XCTAssertNil(PluginNumberField.parse(value, min: nil, max: nil, integer: false, locale: us))
+        }
+        for locale in [us, de, Locale(identifier: "ar_EG"), Locale(identifier: "fa_IR"), Locale(identifier: "sv_SE")] {
+            for number in [1.234, 1234.5, -42, 1e30, 1e100, 1e-100] {
+                let text = PluginNumberField.format(number, integer: false, locale: locale)
+                XCTAssertEqual(PluginNumberField.parse(text, min: nil, max: nil, integer: false, locale: locale), .number(number))
+            }
+        }
+    }
+
     func testNumberFieldsKeepLargeStoredValuesReadableAndRejectNonFiniteEdits() {
         for n in [1e30, -1e30, Double(Int.max), Double.infinity, -Double.infinity, Double.nan] {
             XCTAssertFalse(PluginNumberField.format(n, integer: false).isEmpty)
@@ -563,6 +697,44 @@ final class ContributionMapperTests: XCTestCase {
         XCTAssertEqual(PluginToolPreview.resolve("none", input: .stroke), PluginToolPreview.none)
         XCTAssertEqual(PluginToolPreview.resolve(nil, input: .stroke), .ink)
         XCTAssertEqual(PluginToolPreview.resolve("ink", input: .rect), .rect)
+    }
+
+    func testLateToolCompletionPreservesTheNextGesture() async throws {
+        for sticky in [false, true] {
+            let kit = PluginTestKit()
+            var calls = 0
+            var release = false
+            var completed = false
+            kit.h.app.commands.register(CommandDescriptor(id: "test.delayedTool", title: "Delayed", summary: "Test tool.",
+                                                          effect: .edit, owner: "test")) { _, _ in
+                calls += 1
+                if calls == 1 {
+                    for _ in 0..<500 where !release { try await Task.sleep(nanoseconds: 1_000_000) }
+                    completed = true
+                }
+                return .null
+            }
+            let host = FakeCanvasHost(kit.h)
+            kit.h.session.selectTool("pen")
+            kit.h.session.selectTool("test.tool")
+            let tool = PluginCanvasTool(PluginToolSpec(id: "test.tool", pluginID: "test", command: "test.delayedTool",
+                                                       input: .stroke, preview: .ink, sticky: sticky))
+            let sample = CanvasSample(page: Fixtures.page1, location: Point(10, 10))
+            tool.touchesBegan(sample, host: host)
+            tool.touchesEnded(sample, host: host)
+            let started = await eventually { calls == 1 }
+            XCTAssertTrue(started)
+            tool.touchesBegan(sample, host: host)
+            let livePreview = host.overlayLayer.sublayers?.last
+            release = true
+            let cleaned = await eventually { completed && host.overlayLayer.sublayers?.count == 1 }
+            XCTAssertTrue(cleaned)
+            XCTAssertTrue(host.overlayLayer.sublayers?.last === livePreview)
+            XCTAssertEqual(kit.h.session.tool, "test.tool")
+            tool.touchesEnded(sample, host: host)
+            let submitted = await eventually { calls == 2 }
+            XCTAssertTrue(submitted, "The second stroke must reach its command")
+        }
     }
 
     func testCanvasToolRunsItsCommandOnceWithAPreview() async throws {

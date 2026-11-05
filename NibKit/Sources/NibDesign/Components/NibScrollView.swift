@@ -5,6 +5,7 @@ import SwiftUI
 /// Use one axis, and give the content its usual stack and insets.
 public struct NibScrollView<Content: View>: View {
     private let axis: Axis
+    private let label: String?
     private let content: Content
     @Namespace private var scrollSpace
     @State private var contentSize = CGSize.zero
@@ -13,8 +14,12 @@ public struct NibScrollView<Content: View>: View {
     @State private var scrollSize = CGSize.zero
     @Environment(\.layoutDirection) private var direction
 
-    public init(_ axis: Axis = .vertical, @ViewBuilder content: () -> Content) {
+    /// - Parameter label: names the scroll view itself for accessibility. A popover passes its title, so the title
+    ///   stays on the scroll view as it was before the cue lane existed; a label on a view around the scroller and
+    ///   the cue would become a second, anonymous container instead.
+    public init(_ axis: Axis = .vertical, label: String? = nil, @ViewBuilder content: () -> Content) {
         self.axis = axis
+        self.label = label
         self.content = content()
     }
 
@@ -54,6 +59,7 @@ public struct NibScrollView<Content: View>: View {
         .scrollBounceBehavior(.basedOnSize)
         .scrollIndicators(.visible)
         .scrollIndicatorsFlash(trigger: overflows)
+        .nibScrollLabel(label)
     }
 
     private var cue: some View {
@@ -70,6 +76,16 @@ public struct NibScrollView<Content: View>: View {
         if axis == .vertical { return hasMore ? 0 : 180 }
         let forward = direction == .rightToLeft ? 90.0 : -90.0
         return hasMore ? forward : forward + 180
+    }
+}
+
+private extension View {
+    @ViewBuilder func nibScrollLabel(_ label: String?) -> some View {
+        if let label {
+            accessibilityElement(children: .contain).accessibilityLabel(label)
+        } else {
+            self
+        }
     }
 }
 

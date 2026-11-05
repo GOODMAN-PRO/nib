@@ -8,19 +8,22 @@ struct DevConsoleView: View {
     let app: NibApp
     let initialPlugin: String?
     let close: () -> Void
+    let presentation: PanelPresentation?
     @StateObject private var model: PluginManagerModel
     @State private var pluginID = ""
     @State private var javascript = ""
     @State private var result = ""
     @State private var evaluating = false
     @State private var newPlugin = false
-    init(app: NibApp, initialPlugin: String? = nil, close: @escaping () -> Void) {
+    init(app: NibApp, initialPlugin: String? = nil, presentation: PanelPresentation? = nil, close: @escaping () -> Void) {
         self.app = app; self.initialPlugin = initialPlugin; self.close = close
+        self.presentation = presentation
         _model = StateObject(wrappedValue: PluginManagerModel(app: app))
     }
     var body: some View {
         VStack(spacing: 0) {
-            NibPanelHeader(title: String(localized: "Developer Console"), symbol: .command, onClose: {
+            NibPanelHeader(title: String(localized: "Developer Console"), symbol: .command,
+                           handlesEscape: presentation == .sheet || presentation == .fullScreen, onClose: {
                 app.perform(CommandIDs.panelClose, ["id": .string(ManagerCommands.consolePanel)]); close()
             })
             ScrollView {

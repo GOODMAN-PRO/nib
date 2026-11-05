@@ -62,6 +62,39 @@ final class NibPDFTests: XCTestCase {
 
     // MARK: Import
 
+    func testCancellationDuringAssetStorageDoesNotCommitPages() async throws {
+        for newDocument in [false, true] {
+            let h = Harness(features: [NibPDFFeature.self])
+            let before = try h.snapshot()
+            let entered = expectation(description: "Asset storage entered")
+            let finished = expectation(description: "Import finished")
+            let assets = BlockingPDFAssets(base: h.assets, entered: entered)
+            h.app.services.assets = assets
+            var commits = 0
+            let subscription = h.app.bus.observeCommits { _ in commits += 1 }
+            defer { subscription.cancel() }
+            let url = try TestPDF.file(TestPDF.make(pages: 1))
+            let target = newDocument ? ImportTarget(ids: ["CANCELPDF001"]) : ImportTarget(document: Fixtures.docID)
+            var succeeded = false
+            let task = Task { @MainActor in
+                defer { finished.fulfill() }
+                do {
+                    _ = try await self.importPDF(h, url, target)
+                    succeeded = true
+                } catch { /* Cancellation must reach the importer before its commit. */ }
+            }
+            await fulfillment(of: [entered], timeout: 2)
+            task.cancel()
+            assets.release.signal()
+            await fulfillment(of: [finished], timeout: 2)
+            XCTAssertFalse(succeeded)
+            XCTAssertEqual(commits, 0, "Cancelled storage must not produce a late document commit")
+            XCTAssertEqual(try h.snapshot(), before)
+            XCTAssertNil(h.library.node("CANCELPDF001"), "A cancelled new notebook is cleaned up")
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        }
+    }
+
     func testImportingA300PagePDFCreates300PageRecordsWithinBudget() async throws {
         let h = Harness(features: [NibPDFFeature.self])
         let url = try TestPDF.file(TestPDF.make(pages: 300), name: "Mechanics Past Papers")
@@ -325,4 +358,25 @@ final class NibPDFTests: XCTestCase {
         XCTAssertEqual(t.width, r.height, accuracy: 0.02)
         XCTAssertEqual(t.height, r.width, accuracy: 0.02)
     }
+}
+
+private final class BlockingPDFAssets: AssetStore {
+    let base: AssetStore
+    let entered: XCTestExpectation
+    let release = DispatchSemaphore(value: 0)
+    init(base: AssetStore, entered: XCTestExpectation) {
+        self.base = base
+        self.entered = entered
+    }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef {
+        entered.fulfill()
+        guard release.wait(timeout: .now() + 3) == .success else {
+            throw NibError(.timeout, "Test asset storage was not released")
+        }
+        return try base.put(data, ext: ext, doc: doc)
+    }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
 }

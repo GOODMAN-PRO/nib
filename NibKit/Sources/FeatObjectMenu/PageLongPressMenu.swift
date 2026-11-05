@@ -236,6 +236,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
     private var commits = 0
     private var builtFor: BuildKey?
     private var lastContainerRect: CGRect?
+    private var obstacleBounds: [CGRect] = []
     private var reshow: Task<Void, Never>?
     private var editMenuShownFor: Selection?
     private var pendingMenu: UIMenu?
@@ -258,6 +259,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         var menus: UInt64
         var inspectors: UInt64
         var readOnly: Bool
+        var hiddenLayers: Set<Int> = []
     }
 
     override init() {
@@ -291,7 +293,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         })
         subscriptions.append(host.app.events.subscribe { [weak self] e in
             guard e.type == NibEventType.selectionChanged || e.type == NibEventType.sessionDocument
-                    || e.type == NibEventType.toolChanged,
+                    || e.type == NibEventType.toolChanged || e.type == NibEventType.layersChanged,
                   e.payload?["session"]?.stringValue == sessionID else { return }
             self?.refresh()
         })
@@ -345,7 +347,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         let session = host.session
         let key = BuildKey(selection: session.selection, document: session.document, commits: commits,
                            menus: host.app.ui.menus.generation, inspectors: host.app.ui.inspectors.generation,
-                           readOnly: session.readOnly)
+                           readOnly: session.readOnly, hiddenLayers: session.hiddenLayers)
         let changed = key != builtFor
         if changed {
             builtFor = key
@@ -356,6 +358,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
 
     private func rebuild() {
         guard let host else { return }
+        obstacleBounds = []
         rebuilds += 1
         let session = host.session, app = host.app
         guard session.document == host.documentID, session.selection.doc == host.documentID,
@@ -371,6 +374,12 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
             return
         }
         model.show(entries, context: context, facts: facts, header: PageMenus.header(facts, app: app))
+        let selected = Set(facts.items.map(\.id))
+        let pageItems = (try? app.workspace.items(facts.doc, page: facts.page)) ?? []
+        let neighbours = pageItems.lazy.filter {
+            !$0.deleted && !selected.contains($0.id) && !session.hiddenLayers.contains($0.layer)
+        }.map { app.content.hitBounds(for: $0).cg }
+        obstacleBounds = ObjectMenuPlacement.nearestObstacles(neighbours, selection: facts.bounds.cg)
     }
 
     private func reposition(contentChanged: Bool) {
@@ -424,6 +433,16 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         } == true
         if contentChanged || moved || lastContainerRect == nil { lastContainerRect = rect }
         model.setAnchor(rect)
+        if let transform = host.pageTransform(facts.page) {
+            // Resolve the page transform once, rather than converting four corners per neighbouring item.
+            model.setObstacles(obstacleBounds.compactMap { bounds -> CGRect? in
+                let projected = bounds.applying(transform)
+                guard projected.intersects(host.canvasView.bounds) else { return nil }
+                return target.containerRect(projected, from: host.canvasView)
+            })
+        } else {
+            model.setObstacles([])
+        }
         // The canvas's safe area reserves the bars, palette and docked panels. Convert that viewport into
         // the same space as the selection rather than clamping against the whole window behind its chrome.
         let viewport = ObjectMenuPlacement.viewport(in: host.canvasView)

@@ -7,6 +7,7 @@ enum ChatCommands {
     static func register(_ r: CommandRegistry) {
         r.register(AIAsk.self)
         r.register(AIChatList.self)
+        r.register(AIChatSave.self)
         r.register(AIChatRename.self)
         r.register(AIChatDelete.self)
         r.register(AIChatFeedback.self)
@@ -169,6 +170,23 @@ struct AIAsk: NibCommand {
 
 // MARK: - Conversations
 
+/// Persistence recovery is deliberately separate from ai.ask / AIService.stream: no generation.
+struct AIChatSave: NibCommand {
+    struct Params: Codable { var chat: String }
+    typealias Output = AIResponse
+    static let descriptor = CommandDescriptor(
+        id: "ai.chat.save", title: "Retry Saving Conversation",
+        summary: "Save a retained answer after a conversation write failed, without asking the provider again.",
+        params: .obj(["chat": .str("conversation id with an unsaved answer")], required: ["chat"]),
+        examples: [["chat": "FIXTURECHAT1"]], effect: .session, target: .app)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> AIResponse {
+        try ChatCommands.checkChatID(p.chat)
+        let agent = try ChatCommands.agent(ctx)
+        return try await agent.retrySave(chatID: p.chat, principal: ctx.principal, dryRun: ctx.dryRun)
+    }
+}
+
 struct AIChatList: NibCommand {
     struct Params: Codable {
         var doc: String?
@@ -218,29 +236,49 @@ struct AIChatList: NibCommand {
         func visible(_ owner: DocumentID?) -> Bool {
             ctx.principal.isUser || owner.map { !ctx.bus.gateway.isLocked($0) } ?? true
         }
-        let summaries = (agent?.chatStore.summaries(doc: doc, all: p.all ?? false) ?? ai.chats(doc: doc))
-            .filter { visible($0.doc) }
-        let rows = summaries.map { s -> Row in
-            let count = agent?.chatStore.visibleMessages(s.id).count ?? ai.messages(chatID: s.id).count
-            return Row(id: s.id, title: s.title, doc: s.doc.map { NodeRef.document($0).description }, updated: s.updated,
-                       messages: count)
+        let store = agent?.chatStore
+        let library = ctx.services.library
+        let libraryRoot = library?.rootURL
+        let metadata = library?.metadataURL
+        func checkLibrary() throws {
+            guard ctx.services.library === library,
+                  ctx.services.library?.rootURL == libraryRoot,
+                  ctx.services.library?.metadataURL == metadata else {
+                throw NibError(.conflict, String(localized: "The library changed while loading conversations."),
+                               hint: String(localized: "Open conversation history again."))
+            }
         }
-        guard let chat = p.chat else { return Output(chats: rows) }
-        guard let agent = agent else {
+        let loaded: [AIChatSummary]
+        if let store = store { loaded = await store.summariesAsync(doc: doc, all: p.all ?? false) }
+        else { loaded = ai.chats(doc: doc) }
+        try checkLibrary()
+        // Construct rows only at the return boundary: selected-chat loading can suspend
+        // while any other listed document becomes locked.
+        func rows() -> [Row] {
+            loaded.filter { visible($0.doc) }.map { s -> Row in
+                let count = store?.messageCount(s.id) ?? ai.messages(chatID: s.id).count
+                return Row(id: s.id, title: s.title, doc: s.doc.map { NodeRef.document($0).description }, updated: s.updated,
+                           messages: count)
+            }
+        }
+        guard let chat = p.chat else { return Output(chats: rows()) }
+        guard let store = store else {
             let list = ai.messages(chatID: chat).enumerated().map {
                 Message(id: String($0.offset), role: $0.element.role, text: $0.element.text)
             }
-            return Output(chats: rows, messages: list)
+            return Output(chats: rows(), messages: list)
         }
-        guard let state = agent.chatStore.state(chat) else { throw ChatStore.unknownChat(chat) }
+        let loadedState = await store.stateAsync(chat)
+        try checkLibrary()
+        guard let state = loadedState else { throw ChatStore.unknownChat(chat) }
         guard visible(state.meta?.doc.map { DocumentID($0) }) else {
             throw NibError(.locked, "the conversation belongs to a locked document", hint: "ask the user to unlock it first")
         }
-        let list = agent.chatStore.visibleMessages(chat).map {
+        let list = state.messages.filter(\.isVisibleMessage).map {
             Message(id: $0.id.raw, role: $0.role ?? "user", text: $0.text ?? "", at: $0.at, rating: $0.rating,
                     group: $0.group, changes: $0.changes, cancelled: $0.cancelled)
         }
-        return Output(chats: rows, messages: list)
+        return Output(chats: rows(), messages: list)
     }
 }
 
@@ -259,8 +297,10 @@ struct AIChatRename: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
         try ChatCommands.checkChatID(p.chat)
         let agent = try ChatCommands.agent(ctx)
-        try agent.chatStore.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
-        try agent.chatStore.rename(p.chat, title: p.title)
+        let store = agent.chatStore
+        try store.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
+        try store.rename(p.chat, title: p.title)
+        if let error = await store.flushAsync() { throw error }
         return NoResult()
     }
 }
@@ -279,9 +319,10 @@ struct AIChatDelete: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
         try ChatCommands.checkChatID(p.chat)
         let agent = try ChatCommands.agent(ctx)
-        try agent.chatStore.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
-        agent.cancel(chatID: p.chat)
-        try agent.chatStore.delete(p.chat)
+        let store = agent.chatStore
+        try store.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
+        try agent.deleteChat(p.chat, from: store)
+        if let error = await store.flushAsync() { throw error }
         return NoResult()
     }
 }
@@ -308,8 +349,10 @@ struct AIChatFeedback: NibCommand {
             throw NibError(.invalidParams, "rating is 'up', 'down' or 'none'", path: "$.rating")
         }
         let agent = try ChatCommands.agent(ctx)
-        try agent.chatStore.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
-        try agent.chatStore.rate(p.chat, message: p.message, rating: p.rating == "none" ? nil : p.rating)
+        let store = agent.chatStore
+        try store.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
+        try store.rate(p.chat, message: p.message, rating: p.rating == "none" ? nil : p.rating)
+        if let error = await store.flushAsync() { throw error }
         return NoResult()
     }
 }

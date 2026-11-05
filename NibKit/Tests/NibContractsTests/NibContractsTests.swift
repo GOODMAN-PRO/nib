@@ -71,6 +71,21 @@ final class NibContractsTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode([Rev].self, from: data), [a])
     }
 
+    func testRecordFingerprintTracksEveryRevisionAndTombstoneIndependentOfOrder() {
+        var a = PageRecord(id: "FINGERPRINTA", order: "V")
+        var b = PageRecord(id: "FINGERPRINTB", order: "W")
+        a.rev = Rev(wallMs: 100, counter: 0, device: 7)
+        b.rev = Rev(wallMs: 10, counter: 0, device: 8)
+        let original = LWW.fingerprint([a, b])
+        XCTAssertEqual(original, LWW.fingerprint([b, a]))
+        b.rev = Rev(wallMs: 50, counter: 0, device: 8)
+        XCTAssertNotEqual(original, LWW.fingerprint([a, b]))
+        let edited = LWW.fingerprint([a, b])
+        b.deleted = true
+        XCTAssertNotEqual(edited, LWW.fingerprint([a, b]))
+        XCTAssertNotEqual(original, LWW.fingerprint([a]))
+    }
+
     func testStrokeCodecBothForms() throws {
         let s = Stroke(style: InkStyle(), points: [StrokePoint(x: 1, y: 2, t: 0.5, force: 0.7), StrokePoint(x: 3, y: 4)], t0: 100)
         let plain = try JSONValue.from(s)
@@ -365,6 +380,36 @@ final class NibContractsTests: XCTestCase {
         XCTAssertEqual(list["commands"]?.arrayValue?.count, 2)
     }
 
+    func testGatewayRevalidatesAuthorityAfterConfirmation() async throws {
+        for decision in [ConfirmationDecision.allow, .allowRestOfGroup] {
+            for revoke in [true, false] {
+                let h = Harness()
+                let before = try h.snapshot()
+                h.app.gateway.grants = { _ in Set(Scope.allCases) }
+                let presenter = ChangingAuthorityPresenter(decision: decision) {
+                    if revoke { h.app.gateway.grants = { _ in [] } }
+                    else { h.app.gateway.isLocked = { _ in true } }
+                }
+                h.app.gateway.presenter = presenter
+                h.app.commands.register(CommandDescriptor(id: "test.delete", title: "Delete", summary: "Delete an item.",
+                                                          effect: .edit, destructive: true)) { _, ctx in
+                    try ctx.mutate { tx in
+                        try tx.delete(item: Fixtures.strokeID, doc: Fixtures.docID, page: Fixtures.page1)
+                    }
+                    return .null
+                }
+                do {
+                    _ = try await h.run("test.delete", ["doc": "doc:FIXTUREDOC01"], as: .plugin("disabled"))
+                    XCTFail("Authority changed while confirmation was suspended")
+                } catch let error as NibError {
+                    XCTAssertEqual(error.code, revoke ? .permissionDenied : .locked)
+                }
+                XCTAssertEqual(try h.snapshot(), before)
+                XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+            }
+        }
+    }
+
     func testSchemaValidation() {
         let s = JSONSchema.obj(["page": .ref, "n": .int(min: 1)], required: ["page"])
         XCTAssertTrue(s.validate(["page": "page:A/B", "n": 2]).isEmpty)
@@ -555,5 +600,20 @@ enum ProbeFeature: NibFeature {
                                                 examples: [[:]], effect: .edit)) { _, ctx in
             try await ctx.execute("missing.command")
         }
+    }
+}
+
+@MainActor
+private final class ChangingAuthorityPresenter: ConfirmationPresenter {
+    let decision: ConfirmationDecision
+    let change: () -> Void
+    init(decision: ConfirmationDecision, change: @escaping () -> Void) {
+        self.decision = decision
+        self.change = change
+    }
+    func confirm(_ request: ConfirmationRequest) async -> ConfirmationDecision {
+        await Task.yield()
+        change()
+        return decision
     }
 }

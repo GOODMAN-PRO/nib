@@ -93,25 +93,165 @@ final class FeatSettingsTests: XCTestCase {
         let state = SettingsNavigationState()
         state.show(page: "test.draft", in: SettingsCatalog(pages: h.app.ui.settingsPages.all))
         let root = SettingsRootView(app: h.app, state: state, onDone: {})
-        let host = UIHostingController(rootView: root.environment(\.dynamicTypeSize, .large))
+        let host = UIHostingController(rootView: root.environment(\.dynamicTypeSize, .large).ignoresSafeArea())
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 900, height: 800))
         window.rootViewController = host
         window.makeKeyAndVisible()
         defer { window.isHidden = true; window.rootViewController = nil }
+        var enteredDraft = false
         for (width, size) in [(CGFloat(900), DynamicTypeSize.large), (390, .large),
                               (900, .large), (900, .accessibility5), (900, .large)] {
             window.frame.size.width = width
             host.view.frame = window.bounds
-            host.rootView = root.environment(\.dynamicTypeSize, size)
+            host.traitOverrides.horizontalSizeClass = width < 600 ? .compact : .regular
+            host.rootView = root.environment(\.dynamicTypeSize, size).ignoresSafeArea()
             for _ in 0..<10 {
                 host.view.layoutIfNeeded()
                 try await Task.sleep(for: .milliseconds(20))
             }
             XCTAssertEqual(probe.models.count, 1, "resizing must not create another page model")
             let draft = try XCTUnwrap(probe.models.last)
-            if draft.password.isEmpty { draft.password = "unsaved password" }
-            XCTAssertEqual(probe.models.first?.password, draft.password)
+            let field = try XCTUnwrap(settingsSubviews(host.view).compactMap { $0 as? UITextField }
+                .first { $0.isSecureTextEntry })
+            if !enteredDraft {
+                field.text = "unsaved password"
+                field.sendActions(for: .editingChanged)
+                try await Task.sleep(for: .milliseconds(20))
+                enteredDraft = true
+            }
+            XCTAssertEqual(draft.password, "unsaved password")
+            XCTAssertEqual(field.text, "unsaved password", "the visible field must retain the draft")
         }
+    }
+
+    func testSinglePageContentAfterSidebarSelection() async throws {
+        try await assertSinglePageContent(route: .sidebar)
+    }
+
+    func testSinglePageContentAfterSettingsOpenPage() async throws {
+        try await assertSinglePageContent(route: .commandPage)
+    }
+
+    func testSinglePageContentAfterSettingsOpenPlace() async throws {
+        try await assertSinglePageContent(route: .commandPlace)
+    }
+
+    func testSinglePageContentAfterSearch() async throws {
+        try await assertSinglePageContent(route: .search)
+        try await assertSinglePageContent(route: .sidebarSearch)
+    }
+
+    func testSinglePageContentAfterCommandComma() async throws {
+        try await assertSinglePageContent(route: .shortcut)
+    }
+
+    func testSinglePageContentAfterRestoringSectionWithoutAPush() async throws {
+        try await assertSinglePageContent(route: .restored)
+    }
+
+    func testSinglePageContentOnInitialPageAndDefaultSection() async throws {
+        try await assertSinglePageContent(route: .initialPage)
+        try await assertSinglePageContent(route: .defaultSection)
+    }
+
+    func testSinglePageSectionsRenderDirectlyAndCompactIndexRemainsReachable() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let probe = SettingsDraftProbe()
+        registerDraftPage(h, probe: probe, id: "test.plugins", section: .plugins)
+        registerDraftPage(h, probe: probe, id: "test.bridge", section: .bridge)
+        let root = SettingsRootViewController(app: h.app, initialPage: nil)
+        let hosted = try HostedSettings(root, width: 900)
+        defer { hosted.close() }
+        for section in [SettingsSection.plugins, .bridge] {
+            root.state.select(section)
+            try await hosted.settle()
+            try assertSolePageIsVisible(hosted)
+            hosted.resize(width: 390)
+            try await hosted.settle()
+            try assertSolePageIsVisible(hosted)
+            root.state.showIndex() // The compact Settings back button's action.
+            try await hosted.settle()
+            XCTAssertTrue(hosted.draftFields.isEmpty)
+            XCTAssertFalse(hosted.lists.isEmpty, "returning to the index must expose the page rows")
+            root.show(page: section == .plugins ? "test.plugins" : "test.bridge")
+            try await hosted.settle()
+            try assertSolePageIsVisible(hosted)
+            hosted.resize(width: 900)
+            try await hosted.settle()
+            try assertSolePageIsVisible(hosted)
+        }
+    }
+
+    func testMultiPageSectionKeepsItsListAndPushedDraftAcrossSizeClasses() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let probe = SettingsDraftProbe()
+        registerDraftPage(h, probe: probe)
+        h.app.ui.settingsPages.register(page("test.other", "Other", .plugins, owner: "test"))
+        let root = SettingsRootViewController(app: h.app, initialPage: nil)
+        root.state.select(.plugins)
+        let hosted = try HostedSettings(root, width: 900)
+        defer { hosted.close() }
+        for width in [CGFloat(900), 390, 900] {
+            hosted.resize(width: width)
+            try await hosted.settle()
+            XCTAssertFalse(hosted.lists.isEmpty, "multiple pages must remain rows")
+            XCTAssertTrue(hosted.draftFields.isEmpty, "no page should be open before choosing a row")
+        }
+        let catalog = SettingsCatalog(pages: h.app.ui.settingsPages.all)
+        let draftPage = try XCTUnwrap(catalog.page("test.draft"))
+        SettingsPageRow(page: draftPage, catalog: catalog, state: root.state).open()
+        try await hosted.settle()
+        try await hosted.enterDraft("multi-page draft")
+        for width in [CGFloat(390), 900] {
+            hosted.resize(width: width)
+            try await hosted.settle()
+            XCTAssertEqual(probe.models.count, 1)
+            XCTAssertEqual(probe.models.first?.password, "multi-page draft")
+            XCTAssertEqual(hosted.draftFields.first?.text, "multi-page draft")
+        }
+        root.state.compactPath = [] // Native Back returns to the section's rows.
+        try await hosted.settle()
+        XCTAssertFalse(hosted.lists.isEmpty)
+        XCTAssertTrue(hosted.draftFields.isEmpty)
+    }
+
+    func testHostedSinglePageInSecondWindowDoesNotChangeFirstWindowDraft() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let probe = SettingsDraftProbe()
+        registerDraftPage(h, probe: probe)
+        registerDraftPage(h, probe: probe, id: "test.bridge", section: .bridge)
+        let first = RecordingNavigator(h)
+        h.app.ui.activeNavigator = first
+        try await h.run(CommandIDs.settingsOpen, ["page": "test.draft"])
+        let firstRoot = try XCTUnwrap(first.presented as? SettingsRootViewController)
+        first.rootViewController = firstRoot
+        let firstHost = try HostedSettings(firstRoot, width: 900)
+        defer { firstHost.close() }
+        try await firstHost.settle()
+        try assertSolePageIsVisible(firstHost)
+        try await firstHost.enterDraft("first window draft")
+
+        let second = RecordingNavigator(h)
+        h.app.ui.activeNavigator = second
+        try await h.run(CommandIDs.settingsOpen, ["page": "test.bridge"])
+        let secondRoot = try XCTUnwrap(second.presented as? SettingsRootViewController)
+        second.rootViewController = secondRoot
+        let secondHost = try HostedSettings(secondRoot, width: 390)
+        defer { secondHost.close() }
+        try await secondHost.settle()
+        try assertSolePageIsVisible(secondHost)
+        try await secondHost.enterDraft("second window draft")
+        firstHost.resize(width: 390)
+        secondHost.resize(width: 900)
+        try await firstHost.settle()
+        try await secondHost.settle()
+        XCTAssertEqual(firstRoot.state.section, .plugins)
+        XCTAssertEqual(secondRoot.state.section, .bridge)
+        XCTAssertEqual(firstHost.draftFields.first?.text, "first window draft")
+        XCTAssertEqual(secondHost.draftFields.first?.text, "second window draft")
+        XCTAssertEqual(probe.models.count, 2)
+        XCTAssertEqual(first.requestedPages, ["test.draft"])
+        XCTAssertEqual(second.requestedPages, ["test.bridge"])
     }
 
     func testPagesFromOtherFeaturesAppearInTheirSection() {
@@ -207,8 +347,8 @@ final class FeatSettingsTests: XCTestCase {
         XCTAssertEqual(state.section, .stylus)
         XCTAssertEqual(state.query, "")
         XCTAssertTrue(state.detailPath.isEmpty, "the regular layout already displays the only page")
-        XCTAssertEqual(state.compactPath, [SettingsPageLink(id: CoreSettingsPages.stylus)],
-                       "the compact layout must still push the page from its index")
+        XCTAssertTrue(state.compactPath.isEmpty,
+                      "a sole page is root content in both layouts, with no intermediate list or push")
     }
 
     func testPencilOnlySelectionFromAnyInputPersistsThroughSettingsCommand() async throws {
@@ -341,7 +481,7 @@ final class FeatSettingsTests: XCTestCase {
         let root = try XCTUnwrap(navigator.presented as? SettingsRootViewController)
         XCTAssertEqual(root.state.section, .stylus)
         XCTAssertTrue(root.state.detailPath.isEmpty, "a section's only page is its detail")
-        XCTAssertEqual(root.state.compactPath.count, 1)
+        XCTAssertTrue(root.state.compactPath.isEmpty, "the sole page is also the compact root content")
 
         try await h.run(CommandIDs.settingsOpen)
         XCTAssertEqual(navigator.requestedPages, ["settings.stylus", nil])
@@ -590,6 +730,92 @@ final class FeatSettingsTests: XCTestCase {
 
     // MARK: Helpers
 
+    private enum SinglePageRoute: Equatable {
+        case sidebar, commandPage, commandPlace, search, sidebarSearch, shortcut, restored, initialPage, defaultSection
+    }
+
+    private func assertSinglePageContent(route: SinglePageRoute) async throws {
+        for width in [CGFloat(900), 390] {
+            for style in [UIUserInterfaceStyle.light, .dark] {
+                let h = Harness(features: [FeatSettingsFeature.self])
+                let probe = SettingsDraftProbe()
+                let usesDefaultSection = route == .shortcut || route == .defaultSection
+                if usesDefaultSection {
+                    for page in h.app.ui.settingsPages.all where page.section == .general {
+                        h.app.ui.settingsPages.unregister(id: page.id)
+                    }
+                }
+                let section: SettingsSection = usesDefaultSection ? .general : .plugins
+                registerDraftPage(h, probe: probe, section: section)
+                let navigator = RecordingNavigator(h)
+                h.app.ui.activeNavigator = navigator
+                if route == .shortcut {
+                    let key = try XCTUnwrap(KeyCommandRouting.unhandledPress(AppMenu.settingsShortcut,
+                        descriptors: h.app.content.keyCommands.all, in: KeyCommandContext(docKind: nil)))
+                    try await h.run(key.command, key.resolvedParams(for: h.session))
+                } else if route == .initialPage {
+                    try await h.run(CommandIDs.settingsOpen, ["page": "test.draft"])
+                } else {
+                    try await h.run(CommandIDs.settingsOpen)
+                }
+                let root = try XCTUnwrap(navigator.presented as? SettingsRootViewController)
+                navigator.rootViewController = root
+                if route == .restored {
+                    root.state.section = section // Restored selection, deliberately no navigation push.
+                }
+                let hosted = try HostedSettings(root, width: width, style: style)
+                defer { hosted.close() }
+                try await hosted.settle()
+                let catalog = SettingsCatalog(pages: h.app.ui.settingsPages.all)
+                switch route {
+                case .sidebar:
+                    root.state.select(section) // The exact action used by SettingsSidebar's section button.
+                case .commandPage:
+                    try await h.run(CommandIDs.settingsOpen, ["page": "test.draft"])
+                case .commandPlace:
+                    try await h.run(CommandIDs.settingsOpen, ["place": "settings", "page": "test.draft"])
+                case .search, .sidebarSearch:
+                    root.state.query = "Draft"
+                    let result = try XCTUnwrap(catalog.search(root.state.query).first)
+                    if route == .sidebarSearch {
+                        root.state.show(page: result.id, in: catalog)
+                    } else {
+                        SettingsPageRow(page: result, catalog: catalog, state: root.state).open()
+                    }
+                    XCTAssertTrue(root.state.query.isEmpty)
+                case .shortcut, .restored, .initialPage, .defaultSection:
+                    break
+                }
+                try await hosted.settle()
+                try assertSolePageIsVisible(hosted)
+                XCTAssertEqual(probe.models.count, 1)
+                XCTAssertTrue(root.state.compactPath.isEmpty, "content must not depend on a push")
+            }
+        }
+    }
+
+    private func registerDraftPage(_ h: Harness, probe: SettingsDraftProbe, id: String = "test.draft",
+                                   section: SettingsSection = .plugins) {
+        h.app.ui.settingsPages.register(SettingsPageDescriptor(
+            id: id, title: "Draft", icon: "gearshape", section: section, order: 0, owner: "test"
+        ) { _ in AnyView(SettingsDraftProbeView(probe: probe)) })
+    }
+
+    private func assertSolePageIsVisible(_ hosted: HostedSettings, file: StaticString = #filePath,
+                                       line: UInt = #line) throws {
+        let field = try XCTUnwrap(hosted.draftFields.first, "the page's own content must be in the hierarchy",
+                                  file: file, line: line)
+        XCTAssertTrue(field.window === hosted.window, file: file, line: line)
+        let frame = field.convert(field.bounds, to: hosted.host.view)
+        XCTAssertTrue(hosted.host.view.bounds.intersects(frame), file: file, line: line)
+        var ancestor: UIView? = field
+        while let view = ancestor {
+            XCTAssertFalse(view.isHidden, file: file, line: line)
+            ancestor = view.superview
+        }
+        XCTAssertTrue(hosted.lists.isEmpty, "there must be no intermediate one-row list", file: file, line: line)
+    }
+
     private func assertError(_ code: NibError.Code, _ message: String = "", file: StaticString = #filePath,
                              line: UInt = #line, _ body: () async throws -> JSONValue) async {
         do {
@@ -601,6 +827,69 @@ final class FeatSettingsTests: XCTestCase {
             XCTFail("\(error)", file: file, line: line)
         }
     }
+}
+
+/// Hosts the production controller and its SwiftUI root, including the router's visible-window check.
+@MainActor
+private final class HostedSettings {
+    let root: SettingsRootViewController
+    let host: UIHostingController<SettingsRootView>
+    let window: UIWindow
+
+    init(_ root: SettingsRootViewController, width: CGFloat,
+         style: UIUserInterfaceStyle = .light) throws {
+        self.root = root
+        root.loadViewIfNeeded()
+        let hostingController = try XCTUnwrap(root.children.compactMap { $0 as? UIHostingController<SettingsRootView> }.first)
+        hostingController.safeAreaRegions = [] // Ignore the test window's safe area, including at narrow widths.
+        host = hostingController
+        window = UIWindow(frame: CGRect(x: 0, y: 0, width: width, height: 800))
+        window.overrideUserInterfaceStyle = style
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        resize(width: width)
+    }
+
+    var draftFields: [UITextField] {
+        settingsSubviews(host.view).compactMap { $0 as? UITextField }.filter { $0.isSecureTextEntry }
+    }
+
+    var lists: [UIView] {
+        settingsSubviews(host.view).filter { $0 is UICollectionView || $0 is UITableView }
+    }
+
+    func resize(width: CGFloat) {
+        window.frame.size.width = width
+        root.view.frame = window.bounds
+        host.view.frame = root.view.bounds
+        host.traitOverrides.horizontalSizeClass = width < 600 ? .compact : .regular
+        host.view.setNeedsLayout()
+    }
+
+    func settle() async throws {
+        for _ in 0..<25 {
+            host.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    func enterDraft(_ text: String) async throws {
+        let field = try XCTUnwrap(draftFields.first)
+        field.text = text
+        field.sendActions(for: .editingChanged)
+        try await settle()
+        XCTAssertEqual(field.text, text)
+    }
+
+    func close() {
+        window.isHidden = true
+        window.rootViewController = nil
+    }
+}
+
+@MainActor
+private func settingsSubviews(_ view: UIView) -> [UIView] {
+    [view] + view.subviews.flatMap { settingsSubviews($0) }
 }
 
 @MainActor

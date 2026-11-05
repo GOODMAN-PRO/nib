@@ -631,6 +631,18 @@ struct DocSetScrollDirection: NibCommand {
 /// Shared with the app shell so its presentation decisions are covered by package tests.
 @MainActor
 public enum ShellChromePolicy {
+    /// Re-read after any suspended open gate, before loading content or changing the current tab.
+    public static func validateOpen(_ doc: DocumentID, app: NibApp) -> Bool {
+        guard let node = app.services.library?.node(doc), node.kind == .document, node.trashedAt == nil else {
+            let failure = NibError(.notFound, String(localized: "This document is no longer available in the library."),
+                                   hint: String(localized: "Check the library or restore the document from Trash."))
+            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                            userInfo: ["command": CommandIDs.docOpen, "error": failure])
+            return false
+        }
+        return true
+    }
+
     public static func hasModal(_ controller: UIViewController) -> Bool {
         controller.presentedViewController != nil || controller.children.contains { hasModal($0) }
     }

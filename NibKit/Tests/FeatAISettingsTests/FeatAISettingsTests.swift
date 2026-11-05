@@ -192,6 +192,64 @@ final class FeatAISettingsTests: XCTestCase {
         XCTAssertTrue(checked)
         XCTAssertEqual(Keychain.getString(service: AIProviderConfig.keychainService, account: c.keychainAccount), "staged-secret-086")
     }
+    func testRepeatedEditorSaveUsesStoredOptionalFieldsAsBaseline() async throws {
+        let (h, store) = setupStore()
+        var baseline = try config()
+        baseline.transcriptionModel = "speech-model"
+        baseline.imageModel = "image-model"
+        baseline.contextTokens = 8192
+        try store.save(baseline, apiKey: nil)
+        var draft = ProviderDraft(config: baseline)
+        draft.transcriptionModel = ""
+        draft.imageModel = ""
+        // contextTokens is not a ProviderSave parameter: the command preserves the stored
+        // 8192 even when the submitted draft has nil. Cleared model strings do become nil.
+        draft.contextTokens = nil
+        let submitted = try draft.config()
+        let runtime = try XCTUnwrap(h.app.services.get(ProviderSettingsRuntime.serviceKey, as: ProviderSettingsRuntime.self))
+        let saved = try await runtime.saveFromSettings(submitted, key: nil, app: h.app, expected: baseline)
+        XCTAssertEqual(saved.config, store.configs.first)
+        XCTAssertNil(saved.config.transcriptionModel)
+        XCTAssertNil(saved.config.imageModel)
+        XCTAssertNil(submitted.contextTokens)
+        XCTAssertEqual(saved.config.contextTokens, 8192)
+        XCTAssertNotEqual(saved.config, submitted)
+        draft = ProviderDraft(config: saved.config)
+        draft.name = "Renamed again"
+        let second = try await runtime.saveFromSettings(draft.config(), key: nil, app: h.app, expected: saved.config)
+        XCTAssertEqual(second.config.name, "Renamed again")
+        XCTAssertEqual(second.config.contextTokens, 8192)
+        XCTAssertNil(second.config.transcriptionModel)
+        XCTAssertNil(second.config.imageModel)
+        XCTAssertEqual(second.config, store.configs.first)
+    }
+
+    func testNameOnlyDraftRejectsExternallyChangedModelAtCommandCommit() async throws {
+        for changeInHook in [false, true] {
+            let (h, store) = setupStore()
+            let baseline = try config()
+            try store.save(baseline, apiKey: nil)
+            var external = baseline
+            external.model = "new-model"
+            var draft = baseline
+            draft.name = "New name"
+            let runtime = try XCTUnwrap(h.app.services.get(ProviderSettingsRuntime.serviceKey, as: ProviderSettingsRuntime.self))
+            if changeInHook {
+                h.app.bus.hooks.register(.guarding(id: "test.external", owner: "test", commands: [CommandIDs.aiProviderSave]) { _, _, _ in
+                    try store.save(external, apiKey: nil)
+                    return nil
+                })
+            } else {
+                try store.save(external, apiKey: nil)
+            }
+            do {
+                try await runtime.saveFromSettings(draft, key: nil, app: h.app, expected: baseline)
+                XCTFail("A stale editor must not overwrite the external model")
+            } catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+            XCTAssertEqual(store.configs, [external])
+        }
+    }
+
     func testHookCannotRewriteStagedProvider() async throws {
         let (h, store) = setupStore()
         let c = try config()

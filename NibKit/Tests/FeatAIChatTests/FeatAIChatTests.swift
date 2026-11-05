@@ -8,6 +8,49 @@ import NibTesting
 
 @MainActor
 final class FeatAIChatTests: XCTestCase {
+    func testModalChatPanelConsumesEscapeAndCloses() async throws {
+        for presentation in [PanelPresentation.sheet, .fullScreen] {
+            try await checkChatEscape(presentation, consumes: true)
+        }
+    }
+
+    func testPersistentChatPanelDoesNotConsumeEscape() async throws {
+        for presentation in [PanelPresentation.sidebar, .floating, .window, .libraryTab] {
+            try await checkChatEscape(presentation, consumes: false)
+        }
+    }
+
+    private func checkChatEscape(_ presentation: PanelPresentation, consumes: Bool) async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.session.openPanels.insert(PanelIDs.assistant)
+        var closed = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelClose, title: "Close panel",
+            summary: "Record the chat close action.", effect: .session)) { p, ctx in
+            XCTAssertEqual(p["id"]?.stringValue, PanelIDs.assistant)
+            XCTAssertTrue(ctx.activeSession === h.session)
+            closed += 1
+            h.session.openPanels.remove(PanelIDs.assistant)
+            return [:]
+        }
+        var context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+        context.presentation = presentation
+        let descriptor = try XCTUnwrap(h.app.ui.panels.get(PanelIDs.assistant))
+        let host = UIHostingController(rootView: descriptor.makeView(context))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 600))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        // The app's plain pressesBegan Escape route uses this dispatcher, without key commands.
+        XCTAssertEqual(NibEscapeRouting.cancel(in: host.view), consumes)
+        for _ in 0..<50 {
+            if closed > 0 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(closed, consumes ? 1 : 0)
+        XCTAssertEqual(h.session.openPanels.contains(PanelIDs.assistant), !consumes)
+    }
+
     func testRegistrationUsesAssistantPanelAndMenuContexts() throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let panel = try XCTUnwrap(h.app.ui.panels.get(PanelIDs.assistant))

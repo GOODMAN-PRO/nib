@@ -195,6 +195,20 @@ final class ChatViewModel: ObservableObject {
     @Published var docKind: DocumentKind?
     @Published var needsImagePicker = false
     @Published var retryPrompt: String?
+    @Published private(set) var isSavingConversation = false
+    private struct ConversationOrigin: Equatable {
+        var chat: String
+        var root: URL?
+        var metadata: URL?
+    }
+    private struct SaveRecovery {
+        var origin: ConversationOrigin
+        // This follows canonical ID reconciliation, never the position of the latest receipt.
+        var answerID: String
+        var response: AIResponse?
+    }
+    private var conversationOrigin: ConversationOrigin?
+    private var saveRecovery: SaveRecovery?
     private var generation: UUID?
     private var sessionObservation: AnyCancellable?
     private var citationPages = ChatPageIndexCache()
@@ -234,14 +248,20 @@ final class ChatViewModel: ObservableObject {
     }
     var isConfigured: Bool { app?.services.ai?.isConfigured ?? false }
     // These mirror existing command guards; presentation must not offer an action the model rejects.
-    var canChangeConversation: Bool { !isStreaming && !isGeneratingImage && !isApplyingProposals && !isStagingProposals }
+    var canChangeConversation: Bool { !isStreaming && !isGeneratingImage && !isApplyingProposals && !isStagingProposals && !isSavingConversation }
     var canStartGeneration: Bool { canChangeConversation && !isLoadingChat }
     var canSend: Bool { isConfigured && canStartGeneration && proposals.isEmpty }
+    var needsSaveRetry: Bool { error?.path == "$.chat.persistence" }
+    var canRetry: Bool {
+        if needsSaveRetry { return chatID != nil && canChangeConversation && !isLoadingChat }
+        return retryPrompt != nil && canSend
+    }
     var canGenerateImage: Bool { isConfigured && app?.services.assets != nil && canStartGeneration }
     var canConfigureContext: Bool { !isStreaming && !isApplyingProposals }
     var canUseHistory: Bool { canStartGeneration && historyOperationLabel == nil }
     var progressLabel: String? {
         if let historyOperationLabel { return historyOperationLabel }
+        if isSavingConversation { return String(localized: "Saving conversation…") }
         if isLoadingChat { return String(localized: "Loading conversation…") }
         if isGeneratingImage { return String(localized: "Generating image…") }
         if isApplyingProposals { return String(localized: "Applying changes…") }
@@ -399,16 +419,20 @@ final class ChatViewModel: ObservableObject {
     func selectChat(_ id: String, principal: Principal = .user) async throws {
         guard canChangeConversation else { throw NibError(.conflict, "stop this turn before switching conversations") }
         guard let app else { throw NibError.unavailable("assistant is closed") }
+        let origin = self.origin(for: id)
         let token = UUID()
         loadToken = token
         isLoadingChat = true
         defer { if loadToken == token { loadToken = nil; isLoadingChat = false } }
         let result = try await app.bus.execute(CommandIDs.aiChatList, ["all": true, "chat": .string(id)], principal: principal, session: session)
+        try checkOrigin(origin, checkChat: false)
         guard loadToken == token, !isStreaming, !isGeneratingImage else { throw CancellationError() }
         let list = try result.decode(ChatListResult.self)
-        let restored = try await ChatArchive.restore(chat: id, listed: list.messages ?? [], metadata: app.services.library?.metadataURL)
+        let restored = try await ChatArchive.restore(chat: id, listed: list.messages ?? [], metadata: origin.metadata)
+        try checkOrigin(origin, checkChat: false)
         guard loadToken == token, !isStreaming, !isGeneratingImage else { throw CancellationError() }
         chatID = id
+        conversationOrigin = origin
         conversations = list.chats
         entries = restored.map(\.entry)
         let usage = restored.compactMap(\.usage)
@@ -427,6 +451,7 @@ final class ChatViewModel: ObservableObject {
         draft = nil
         error = nil
         retryPrompt = nil
+        saveRecovery = nil
     }
 
     func newChat() throws {
@@ -434,6 +459,7 @@ final class ChatViewModel: ObservableObject {
         loadToken = nil
         isLoadingChat = false
         chatID = nil
+        conversationOrigin = nil
         totalTokens = 0
         entries = []
         proposals = []
@@ -444,12 +470,16 @@ final class ChatViewModel: ObservableObject {
         draft = nil
         error = nil
         retryPrompt = nil
+        saveRecovery = nil
         showsConversations = false
     }
 
     @discardableResult
     func send(prompt: String, principal: Principal, group: String, retry: Bool = false,
               linkUndoAcrossDocuments: (@MainActor () -> Void)? = nil) async throws -> AIResponse {
+        // Persistence recovery keeps the completed turn, including unreverted edits. It does
+        // not require a provider, a prompt, vision support or an empty proposal queue.
+        if retry && needsSaveRetry { return try await retryConversationSave(principal: principal) }
         guard let app, let ai = app.services.ai, ai.isConfigured else {
             throw NibError(.unavailable, "Connect a model to use the assistant.", hint: "open Settings › AI")
         }
@@ -464,7 +494,10 @@ final class ChatViewModel: ObservableObject {
         }
         guard proposals.isEmpty else { throw NibError(.conflict, "accept or discard the pending proposals first") }
         let id = chatID ?? NibID.make().raw
+        let origin = conversationOrigin ?? self.origin(for: id)
+        try checkOrigin(origin, checkChat: chatID != nil)
         chatID = id
+        conversationOrigin = origin
         let prior = retry ? entries.first(where: { $0.id == retryEntry }) : nil
         if let prior, !prior.changes.isEmpty, !prior.reverted {
             throw NibError(.conflict, "Undo this turn's partial changes before retrying.")
@@ -490,6 +523,7 @@ final class ChatViewModel: ObservableObject {
         retryPrompt = text
         retryImages = images
         retryEntry = answerID
+        saveRecovery = SaveRecovery(origin: origin, answerID: answerID)
         let effectivePrincipal = principal.isUser ? Principal.ai(id) : principal
         var request = AIRequest(chatID: id, messages: [AIMessage(role: "user", text: text, images: images.isEmpty ? nil : images)],
                                 mode: mode, scope: scope, principal: effectivePrincipal, group: group)
@@ -535,6 +569,10 @@ final class ChatViewModel: ObservableObject {
                     }
                     if let changes { entries[i].changes.merge(changes) }
                 case .finished(let response):
+                    // The agent has already saved this receipt. Keep it before any library
+                    // check or suspension so recovery never asks it to save a nonexistent draft.
+                    saveRecovery?.response = response
+                    try checkOrigin(origin)
                     entries[i].text = response.text
                     resolveEntryCitations(i)
                     entries[i].changes.merge(response.changes)
@@ -548,16 +586,18 @@ final class ChatViewModel: ObservableObject {
                     if app.commands.entry(CommandIDs.aiChatList) != nil {
                         do {
                             let list = try await app.bus.execute(CommandIDs.aiChatList, ["chat": .string(chatID ?? id)], session: session)
+                            try checkOrigin(origin)
                             let stored = try list.decode(ChatListResult.self)
                             if generation == token { conversations = stored.chats }
                             if generation == token, let current = entries.firstIndex(where: { $0.id == answerID }),
                                let last = stored.messages?.last(where: { $0.role == "assistant" && ($0.group == (response.group ?? group) || ($0.group == nil && $0.text == response.text)) }) {
-                                entries[current].id = last.id
+                                reconcileEntry(current, to: last.id)
                                 entries[current].isPersisted = true
                             }
                         } catch { /* The streamed receipt remains usable when the catalogue is temporarily unavailable. */ }
                     }
                     try await persistConversation()
+                    saveRecovery = nil
                     return response
                 case .failed(let failure): throw failure
                 }
@@ -570,9 +610,56 @@ final class ChatViewModel: ObservableObject {
             if generation == token, let i = entries.firstIndex(where: { $0.id == answerID }) {
                 entries[i].finishText(citationLabel)
             }
-            if generation == token, !(error is CancellationError) { self.error = NibError.wrap(error) }
+            let failure = NibError.wrap(error)
+            let reported = saveRecovery?.response == nil ? failure
+                : NibError(failure.code, failure.message, path: "$.chat.persistence", hint: failure.hint)
+            if generation == token, !(error is CancellationError) { self.error = reported }
             try? await persistConversation()
+            if !(error is CancellationError) { throw reported }
             throw error
+        }
+    }
+
+    private func retryConversationSave(principal: Principal) async throws -> AIResponse {
+        guard canRetry, let app, let recovery = saveRecovery else {
+            throw NibError(.conflict, String(localized: "The conversation is not ready to retry saving."))
+        }
+        isSavingConversation = true
+        defer { isSavingConversation = false }
+        do {
+            try checkOrigin(recovery.origin)
+            let response: AIResponse
+            if let saved = recovery.response { response = saved }
+            else {
+                let value = try await app.bus.execute("ai.chat.save", ["chat": .string(recovery.origin.chat)],
+                                                      principal: principal, session: session)
+                response = try value.decode(AIResponse.self)
+                // Keep the receipt if the supplemental UI archive fails after the agent saved.
+                saveRecovery?.response = response
+            }
+            try checkOrigin(recovery.origin)
+            guard response.chatID == nil || response.chatID == recovery.origin.chat,
+                  let answerID = saveRecovery?.answerID,
+                  let answer = entries.firstIndex(where: { $0.id == answerID && !$0.isReceipt }) else {
+                throw NibError(.conflict, String(localized: "The conversation is not ready to retry saving."))
+            }
+            let previousTokens = entries[answer].usage.input + entries[answer].usage.output
+            totalTokens += response.usage.input + response.usage.output - previousTokens
+            entries[answer].text = response.text
+            resolveEntryCitations(answer)
+            entries[answer].usage = response.usage
+            entries[answer].changes.merge(response.changes)
+            entries[answer].group = response.group ?? entries[answer].group
+            try await persistConversation()
+            error = nil
+            retryPrompt = nil
+            saveRecovery = nil
+            return response
+        } catch {
+            let failure = NibError.wrap(error)
+            let recoveryError = NibError(failure.code, failure.message, path: "$.chat.persistence", hint: failure.hint)
+            self.error = recoveryError
+            throw recoveryError
         }
     }
 
@@ -691,22 +778,51 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    private func origin(for chat: String) -> ConversationOrigin {
+        ConversationOrigin(chat: chat, root: app?.services.library?.rootURL,
+                           metadata: app?.services.library?.metadataURL)
+    }
+
+    private func checkOrigin(_ origin: ConversationOrigin, checkChat: Bool = true) throws {
+        guard (!checkChat || chatID == origin.chat),
+              app?.services.library?.rootURL == origin.root,
+              app?.services.library?.metadataURL == origin.metadata else {
+            throw NibError(.conflict, String(localized: "The conversation belongs to another library."),
+                           path: "$.chat.persistence", hint: String(localized: "Switch back to its library to save it."))
+        }
+    }
+
+    private func reconcileEntry(_ index: Int, to id: String) {
+        let previous = entries[index].id
+        if retryEntry == previous { retryEntry = id }
+        if saveRecovery?.answerID == previous { saveRecovery?.answerID = id }
+        entries[index].id = id
+    }
+
     func persistConversation() async throws {
-        guard let app, let chatID, let metadata = app.services.library?.metadataURL else { return }
+        guard let app, let chatID else { return }
+        // Pin both the destination and ownership check across catalogue/archive suspension.
+        let origin = conversationOrigin ?? self.origin(for: chatID)
+        conversationOrigin = origin
+        try checkOrigin(origin)
+        guard let metadata = origin.metadata else { return }
         // Reconcile the user message too, so attachments merge by F084's canonical message id.
-        if app.commands.entry(CommandIDs.aiChatList) != nil,
-           let value = try? await app.bus.execute(CommandIDs.aiChatList, ["chat": .string(chatID)], session: session),
-           let stored = try? value.decode(ChatListResult.self) {
+        if app.commands.entry(CommandIDs.aiChatList) != nil {
+            let value = try await app.bus.execute(CommandIDs.aiChatList, ["chat": .string(chatID)], session: session)
+            try checkOrigin(origin)
+            let stored = try value.decode(ChatListResult.self)
             var used = Set(entries.filter(\.isPersisted).map(\.id))
             for i in entries.indices where !entries[i].isPersisted && !entries[i].isReceipt {
                 if let match = stored.messages?.first(where: { !used.contains($0.id) && $0.role == entries[i].role && $0.text == entries[i].text && ($0.group == nil || $0.group == entries[i].group) }) {
-                    entries[i].id = match.id; entries[i].isPersisted = true; used.insert(match.id)
+                    reconcileEntry(i, to: match.id)
+                    entries[i].isPersisted = true; used.insert(match.id)
                 }
             }
         }
         let records = entries.filter { $0.isPersisted || $0.isReceipt }.map { ChatArchive.Record(message: StoredChatEntry($0), rev: app.clock.tick()) }
         try await ChatArchive.save(chat: chatID, device: app.deviceHex, records: records, metadata: metadata,
                                    assets: app.services.assets, doc: scope.doc)
+        try checkOrigin(origin)
     }
 
     func imageURL(_ asset: AssetRef) -> URL? {

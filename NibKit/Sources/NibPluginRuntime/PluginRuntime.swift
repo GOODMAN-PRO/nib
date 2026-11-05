@@ -435,7 +435,8 @@ final class PluginInstance: PluginRuntimeHandle {
         bridge.onSubscribe = { type, includeOwn, delta in
             subscriptions.update(type, includeOwn: includeOwn, delta: delta)
         }
-        bridge.onCall = { [weak self] method, args, callID, reply in
+        bridge.onCall = { [weak self, weak bridge] method, args, callID, reply in
+            guard let bridge = bridge else { return }
             if method.hasPrefix("storage.") {
                 // Storage never needs the main actor: it runs on its own queue, in call order.
                 PluginInstance.storageCall(storage, bridge: bridge, method: method, argsJSON: args, reply: reply)

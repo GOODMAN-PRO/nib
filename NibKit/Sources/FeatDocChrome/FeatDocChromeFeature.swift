@@ -229,7 +229,8 @@ struct RenameDocumentDraft {
             throw NibError.invalid(String(localized: "The document title changed while Rename was open. Cancel and reopen Rename to use its latest title."))
         }
         _ = try await context.app.bus.execute(CommandIDs.libraryRename,
-            ["ref": .string(NodeRef.document(document).description), "title": .string(trimmed)], session: context.session)
+            ["ref": .string(NodeRef.document(document).description), "title": .string(trimmed),
+             "expectedTitle": .string(originalTitle)], session: context.session)
     }
 }
 

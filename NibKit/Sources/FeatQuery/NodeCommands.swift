@@ -652,6 +652,7 @@ struct ItemUpdate: NibCommand {
     struct Params: Codable {
         var ref: String
         var patch: JSONValue
+        var expectedText: RichText?
     }
 
     struct Output: Codable {
@@ -664,7 +665,8 @@ struct ItemUpdate: NibCommand {
         id: "item.update", title: "Update Item",
         summary: "Patch an item's fields (style, frame, text, ext…; payload fields may be given directly); stroke points need {fmt, pts} and replace the array.",
         params: .obj(["ref": .ref,
-                      "patch": .obj([:], required: [], "e.g. {\"frame\": {\"w\": 300}}, {\"text\": \"Hi\"}, {\"stroke\": {\"fmt\": \"xy\", \"pts\": […]}}")],
+                      "patch": .obj([:], required: [], "e.g. {\"frame\": {\"w\": 300}}, {\"text\": \"Hi\"}, {\"stroke\": {\"fmt\": \"xy\", \"pts\": […]}}"),
+                      "expectedText": .anything("optional RichText baseline; conflicts if the current text differs")],
                      required: ["ref", "patch"]),
         examples: [
             try! JSONValue.parse(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01", "patch": {"stroke": {"fmt": "xy", "pts": [72, 140, 150, 170, 230, 140]}}}"#),
@@ -682,14 +684,28 @@ struct ItemUpdate: NibCommand {
         }
         try Shapes.requireUnlocked(doc, ctx)
         try Shapes.rejectProtected(patch, keys: Shapes.protectedFields, path: "$.patch", ctx)
-        let old = try ctx.workspace.item(doc, page: page, id: id)
-        var routed = Edits.route(patch, kind: old.kind)
-        Shapes.unref(&routed, ["attachedTo"])
-        if let stroke = routed["stroke"]?.objectValue {
-            try Shapes.checkStrokePoints(stroke, path: patch["pts"] != nil ? "$.patch" : "$.patch.stroke")
+        @MainActor func patched(_ old: Item) throws -> Item {
+            if let expected = p.expectedText, (old.text?.text ?? old.sticky?.text) != expected {
+                throw NibError(.conflict, String(localized: "This text changed elsewhere. Reopen the editor to review the latest text before saving."))
+            }
+            var routed = Edits.route(patch, kind: old.kind)
+            Shapes.unref(&routed, ["attachedTo"])
+            if let stroke = routed["stroke"]?.objectValue {
+                try Shapes.checkStrokePoints(stroke, path: patch["pts"] != nil ? "$.patch" : "$.patch.stroke")
+            }
+            return try Edits.patchItem(old, routed, path: "$.patch")
         }
-        let new = try Edits.patchItem(old, routed, path: "$.patch")
-        let changed = try Edits.write(old, new, doc: doc, page: page, ctx)
-        return Output(ref: NodeRef.item(doc, page, id).description, changed: changed, bbox: new.bounds)
+        let existing = try ctx.workspace.item(doc, page: page, id: id)
+        if try patched(existing) == existing {
+            return Output(ref: NodeRef.item(doc, page, id).description, changed: false, bbox: existing.bounds)
+        }
+        return try ctx.mutate { tx in
+            let old = try tx.item(doc, page: page, id: id)
+            // Recheck the baseline and apply the patch to the transaction's current item.
+            let new = try patched(old)
+            let changed = new != old
+            if changed { try tx.put(new, doc: doc, page: page) }
+            return Output(ref: NodeRef.item(doc, page, id).description, changed: changed, bbox: new.bounds)
+        }
     }
 }

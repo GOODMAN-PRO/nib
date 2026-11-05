@@ -2547,10 +2547,24 @@ final class FeatCanvasTests: XCTestCase {
                              "The regression must start with a recovery control below the visible paper")
         for action in actions {
             let target = try XCTUnwrap(action.view)
+            // SwiftUI can publish the native target before assigning its final bounds.
+            error.setNeedsLayout()
+            error.layoutIfNeeded()
+            error.hosting.view.layoutIfNeeded()
+            XCTAssertFalse(target.bounds.isEmpty, "Lay out the recovery target before scrolling to it")
             error.viewport.scrollRectToVisible(target.convert(target.bounds, to: error.viewport), animated: false)
-            for _ in 0..<5 { error.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            for _ in 0..<5 {
+                error.layoutIfNeeded(); error.hosting.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
             let frame = target.convert(target.bounds, to: error)
-            XCTAssertTrue(error.bounds.insetBy(dx: -1, dy: -1).contains(frame), "Show the whole recovery button")
+            let fitted = error.hosting.sizeThatFits(in: CGSize(width: error.viewport.bounds.width,
+                                                             height: CGFloat.greatestFiniteMagnitude))
+            let geometry = "button=\(frame), error=\(error.bounds), host=\(error.hosting.view.frame), fitted=\(fitted)"
+            let scrolling = "viewport=\(error.viewport.bounds), content=\(error.viewport.contentSize)"
+            let insets = "adjusted=\(error.viewport.adjustedContentInset), safe=\(vc.view.safeAreaInsets), paper=\(visiblePaper)"
+            XCTAssertTrue(error.bounds.insetBy(dx: -1, dy: -1).contains(frame),
+                          "Show the whole recovery button: \(geometry); \(scrolling); \(insets)")
             let point = target.convert(CGPoint(x: target.bounds.midX, y: target.bounds.midY), to: window)
             let hit = try XCTUnwrap(window.hitTest(point, with: nil))
             XCTAssertTrue(hit === target || hit.isDescendant(of: target), "Recovery receives the touch instead of the canvas")

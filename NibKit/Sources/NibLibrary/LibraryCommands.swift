@@ -1115,6 +1115,7 @@ struct LibraryRename: NibCommand {
     struct Params: Codable {
         var ref: String
         var title: String
+        var expectedTitle: String?
     }
     struct Output: Codable {
         var ref: String
@@ -1124,13 +1125,20 @@ struct LibraryRename: NibCommand {
     static let descriptor = CommandDescriptor(
         id: CommandIDs.libraryRename, title: "Rename",
         summary: "Rename a document or folder (the title is its file name; a clash in the folder gets a number).",
-        params: .obj(["ref": .str("doc:<id> or folder:<id>"), "title": .str("new name")], required: ["ref", "title"]),
+        params: .obj(["ref": .str("doc:<id> or folder:<id>"), "title": .str("new name"),
+                      "expectedTitle": .str("optional exact title seen before editing; rejects a concurrent rename")],
+                     required: ["ref", "title"]),
         examples: [["ref": "doc:FIXTUREDOC01", "title": "Physics notes"], ["ref": "folder:FIXTUREFLD01", "title": "Coursework"]],
         effect: .library, target: .library)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let library = try ctx.services.require(ctx.services.library, "the library")
         let node = try LibraryRefs.node(p.ref, library, ctx, path: "$.ref")
+        // No suspension between this comparison and the synchronous library mutation.
+        if let expected = p.expectedTitle, node.title != expected {
+            throw NibError.invalid(String(localized: "The title changed while Rename was open. Your draft has been kept. Cancel and reopen Rename to use the latest title."),
+                                   path: "$.expectedTitle")
+        }
         let title = p.title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { throw NibError.invalid("title must not be empty", path: "$.title") }
         if ctx.dryRun { return Output(ref: LibraryRefs.ref(node), title: title) }

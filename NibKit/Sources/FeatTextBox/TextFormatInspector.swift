@@ -987,7 +987,7 @@ private struct TextParagraphSection: View {
                     .accessibilityElement(children: .contain)
                     .accessibilityLabel(String(localized: "Alignment"))
                 Text(String(localized: "Line Spacing"))
-                    .font(NibFont.footnote)
+                    .font(NibFont.footnoteEmphasis)
                     .foregroundStyle(NibColor.labelSecondary)
                     .accessibilityHidden(true)
                 NibSegmentedControl(selection: Binding(get: { model.state.lineSpacingOption }, set: { model.setLineSpacing($0) }),

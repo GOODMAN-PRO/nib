@@ -43,7 +43,7 @@ enum WhiteboardGrids {
         }
     }
 
-    static let dots = board(TemplateIDs.whiteboardDots, "Whiteboard Dots", order: 500, spacing: baseSpacing) { c, s, f in
+    static let dots = board(TemplateIDs.whiteboardDots, String(localized: "Whiteboard Dots"), order: 500, spacing: baseSpacing) { c, s, f in
         let ink = c.style.strong
         let r = 1.6 / c.scale  // constant on screen
         if f > WhiteboardGrids.invisible {
@@ -58,7 +58,7 @@ enum WhiteboardGrids {
         }
     }
 
-    static let grid = board(TemplateIDs.whiteboardGrid, "Whiteboard Grid", order: 510, spacing: baseSpacing) { c, s, f in
+    static let grid = board(TemplateIDs.whiteboardGrid, String(localized: "Whiteboard Grid"), order: 510, spacing: baseSpacing) { c, s, f in
         let minor = c.style.line, major = c.style.strong
         let px = 1 / c.scale
         if f > WhiteboardGrids.invisible {
@@ -80,7 +80,7 @@ enum WhiteboardGrids {
         }
     }
 
-    static let lines = board(TemplateIDs.whiteboardLines, "Whiteboard Lines", order: 520, spacing: baseSpacing * 1.5) { c, s, f in
+    static let lines = board(TemplateIDs.whiteboardLines, String(localized: "Whiteboard Lines"), order: 520, spacing: baseSpacing * 1.5) { c, s, f in
         let px = 1 / c.scale
         if f > WhiteboardGrids.invisible {
             c.latticeH(spacing: s / 2, color: c.style.line.withAlpha(c.style.line.alpha * f), width: px)

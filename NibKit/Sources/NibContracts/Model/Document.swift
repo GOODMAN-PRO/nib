@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 // MARK: - Last-writer-wins records
 
@@ -10,6 +11,14 @@ public protocol LWWRecord: Codable, Equatable {
 }
 
 public enum LWW {
+    /// Stable identity of a merged record set, including tombstones. A maximum revision alone misses writes
+    /// that win for one record but predate another record. Does not encode the (potentially large) payloads.
+    public static func fingerprint<T: LWWRecord>(_ records: [T]) -> String {
+        let versions = records.map { $0.id.raw + ":" + $0.rev.description + ($0.deleted ? ":d" : ":l") }.sorted()
+        let digest = SHA256.hash(data: Data(versions.joined(separator: "\n").utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
     /// Merges `incoming` into `base` by id keeping the higher rev (far-future revs are distrusted, see `Rev.effective`).
     /// Order: base order, new records appended.
     public static func merge<T: LWWRecord>(_ base: [T], _ incoming: [T]) -> [T] {

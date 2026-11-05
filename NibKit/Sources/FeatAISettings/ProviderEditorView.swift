@@ -320,14 +320,10 @@ struct ProviderEditorView: View {
                 guard let runtime = app.services.get(ProviderSettingsRuntime.serviceKey, as: ProviderSettingsRuntime.self) else {
                     throw NibError.unavailable("Provider settings are unavailable. Open Settings again.")
                 }
-                try await runtime.saveFromSettings(config, key: replaceKey || !key.isEmpty ? key : nil, app: app)
-                savedConfig = config; draft = ProviderDraft(config: config)
-                key = ""; replaceKey = false
-                let result = try await app.bus.execute(CommandIDs.aiProviderList, ["id": .string(config.id.uuidString)])
-                let rows = try result.decode(ProviderList.Output.self)
-                if let row = rows.providers.first(where: { $0.id == config.id }) {
-                    hasCredentials = row.hasCredentials; credentialsMissing = row.credentialsMissing
-                }
+                let row = try await runtime.saveFromSettings(config, key: replaceKey || !key.isEmpty ? key : nil,
+                                                            app: app, expected: savedConfig)
+                savedConfig = row.config; draft = ProviderDraft(config: row.config)
+                hasCredentials = row.hasCredentials; credentialsMissing = row.credentialsMissing
                 key = ""; replaceKey = false
                 message = String(localized: "Provider saved."); failed = false
             } catch is CancellationError { }

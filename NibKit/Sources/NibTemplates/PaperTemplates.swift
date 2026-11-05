@@ -432,10 +432,10 @@ enum PaperTemplates {
 
     // Essentials
 
-    static let blank = TemplateFactory.paper(TemplateIDs.blank, "Blank", category: "Essentials", order: 100,
+    static let blank = TemplateFactory.paper(TemplateIDs.blank, String(localized: "Blank"), category: "Essentials", order: 100,
                                              params: [ParamSpec.paper]) { _ in }
 
-    static let dots = TemplateFactory.paper(TemplateIDs.dots, "Dot Grid", category: "Essentials", order: 110,
+    static let dots = TemplateFactory.paper(TemplateIDs.dots, String(localized: "Dot Grid"), category: "Essentials", order: 110,
                                             params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(4, 60)],
                                             defaults: [TemplateParamNames.spacing: .number(5 * mm)],
                                             metrics: PaperMetrics.lattice(5 * mm, in: 4...60)) { c in
@@ -443,7 +443,7 @@ enum PaperTemplates {
         c.dots(c.page, spacing: s, radius: min(0.9, 1.8 / c.scale), color: c.style.strong)
     }
 
-    static let grid = TemplateFactory.paper(TemplateIDs.grid, "Grid", category: "Essentials", order: 120,
+    static let grid = TemplateFactory.paper(TemplateIDs.grid, String(localized: "Grid"), category: "Essentials", order: 120,
                                             params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(4, 60)],
                                             defaults: [TemplateParamNames.spacing: .number(5 * mm)],
                                             metrics: PaperMetrics.lattice(5 * mm, in: 4...60)) { c in
@@ -453,7 +453,7 @@ enum PaperTemplates {
     }
 
     /// Engineering graph paper: a minor grid with a heavier line every fifth cell.
-    static let graph = TemplateFactory.paper(TemplateIDs.graph, "Graph Paper", category: "Essentials", order: 130,
+    static let graph = TemplateFactory.paper(TemplateIDs.graph, String(localized: "Graph Paper"), category: "Essentials", order: 130,
                                              params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(2, 30)],
                                              defaults: [TemplateParamNames.spacing: .number(5 * mm)],
                                              metrics: PaperMetrics.lattice(5 * mm, in: 2...30, period: 5)) { c in
@@ -466,7 +466,7 @@ enum PaperTemplates {
 
     /// Triangular lattice: vertical lines plus two families at ±30°, sharing intersections. It repeats every
     /// spacing·√3 across and every spacing down, and has no square grid to snap to.
-    static let isometric = TemplateFactory.paper(TemplateIDs.isometric, "Isometric", category: "Essentials", order: 140,
+    static let isometric = TemplateFactory.paper(TemplateIDs.isometric, String(localized: "Isometric"), category: "Essentials", order: 140,
                                                  params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(8, 60)],
                                                  defaults: [TemplateParamNames.spacing: .number(7 * mm)],
                                                  metrics: { p, _ in
@@ -490,7 +490,7 @@ enum PaperTemplates {
     }
 
     /// 16:9 frames with caption lines: 2 × 3 in portrait, 3 × 2 in landscape.
-    static let storyboard = TemplateFactory.paper("builtin.storyboard", "Storyboard", category: "Essentials", order: 150,
+    static let storyboard = TemplateFactory.paper("builtin.storyboard", String(localized: "Storyboard"), category: "Essentials", order: 150,
                                                   params: [ParamSpec.paper, ParamSpec.line]) { c in
         let m = Layout.margin(c)
         let cols = c.isLandscape ? 3 : 2, rows = c.isLandscape ? 2 : 3
@@ -517,7 +517,7 @@ enum PaperTemplates {
     static func ruledFirstRule(_ s: Double) -> Double { max(s * 3, 36) }
 
     static let ruledNarrow = TemplateFactory.paper(
-        TemplateIDs.ruledNarrow, "Narrow Ruled", category: "Writing", order: 200, params: lined,
+        TemplateIDs.ruledNarrow, String(localized: "Narrow Ruled"), category: "Writing", order: 200, params: lined,
         defaults: [TemplateParamNames.spacing: 20, TemplateParamNames.margin: 0], zoomReturnHeight: 20,
         metrics: PaperMetrics.ruled(spacing: 20, margin: 0, firstRule: ruledFirstRule)) { c in
         Layout.ruled(&c, spacing: c.number(TemplateParamNames.spacing, 20, in: 12...60),
@@ -526,7 +526,7 @@ enum PaperTemplates {
 
     /// The default paper (`NibSettings.defaultPaper`).
     static let ruledCollege = TemplateFactory.paper(
-        TemplateIDs.ruled, "College Ruled", category: "Writing", order: 210, params: lined,
+        TemplateIDs.ruled, String(localized: "College Ruled"), category: "Writing", order: 210, params: lined,
         defaults: [TemplateParamNames.spacing: 24.7, TemplateParamNames.margin: .number(25 * mm)], zoomReturnHeight: 24.7,
         metrics: PaperMetrics.ruled(spacing: 24.7, margin: 25 * mm, firstRule: ruledFirstRule)) { c in
         Layout.ruled(&c, spacing: c.number(TemplateParamNames.spacing, 24.7, in: 12...60),
@@ -534,7 +534,7 @@ enum PaperTemplates {
     }
 
     static let ruledWide = TemplateFactory.paper(
-        TemplateIDs.ruledWide, "Wide Ruled", category: "Writing", order: 220, params: lined,
+        TemplateIDs.ruledWide, String(localized: "Wide Ruled"), category: "Writing", order: 220, params: lined,
         defaults: [TemplateParamNames.spacing: .number(10 * mm), TemplateParamNames.margin: 0], zoomReturnHeight: 10 * mm,
         metrics: PaperMetrics.ruled(spacing: 10 * mm, margin: 0, firstRule: ruledFirstRule)) { c in
         Layout.ruled(&c, spacing: c.number(TemplateParamNames.spacing, 10 * mm, in: 12...60),
@@ -543,7 +543,7 @@ enum PaperTemplates {
 
     /// Yellow legal pad: rules, a double header rule and a double margin line (3 pt apart).
     static let legalPad = TemplateFactory.paper(
-        TemplateIDs.legalPad, "Legal Pad", category: "Writing", order: 230, params: lined,
+        TemplateIDs.legalPad, String(localized: "Legal Pad"), category: "Writing", order: 230, params: lined,
         defaults: [TemplateParamNames.paper: .string(RGBA.paperYellow.hex), TemplateParamNames.spacing: 24.7,
                    TemplateParamNames.margin: 88],
         zoomReturnHeight: 24.7,
@@ -562,7 +562,7 @@ enum PaperTemplates {
 
     /// Handwriting practice: top line, dashed midline and baseline per row (row pitch 1.5 × spacing).
     static let handwriting = TemplateFactory.paper(
-        "builtin.handwriting", "Handwriting Practice", category: "Writing", order: 240,
+        "builtin.handwriting", String(localized: "Handwriting Practice"), category: "Writing", order: 240,
         params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(18, 80)],
         defaults: [TemplateParamNames.spacing: 36], zoomReturnHeight: 54,
         metrics: PaperMetrics.rows(36, in: 18...80, pitch: 1.5)) { c in
@@ -579,7 +579,7 @@ enum PaperTemplates {
 
     /// Cornell notes: header, cue column, notes and a summary band.
     static let cornell = TemplateFactory.paper(
-        TemplateIDs.cornell, "Cornell Notes", category: "Writing", order: 250,
+        TemplateIDs.cornell, String(localized: "Cornell Notes"), category: "Writing", order: 250,
         params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(12, 60)],
         defaults: [TemplateParamNames.spacing: 24.7], zoomReturnHeight: 24.7,
         metrics: PaperMetrics.rows(24.7, in: 12...60)) { c in
@@ -600,7 +600,7 @@ enum PaperTemplates {
     }
 
     static let checklist = TemplateFactory.paper(
-        "builtin.checklist", "Checklist", category: "Writing", order: 260,
+        "builtin.checklist", String(localized: "Checklist"), category: "Writing", order: 260,
         params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(18, 60)],
         defaults: [TemplateParamNames.spacing: 28], zoomReturnHeight: 28,
         metrics: PaperMetrics.rows(28, in: 18...60)) { c in
@@ -611,7 +611,7 @@ enum PaperTemplates {
 
     /// To-do list: title and date, a task column with checkboxes and a Due column.
     static let todo = TemplateFactory.paper(
-        "builtin.todo", "To-Do List", category: "Writing", order: 270,
+        "builtin.todo", String(localized: "To-Do List"), category: "Writing", order: 270,
         params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(18, 60)],
         defaults: [TemplateParamNames.spacing: 28], zoomReturnHeight: 28,
         metrics: PaperMetrics.rows(28, in: 18...60)) { c in
@@ -633,8 +633,8 @@ enum PaperTemplates {
 
     // Music
 
-    static let music = staffPaper("builtin.music", "Music Staff", order: 400, lines: 5, staves: 10, tab: false)
-    static let tablature = staffPaper("builtin.tablature", "Guitar Tablature", order: 410, lines: 6, staves: 8, tab: true)
+    static let music = staffPaper("builtin.music", String(localized: "Music Staff"), order: 400, lines: 5, staves: 10, tab: false)
+    static let tablature = staffPaper("builtin.tablature", String(localized: "Guitar Tablature"), order: 410, lines: 6, staves: 8, tab: true)
 
     /// Evenly distributed staves of `lines` lines with bar lines at both ends (tablature adds a T-A-B clef).
     static func staffPaper(_ id: String, _ title: String, order: Int, lines: Int, staves: Double, tab: Bool) -> TemplateDefinition {

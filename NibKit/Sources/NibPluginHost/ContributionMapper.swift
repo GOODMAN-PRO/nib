@@ -1689,19 +1689,23 @@ struct SchemaFieldControl: View {
         case let .number(min, max, integer):
             if let lo = min, let hi = max, lo.isFinite, hi.isFinite, hi > lo,
                (hi - lo).isFinite, (hi - lo) / 100 > 0 {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(verbatim: field.title)
-                        Spacer()
-                        Text(verbatim: PluginNumberField.format(number, integer: integer)).monospacedDigit()
+                if compact {
+                    HStack(spacing: 8) {
+                        Text(verbatim: field.title).fixedSize()
+                        numberSlider(lo: lo, hi: hi, integer: integer).frame(width: 140)
+                        Text(verbatim: PluginNumberField.display(number, integer: integer))
+                            .monospacedDigit().fixedSize()
                     }
-                    Slider(value: $number, in: lo...hi, step: integer ? 1 : (hi - lo) / 100) { editing in
-                        if !editing { commit(field.key, .number(integer ? number.rounded() : number)) }
+                } else {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(verbatim: field.title)
+                            Spacer()
+                            Text(verbatim: PluginNumberField.display(number, integer: integer)).monospacedDigit()
+                        }
+                        numberSlider(lo: lo, hi: hi, integer: integer)
                     }
-                    .accessibilityLabel(Text(verbatim: field.title))
-                    .accessibilityValue(Text(verbatim: PluginNumberField.format(number, integer: integer)))
                 }
-                .frame(minWidth: compact ? 180 : nil)
             } else {
                 textField(keyboard: .numbersAndPunctuation) {
                     PluginNumberField.parse(draft, min: min, max: max, integer: integer)
@@ -1725,6 +1729,14 @@ struct SchemaFieldControl: View {
         case .json:
             textField(keyboard: .default) { try? JSONValue.parse(draft) }
         }
+    }
+
+    private func numberSlider(lo: Double, hi: Double, integer: Bool) -> some View {
+        Slider(value: $number, in: lo...hi, step: integer ? 1 : (hi - lo) / 100) { editing in
+            if !editing { commit(field.key, .number(integer ? number.rounded() : number)) }
+        }
+        .accessibilityLabel(Text(verbatim: field.title))
+        .accessibilityValue(Text(verbatim: PluginNumberField.display(number, integer: integer)))
     }
 
     private func textField(keyboard: UIKeyboardType, parse: @escaping () -> JSONValue?) -> some View {
@@ -1773,14 +1785,85 @@ struct SchemaFieldControl: View {
 
 /// Keep legacy large values readable without converting an untrusted Double with a trapping initializer.
 enum PluginNumberField {
-    static func format(_ n: Double, integer: Bool) -> String {
-        guard n.isFinite, let whole = Int(exactly: n.rounded()) else { return String(format: "%g", n) }
-        if integer || n == n.rounded() { return String(whole) }
-        return String(format: "%.2f", n)
+    /// Compact slider labels and VoiceOver values must not expose binary floating-point noise.
+    /// Editing keeps the separate round-trip formatter below so drafts never round stored values.
+    static func display(_ n: Double, integer: Bool, locale: Locale = .current) -> String {
+        guard n.isFinite else { return String(n) }
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = false
+        formatter.usesSignificantDigits = false
+        formatter.maximumIntegerDigits = 309
+        formatter.maximumFractionDigits = integer ? 0 : 2
+        return formatter.string(from: NSNumber(value: integer ? n.rounded() : n)) ?? String(n)
     }
 
-    static func parse(_ draft: String, min: Double?, max: Double?, integer: Bool) -> JSONValue? {
-        guard let n = Double(draft.replacingOccurrences(of: ",", with: ".")), n.isFinite else { return nil }
+    static func format(_ n: Double, integer: Bool, locale: Locale = .current) -> String {
+        guard n.isFinite else { return String(n) }
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = false
+        formatter.usesSignificantDigits = true
+        formatter.minimumSignificantDigits = 1
+        formatter.maximumSignificantDigits = 17
+        formatter.maximumIntegerDigits = 309
+        formatter.maximumFractionDigits = 340
+        return formatter.string(from: NSNumber(value: integer ? n.rounded() : n)) ?? String(n)
+    }
+
+    static func parse(_ draft: String, min: Double?, max: Double?, integer: Bool,
+                      locale: Locale = .current) -> JSONValue? {
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .decimal
+        let decimal = formatter.decimalSeparator ?? "."
+        let grouping = formatter.groupingSeparator ?? ","
+        // Normalize digits, but validate the entire input before Double conversion. NumberFormatter
+        // alone can accept a valid prefix and silently ignore a malformed suffix or grouping.
+        func withoutDirectionMarks(_ value: String) -> String {
+            value.replacingOccurrences(of: "\u{061C}", with: "")
+                .replacingOccurrences(of: "\u{200E}", with: "")
+                .replacingOccurrences(of: "\u{200F}", with: "")
+        }
+        var text = withoutDirectionMarks(draft.trimmingCharacters(in: .whitespacesAndNewlines))
+        let minus = withoutDirectionMarks(formatter.minusSign ?? "-")
+        let plus = withoutDirectionMarks(formatter.plusSign ?? "+")
+        if !minus.isEmpty { text = text.replacingOccurrences(of: minus, with: "-") }
+        if !plus.isEmpty { text = text.replacingOccurrences(of: plus, with: "+") }
+        text = text.map { character -> String in
+            if let digit = character.wholeNumberValue, (0...9).contains(digit) { return String(digit) }
+            return String(character)
+        }.joined()
+        let exponentParts = text.lowercased().components(separatedBy: "e")
+        guard exponentParts.count <= 2 else { return nil }
+        var mantissa = exponentParts[0]
+        var sign = ""
+        if mantissa.first == "-" || mantissa.first == "+" { sign = String(mantissa.removeFirst()) }
+        let parts = mantissa.components(separatedBy: decimal)
+        guard parts.count <= 2 else { return nil }
+        let groups = parts[0].components(separatedBy: grouping)
+        func digits(_ value: String) -> Bool { !value.isEmpty && value.allSatisfy { $0 >= "0" && $0 <= "9" } }
+        if groups.count > 1 {
+            let primary = Swift.max(1, formatter.groupingSize)
+            let secondary = formatter.secondaryGroupingSize > 0 ? formatter.secondaryGroupingSize : primary
+            guard groups.allSatisfy(digits), groups.last?.count == primary,
+                  (1...secondary).contains(groups[0].count),
+                  groups.dropFirst().dropLast().allSatisfy({ $0.count == secondary }) else { return nil }
+        } else if !parts[0].isEmpty && !digits(parts[0]) { return nil }
+        let whole = groups.joined()
+        let fraction = parts.count == 2 ? parts[1] : ""
+        guard !whole.isEmpty || !fraction.isEmpty, fraction.isEmpty || digits(fraction) else { return nil }
+        var normalized = sign + (whole.isEmpty ? "0" : whole)
+        if parts.count == 2 { normalized += "." + fraction }
+        if exponentParts.count == 2 {
+            var exponent = exponentParts[1]
+            if exponent.first == "-" || exponent.first == "+" { exponent.removeFirst() }
+            guard digits(exponent) else { return nil }
+            normalized += "e" + exponentParts[1]
+        }
+        guard let n = Double(normalized), n.isFinite else { return nil }
         let value = integer ? n.rounded() : n
         if let lo = min, value < lo { return nil }
         if let hi = max, value > hi { return nil }
@@ -1896,13 +1979,15 @@ struct PluginPanelUnavailable: View {
 
 /// A plugin's text-document block: draws `CustomBlock.display` at the block's height; a tap runs the block's command
 /// with {ref} (docs/PLUGIN_API.md §5.9).
-final class PluginBlockView: UIView {
+final class PluginBlockView: UIScrollView {
     private let app: NibApp
     private let session: EditorSession
     private let doc: DocumentID
     private let block: TextBlock
     private let command: String
     private let height: CGFloat
+    private let surface = PluginBlockSurface()
+    private var drawingWidth: CGFloat = 0
 
     @MainActor
     init(context: BlockViewContext, command: String, title: String, defaultHeight: Double) {
@@ -1915,7 +2000,23 @@ final class PluginBlockView: UIView {
         super.init(frame: CGRect(x: 0, y: 0, width: 320, height: height))
         isOpaque = false
         backgroundColor = .clear
-        contentMode = .redraw
+        alwaysBounceVertical = false
+        showsVerticalScrollIndicator = false
+        isDirectionalLockEnabled = true
+        contentInsetAdjustmentBehavior = .never
+        surface.isOpaque = false
+        surface.backgroundColor = .clear
+        surface.contentMode = .redraw
+        surface.drawContent = { [weak self] cg in
+            guard let self = self, let display = self.block.custom?.display else { return }
+            display.draw(in: cg, origin: .zero, assets: self.app.services.assets, doc: self.doc)
+        }
+        for op in block.custom?.display.ops ?? [] {
+            let edge = max(op.rect?.maxX ?? 0, op.points?.map(\.x).max() ?? 0)
+            let padded = edge + max(0, op.width ?? 1) / 2
+            if padded.isFinite { drawingWidth = max(drawingWidth, CGFloat(padded)) }
+        }
+        addSubview(surface)
         isAccessibilityElement = true
         accessibilityLabel = title
         accessibilityTraits = .button
@@ -1928,12 +2029,35 @@ final class PluginBlockView: UIView {
 
     override var intrinsicContentSize: CGSize { CGSize(width: UIView.noIntrinsicMetric, height: height) }
 
-    override func draw(_ rect: CGRect) {
-        guard let cg = UIGraphicsGetCurrentContext(), let display = block.custom?.display else { return }
-        display.draw(in: cg, origin: .zero, assets: app.services.assets, doc: doc)
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let size = CGSize(width: max(bounds.width, drawingWidth), height: height)
+        surface.frame = CGRect(origin: .zero, size: size)
+        if contentSize != size { contentSize = size }
+        let offset = min(max(0, contentOffset.x), max(0, size.width - bounds.width))
+        if contentOffset.x != offset { contentOffset.x = offset }
+    }
+
+    override func accessibilityScroll(_ direction: UIAccessibilityScrollDirection) -> Bool {
+        guard direction == .left || direction == .right else { return super.accessibilityScroll(direction) }
+        let delta = direction == .left ? bounds.width : -bounds.width
+        let offset = min(max(0, contentOffset.x + delta), max(0, contentSize.width - bounds.width))
+        guard offset != contentOffset.x else { return false }
+        setContentOffset(CGPoint(x: offset, y: 0), animated: false)
+        UIAccessibility.post(notification: .pageScrolled, argument: nil)
+        return true
     }
 
     @objc private func tapped() {
         app.perform(command, ["ref": .string(NodeRef.block(doc, block.id).description)], session: session)
+    }
+}
+
+private final class PluginBlockSurface: UIView {
+    var drawContent: ((CGContext) -> Void)?
+
+    override func draw(_ rect: CGRect) {
+        guard let context = UIGraphicsGetCurrentContext() else { return }
+        drawContent?(context)
     }
 }

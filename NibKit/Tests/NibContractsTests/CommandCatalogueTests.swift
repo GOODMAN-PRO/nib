@@ -28,6 +28,7 @@ final class CommandCatalogueTests: XCTestCase {
         ("ai.chat.rename", CommandIDs.aiChatRename),
         ("ai.chat.delete", CommandIDs.aiChatDelete),
         ("ai.chat.feedback", CommandIDs.aiChatFeedback),
+        ("ai.chat.save", CommandIDs.aiChatSave),
         ("ai.provider.list", CommandIDs.aiProviderList),
         ("ai.provider.save", CommandIDs.aiProviderSave),
         ("ai.provider.activate", CommandIDs.aiProviderActivate),
