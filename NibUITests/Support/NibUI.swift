@@ -961,7 +961,45 @@ final class NibUI {
         try sendHardwareKey(key, modifiers)
     }
 
+    /// Keyboard-page HID usage for the keys XCTest's text-input synthesis cannot produce. typeKey maps characters
+    /// through the keyboard layout: the probe runs 41986732631 and 41990900260 (KeyProbeUITests) showed that
+    /// Escape, Delete and Forward Delete never reach the app that way, with or without text focus, while the
+    /// same keys sent as a HID device event do, and that Return arrives only when sent as a line feed.
+    private func hidUsage(forKey key: String) -> UInt? {
+        if key == XCUIKeyboardKey.escape.rawValue { return 0x29 }
+        if key == XCUIKeyboardKey.delete.rawValue || key == "\u{8}" || key == "\u{7F}" { return 0x2A }
+        if key == XCUIKeyboardKey.forwardDelete.rawValue { return 0x4C }
+        return nil
+    }
+
+    private func sendHIDKey(_ usage: UInt) throws {
+        try XCTContext.runActivity(named: "Hardware key HID usage \(usage)") { _ in
+            let done = XCTestExpectation(description: "HID key delivered")
+            var failure: Error?
+            NibTouchPaths.sendHIDUsage(usage, page: 0x07, duration: 0.05) { error in
+                failure = error; done.fulfill()
+            }
+            guard XCTWaiter.wait(for: [done], timeout: 10) == .completed else {
+                throw Failure.message("HID key synthesis timed out")
+            }
+            if let failure { throw failure }
+        }
+    }
+
     private func sendHardwareKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags) throws {
+        if let usage = hidUsage(forKey: key) {
+            if modifiers.isEmpty {
+                try sendHIDKey(usage)
+                return
+            }
+            // A device event cannot hold a modifier; the typed route below is known not to deliver this key.
+            logQA("Hardware key without a working route", "usage=\(usage) modifiers=\(modifiers.rawValue)")
+        }
+        // The carriage return XCUIKeyboardKey.return carries is dropped; a line feed produces the Return key.
+        try sendTypedKey(key == XCUIKeyboardKey.return.rawValue ? "\n" : key, modifiers)
+    }
+
+    private func sendTypedKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags) throws {
         try XCTContext.runActivity(named: "Hardware key \(key), modifiers \(modifiers.rawValue)") { activity in
             let route = XCTAttachment(string: "route=NibTouchPaths key=\(key) modifiers=\(modifiers.rawValue); SPI route is in runner log")
             route.lifetime = .keepAlways; activity.add(route)
@@ -1362,7 +1400,12 @@ final class NibUI {
                 let attachment = XCTAttachment(string: "route=XCUIElement.typeKey field=\(field.label) key=\(key) modifiers=\(modifiers.rawValue) probe=\(probe.value ?? "missing")")
                 attachment.lifetime = .keepAlways; activity.add(attachment)
             }
-            field.typeKey(key, modifierFlags: modifiers)
+            if modifiers.isEmpty, let usage = hidUsage(forKey: key) {
+                // XCUIElement.typeKey cannot produce Escape or Delete either (see hidUsage(forKey:)).
+                try sendHIDKey(usage)
+            } else {
+                field.typeKey(key == XCUIKeyboardKey.return.rawValue ? "\n" : key, modifierFlags: modifiers)
+            }
         }
     }
 
