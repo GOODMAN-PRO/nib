@@ -242,6 +242,57 @@ final class LessonManagerTests: XCTestCase {
         XCTAssertNil(store.saveError(doc))
     }
 
+    func testPrivateSaveStatusDoesNotWaitForTheNextWrite() async throws {
+        try await assertPrivateSaveDoesNotWaitForTheNextWrite(failFirst: true)
+    }
+
+    func testSuccessfulPrivateSaveDoesNotWaitForTheNextWrite() async throws {
+        try await assertPrivateSaveDoesNotWaitForTheNextWrite(failFirst: false)
+    }
+
+    private func assertPrivateSaveDoesNotWaitForTheNextWrite(failFirst: Bool) async throws {
+        let h = harness()
+        let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
+        let blocked = expectation(description: "second save is writing")
+        let reported = failFirst ? expectation(description: "first save reports on main while second is blocked") : nil
+        let writer = BlockingPrivateSave(started: blocked, failFirst: failFirst)
+        defer { writer.release() }
+        let store = PrivateLessonPersistence(base: h.persistence,
+            root: h.persistence.root.appendingPathComponent("blocked-private-save"),
+            write: { try writer.write($0, url: $1) },
+            report: { _, error in if error != nil { reported?.fulfill() } })
+        var head = DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook))
+        try store.seed(LessonSnapshot(content: head, items: [:]))
+        head.meta.layers[0].name = "First edit"
+        store.didChange(doc, head: head, pages: [:])
+        head.meta.layers[0].name = "Second edit"
+        store.didChange(doc, head: head, pages: [:])
+        var waiting = [blocked]
+        if let reported { waiting.append(reported) }
+        await fulfillment(of: waiting, timeout: 1)
+        let responsive = expectation(description: "main queue responds while second write is blocked")
+        DispatchQueue.main.async { responsive.fulfill() }
+        await fulfillment(of: [responsive], timeout: 1)
+        // With writer.sync in the callback, the main actor cannot reach here until the
+        // writer's bounded gate times out. Do not rely solely on XCTest's timeout timer.
+        XCTAssertFalse(writer.timedOut)
+        writer.release()
+        store.flush(doc)
+        XCTAssertNil(store.saveError(doc))
+        XCTAssertEqual(try store.loadHead(doc), head)
+    }
+
+    func testMissingPrivateSnapshotReportsLoadFailure() {
+        let h = harness()
+        let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
+        var reported: [String] = []
+        let store = PrivateLessonPersistence(base: h.persistence,
+            root: h.persistence.root.appendingPathComponent("missing-private-snapshot"),
+            report: { _, error in if let error { reported.append(error) } })
+        store.didChange(doc, head: nil, pages: [:])
+        XCTAssertEqual(reported, [String(localized: "The existing private notes could not be loaded, so this edit was not saved. Reopen the document and try again.")])
+    }
+
     func testFailedPrivateSaveRetainsSnapshotReportsAndRetriesOnFlush() throws {
         let h = harness()
         let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
@@ -747,6 +798,30 @@ private final class PrivateSaveFailureSwitch {
     func write(_ snapshot: LessonSnapshot, url: URL) throws {
         lock.lock(); let fail = failing; lock.unlock()
         if fail { throw NibError.unavailable("disk full") }
+        try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+    }
+}
+
+private final class BlockingPrivateSave {
+    let started: XCTestExpectation
+    let failFirst: Bool
+    private let gate = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var writes = 0
+    private var didTimeOut = false
+    var timedOut: Bool { lock.lock(); defer { lock.unlock() }; return didTimeOut }
+    init(started: XCTestExpectation, failFirst: Bool) { self.started = started; self.failFirst = failFirst }
+    func release() { gate.signal() }
+    func write(_ snapshot: LessonSnapshot, url: URL) throws {
+        // Seed and saves all run on the same serial writer queue.
+        writes += 1
+        if writes == 2 && failFirst { throw NibError.unavailable("first save failed") }
+        if writes == 3 {
+            started.fulfill()
+            if gate.wait(timeout: .now() + 3) != .success {
+                lock.lock(); didTimeOut = true; lock.unlock()
+            }
+        }
         try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
     }
 }

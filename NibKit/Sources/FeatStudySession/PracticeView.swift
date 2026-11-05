@@ -330,7 +330,7 @@ struct StudySessionView: View {
     @GestureState private var dragActive = false
     @State private var dragState = StudyCardDragState()
     @State private var swipeOffset = CGSize.zero
-    private var drag: CGSize { swiping ? swipeOffset : (dragActive ? dragState.offset : .zero) }
+    private var drag: CGSize { swiping ? swipeOffset : dragState.offset }
     @State private var swiping = false
     @State private var resetConfirmed = false
     @State private var optionsPresented = false
@@ -468,29 +468,33 @@ struct StudySessionView: View {
             guard !model.busy, !swiping else { return }
             dragState.changed(value.translation, reduceMotion: reduceMotion)
         }.onEnded { value in
-            dragState.ended {
-                guard !model.busy, !swiping else { return }
-                let travel = value.predictedEndTranslation.width
-                if abs(travel) > size.width / 4 {
-                    if model.flipped, !model.readOnly {
-                        if reduceMotion { model.grade(travel > 0 ? .good : .again) }
-                        else {
-                            swipeOffset = value.translation
-                            swiping = true
-                            withAnimation(NibMotion.sheet.animation, completionCriteria: .logicallyComplete) {
-                                swipeOffset = CGSize(width: travel > 0 ? max(travel, size.width) : min(travel, -size.width), height: value.predictedEndTranslation.height)
-                            } completion: {
-                                if model.current?.id == card.id { model.grade(travel > 0 ? .good : .again) }
-                                swiping = false
-                                var transaction = Transaction(); transaction.disablesAnimations = true
-                                withTransaction(transaction) { swipeOffset = .zero }
+            withAnimation(reduceMotion ? nil : NibMotion.slot.animation) {
+                dragState.ended {
+                    guard !model.busy, !swiping else { return }
+                    let travel = value.predictedEndTranslation.width
+                    if abs(travel) > size.width / 4 {
+                        if model.flipped, !model.readOnly {
+                            if reduceMotion { model.grade(travel > 0 ? .good : .again) }
+                            else {
+                                swipeOffset = value.translation
+                                swiping = true
+                                withAnimation(NibMotion.sheet.animation, completionCriteria: .logicallyComplete) {
+                                    swipeOffset = CGSize(width: travel > 0 ? max(travel, size.width) : min(travel, -size.width), height: value.predictedEndTranslation.height)
+                                } completion: {
+                                    if model.current?.id == card.id { model.grade(travel > 0 ? .good : .again) }
+                                    swiping = false
+                                    var transaction = Transaction(); transaction.disablesAnimations = true
+                                    withTransaction(transaction) { swipeOffset = .zero }
+                                }
                             }
-                        }
-                    } else if !smartLearn { model.action(travel < 0 ? "next" : "previous", instant: true) }
+                        } else if !smartLearn { model.action(travel < 0 ? "next" : "previous", instant: true) }
+                    }
                 }
             }
         })
-        .onChange(of: dragActive) { _, active in dragState.activityChanged(active) }
+        .onChange(of: dragActive) { _, active in
+            withAnimation(reduceMotion ? nil : NibMotion.slot.animation) { dragState.activityChanged(active) }
+        }
         .onChange(of: card.id) { _, _ in dragState.activityChanged(false) }
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(.isButton)

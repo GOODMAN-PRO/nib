@@ -189,12 +189,20 @@ enum LessonManager {
     }
 }
 
+/// Captured on the writer queue and delivered by value on the main actor.
+private struct PrivateLessonStatusBatch {
+    let sequence: Int
+    let changes: [(DocumentID, String?)]
+}
+
 /// Accessed only on the persistence writer queue. A failed write never consumes its snapshot.
 private final class PrivateLessonWrites {
     var pending: [DocumentID: LessonSnapshot] = [:]
     var errors: [DocumentID: String] = [:]
     var statusChanges: [(DocumentID, String?)] = []
     private var reportedErrors: [DocumentID: String] = [:]
+    private var statusSequence = 0
+    var undeliveredStatus: [PrivateLessonStatusBatch] = []
     let write: (LessonSnapshot, URL) throws -> Void
     init(write: @escaping (LessonSnapshot, URL) throws -> Void) { self.write = write }
     func retry(_ doc: DocumentID, at url: URL) {
@@ -211,6 +219,15 @@ private final class PrivateLessonWrites {
         reportedErrors[doc] = error
         statusChanges.append((doc, error))
     }
+    func drainStatus() -> PrivateLessonStatusBatch? {
+        guard !statusChanges.isEmpty else { return nil }
+        statusSequence += 1
+        let batch = PrivateLessonStatusBatch(sequence: statusSequence, changes: statusChanges)
+        statusChanges.removeAll()
+        // Explicit flush/seed can deliver these before the queued MainActor callback runs.
+        undeliveredStatus.append(batch)
+        return batch
+    }
 }
 
 /// The private Present workspace lives in Application Support, outside every class/library sync folder. It uses
@@ -225,6 +242,7 @@ final class PrivateLessonPersistence: DocumentPersistence {
 
     private let writes: PrivateLessonWrites
     private let report: (DocumentID, String?) -> Void
+    private var deliveredStatusSequence = 0
 
     init(base: DocumentPersistence, root: URL,
          write: @escaping (LessonSnapshot, URL) throws -> Void = { snapshot, url in
@@ -236,12 +254,18 @@ final class PrivateLessonPersistence: DocumentPersistence {
     func pendingSnapshot(_ doc: DocumentID) -> LessonSnapshot? { writer.sync { writes.pending[doc] } }
     func saveError(_ doc: DocumentID) -> String? { writer.sync { writes.errors[doc] } }
     private func reportStatus() {
-        let changes = writer.sync {
-            let changes = writes.statusChanges
-            writes.statusChanges.removeAll()
-            return changes
+        let batches = writer.sync {
+            _ = writes.drainStatus()
+            return writes.undeliveredStatus
         }
-        for (doc, error) in changes { report(doc, error) }
+        for batch in batches { deliverStatus(batch) }
+    }
+    private func deliverStatus(_ batch: PrivateLessonStatusBatch) {
+        guard batch.sequence > deliveredStatusSequence else { return }
+        deliveredStatusSequence = batch.sequence
+        for (doc, error) in batch.changes { report(doc, error) }
+        let writes = self.writes
+        writer.async { writes.undeliveredStatus.removeAll { $0.sequence <= batch.sequence } }
     }
 
     static func reportStatus(_ doc: DocumentID, message: String?, app: NibApp) {
@@ -295,11 +319,17 @@ final class PrivateLessonPersistence: DocumentPersistence {
             writer.async { [weak self] in
                 writes.pending[doc] = value
                 writes.retry(doc, at: url)
-                Task { @MainActor [weak self] in self?.reportStatus() }
+                if writes.drainStatus() != nil {
+                    let batches = writes.undeliveredStatus
+                    Task { @MainActor [weak self] in
+                        for batch in batches { self?.deliverStatus(batch) }
+                    }
+                }
             }
         } catch {
             log.error("Could not load private presentation: \(error.localizedDescription, privacy: .public)")
-            writer.sync { writes.recordStatus(doc, error: error.localizedDescription) }
+            let message = String(localized: "The existing private notes could not be loaded, so this edit was not saved. Reopen the document and try again.")
+            writer.sync { writes.recordStatus(doc, error: message) }
             reportStatus()
         }
     }

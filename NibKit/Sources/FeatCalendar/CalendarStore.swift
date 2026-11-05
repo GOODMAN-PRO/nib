@@ -843,6 +843,9 @@ final class UserNotificationScheduler: NotificationScheduling {
         let pending = await requests.pendingRequests()
         let desired = Set(reminders.map(\.identifier))
         let stale = pending.filter { $0.identifier.hasPrefix(prefix) && !desired.contains($0.identifier) }
+        let existing = Set(pending.map(\.identifier))
+        let hasUnmatchedLegacy = stale.contains { $0.content.userInfo[CalendarReminderNames.stableEventKey] as? String == nil }
+        var added = [String]()
         var failures = 0
         var failedKeys = Set<String>()
         let calendar = Calendar.current
@@ -860,11 +863,18 @@ final class UserNotificationScheduler: NotificationScheduling {
                                                 trigger: UNCalendarNotificationTrigger(dateMatching: when, repeats: false))
             do {
                 try await requests.add(request)
+                if !existing.contains(r.identifier) { added.append(r.identifier) }
             } catch {
                 failures += 1
                 if let key = r.eventKey { failedKeys.insert(key) }
                 calendarLog.error("reminder not scheduled: \(error.localizedDescription, privacy: .public)")
             }
+        }
+        if failures > 0 && hasUnmatchedLegacy {
+            // A moved legacy event cannot be matched to its replacement. Roll back new identifiers
+            // and keep all old requests, including keyed ones whose replacements were rolled back.
+            if !added.isEmpty { requests.remove(added) }
+            throw NibError(.unavailable, String(localized: "Some event reminders could not be scheduled. Try scheduling reminders again."))
         }
         let obsolete = stale.filter { request in
             if let key = request.content.userInfo[CalendarReminderNames.stableEventKey] as? String {
@@ -1005,6 +1015,8 @@ final class CalendarStore: ObservableObject {
     private(set) var startTask: Task<Void, Never>?
 
     private var activeReads: [UUID: DateInterval] = [:]
+    private var readSequences: [UUID: Int] = [:]
+    private var nextReadSequence = 0
     private var supersededReads = Set<UUID>()
     private var accessGeneration = 0
     private var providerStorage: CalendarProvider?
@@ -1212,13 +1224,14 @@ final class CalendarStore: ObservableObject {
         }
         let request = UUID()
         let interval = DateInterval(start: from, end: to)
-        for (id, range) in activeReads where range.start < to && range.end > from {
-            supersededReads.insert(id)
-        }
+        nextReadSequence += 1
+        let sequence = nextReadSequence
+        readSequences[request] = sequence
         activeReads[request] = interval
         isSyncing = true
         defer {
             activeReads[request] = nil
+            readSequences[request] = nil
             supersededReads.remove(request)
             isSyncing = !activeReads.isEmpty
         }
@@ -1246,6 +1259,11 @@ final class CalendarStore: ObservableObject {
         try Task.checkCancellation()
         if lostAccess() { return [] }
         guard isCurrent() else { return events }
+        // Only a published success supersedes older overlapping reads. A failed/cancelled
+        // newer request must leave an older successful read free to refresh the cache.
+        for (id, range) in activeReads where range.start < to && range.end > from {
+            if let older = readSequences[id], older < sequence { supersededReads.insert(id) }
+        }
         lastError = nil
         var names: [String] = []
         for c in calendars where !c.source.isEmpty && !names.contains(c.source) { names.append(c.source) }
@@ -1346,7 +1364,11 @@ final class CalendarStore: ObservableObject {
         do {
             _ = try await load(from: window.start, to: window.end, session: session)
             upcomingLoaded = true
+        } catch is CancellationError {
+            return
         } catch {
+            // The command bus may wrap cancellation before it reaches this UI boundary.
+            guard !Task.isCancelled else { return }
             lastError = NibError.wrap(error)
             refreshAccess()
         }
