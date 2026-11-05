@@ -41,3 +41,11 @@ D:idle-stalls#2 verdict rejects query shape as the proven root cause: unchanged 
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Ink PencilDoubleTapAndSqueezeBindingChoicesPersist | Pencil AX duration | Does latency remain in collection resolution or snapshot/row binding despite fewer queries? |
+
+## C3 - decimal keyboard dismissal
+
+D:escape-and-keyboard#2 and verdict: the inert-header contact removes the floating pad while the docked keyboard and Width focus remain. Only the two existing inertHeader custom-size callers now re-check keyboard existence, re-resolve the visible system Hide key and send at most one additional coordinate tap. Retain the five-second keyboard-gone wait and all dimension/validation assertions. Other dismissal callers are unchanged. CI must show pad removal, the conditional docked-Hide contact, keyboard disappearance, then the exact custom-size results. The second contact's effect on decimal input is inferred from the working Title keyboard route and remains runtime-unverified.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Create CustomSize / InvalidCustomSizePreventsCreation | Decimal keyboard remaining / Width keyboard after docked Hide | Was a docked keyboard still present and did the second observed-state contact remove it? |

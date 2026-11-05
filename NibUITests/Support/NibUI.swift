@@ -1411,6 +1411,23 @@ final class NibUI {
             } else { try hardwareKey(XCUIKeyboardKey.escape.rawValue) }
         }
         inspect("after Hide")
+        // In the custom-size decimal editor the first outside tap dismisses only the floating pad.
+        // A second contact is justified only by a still-present keyboard, never by a fixed delay.
+        if inertHeader != nil, source.keyboards.firstMatch.exists {
+            let hide = source.keyboards.buttons.matching(NSPredicate(
+                format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).allElementsBoundByIndex.prefix(8).first {
+                    hasVisibleFrame($0, in: viewport)
+                }
+            guard let hide else {
+                logQA("Decimal keyboard remaining", source.keyboards.debugDescription)
+                throw Failure.message("Decimal keyboard remains but exposes no visible Hide keyboard key")
+            }
+            let frame = hide.frame
+            logQA("Decimal keyboard remaining", "second contact on Hide keyboard frame=\(frame)")
+            source.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(dx: frame.midX - source.frame.minX, dy: frame.midY - source.frame.minY)).tap()
+            inspect("after docked Hide")
+        }
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
         guard !source.keyboards.firstMatch.exists || XCTWaiter.wait(for: [gone], timeout: 5) == .completed else {
             throw Failure.message("Keyboard did not dismiss after \(route)")
