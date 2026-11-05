@@ -289,6 +289,7 @@ final class ConnectorEditor: CanvasAttachment {
     private var target: Target?
     private var spots: [Spot] = []
     private var drag: Drag?
+    private var committing = false
     private var hovered: Handle?
     private var elements: [String: OverlayElement] = [:]
 
@@ -412,6 +413,8 @@ final class ConnectorEditor: CanvasAttachment {
             render()
             return
         }
+        params["expected"] = try? JSONValue.from(t.connector)
+        committing = true
         let page = t.page
         let call = JSONValue.object(params)
         Task { [weak self, kit] in
@@ -423,6 +426,7 @@ final class ConnectorEditor: CanvasAttachment {
             host.afterNextRender(page: page) { [weak self] in
                 guard let self = self else { return }
                 self.drag = nil
+                self.committing = false
                 self.refresh()
             }
         }
@@ -433,7 +437,8 @@ final class ConnectorEditor: CanvasAttachment {
     private func refresh() {
         guard let host = kit.host else { return }
         let next = ConnectorEditor.selectedConnector(in: host)
-        if target?.item.id != next?.item.id || target?.page != next?.page {
+        if target?.item.id != next?.item.id || target?.page != next?.page
+            || (!committing && target?.connector != next?.connector) {
             if let previous = target, drag?.moved == true { host.setHidden([], page: previous.page) }
             drag = nil
         }

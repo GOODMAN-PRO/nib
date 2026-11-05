@@ -259,6 +259,7 @@ struct ConnectorSetPath: NibCommand {
         var bends: [Point]?
         var from: EndParam?
         var to: EndParam?
+        var expected: ConnectorItem?
     }
 
     static let maxBends = ConnectorRouter.maxBends
@@ -273,6 +274,7 @@ struct ConnectorSetPath: NibCommand {
             "bends": .arr(.point, "every bend / control point in order, in page points"),
             "from": DiagramSchemas.end,
             "to": DiagramSchemas.end,
+            "expected": .anything("optional connector snapshot; reject an edit based on an older connector"),
         ], required: ["ref"]),
         examples: [
             try! JSONValue.parse(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURECON01", "route": "elbow"}"#),
@@ -289,6 +291,9 @@ struct ConnectorSetPath: NibCommand {
         }
         guard !item.locked else {
             throw NibError(.invalidParams, "connector \(id) is locked", path: "$.ref", hint: "unlock it with item.setLocked first")
+        }
+        if let expected = p.expected, expected != c {
+            throw NibError(.conflict, String(localized: "The connector changed. Try moving the handle again."))
         }
         let original = c
         if let r = p.route, r != c.route {

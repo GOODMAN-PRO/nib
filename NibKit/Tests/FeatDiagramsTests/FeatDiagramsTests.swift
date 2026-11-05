@@ -592,6 +592,37 @@ final class FeatDiagramsTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
     }
 
+    func testExternalBendEditDuringDragIsPreserved() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let ref = NodeRef.item(Fixtures.docID, Fixtures.page1, Fixtures.connectorID).description
+        try await h.run(CommandIDs.connectorSetPath, ["ref": .string(ref), "route": "straight",
+                                                     "bends": [[300, 300], [350, 350]]])
+        let original = try connector(h, Fixtures.connectorID)
+        let host = FakeCanvasHost(h)
+        let editor = ConnectorEditor(host: host)
+        editor.attach(to: host)
+        defer { editor.detach(from: host) }
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.connectorID])
+        editor.canvasDidChange(host)
+        editor.touchesBegan(CanvasSample(page: Fixtures.page1, location: Point(300, 300)), host: host)
+        editor.touchesMoved([CanvasSample(page: Fixtures.page1, location: Point(280, 320))], host: host)
+        XCTAssertEqual(host.hidden[Fixtures.page1], [Fixtures.connectorID])
+        try await h.run(CommandIDs.connectorSetPath, ["ref": .string(ref), "bends": [[300, 300], [380, 380]]])
+        editor.canvasDidChange(host)
+        XCTAssertNil(host.hidden[Fixtures.page1])
+        editor.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(280, 320)), host: host)
+        XCTAssertEqual(try connector(h, Fixtures.connectorID).bends, [Point(300, 300), Point(380, 380)])
+        // A queued drag must also reject its old snapshot even before the next canvas refresh.
+        do {
+            try await h.run(CommandIDs.connectorSetPath, ["ref": .string(ref), "bends": [[280, 320], [350, 350]],
+                                                         "expected": try JSONValue.from(original)])
+            XCTFail("A stale connector snapshot must be rejected")
+        } catch {
+            XCTAssertEqual(NibError.wrap(error).code, .conflict)
+        }
+        XCTAssertEqual(try connector(h, Fixtures.connectorID).bends, [Point(300, 300), Point(380, 380)])
+    }
+
     func testConnectorEditorDragsAnEndOntoAnotherItem() async throws {
         let h = Harness(features: [FeatDiagramsFeature.self])
         let host = FakeCanvasHost(h)
