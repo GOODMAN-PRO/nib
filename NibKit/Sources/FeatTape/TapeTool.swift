@@ -302,7 +302,7 @@ final class TapeSettingsModel: ObservableObject {
         let ref = pattern.map { PresetSwatch.tapePatternRef(id: $0) }
         var params: [String: JSONValue] = ["tool": "tape", "index": .number(Double(presets.selectedSwatch)),
                                            "color": .string(colour.hex)]
-        if let ref { params["pattern"] = .string(ref.name) }
+        params["pattern"] = .string(ref?.name ?? "")
         updatePresets(command: "preset.setSwatch", params: .object(params)) { p in
             guard p.swatches.indices.contains(p.selectedSwatch) else { return }
             p.swatches[p.selectedSwatch] = PresetSwatch(color: colour, pattern: ref)
