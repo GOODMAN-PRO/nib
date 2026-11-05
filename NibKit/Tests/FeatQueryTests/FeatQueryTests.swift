@@ -624,6 +624,17 @@ final class FeatQueryTests: XCTestCase {
         }
     }
 
+    func testAssetDeliveryStorageFailureDoesNotReportMissingSource() async throws {
+        let h = harness()
+        h.app.services.assets = FailingDeliveryAssets(base: h.assets)
+        let error = await nibError {
+            try await h.run("asset.get", ["doc": "doc:FIXTUREDOC01", "asset": "fixture-image.png"])
+        }
+        XCTAssertEqual(error?.code, .unavailable)
+        XCTAssertNotNil(error?.hint)
+        XCTAssertEqual(try h.assets.data(AssetRef("fixture-image.png"), doc: Fixtures.docID), Fixtures.pngData)
+    }
+
     func testAssetPutIsAnEditThatIsNotUndoable() async throws {
         let h = harness()
         let d = try XCTUnwrap(h.app.commands.descriptor("asset.put"))
@@ -652,4 +663,16 @@ private final class TabsNavigator: SceneNavigator {
     func showLibrary(folder: FolderID?) {}
     func showSettings(page: String?) {}
     func presentModal(_ viewController: UIViewController) {}
+}
+
+private final class FailingDeliveryAssets: AssetStore {
+    let base: AssetStore
+    init(base: AssetStore) { self.base = base }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { try base.put(data, ext: ext, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef {
+        throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)
+    }
+    func temporaryURL(_ ref: AssetRef) -> URL? { nil }
 }
