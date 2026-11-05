@@ -65,6 +65,11 @@ enum ImageImporter {
                                         background: .ofImage(stored[i].asset)))
             }
             try ctx.mutate(String(localized: "Import Images")) { tx in
+                let current = try tx.content(doc)
+                for id in pageIDs where current.page(id) != nil {
+                    throw NibError(.conflict, "page \(id.raw) already exists in document \(doc.raw)", path: "$.ids",
+                                   hint: "choose other ids, or leave ids out")
+                }
                 try tx.put(placement.rekeyed, doc: doc)
                 _ = try tx.put(pages, doc: doc)
             }
