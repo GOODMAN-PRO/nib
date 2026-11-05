@@ -201,6 +201,29 @@ final class FeatStudySessionTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(doc), 0)
     }
 
+    func testLargeSmartLearnQueueUsesReviewedSetAndResetsWithoutRepeats() throws {
+        let (h, runtime, _) = harness()
+        let model = runtime.model(app: h.app, doc: doc, session: h.session)
+        let keys = FractionalIndex.balanced(count: 5_001)
+        let cards = keys.enumerated().map { i, key in
+            StudyCard(id: NibID("LARGE\(i)"), front: CardFace(), back: CardFace(), order: key)
+        }
+        model.accept(DocumentContent(meta: DocumentMeta(id: doc, kind: .studySet), cards: cards))
+        try model.act("start", mode: "smartLearn", language: nil, instant: true)
+        let order = model.queue
+        for id in order.prefix(5_000) { model.recordGrade(id, rating: .good) }
+        XCTAssertEqual(model.current?.id, order.last)
+        XCTAssertEqual(model.reviewed, Array(order.prefix(5_000)))
+        XCTAssertEqual(model.reviewedIDs, Set(order.prefix(5_000)), "membership is a hash-set lookup, not a scan of the reviewed prefix")
+        model.recordGrade(order[0], rating: .good)
+        XCTAssertEqual(model.reviewed.count, 5_000)
+        XCTAssertEqual(model.current?.id, order.last)
+        try model.act("start", mode: "smartLearn", language: nil, instant: true)
+        XCTAssertTrue(model.reviewedIDs.isEmpty)
+        XCTAssertTrue(model.reviewed.isEmpty)
+        XCTAssertEqual(model.current?.id, order.first)
+    }
+
     func testCardActionsMatchModeRevealNavigationAndBusyState() async throws {
         let (h, runtime, _) = harness()
         let model = runtime.model(app: h.app, doc: doc, session: h.session)

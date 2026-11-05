@@ -64,6 +64,7 @@ final class StudySessionModel: ObservableObject {
     @Published private(set) var flipped = false
     @Published private(set) var mode = "practice"
     @Published private(set) var reviewed: [NibID] = []
+    private(set) var reviewedIDs = Set<NibID>()
     @Published private(set) var hardest: [NibID] = []
     @Published private(set) var language = "en-US"
     @Published private(set) var started = false
@@ -139,7 +140,7 @@ final class StudySessionModel: ObservableObject {
             guard let content else { throw NibError.notFound("study set") }
             self.mode = mode ?? "practice"
             queue = (self.mode == "smartLearn" ? Scheduler.due(liveCards, now: runtime.now()) : liveCards).map(\.id)
-            index = 0; reviewed = []; hardest = []; instantFlip = true; flipped = false; started = true
+            index = 0; reviewed = []; reviewedIDs = []; hardest = []; instantFlip = true; flipped = false; started = true
             self.language = StudyVoiceLanguages.resolve(content.meta.language, installed: voiceLanguages) ?? content.meta.language
             speaker.stop()
         case "flip":
@@ -180,8 +181,8 @@ final class StudySessionModel: ObservableObject {
         guard started, queue.contains(id) else { return }
         if mode == "practice" {
             guard current?.id == id else { return }
-        } else if reviewed.contains(id) { return }
-        if !reviewed.contains(id) { reviewed.append(id) }
+        } else if reviewedIDs.contains(id) { return }
+        if reviewedIDs.insert(id).inserted { reviewed.append(id) }
         if (rating == .again || rating == .hard), !hardest.contains(id) { hardest.append(id) }
         instantFlip = true
         flipped = false; speaker.stop()
@@ -190,7 +191,7 @@ final class StudySessionModel: ObservableObject {
 
     private func moveToDueCard() {
         index = queue.firstIndex { id in
-            !reviewed.contains(id) && cardsByID[id].map { Scheduler.dueDate($0) <= runtime.now() } == true
+            !reviewedIDs.contains(id) && cardsByID[id].map { Scheduler.dueDate($0) <= runtime.now() } == true
         } ?? queue.count
     }
 
