@@ -251,6 +251,39 @@ final class WebDAVMirrorTests: XCTestCase {
         return report
     }
 
+    func testFailedStateCheckpointsReportFailureAndRetryPersistsBaseline() async throws {
+        // Save 1 precedes mutation; save 2 is either a periodic checkpoint or the final baseline.
+        for (failAt, checkpointEvery) in [(1, 50), (2, 50), (2, 1)] {
+            let server = FakeDAVServer.install()
+            let root = DAVTest.tempDir("checkpoint-library")
+            let directory = DAVTest.tempDir("checkpoint-state")
+            try DAVTest.write(root, "Book.nibnote/doc.0000000a.json", "head")
+            var saves = 0
+            let store = MirrorStateStore(directory: directory, key: "0000000a") { data, url in
+                saves += 1
+                if saves >= failAt { throw CocoaError(.fileWriteOutOfSpace) }
+                try data.write(to: url, options: .atomic)
+            }
+            let run = WebDAVMirrorRun(client: try DAVTest.client(server), root: root, store: store,
+                                      deviceHex: "0000000a", lockedPackages: [])
+            run.checkpointEvery = checkpointEvery
+            let report = await run.run()
+            XCTAssertNotNil(report.failure)
+            XCTAssertFalse(report.errors.isEmpty)
+            XCTAssertNil(store.load().lastSync)
+            if failAt == 1 {
+                XCTAssertEqual(server.requestCount("PUT"), 0)
+                XCTAssertEqual(server.requestCount("MKCOL"), 0)
+            }
+
+            let retry = try await sync(server, root, directory, "0000000a")
+            XCTAssertNil(retry.failure)
+            let saved = store.load()
+            XCTAssertNotNil(saved.lastSync)
+            XCTAssertFalse(saved.entries.isEmpty)
+        }
+    }
+
     func testTwoDevicesMirrorAddsEditsMovesAndDeletes() async throws {
         let server = FakeDAVServer.install()
         let a = DAVTest.tempDir("A"), b = DAVTest.tempDir("B")
