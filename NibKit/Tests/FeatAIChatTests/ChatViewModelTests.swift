@@ -12,9 +12,12 @@ final class ChatViewModelTests: XCTestCase {
             let other = Harness()
             installProposalEdits(h)
             let edit: JSONValue = ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "text": "Kept edit"]
+            // Built in steps: a nested literal inside a tuple inside a conditional exceeds what the type checker infers.
+            let change: JSONValue = .object(["command": .string("test.proposedEdit"), "params": edit])
+            let proposed: JSONValue = .object(["changes": .array([change])])
             let calls: [(command: String, params: JSONValue)] = proposal
-                ? [(ChatCommand.propose, ["changes": [["command": "test.proposedEdit", "params": edit]]])]
-                : [("test.proposedEdit", edit)]
+                ? [(command: ChatCommand.propose, params: proposed)]
+                : [(command: "test.proposedEdit", params: edit)]
             let provider = FakeAIService(responses: [.init(text: "Final saved answer", toolCalls: calls)], bus: h.app.bus)
             let destination = h.library.metadataURL.appendingPathComponent("successful-switch.jsonl")
             try FileManager.default.createDirectory(at: h.library.metadataURL, withIntermediateDirectories: true)

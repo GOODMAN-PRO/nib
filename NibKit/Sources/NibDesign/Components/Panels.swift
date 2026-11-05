@@ -43,12 +43,14 @@ public struct NibPopoverPanel<Content: View>: View {
                 .padding(NibSpacing.l)
                 .frame(width: min(width, viewport.width))
                 .frame(height: min(maxHeight, NibMetrics.popoverMaxHeight, viewport.height))
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel(title)
             }
         }
         .scrollDisabled(!isPresented)
         .allowsHitTesting(isPresented)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(title)
+        // A scrolling panel names its scroll view (see `NibScrollView(label:)`): tools and UI tests find a
+        // popover as the scroll view that carries its title.
         .accessibilityHidden(!isPresented)
     }
 
@@ -70,7 +72,7 @@ public struct NibPopoverPanel<Content: View>: View {
     }
 
     private func scrollingContent(isPresented: Bool) -> some View {
-        NibScrollView {
+        NibScrollView(label: title) {
             VStack(alignment: .leading, spacing: NibSpacing.m) {
                 header
                 content

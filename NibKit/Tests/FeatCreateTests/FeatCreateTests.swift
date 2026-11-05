@@ -1942,8 +1942,20 @@ final class FeatCreateTests: XCTestCase {
                 let verticals = scrollViews(host.view).filter { $0.contentSize.height > $0.bounds.height + 1 }
                 XCTAssertEqual(verticals.count, 1, "The production sheet has one vertical form scroll")
                 let vertical = try XCTUnwrap(verticals.first)
-                XCTAssertEqual(vertical.contentOffset.y, 0, accuracy: 1,
-                    "The continuation cue must not add a changing top inset")
+                let inset = vertical.adjustedContentInset
+                // UIKit may extend the scroller beneath the 60 pt sheet header. Its resting
+                // offset includes that safe-area adjustment; it is not the SwiftUI viewport origin.
+                func diagnostics() -> String {
+                    [
+                        "size=\(size), variant=\(variant), frames=\(frames)",
+                        "scroll=\(vertical.frame), offset=\(vertical.contentOffset)",
+                        "inset=\(vertical.contentInset), adjusted=\(vertical.adjustedContentInset)",
+                        "safeArea=\(vertical.safeAreaInsets), hostSafeArea=\(host.view.safeAreaInsets)"
+                    ].joined(separator: "; ")
+                }
+                XCTAssertEqual(vertical.contentOffset.y + inset.top, 0, accuracy: 1, diagnostics())
+                XCTAssertEqual((try XCTUnwrap(frames["documentType"])).minY - viewport.minY,
+                               NibSpacing.xl, accuracy: 1, diagnostics())
                 let strip = try XCTUnwrap(frames["coverStrip"])
                 let horizontal = try XCTUnwrap(scrollViews(host.view).first {
                     $0.contentSize.width > $0.bounds.width + 1
@@ -1962,6 +1974,9 @@ final class FeatCreateTests: XCTestCase {
                 vertical.setContentOffset(CGPoint(x: vertical.contentOffset.x, y: resting + 100), animated: false)
                 try await settle()
                 XCTAssertEqual(preview.minY - (try XCTUnwrap(frames["preview"])).minY, 100, accuracy: 1)
+                XCTAssertEqual(vertical.adjustedContentInset, inset, diagnostics())
+                XCTAssertEqual(frames["viewport"], viewport, diagnostics())
+                XCTAssertEqual(frames["cue"], cue, diagnostics())
             }
         }
     }
@@ -2002,26 +2017,40 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertFalse(cue.intersects(type), "The cue must not cover any part of the document-type control")
                 XCTAssertGreaterThanOrEqual(cue.minY, viewport.maxY)
                 let scroll = try XCTUnwrap(scrollViews(host.view).first { $0.contentSize.height > $0.bounds.height + 1 })
-                XCTAssertEqual(scroll.contentOffset.y, 0, accuracy: 1)
                 let inset = scroll.adjustedContentInset
-                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: 100), animated: false)
+                let resting = scroll.contentOffset.y
+                func diagnostics() -> String {
+                    [
+                        "size=\(size), typeSize=\(typeSize), frames=\(frames)",
+                        "scroll=\(scroll.frame), offset=\(scroll.contentOffset)",
+                        "inset=\(scroll.contentInset), adjusted=\(scroll.adjustedContentInset)",
+                        "safeArea=\(scroll.safeAreaInsets), hostSafeArea=\(host.view.safeAreaInsets)"
+                    ].joined(separator: "; ")
+                }
+                XCTAssertEqual(resting + inset.top, 0, accuracy: 1, diagnostics())
+                XCTAssertEqual(type.minY - viewport.minY, NibSpacing.xl, accuracy: 1, diagnostics())
+                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: resting + 100), animated: false)
                 try await settle()
-                XCTAssertEqual(type.minY - (try XCTUnwrap(frames["documentType"])).minY, 100, accuracy: 1)
+                XCTAssertEqual(type.minY - (try XCTUnwrap(frames["documentType"])).minY, 100, accuracy: 1, diagnostics())
                 XCTAssertFalse(cue.intersects(try XCTUnwrap(frames["documentType"])))
+                XCTAssertEqual(frames["viewport"], viewport, diagnostics())
+                XCTAssertEqual(frames["cue"], cue, diagnostics())
+                XCTAssertEqual(scroll.adjustedContentInset, inset, diagnostics())
                 // Reach the end and return: hiding/showing the cue must not alter layout or insets.
                 let end = scroll.contentSize.height - scroll.bounds.height + inset.bottom
                 scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: end), animated: false)
                 try await settle()
-                XCTAssertEqual(scroll.contentOffset.y, end, accuracy: 1)
-                XCTAssertEqual(frames["viewport"], viewport)
-                XCTAssertEqual(frames["cue"], cue)
-                XCTAssertEqual(scroll.adjustedContentInset, inset)
-                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: 0), animated: false)
+                XCTAssertEqual(scroll.contentOffset.y, end, accuracy: 1, diagnostics())
+                XCTAssertEqual(frames["viewport"], viewport, diagnostics())
+                XCTAssertEqual(frames["cue"], cue, diagnostics())
+                XCTAssertEqual(scroll.adjustedContentInset, inset, diagnostics())
+                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: resting), animated: false)
                 try await settle()
-                XCTAssertEqual(frames["viewport"], viewport)
-                XCTAssertEqual(frames["cue"], cue)
-                XCTAssertEqual((try XCTUnwrap(frames["documentType"])).minY, type.minY, accuracy: 1)
-                XCTAssertEqual(scroll.contentOffset.y, 0, accuracy: 1)
+                XCTAssertEqual(frames["viewport"], viewport, diagnostics())
+                XCTAssertEqual(frames["cue"], cue, diagnostics())
+                XCTAssertEqual(scroll.adjustedContentInset, inset, diagnostics())
+                XCTAssertEqual((try XCTUnwrap(frames["documentType"])).minY, type.minY, accuracy: 1, diagnostics())
+                XCTAssertEqual(scroll.contentOffset.y, resting, accuracy: 1, diagnostics())
             }
         }
     }
@@ -2114,6 +2143,8 @@ final class FeatCreateTests: XCTestCase {
                 var categoryFrame = CGRect.zero
                 var tileFrame = CGRect.zero
                 var formFrame = CGRect.zero
+                var inkFrame = CGRect.zero
+                var frames: [String: CGRect] = [:]
                 let view = NewNotebookFormViewport(contentInset: NibSpacing.l) {
                     Rectangle().fill(NibColor.fill3).frame(height: 1_200)
                         .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
@@ -2135,8 +2166,13 @@ final class FeatCreateTests: XCTestCase {
                         }
                         // Continuous ink through the viewport boundary makes the fade measurable.
                         Rectangle().fill(NibColor.label).frame(height: 1_200)
+                            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                                inkFrame = $0
+                            }
                     }
                 }
+                .environment(\.notebookLayoutDiagnostics, true)
+                .onPreferenceChange(NotebookLayoutFrames.self) { frames = $0 }
                 .background(NibColor.backgroundSecondary)
                 .ignoresSafeArea()
                 .environment(\.colorScheme, variant.colorScheme)
@@ -2166,7 +2202,9 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertGreaterThan(categoryFrame.minY, formFrame.maxY,
                                      "Tall cover controls must remain before Paper, without a separate viewport")
                 let region = try XCTUnwrap(regions.first)
-                let viewport = region.convert(region.bounds, to: window)
+                // SwiftUI masks its viewport, not the UIKit scroll bounds, which can extend
+                // beneath safe-area content (including the reserved continuation-cue row).
+                let viewport = try XCTUnwrap(frames["viewport"])
                 let initialFormY = formFrame.minY
                 let initialCategoryY = categoryFrame.minY
                 let offset = initialCategoryY - NibSpacing.m
@@ -2190,14 +2228,39 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertGreaterThanOrEqual(categoryFrame.minX, NibSpacing.l)
                 XCTAssertLessThanOrEqual(categoryFrame.maxX, size.width - NibSpacing.l)
 
+                // Complete layout after the last state delivery before reading pixels.
+                host.view.setNeedsLayout()
+                host.view.layoutIfNeeded()
+                let fadeViewport = try XCTUnwrap(frames["viewport"])
+                let captureViewport = host.view.convert(fadeViewport, from: window)
+                let captureInk = host.view.convert(inkFrame, from: window)
+                let diagnostics = [
+                    "size=\(size), variant=\(variant), host=\(host.view.bounds)",
+                    "viewport=\(fadeViewport), scroll=\(region.convert(region.bounds, to: window))",
+                    "ink=\(inkFrame), tile=\(tileFrame), frames=\(frames)",
+                    "offset=\(region.contentOffset), inset=\(region.contentInset)",
+                    "adjusted=\(region.adjustedContentInset), safeArea=\(region.safeAreaInsets)"
+                ].joined(separator: "; ")
+                XCTAssertEqual(fadeViewport, viewport, diagnostics)
+                XCTAssertGreaterThan(fadeViewport.height, 20, diagnostics)
+                let sampleX = captureViewport.midX
+                for distance in [CGFloat(20), 16, 8, 1] {
+                    let point = CGPoint(x: sampleX, y: captureViewport.maxY - distance)
+                    XCTAssertTrue(host.view.bounds.contains(point), diagnostics)
+                    XCTAssertTrue(captureInk.contains(point), "The fade samples must lie over ink; \(diagnostics)")
+                }
                 host.view.layer.displayIfNeeded()
-                let image = UIGraphicsImageRenderer(size: size).image { context in
+                let image = UIGraphicsImageRenderer(size: host.view.bounds.size).image { context in
                     host.view.layer.render(in: context.cgContext)
                 }
-                let background = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 1, y: size.height - 1)))
+                let attachment = XCTAttachment(image: image)
+                attachment.name = "Notebook-fade-\(Int(size.width))x\(Int(size.height))-\(variant.rawValue)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+                let background = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 1, y: image.size.height - 1)))
                 func contrast(at distance: CGFloat) throws -> Int {
                     let pixel = try XCTUnwrap(NibSnapshot.pixel(image,
-                        at: CGPoint(x: size.width / 2, y: viewport.maxY - distance)))
+                        at: CGPoint(x: sampleX, y: captureViewport.maxY - distance)), diagnostics)
                     return abs(Int(pixel.r) - Int(background.r))
                         + abs(Int(pixel.g) - Int(background.g)) + abs(Int(pixel.b) - Int(background.b))
                 }
@@ -2205,12 +2268,12 @@ final class FeatCreateTests: XCTestCase {
                 let fadeStart = try contrast(at: 16)
                 let fadeMiddle = try contrast(at: 8)
                 let fadeEnd = try contrast(at: 1)
-                XCTAssertGreaterThan(solid, 100, "The scrolling content must actually render")
+                XCTAssertGreaterThan(solid, 100, "The scrolling content must actually render; \(diagnostics)")
                 XCTAssertEqual(Double(fadeStart), Double(solid), accuracy: 20,
-                               "Only the final 16 pt should fade")
-                XCTAssertGreaterThan(fadeStart, fadeMiddle)
-                XCTAssertGreaterThan(fadeMiddle, fadeEnd)
-                XCTAssertLessThan(fadeEnd, solid / 4)
+                               "Only the final 16 pt should fade; \(diagnostics)")
+                XCTAssertGreaterThan(fadeStart, fadeMiddle, diagnostics)
+                XCTAssertGreaterThan(fadeMiddle, fadeEnd, diagnostics)
+                XCTAssertLessThan(fadeEnd, solid / 4, diagnostics)
             }
         }
     }

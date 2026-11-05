@@ -268,6 +268,9 @@ final class FeatPencilHardwareTests: XCTestCase {
         let controller = UIHostingController(rootView: PaletteOverlay(model: model,
             anchor: CGPoint(x: 426, y: 190), insets: insets, dismiss: {})
             .environment(\.dynamicTypeSize, .accessibility5))
+        // This fixture supplies its safe area explicitly to PaletteOverlay. Do not also inherit
+        // the test host's device safe area, which can extend an ignoresSafeArea root past the window.
+        controller.safeAreaRegions = []
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 852, height: 393))
         window.rootViewController = controller
         window.isHidden = false
@@ -278,9 +281,14 @@ final class FeatPencilHardwareTests: XCTestCase {
                 view.gestureRecognizers?.contains { $0 is NibActionTapRecognizer } == true
             }
         }
+        var previousFrames: [CGRect] = []
         for _ in 0..<50 {
             controller.view.layoutIfNeeded()
-            if targets().count == 40 { break } // 37 tools and three thickness presets
+            let frames = targets().map { $0.convert($0.bounds, to: window) }
+            // 37 tools and three thickness presets; their existence alone does not mean the
+            // onGeometryChange-driven palette position has received its next layout pass.
+            if frames.count == 40, frames.allSatisfy({ !$0.isEmpty }), frames == previousFrames { break }
+            previousFrames = frames
             try await Task.sleep(for: .milliseconds(20))
         }
         let scroll = try XCTUnwrap(descendants(controller.view).compactMap { $0 as? UIScrollView }
@@ -290,7 +298,10 @@ final class FeatPencilHardwareTests: XCTestCase {
         XCTAssertEqual(scroll.bounds.width, naturalSize.width, accuracy: 1,
                        "Switching to scrolling must retain the plain palette's width")
         let safe = window.bounds.inset(by: insets).insetBy(dx: NibMetrics.chromeInset, dy: NibMetrics.chromeInset)
-        XCTAssertTrue(safe.insetBy(dx: -1, dy: -1).contains(scroll.convert(scroll.bounds, to: window)))
+        let viewport = scroll.convert(scroll.bounds, to: window)
+        let geometry = "viewport=\(viewport), safe=\(safe), host=\(controller.view.frame), window=\(window.bounds)"
+        let scrolling = "offset=\(scroll.contentOffset), content=\(scroll.contentSize), adjusted=\(scroll.adjustedContentInset)"
+        XCTAssertTrue(safe.insetBy(dx: -1, dy: -1).contains(viewport), "Palette stays in the safe area: \(geometry); \(scrolling)")
         let cells = targets().sorted { a, b in
             let a = a.convert(a.bounds, to: scroll), b = b.convert(b.bounds, to: scroll)
             return abs(a.minY - b.minY) > 1 ? a.minY < b.minY : a.minX < b.minX
@@ -302,7 +313,8 @@ final class FeatPencilHardwareTests: XCTestCase {
             scroll.scrollRectToVisible(cell.convert(cell.bounds, to: scroll), animated: false)
             for _ in 0..<5 { controller.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
             let frame = cell.convert(cell.bounds, to: window)
-            XCTAssertTrue(safe.insetBy(dx: -1, dy: -1).contains(frame))
+            XCTAssertTrue(safe.insetBy(dx: -1, dy: -1).contains(frame),
+                          "Show the whole palette cell: cell=\(frame); \(geometry); offset=\(scroll.contentOffset), adjusted=\(scroll.adjustedContentInset)")
             let hit = try XCTUnwrap(window.hitTest(CGPoint(x: frame.midX, y: frame.midY), with: nil))
             XCTAssertTrue(hit === cell || hit.isDescendant(of: cell), "The visible cell must own its touch")
         }
