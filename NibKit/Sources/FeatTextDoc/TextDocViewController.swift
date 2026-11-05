@@ -1069,8 +1069,12 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     /// Renames the document after the first line once typing pauses (`titleDebounce`), or right away (`after: 0`:
     /// on open, when the title's block loses the caret, when the editor closes).
     private func scheduleTitleUpdate(after delay: TimeInterval? = nil) {
-        guard autoTitle, let derived = TextDocTitle.derive(from: blocks), derived != expectedTitle,
-              derived != requestedTitle else { return }
+        guard autoTitle, let derived = TextDocTitle.derive(from: blocks) else { return }
+        if derived == expectedTitle {
+            titleTask?.cancel()
+            return
+        }
+        guard derived != requestedTitle else { return }
         titleTask?.cancel()
         let wait = delay ?? titleDebounce
         if wait <= 0 {

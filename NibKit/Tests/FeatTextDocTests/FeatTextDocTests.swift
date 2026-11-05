@@ -945,6 +945,20 @@ final class FeatTextDocTests: XCTestCase {
                      "entries see the block they are for")
     }
 
+    func testReturningToTheCurrentFirstLineCancelsPendingRename() async throws {
+        let h = harness()
+        registerRename(h)
+        try h.library.rename(doc, to: "Fixture Text")
+        let editor = TextDocViewController(doc: doc, session: h.session, app: h.app)
+        editor.titleDebounce = 0.05
+        editor.loadViewIfNeeded()
+        try await h.run("block.update", ["ref": .string(heading), "text": "Fixture Text!"])
+        try await h.run("block.update", ["ref": .string(heading), "text": "Fixture Text"])
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(h.library.node(doc)?.title, "Fixture Text")
+        XCTAssertTrue(editor.followsFirstLine)
+    }
+
     func testTheNameFollowsTheFirstLineUntilTheUserRenamesTheDocument() async throws {
         let h = harness()
         registerRename(h)
