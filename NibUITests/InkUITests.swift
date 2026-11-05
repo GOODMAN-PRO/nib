@@ -199,14 +199,35 @@ final class InkUITests: XCTestCase {
         }
     }
 
-    private var swatches: [XCUIElement] {
+    @MainActor
+    private struct Swatch {
+        let label: String
+        let element: XCUIElement
+        var isSelected: Bool { element.isSelected }
+        func tap() { element.tap() }
+        func press(forDuration duration: TimeInterval) { element.press(forDuration: duration) }
+    }
+
+    private var swatches: [Swatch] {
         let tool = (try? ui.state().tool) ?? "pen"
         let names = ["pen": "Pen", "pencil": "Pencil", "highlighter": "Highlighter", "tape": "Tape", "shape": "Shapes", "drawShape": "Draw Shape"]
         // The main palette mirrors quick inks using the same command ID. Count/edit only the slots in
         // the active tool's options bar; the mirrored buttons are not additional stored presets.
         let group = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", (names[tool] ?? tool) + " presets")).firstMatch
-        return group.buttons.matching(identifier: "cmd.preset.select").allElementsBoundByIndex
-            .filter { !$0.label.hasPrefix("Thickness ") }
+        guard let snapshot = try? group.snapshot() else {
+            XCTFail("Active tool presets must expose a snapshot")
+            return []
+        }
+        func buttons(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
+            let own = node.elementType == .button && node.identifier == "cmd.preset.select" ? [node] : []
+            return own + node.children.flatMap { buttons($0) }
+        }
+        let query = group.buttons.matching(identifier: "cmd.preset.select")
+        // Ordinals refer only to this typed, identifier-scoped button query, never snapshot child paths.
+        return buttons(snapshot).enumerated().compactMap { index, node in
+            guard !node.label.hasPrefix("Thickness ") else { return nil }
+            return Swatch(label: node.label, element: query.element(boundBy: index))
+        }
     }
 
     private func widthButton(_ slot: Int) throws -> XCUIElement {
@@ -229,7 +250,8 @@ final class InkUITests: XCTestCase {
     }
 
     private func swatchMenu(_ action: String, index: Int = 0) throws {
-        let button = try XCTUnwrap(swatches.indices.contains(index) ? swatches[index] : nil, "Missing colour slot \(index)")
+        let slots = swatches
+        let button = try XCTUnwrap(slots.indices.contains(index) ? slots[index] : nil, "Missing colour slot \(index)")
         button.press(forDuration: 0.7)
         try tap(action, scroll: true)
     }

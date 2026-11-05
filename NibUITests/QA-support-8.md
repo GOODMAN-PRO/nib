@@ -112,3 +112,9 @@ D:keyboard-and-state#8 proves the Hide key tap leaves Width focused and the keyb
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Create CustomSize / InvalidCustomSize | Width keyboard frame | What are keyboard frames before and after the inert-header dismissal? |
+
+## H10 - success-path query costs
+
+D:timeouts#3/#4/#5 and verdicts confirm 10.4s empty-modifier overhead, doubled probe resolutions, and per-swatch label faulting amplified by ~4x runner latency. Selection drag calls its exact gesture body directly for empty modifiers. readState uses one probe snapshot per read, keeping decode/fixture-error behavior. Ink swatches resolves the group once, traverses one immutable snapshot for button identifiers/labels, and constructs lazy typed scoped element references only for tap/press/isSelected; labels/counts/poll comparisons need no per-slot AX reads. swatchMenu reuses one collection per call. Native clear reads the focused value before Cmd-A and returns only for proven empty/placeholder values; replacement still verifies exact text. H2 covers the independently evidenced typed lookup cost. No speculative scopes or idle-wait changes.
+
+All swatch callers audited: only label/count/indices/iteration, tap/press and isSelected are used; labels are snapshot data, selection state stays live. All existing assertions and allowances remain. Estimated, unmeasured savings: ~20.8s in Selection AlignmentSnapping (~177s/class), roughly half the ~470s Insert probe cost (~235s), and up to much of the ~87-91s swatch lookup cost in Ink RestoreDefaults. Empty clears remove one chord/delete pair each (~3s estimate); they reduce stall exposure, not prove a stall fix. CI must complete the same final assertions under current allowances and compare passing common paths, especially RestoreDefaults and AlignmentSnapping.

@@ -118,9 +118,11 @@ final class SelectionUITests: XCTestCase {
         ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: point.x - ui.app.frame.minX, dy: point.y - ui.app.frame.minY))
     }
     private func drag(_ start: CGPoint, _ end: CGPoint, modifiers: XCUIElement.KeyModifierFlags = []) {
-        XCUIElement.perform(withKeyModifiers: modifiers) {
+        let body = {
             self.screen(start).press(forDuration: 0.08, thenDragTo: self.screen(end), withVelocity: .slow, thenHoldForDuration: 0)
         }
+        if modifiers.isEmpty { body() }
+        else { XCUIElement.perform(withKeyModifiers: modifiers, block: body) }
     }
     private func centre(_ r: CGRect) -> CGPoint { CGPoint(x: r.midX, y: r.midY) }
     private func clear() throws {

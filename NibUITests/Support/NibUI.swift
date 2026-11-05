@@ -1275,9 +1275,9 @@ final class NibUI {
     func clearNativeText(in field: XCUIElement) throws {
         // focusField taps an unfocused editor and verifies focus before nativeKey can send Select All.
         try focusField(field)
-        try nativeKey("a", in: field)
         guard let value = field.value as? String else { throw Failure.message("Native editor has no readable value") }
         if value.isEmpty || value == field.placeholderValue { return }
+        try nativeKey("a", in: field)
         // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
         field.typeText(XCUIKeyboardKey.delete.rawValue)
         let remainingValue = field.value as? String
@@ -1379,8 +1379,8 @@ final class NibUI {
     }
 
     private func readState() throws -> QAState? {
-        guard probe.exists,
-              let state = try NibUITestSnapshot.decode(probe.value, as: QAState.self) else { return nil }
+        guard let snapshot = try? probe.snapshot(),
+              let state = try NibUITestSnapshot.decode(snapshot.value, as: QAState.self) else { return nil }
         if let failure = state.fixtureError { throw Failure.message("Fixture failed: \(failure)") }
         return state
     }
