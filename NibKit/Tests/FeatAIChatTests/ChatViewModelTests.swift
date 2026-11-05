@@ -6,6 +6,54 @@ import NibTesting
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testLongStreamParsesEachCompletedTokenOnceAndReusesPageIndex() throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let template = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).livePages.first)
+        let pages = (0..<500).map { index -> PageRecord in
+            PageRecord(id: NibID("CITEPAGE\(index)"), order: String(format: "%04d", index),
+                       size: template.size, background: template.background)
+        }
+        let refs = pages.prefix(40).map { NodeRef.page(Fixtures.docID, $0.id).description }
+        let answer = (0..<5).map { _ in refs.joined(separator: " cited. ") + ". " }.joined()
+        var stream = ChatCitationStream()
+        var cache = ChatPageIndexCache()
+        var lookups = 0
+        for character in answer {
+            stream.append(String(character)) { raw in
+                lookups += 1
+                guard case let .page(doc, page)? = NodeRef(raw),
+                      let index = cache.index(of: page, in: doc, pages: pages) else { return "Page" }
+                return "Page \(index + 1)"
+            }
+        }
+        XCTAssertEqual(stream.refs, refs)
+        XCTAssertEqual(lookups, refs.count, "repeated references and deltas reuse resolved labels")
+        XCTAssertEqual(cache.buildCount, 1, "all 40 page citations share one sort of the 500 pages")
+        XCTAssertEqual(stream.parsedUTF16, answer.utf16.count, "completed text is scanned once across all deltas")
+        XCTAssertEqual(stream.displayText, ChatCitations.replacingRefs(in: answer, labels: stream.labels))
+        var reordered = pages
+        reordered[0].order = "9999"
+        XCTAssertEqual(cache.index(of: pages[0].id, in: Fixtures.docID, pages: reordered), 499)
+        XCTAssertEqual(cache.buildCount, 2)
+    }
+
+    func testEntryStreamingHandlesSplitReferencesAndLabelRefresh() {
+        var entry = ChatEntry(id: "STREAM", role: "assistant", text: "")
+        var lookups = 0
+        let label: (String) -> String = { _ in lookups += 1; return "Page 1" }
+        for delta in ["See pa", "ge:D/", "PAGE", ". Again page:D/PAGE."] { entry.appendText(delta, label: label) }
+        XCTAssertEqual(lookups, 1)
+        XCTAssertEqual(entry.text, "See page:D/PAGE. Again page:D/PAGE.")
+        XCTAssertEqual(entry.displayText, "See Page 1. Again Page 1.")
+        entry.resolveCitations { _ in "Page 2" }
+        entry.appendText(" More.", label: label)
+        XCTAssertEqual(entry.displayText, "See Page 2. Again Page 2. More.")
+        XCTAssertEqual(lookups, 1)
+        entry.text = "Replaced with doc:D."
+        entry.resolveCitations { _ in "Notebook" }
+        XCTAssertEqual(entry.displayText, "Replaced with Notebook.")
+    }
+
     func testCitationLabelsRefreshAfterPageReorderAndDocumentRename() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let model = ChatRuntime.get(h.app).model(for: h.session)

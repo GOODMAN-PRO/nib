@@ -6,7 +6,9 @@ import NibContracts
 struct ChatEntry: Identifiable {
     var id: String
     var role: String
-    var text: String { didSet { refreshCitations() } }
+    var text: String { didSet { if !appendingText { refreshCitations() } } }
+    private var appendingText = false
+    private var citationStream: ChatCitationStream?
     private(set) var citationRefs: [String] = []
     private(set) var citationLabels: [String: String] = [:]
     private(set) var displayText = ""
@@ -31,13 +33,32 @@ struct ChatEntry: Identifiable {
     }
 
     private mutating func refreshCitations() {
+        citationStream = nil
         citationRefs = ChatCitations.refs(in: text)
         displayText = ChatCitations.replacingRefs(in: text, labels: citationLabels, refs: citationRefs)
     }
 
     mutating func resolveCitations(_ label: (String) -> String) {
-        citationLabels = Dictionary(uniqueKeysWithValues: citationRefs.map { ($0, label($0)) })
+        let labels = Dictionary(uniqueKeysWithValues: citationRefs.map { ($0, label($0)) })
+        guard labels != citationLabels else { return }
+        citationLabels = labels
+        citationStream = nil
         displayText = ChatCitations.replacingRefs(in: text, labels: citationLabels, refs: citationRefs)
+    }
+
+    mutating func appendText(_ delta: String, label: (String) -> String) {
+        if citationStream == nil {
+            citationStream = ChatCitationStream(labels: citationLabels)
+            citationStream?.append(text, label: label)
+        }
+        appendingText = true
+        text += delta
+        appendingText = false
+        citationStream?.append(delta, label: label)
+        guard let stream = citationStream else { return }
+        citationRefs = stream.refs
+        citationLabels = stream.labels
+        displayText = stream.displayText
     }
 }
 
@@ -171,6 +192,7 @@ final class ChatViewModel: ObservableObject {
     @Published var retryPrompt: String?
     private var generation: UUID?
     private var sessionObservation: AnyCancellable?
+    private var citationPages = ChatPageIndexCache()
     private var contextDocument: DocumentID?
     private var explicitLibraryScope = false
     var turnToken: UUID? { generation }
@@ -498,8 +520,7 @@ final class ChatViewModel: ObservableObject {
                 guard let i = entries.firstIndex(where: { $0.id == answerID }) else { throw CancellationError() }
                 switch event {
                 case .text(let delta):
-                    entries[i].text += delta
-                    resolveEntryCitations(i)
+                    entries[i].appendText(delta, label: citationLabel)
                 case .toolStarted(let name, let arguments):
                     entries[i].tools.append(ChatToolActivity(name: name, arguments: arguments))
                 case .toolFinished(let name, let ok, let changes):
@@ -711,11 +732,11 @@ final class ChatViewModel: ObservableObject {
         let label: String
         switch ref {
         case .document(let doc): label = app?.services.library?.node(doc)?.title ?? String(localized: "Document")
-        case .page(_, let page):
-            label = content?.pageIndex(page).map { String(localized: "Page \($0 + 1)") } ?? String(localized: "Page")
+        case .page(let doc, let page):
+            label = content.flatMap { citationPages.index(of: page, in: doc, pages: $0.pages) }.map { String(localized: "Page \($0 + 1)") } ?? String(localized: "Page")
         case .item(let doc, let page, let item):
             let kind = (try? app?.workspace.item(doc, page: page, id: item).kind.rawValue.capitalized) ?? String(localized: "Item")
-            label = content?.pageIndex(page).map { String(localized: "\(kind) on page \($0 + 1)") } ?? kind
+            label = content.flatMap { citationPages.index(of: page, in: doc, pages: $0.pages) }.map { String(localized: "\(kind) on page \($0 + 1)") } ?? kind
         case .block(_, let block):
             label = content?.liveBlocks.firstIndex(where: { $0.id == block }).map { String(localized: "Block \($0 + 1)") } ?? String(localized: "Block")
         case .card: label = String(localized: "Card")
@@ -741,16 +762,75 @@ final class ChatViewModel: ObservableObject {
     }
 }
 
+/// Streaming only parses completed tokens. A reference split across provider deltas stays in `pending`
+/// until its delimiter arrives, so partial page IDs never trigger workspace lookups.
+struct ChatCitationStream {
+    private var pending = ""
+    private var prefix = ""
+    private var seen = Set<String>()
+    private(set) var refs: [String] = []
+    private(set) var labels: [String: String]
+    private(set) var parsedUTF16 = 0
+    var displayText: String { prefix + pending }
+
+    init(labels: [String: String] = [:]) { self.labels = labels }
+
+    mutating func append(_ delta: String, label: (String) -> String) {
+        // Search the new delta only, never the accumulated answer or incomplete trailing token.
+        guard let boundary = delta.lastIndex(where: { !Self.isReferenceCharacter($0) }) else {
+            pending += delta
+            return
+        }
+        let end = delta.index(after: boundary)
+        let complete = pending + String(delta[..<end])
+        pending = String(delta[end...])
+        parsedUTF16 += complete.utf16.count
+        for ref in ChatCitations.refs(in: complete) {
+            if seen.insert(ref).inserted { refs.append(ref) }
+            if labels[ref] == nil { labels[ref] = label(ref) }
+        }
+        prefix += ChatCitations.replacingRefs(in: complete, labels: labels)
+    }
+
+    private static func isReferenceCharacter(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy {
+            let v = $0.value
+            return (65...90).contains(v) || (97...122).contains(v) || (48...57).contains(v)
+                || v == 95 || v == 45 || v == 47 || v == 58
+        }
+    }
+}
+
+/// Page ordering is shared by every citation in a notebook. Comparing the source records also catches
+/// sync/reorders outside this panel; unchanged records reuse the sorted index.
+struct ChatPageIndexCache {
+    private var documents: [DocumentID: (pages: [PageRecord], indices: [PageID: Int])] = [:]
+    private(set) var buildCount = 0
+
+    mutating func index(of page: PageID, in doc: DocumentID, pages: [PageRecord]) -> Int? {
+        if documents[doc]?.pages != pages {
+            let live = pages.filter { !$0.deleted }.sorted { ($0.order, $0.id.raw) < ($1.order, $1.id.raw) }
+            let indices = Dictionary(uniqueKeysWithValues: live.enumerated().map { ($0.element.id, $0.offset) })
+            documents[doc] = (pages, indices)
+            buildCount += 1
+        }
+        return documents[doc]?.indices[page]
+    }
+}
+
 /// Citation refs are an explicit part of F084's system prompt; never turn arbitrary URLs into commands.
 enum ChatCitations {
     static let regex = try! NSRegularExpression(pattern: #"(?:item|page|doc|block|card|audio|outline):[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+){0,2}"#)
 
     static func replacingRefs(in text: String, labels: [String: String], refs: [String]? = nil) -> String {
-        var result = text
-        for raw in (refs ?? Self.refs(in: text)).sorted(by: { $0.count > $1.count }) {
-            result = result.replacingOccurrences(of: raw, with: labels[raw] ?? String(localized: "Reference"))
+        let source = text as NSString
+        let result = NSMutableString(string: text)
+        for match in regex.matches(in: text, range: NSRange(location: 0, length: source.length)).reversed() {
+            let raw = source.substring(with: match.range)
+            guard NodeRef(raw) != nil else { continue }
+            result.replaceCharacters(in: match.range, with: labels[raw] ?? String(localized: "Reference"))
         }
-        return result
+        return result as String
     }
     static func refs(in text: String) -> [String] {
 
