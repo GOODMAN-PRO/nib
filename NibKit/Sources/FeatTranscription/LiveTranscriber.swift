@@ -448,9 +448,15 @@ final class LiveTranscriber {
     }
 
     private func recordingWasRemoved(_ ref: String) -> Bool {
-        guard let app, case let .audio(doc, id)? = NodeRef(ref),
-              let head = try? app.workspace.content(doc) else { return false }
-        return !head.liveAudio.contains { $0.id == id }
+        guard let app, case let .audio(doc, id)? = NodeRef(ref) else { return false }
+        do {
+            let head = try app.workspace.content(doc)
+            return !head.liveAudio.contains { $0.id == id }
+        } catch {
+            // A failed read alone does not prove removal: existing documents can have real storage errors.
+            guard let library = app.services.library else { return false }
+            return library.node(doc) == nil
+        }
     }
 
     private func backOffEmptyWindow(_ count: Int, ref: String) async throws {
