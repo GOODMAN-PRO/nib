@@ -73,3 +73,7 @@ Confirmed S:singles-insert#1 correction (a/c) and D:keyboard-and-state#1: first 
 | --- | --- | --- |
 | All Nib launch paths | Hardware key route opened / unobserved | Was the first keyed press observed before text focus? |
 | Global modified chords, especially Create Quick Note | Chord modifier loss retry | Did a fresh requested printable key arrive without its modifiers before the single resend? |
+
+## H3 - dismiss only presented surfaces
+
+D:controls-forms#9 confirms header.closeButton followed by cmd.panel.close closed Audio after export. dismissSheets now searches only visible Sheet/Popover/ActivityListView descendants for their own close controls, includes the observed activity header close identifier, and never uses cmd.panel.close or a swipe. No surface returns without acting; an unclosable presented surface fails explicitly. Audited all callers: their generic dismissals must preserve sidebar/floating panels; explicit panel-closing remains with callers. Expected Audio rename/export/delete retains Motion lecture after sharing. CI must confirm native and custom sheet containment and that only the activity sheet closes.

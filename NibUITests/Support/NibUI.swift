@@ -1552,15 +1552,21 @@ final class NibUI {
 
     func dismissSheets() throws {
         for _ in 0..<8 {
+            let surfaces = app.sheets.allElementsBoundByIndex + app.popovers.allElementsBoundByIndex
+                + app.otherElements.matching(identifier: "ActivityListView").allElementsBoundByIndex
+            let presented = surfaces.filter { hasVisibleFrame($0) }
+            if presented.isEmpty { return }
             var close: XCUIElement?
-            for id in ["sheet.dismiss", "cmd.panel.close", "Cancel", "Done", "Close", "Close export options"] {
-                if let found = findControl(id, type: .button), found.isEnabled { close = found; break }
+            for surface in presented {
+                for id in ["sheet.dismiss", "header.closeButton", "Cancel", "Done", "Close", "Close export options"] {
+                    if let found = findControl(id, type: .button, in: surface), found.isEnabled {
+                        close = found; break
+                    }
+                }
+                if close != nil { break }
             }
             if let close { close.tap(); continue }
-            if let sheet = app.sheets.allElementsBoundByIndex.first(where: { hasVisibleFrame($0) && $0.isHittable }) {
-                sheet.swipeDown(); continue
-            }
-            return
+            throw Failure.message("Presented surface has no own close control\n\(app.debugDescription)")
         }
         throw Failure.message("Sheet did not dismiss\n\(app.debugDescription)")
     }
