@@ -115,17 +115,15 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
         return DragSource(context: context, items: items)
     }
 
-    private func itemProvider(_ source: DragSource, host: CanvasHost) -> NSItemProvider {
+    func itemProvider(_ source: DragSource, host: CanvasHost) -> NSItemProvider {
         let provider = NSItemProvider()
         let app = host.app
         let doc = source.context.doc
         let page = source.context.page
         let items = source.items
         let store = app.services.assets
-        if let data = NibFragment.make(items: items, assetData: { ref in try? store?.data(ref, doc: doc) }).encoded() {
-            // Other Nib windows read the fragment; other apps never see it.
-            DragFlavours.now(provider, NibFragment.typeIdentifier, visibility: .ownProcess, data: data)
-        }
+        // Same-canvas moves use localContext and never request or serialize this representation.
+        DragFlavours.fragment(provider, items: items, store: store, doc: doc)
         let prepared = recognized?.key == SelectionKey(host.session.selection) ? recognized?.text : nil
         let png: @MainActor () async -> Data? = {
             let pageItems = (try? app.workspace.items(doc, page: page)) ?? []
@@ -372,6 +370,29 @@ extension CanvasDragDrop: UIDropInteractionDelegate {
 
 /// NSItemProvider registration, kept off the main actor: the system calls load handlers on its own queues.
 enum DragFlavours {
+    /// Captures values only at lift. Asset I/O and encoding start off-main when a receiver requests the fragment.
+    static func fragment(_ provider: NSItemProvider, items: [Item], store: AssetStore?, doc: DocumentID) {
+        provider.registerDataRepresentation(forTypeIdentifier: NibFragment.typeIdentifier, visibility: .ownProcess) { done in
+            let progress = Progress(totalUnitCount: 1)
+            let worker = Task.detached(priority: .userInitiated) {
+                do {
+                    try Task.checkCancellation()
+                    let fragment = try NibFragment.complete(items: items, store: store, doc: doc)
+                    guard let data = fragment.encoded() else {
+                        throw NibError(.unavailable, String(localized: "This selection could not be copied. Try again."))
+                    }
+                    try Task.checkCancellation()
+                    progress.completedUnitCount = 1
+                    done(data, nil)
+                } catch {
+                    done(nil, error)
+                }
+            }
+            progress.cancellationHandler = { worker.cancel() }
+            return progress
+        }
+    }
+
     static func now(_ provider: NSItemProvider, _ type: String, visibility: NSItemProviderRepresentationVisibility, data: Data) {
         provider.registerDataRepresentation(forTypeIdentifier: type, visibility: visibility) { done in
             done(data, nil)

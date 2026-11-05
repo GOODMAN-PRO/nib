@@ -6,6 +6,30 @@ import NibTesting
 import NibDesign
 @testable import FeatClipboard
 
+private final class CountingClipboardAssets: AssetStore {
+    let base: AssetStore
+    private let lock = NSLock()
+    private var calls = 0
+    private var mainThreadCalls = 0
+    init(_ base: AssetStore) { self.base = base }
+    var counts: (reads: Int, onMain: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (calls, mainThreadCalls)
+    }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { try base.put(data, ext: ext, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data {
+        lock.lock()
+        calls += 1
+        if Thread.isMainThread { mainThreadCalls += 1 }
+        lock.unlock()
+        return try base.data(ref, doc: doc)
+    }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
+}
+
 private final class FailingClipboardAssets: AssetStore {
     func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { throw NibError.notFound("asset") }
     func url(_ ref: AssetRef, doc: DocumentID) -> URL? { nil }
@@ -886,6 +910,35 @@ final class FeatClipboardTests: XCTestCase {
     }
 
     /// A drag dropped back on its own canvas moves the selection: same page = item.transform, other page = item.moveToPage.
+    func testDragProviderLoadsEachAssetLazilyOffMain() async throws {
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let host = FakeCanvasHost(h)
+        let image = try items([page1 + "FIXTUREIMG01"], in: h)[0]
+        var second = image
+        second.id = NibID("DRAGSECOND")
+        let selection = [image, second]
+        let expected = NibFragment.make(items: selection) { try? h.assets.data($0, doc: Fixtures.docID) }
+        let store = CountingClipboardAssets(h.assets)
+        h.app.services.assets = store
+        let context = CanvasDragContext(host: ObjectIdentifier(host), doc: Fixtures.docID, page: Fixtures.page1,
+                                        start: image.bounds.center, bounds: image.bounds, refs: [page1 + "FIXTUREIMG01"])
+        let source = CanvasDragDrop.DragSource(context: context, items: selection)
+        let provider = CanvasDragDrop().itemProvider(source, host: host)
+        XCTAssertEqual(store.counts.reads, 0, "lifting a local drag must not read any assets")
+        let loaded = expectation(description: "lazy fragment loaded")
+        _ = provider.loadDataRepresentation(forTypeIdentifier: NibFragment.typeIdentifier) { data, error in
+            XCTAssertNil(error)
+            do {
+                let bytes = try XCTUnwrap(data)
+                XCTAssertEqual(try NibFragment.decode(bytes), expected)
+            } catch { XCTFail("Fragment load failed: \(error)") }
+            loaded.fulfill()
+        }
+        await fulfillment(of: [loaded], timeout: 2)
+        XCTAssertEqual(store.counts.reads, 1, "shared asset bytes are read once per fragment")
+        XCTAssertEqual(store.counts.onMain, 0)
+    }
+
     func testDragTextPreparationIgnoresSelectionRestylingAndOrder() async throws {
         let h = Harness(features: [FeatClipboardFeature.self])
         let host = FakeCanvasHost(h)
