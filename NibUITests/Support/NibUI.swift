@@ -174,36 +174,94 @@ final class NibUI {
             let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
             guard visited.insert(signature).inserted else { return }
             let down = targetFrame.map { $0.midY < viewport.midY } ?? false
-            // Prefer a noninteractive caption: dragging the bare edge previously produced no scroll.
-            func captions(_ node: XCUIElementSnapshot) -> [CGRect] {
-                if [.button, .switch, .slider, .textField, .textView, .cell].contains(node.elementType) { return [] }
-                if node.elementType == .staticText, viewport.insetBy(dx: 4, dy: 24).contains(node.frame) { return [node.frame] }
-                return node.children.flatMap { captions($0) }
-            }
-            let startY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
-            let caption = captions(snapshot).min { abs($0.midY - startY) < abs($1.midY - startY) }
-            let native = [.collectionView, .table].contains(snapshot.elementType)
-            let start = caption.map { CGPoint(x: $0.midX, y: $0.midY) }
-                ?? CGPoint(x: native ? viewport.midX : listFrame.minX + 12, y: startY)
+            guard let start = formDragStart(snapshot, viewport: viewport, down: down) else { return }
             let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
-            XCTContext.runActivity(named: "Reveal form row") { activity in
-                let attachment = XCTAttachment(string: "container=\(snapshot.label) frame=\(listFrame) viewport=\(viewport) target=\(String(describing: targetFrame)) drag=\(start)->\(end) range=\(signature)")
-                attachment.lifetime = .keepAlways; activity.add(attachment)
-            }
+            let values = formControlValues(snapshot)
+            logQA("Form drag before", "point=\(start) container=\(listFrame) rows=\(signature)")
             let origin = app.coordinate(withNormalizedOffset: .zero)
             origin.withOffset(CGVector(dx: start.x - app.frame.minX, dy: start.y - app.frame.minY))
                 .press(forDuration: 0.01, thenDragTo: origin.withOffset(
                     CGVector(dx: end.x - app.frame.minX, dy: end.y - app.frame.minY)), withVelocity: .slow, thenHoldForDuration: 0)
+            guard let after = try? list.snapshot() else {
+                XCTFail("Form disappeared after reveal drag"); return
+            }
+            logQA("Form drag after", "point=\(start) container=\(after.frame) rows=\(formVisibleRange(after, viewport: viewport))")
+            let afterValues = formControlValues(after)
+            let changed = values.keys.filter { afterValues[$0] != nil && afterValues[$0] != values[$0] }
+            guard changed.isEmpty else {
+                logQA("Form drag changed controls", "before=\(values) after=\(afterValues)")
+                XCTFail("Reveal drag changed slider/switch values: \(changed)"); return
+            }
+
         }
     }
 
-    /// Reads one immutable snapshot without waiting so progress checks cannot retain stale virtualized element indices.
+    /// Frames and control identities only: numeric captions and control values are not scroll progress.
     private func formVisibleRange(_ snapshot: XCUIElementSnapshot, viewport: CGRect) -> [String] {
         let frame = snapshot.frame
-        let own = [.button, .staticText].contains(snapshot.elementType)
+        let rowTypes: [XCUIElement.ElementType] = [.button, .switch, .slider, .textField, .textView,
+            .searchField, .secureTextField, .stepper, .segmentedControl, .picker, .pickerWheel]
+        let own = rowTypes.contains(snapshot.elementType)
             && viewport.contains(CGPoint(x: frame.midX, y: frame.midY))
-            ? ["\(snapshot.identifier)|\(snapshot.label)|\(Int(frame.minY))"] : []
+            ? ["\(snapshot.elementType.rawValue)|\(snapshot.identifier)|\(snapshot.label)|\(frame)"] : []
         return own + snapshot.children.flatMap { formVisibleRange($0, viewport: viewport) }
+    }
+
+    private func formControlValues(_ snapshot: XCUIElementSnapshot) -> [String: String] {
+        var result: [String: String] = [:]
+        var occurrences: [String: Int] = [:]
+        func visit(_ node: XCUIElementSnapshot, parent: String) {
+            let identity = "\(node.elementType.rawValue)|\(node.identifier)|\(node.label)"
+            let path = parent + "/" + identity
+            if [.slider, .switch].contains(node.elementType) {
+                let key = path
+                let occurrence = occurrences[key, default: 0]
+                occurrences[key] = occurrence + 1
+                result["\(key)|\(occurrence)"] = String(describing: node.value)
+            }
+            // A native row exposes a labelled switch plus an unlabelled thumb. Keep its parent identity,
+            // so virtualizing another row cannot renumber unrelated thumbs and report a false mutation.
+            let ancestor = [.slider, .switch].contains(node.elementType) ? path : parent
+            node.children.forEach { visit($0, parent: ancestor) }
+        }
+        visit(snapshot, parent: "")
+        return result
+    }
+
+    /// Stay at least 32pt from all interactive frames, including their hit slop. Never restore touched controls.
+    private func formDragStart(_ snapshot: XCUIElementSnapshot, viewport: CGRect, down: Bool) -> CGPoint? {
+        let interactive: [XCUIElement.ElementType] = [.slider, .switch, .button, .textField, .textView,
+            .secureTextField, .searchField, .stepper, .segmentedControl, .picker, .pickerWheel, .link]
+        func controls(_ node: XCUIElementSnapshot) -> [(String, CGRect)] {
+            let own = interactive.contains(node.elementType) ? [(node.label, node.frame)] : []
+            return own + node.children.flatMap { controls($0) }
+        }
+        let blocked = controls(snapshot)
+        let preferredY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
+        let ys = stride(from: viewport.minY + 24, through: viewport.maxY - 24, by: 4).sorted {
+            abs($0 - preferredY) < abs($1 - preferredY)
+        }
+        // Leading inset first, then gaps across the row; all candidates must pass the same exclusion.
+        let xs = [viewport.minX + 6] + Array(stride(from: viewport.minX + 12, through: viewport.maxX - 6, by: 8))
+        for y in ys where (down ? y < viewport.midY : y > viewport.midY) {
+            for x in xs {
+                let point = CGPoint(x: x, y: y)
+                if !blocked.contains(where: { $0.1.insetBy(dx: -32, dy: -32).contains(point) }) { return point }
+            }
+        }
+        logQA("Form no safe point", "container=\(snapshot.frame) viewport=\(viewport) controls=\(blocked)")
+        XCTFail("No form drag point at least 32pt from controls; container=\(snapshot.frame); frames=\(blocked)")
+        return nil
+    }
+
+    /// Runner NSLog is exported in ui.log; text attachments are not. Bound every line, including long trees.
+    func logQA(_ prefix: String, _ facts: String) {
+        let characters = Array(facts)
+        if characters.isEmpty { NSLog("[Nib QA] %@", prefix); return }
+        for start in stride(from: 0, to: characters.count, by: 1200) {
+            let chunk = String(characters[start..<min(start + 1200, characters.count)])
+            NSLog("[Nib QA] %@ [%d] %@", prefix, start / 1200, chunk)
+        }
     }
 
     /// Complete Files' New Folder action using the editor supplied by the OS.
