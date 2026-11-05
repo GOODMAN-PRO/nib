@@ -33,6 +33,8 @@ struct ExportRun: NibCommand {
         var files: [File]
         /// True when `inline` was asked for but the files exceed the inline limit; fetch the tmp: assets instead.
         var inlineOmitted: Bool?
+        var omissions: [ExportOmission]? = nil
+        var warning: String? = nil
     }
 
     /// Total size base64 is returned for (`inline: true`).
@@ -87,7 +89,15 @@ struct ExportRun: NibCommand {
             urls += produced
         }
         guard !urls.isEmpty else { throw NibError(.internalError, "the \(format) exporter produced no file") }
-        return try await ExportDelivery.deliver(urls, inline: p.inline ?? false, ctx: ctx)
+        var output = try await ExportDelivery.deliver(urls, inline: p.inline ?? false, ctx: ctx)
+        let omissions = ExportOmission.read(urls)
+        if !omissions.isEmpty {
+            output.omissions = omissions
+            let warning = ExportOmission.message(omissions)
+            output.warning = warning
+            (ctx.activeSession?.floatingHost ?? ctx.navigator?.floatingHost)?.postToast(warning)
+        }
+        return output
     }
 }
 
@@ -285,6 +295,7 @@ enum ExportDelivery {
         var folders = Set<URL>()
         for url in urls where isTemporary(url) {
             try? fm.removeItem(at: url)
+            try? fm.removeItem(at: ExportOmission.sidecar(url))
             folders.insert(url.deletingLastPathComponent())
         }
         // Only an exporter's own (now empty) folder inside the temporary directory, never that directory itself.

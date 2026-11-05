@@ -862,7 +862,7 @@ final class WebDAVClient {
             http = try await sendUpload(r, file: file)
         }
         try check(http, "PUT", url) { (200..<300).contains($0) }
-        return http.value(forHTTPHeaderField: "ETag")
+        return http.value(forHTTPHeaderField: "ETag") ?? http.value(forHTTPHeaderField: "OC-ETag")
     }
 
     private func sendUpload(_ request: URLRequest, file: URL) async throws -> HTTPURLResponse {

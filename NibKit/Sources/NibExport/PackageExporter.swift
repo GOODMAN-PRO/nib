@@ -4,6 +4,34 @@ import NibContracts
 
 // MARK: - .nibnote packages
 
+/// Returned to command callers and included in the archive, so unattended backups retain their report too.
+struct ExportOmission: Codable, Equatable {
+    var document: String
+    var asset: String
+    var pages: [String]
+
+    static func message(_ omissions: [Self]) -> String {
+        let pages = Set(omissions.flatMap { $0.pages }).sorted().joined(separator: ", ")
+        let count = omissions.count
+        if pages.isEmpty {
+            return String(localized: "Export completed without \(count) unreadable assets in document records. See Export Report.txt in the archive.")
+        }
+        return String(localized: "Export completed without \(count) unreadable assets on pages \(pages). See Export Report.txt in the archive.")
+    }
+
+    static func sidecar(_ url: URL) -> URL { url.appendingPathExtension("nib-export-report.json") }
+    static func read(_ urls: [URL]) -> [Self] {
+        urls.flatMap { url in
+            guard let data = try? Data(contentsOf: sidecar(url)),
+                  let report = try? JSONDecoder().decode([Self].self, from: data) else { return [] }
+            return report
+        }
+    }
+    static func save(_ report: [Self], beside url: URL) throws {
+        if !report.isEmpty { try JSONEncoder().encode(report).write(to: sidecar(url), options: .atomic) }
+    }
+}
+
 /// Everything the package worker needs, captured on the main actor.
 struct PackageJob {
     let doc: DocumentID
@@ -142,7 +170,8 @@ enum PackageExporter {
                                                                            used: &used))
             let packageJob = job
             let pull = MainPull<[Item]> { index in try source.items(index) }
-            try await ExportWorker.run { try PackageWriter.writeArchive(packageJob, pull: pull, to: archive) }
+            let report = try await ExportWorker.run { try PackageWriter.writeArchive(packageJob, pull: pull, to: archive) }
+            try ExportOmission.save(report, beside: archive)
             urls.append(archive)
         }
         guard !urls.isEmpty else { throw ExportPages.nothingInRange(options.pageRange) }
@@ -168,6 +197,7 @@ enum PackageExporter {
         let staging = folder.appendingPathComponent("tree-" + UUID().uuidString, isDirectory: true)
         try fm.createDirectory(at: staging, withIntermediateDirectories: true)
         var exportedDocuments = 0
+        var omissions: [ExportOmission] = []
         var usedPerFolder: [String: Set<String>] = [:]
         do {
             for (i, doc) in request.documents.enumerated() {
@@ -185,6 +215,7 @@ enum PackageExporter {
                 let files = try await exporter.handler(ExportRequest(documents: [doc], pages: request.pages,
                                                                      options: request.options), ctx)
                 defer { ExportDelivery.discard(files) }
+                omissions += ExportOmission.read(files)
                 exportedDocuments += 1
                 let components = chains[i].dropFirst(dropped).map { ExportNames.sanitize($0, fallback: String(localized: "Folder")) }
                 var dir = staging
@@ -216,6 +247,7 @@ enum PackageExporter {
             defer { try? FileManager.default.removeItem(at: staging) }
             try FileManager.default.zipItem(at: staging, to: archive, shouldKeepParent: false, compressionMethod: .deflate)
         }
+        try ExportOmission.save(omissions, beside: archive)
         completed = true
         return [archive]
     }
@@ -250,30 +282,47 @@ enum PackageExporter {
 enum PackageWriter {
     static let log = ExportWorker.log
 
-    static func writeArchive(_ job: PackageJob, pull: MainPull<[Item]>, to archive: URL) throws {
+    @discardableResult
+    static func writeArchive(_ job: PackageJob, pull: MainPull<[Item]>, to archive: URL) throws -> [ExportOmission] {
         let fm = FileManager.default
         let staging = archive.deletingLastPathComponent().appendingPathComponent("package-" + UUID().uuidString, isDirectory: true)
         defer { try? fm.removeItem(at: staging) }
         let package = staging.appendingPathComponent(job.title + "." + NibFormat.packageExtension, isDirectory: true)
-        try write(job, pull: pull, to: package)
+        let omissions = try write(job, pull: pull, to: package)
         try fm.zipItem(at: package, to: archive, shouldKeepParent: true, compressionMethod: .deflate)
+        return omissions
     }
 
     /// Writes the package in the store's format (ARCHITECTURE §4.2): `doc.<dev>.json` (the head), one
     /// `pages/<pageId>/<dev>.nibpage` per page with items (LZFSE-compressed JSON, compact points), the assets the
     /// document uses and the audio files.
-    static func write(_ job: PackageJob, pull: MainPull<[Item]>, to package: URL) throws {
+    @discardableResult
+    static func write(_ job: PackageJob, pull: MainPull<[Item]>, to package: URL) throws -> [ExportOmission] {
         let fm = FileManager.default
         try fm.createDirectory(at: package, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         encoder.userInfo[.nibCompactPoints] = true
         var refs = PackageAssets.refs(in: job.head)
+        var pagesByAsset: [String: Set<String>] = [:]
+        for (index, page) in job.head.livePages.enumerated() {
+            if let asset = page.background.asset {
+                let label = page.title ?? String(localized: "Page \(index + 1)")
+                pagesByAsset[asset.name, default: []].insert(label + " (" + page.id.raw + ")")
+            }
+        }
+        var omissions: [ExportOmission] = []
         for (i, page) in job.pages.enumerated() {
             try autoreleasepool {
                 let items = try pull(i)
                 guard !items.isEmpty else { return }
-                for item in items { refs.formUnion(PackageAssets.refs(in: item)) }
+                let record = job.head.livePages.first { $0.id == page }
+                let label = (record?.title ?? String(localized: "Page \(i + 1)")) + " (" + page.raw + ")"
+                for item in items {
+                    let names = PackageAssets.refs(in: item)
+                    refs.formUnion(names)
+                    for name in names { pagesByAsset[name, default: []].insert(label) }
+                }
                 let json = try encoder.encode(items)
                 let data = try (json as NSData).compressed(using: .lzfse) as Data
                 let dir = package.appendingPathComponent("pages", isDirectory: true).appendingPathComponent(page.raw, isDirectory: true)
@@ -287,7 +336,13 @@ enum PackageWriter {
             let dir = package.appendingPathComponent("assets", isDirectory: true)
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             for name in names {
-                let data = try ExportAssets.data(AssetRef(name), doc: job.doc, assets: job.assets)
+                let data: Data
+                do { data = try ExportAssets.data(AssetRef(name), doc: job.doc, assets: job.assets) }
+                catch {
+                    omissions.append(ExportOmission(document: job.title, asset: name,
+                                                    pages: (pagesByAsset[name] ?? []).sorted()))
+                    continue
+                }
                 try data.write(to: dir.appendingPathComponent(name), options: .atomic)
             }
         }
@@ -297,18 +352,31 @@ enum PackageWriter {
             try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fm.copyItem(at: file.url, to: target)
         }
+        if !omissions.isEmpty {
+            let lines = omissions.map { omission in
+                let location = omission.pages.isEmpty ? String(localized: "Document records") : omission.pages.joined(separator: ", ")
+                return omission.asset + " - " + location
+            }
+            let report = ExportOmission.message(omissions) + "\n\n" + lines.joined(separator: "\n")
+            try Data(report.utf8).write(to: package.appendingPathComponent("Export Report.txt"), options: .atomic)
+        }
+        return omissions
     }
 }
 
-/// Missing or evicted assets must fail an export, never silently produce an incomplete backup or PDF.
+/// Rendered exports fail explicitly; package exports catch these errors and report omitted assets.
 enum ExportAssets {
     static func unavailable(_ name: String) -> NibError {
-        NibError(.unavailable, String(localized: "The asset \(name) could not be read. Download it and try exporting again."))
+        NibError(.unavailable, String(localized: "The asset \(name) is missing, not downloaded, or unreadable. Restore it or download it before exporting this page."))
     }
 
     static func data(_ ref: AssetRef, doc: DocumentID, assets: AssetStore?) throws -> Data {
         guard let assets = assets else { throw unavailable(ref.name) }
-        do { return try assets.data(ref, doc: doc) }
+        do {
+            let data = try assets.data(ref, doc: doc)
+            guard !data.isEmpty else { throw unavailable(ref.name) }
+            return data
+        }
         catch { throw unavailable(ref.name) }
     }
 
@@ -334,7 +402,7 @@ enum PackageAssets {
 
     static func refs(in head: DocumentContent) -> Set<String> {
         var out = Set<String>()
-        for page in head.pages { if let a = page.background.asset { out.insert(a.name) } }
+        for page in head.livePages { if let a = page.background.asset { out.insert(a.name) } }
         for block in head.blocks {
             if let a = block.asset { out.insert(a.name) }
             out.formUnion(refs(in: block.text))

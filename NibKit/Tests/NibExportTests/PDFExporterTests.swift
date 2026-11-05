@@ -79,6 +79,17 @@ final class PDFExporterTests: XCTestCase {
         XCTAssertNil(flat.page(at: 2)?.annotations.first { $0.url != nil })
     }
 
+    func testSourcePDFLinksSurviveExcludingTheBackground() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        let service = FakePDFService()
+        service.linkMap["fixture-page.pdf"] = [PDFLinkInfo(rect: Rect(x: 72, y: 72, width: 120, height: 20), url: "https://source.example")]
+        h.app.services.pdf = service
+        let pdf = try await exportPDF(h, ["pages": ["page:FIXTUREDOC01/FIXTUREPG003"],
+            "options": ["mode": "editable", "background": false]])
+        XCTAssertNotNil(pdf.page(at: 0)?.annotations.first { $0.url?.absoluteString == "https://source.example" })
+        XCTAssertFalse(text(pdf.page(at: 0)).contains("Fixture PDF"))
+    }
+
     // MARK: Searchable text
 
     func testFlattenedAddsAnInvisibleLayerOfRecognisedHandwriting() async throws {

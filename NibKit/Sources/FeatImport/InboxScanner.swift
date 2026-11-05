@@ -100,10 +100,22 @@ enum ShareHandoff {
             throw NibError(.userDenied, "Nib couldn't read what was shared",
                            hint: "share it again and allow pasting when iOS asks")
         }
+        // Persist provenance before clearing the only upstream copy. A later inbox scan (even after
+        // relaunch) must distinguish these originals from the disposable copies iOS makes for Open In.
+        for url in urls { try Data(InboxFiles.key(url).utf8).write(to: recoveryMarker(url), options: .atomic) }
         board.items = []
         lastTaken = Date()
         deniedChangeCount = nil
         return urls
+    }
+
+    static func recoveryMarker(_ url: URL) -> URL {
+        url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".nib-handoff")
+    }
+
+    static func isRecoveryOriginal(_ url: URL) -> Bool {
+        guard url.isFileURL, let data = try? Data(contentsOf: recoveryMarker(url)) else { return false }
+        return String(decoding: data, as: UTF8.self) == InboxFiles.key(url)
     }
 
     /// Writes every hand-off item (name + bytes) into `dir`; other pasteboard items are ignored.
