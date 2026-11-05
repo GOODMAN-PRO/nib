@@ -99,6 +99,151 @@ final class ContractsV2Tests: XCTestCase {
         }
     }
 
+    func testNonUndoablePolicyControlsWhetherAnEarlierCreateCanBeUndone() async throws {
+        for policy in [NonUndoableHistoryPolicy.rebase, .seal] {
+            for writes in [1, 2] {
+                let h = Harness()
+                let ctx = try await probeContext(h)
+                let id: ElementID = "SEALEDCREATE"
+                try ctx.mutate { tx in
+                    var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+                    item.id = id
+                    try tx.put(item, doc: self.doc, page: self.page1)
+                }
+                try ctx.mutate(undoable: false, nonUndoableHistory: policy) { tx in
+                    for layer in 1...writes {
+                        var item = try tx.item(self.doc, page: self.page1, id: id)
+                        item.layer = layer
+                        try tx.put(item, doc: self.doc, page: self.page1)
+                    }
+                }
+                // Later bookkeeping must not bridge a sealed revision gap.
+                try ctx.mutate(undoable: false) { tx in
+                    var item = try tx.item(self.doc, page: self.page1, id: id)
+                    item.locked = true
+                    try tx.put(item, doc: self.doc, page: self.page1)
+                }
+                let saved = try h.app.workspace.item(doc, page: page1, id: id)
+                XCTAssertEqual(h.undoDepth(doc), 1)
+                XCTAssertEqual(h.app.bus.undo(doc), policy == .rebase)
+                XCTAssertEqual(h.undoDepth(doc), 0, "even a wholly blocked step is consumed")
+                XCTAssertEqual(h.app.bus.history.canRedo(doc), policy == .rebase)
+                if policy == .rebase {
+                    XCTAssertThrowsError(try h.app.workspace.item(doc, page: page1, id: id))
+                    XCTAssertTrue(h.app.bus.redo(doc))
+                    let restored = try h.app.workspace.item(doc, page: page1, id: id)
+                    XCTAssertEqual(restored.layer, writes)
+                    XCTAssertTrue(restored.locked)
+                } else {
+                    XCTAssertFalse(h.app.bus.redo(doc), "a blocked undo cannot create a ghost redo")
+                    XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: id), saved)
+                }
+            }
+        }
+    }
+
+    func testSealedRecordSurvivesPartialUndoRedoAndLaterEditsInTheSameGroup() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h)
+        let id: ElementID = "SEALEDCREATE"
+        let original = try h.app.workspace.item(doc, page: page1, id: Fixtures.textID)
+        try ctx.mutate { tx in
+            var created = original
+            created.id = id
+            try tx.put(created, doc: self.doc, page: self.page1)
+            var edited = original
+            edited.locked = !original.locked
+            try tx.put(edited, doc: self.doc, page: self.page1)
+        }
+        try ctx.mutate(undoable: false, nonUndoableHistory: .seal) { tx in
+            var item = try tx.item(self.doc, page: self.page1, id: id)
+            item.layer = 2
+            try tx.put(item, doc: self.doc, page: self.page1)
+        }
+        // Compaction must retain the revision gap even with the same undo group.
+        try ctx.mutate { tx in
+            var item = try tx.item(self.doc, page: self.page1, id: id)
+            item.layer = 3
+            try tx.put(item, doc: self.doc, page: self.page1)
+        }
+        XCTAssertEqual(h.undoDepth(doc), 1)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: id).layer, 2)
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).locked, original.locked)
+        let redo = try XCTUnwrap(h.app.bus.history.popRedo(doc))
+        XCTAssertEqual(redo.mutations.count, 2, "only the later edit and unsealed record were undone")
+        h.app.bus.history.pushRedo(redo, doc: doc)
+        XCTAssertTrue(h.app.bus.redo(doc))
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: id).layer, 3)
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).locked, !original.locked)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: id).layer, 2)
+    }
+
+    func testSealingAnExistingRecordBlocksPendingRedoAndSelectiveRevert() async throws {
+        for pendingRedo in [false, true] {
+            let h = Harness()
+            let ctx = try await probeContext(h)
+            try ctx.mutate { tx in
+                var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+                item.layer = 1
+                try tx.put(item, doc: self.doc, page: self.page1)
+            }
+            if pendingRedo { XCTAssertTrue(h.app.bus.undo(doc)) }
+            try ctx.mutate(undoable: false, nonUndoableHistory: .seal) { tx in
+                var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+                item.layer = 2
+                try tx.put(item, doc: self.doc, page: self.page1)
+            }
+            let sealed = try h.app.workspace.item(doc, page: page1, id: Fixtures.textID)
+            if pendingRedo {
+                XCTAssertFalse(h.app.bus.redo(doc))
+            } else {
+                let result = h.app.bus.revert(group: ctx.group, doc: doc)
+                XCTAssertEqual(result?.reverted, 0)
+                XCTAssertEqual(result?.skipped, 1)
+                XCTAssertEqual(h.undoDepth(doc), 1, "selective revert keeps an entirely skipped entry for retry")
+                XCTAssertFalse(h.app.bus.undo(doc))
+            }
+            XCTAssertFalse(h.app.bus.history.canUndo(doc))
+            XCTAssertFalse(h.app.bus.history.canRedo(doc))
+            XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID), sealed)
+        }
+    }
+
+    func testNeitherNonUndoablePolicyRebasesAcrossARemoteWrite() async throws {
+        for policy in [NonUndoableHistoryPolicy.rebase, .seal] {
+            for remoteFirst in [false, true] {
+                let h = Harness()
+                let ctx = try await probeContext(h)
+                try ctx.mutate { tx in
+                    var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+                    item.locked = true
+                    try tx.put(item, doc: self.doc, page: self.page1)
+                }
+                func mergeRemote() throws {
+                    var remote = try h.app.workspace.item(doc, page: page1, id: Fixtures.textID)
+                    remote.rev = Rev(wallMs: remote.rev.wallMs, counter: remote.rev.counter + 1, device: 99)
+                    remote.text?.text = RichText(plain: "Remote text")
+                    XCTAssertEqual(h.app.bus.applyRemote(DocumentPatch(doc: doc, items: [page1.raw: [remote]]),
+                                                         origin: "test").updated.count, 1)
+                }
+                if remoteFirst { try mergeRemote() }
+                try ctx.mutate(undoable: false, nonUndoableHistory: policy) { tx in
+                    var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+                    item.layer = 2
+                    try tx.put(item, doc: self.doc, page: self.page1)
+                }
+                if !remoteFirst { try mergeRemote() }
+                let saved = try h.app.workspace.item(doc, page: page1, id: Fixtures.textID)
+                XCTAssertEqual(saved.text?.text.plainText, "Remote text")
+                XCTAssertFalse(h.app.bus.undo(doc))
+                XCTAssertFalse(h.app.bus.redo(doc))
+                XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID), saved)
+            }
+        }
+    }
+
     /// F031 (FeatShapesTests.testDroppingAnItemIntoAShapeAttachesItInTheSameUndoStep): a commit observer attaches the
     /// moved item with `item.update` in the move's own undo group; one undo must revert BOTH the attach and the move.
     func testAttachAfterMoveInTheSameGroupUndoesTheMoveToo() async throws {

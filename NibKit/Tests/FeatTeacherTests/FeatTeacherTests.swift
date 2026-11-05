@@ -359,6 +359,30 @@ final class FeatTeacherTests: XCTestCase {
         XCTAssertEqual(try zone(h, zoneID).usage.count, 2)
     }
 
+    func testHintUsageSealsEarlierScoreAndCreateButAllowsLaterEditsToUndo() async throws {
+        let h = harness()
+        let ref = try await create(h)
+        try await h.run(CommandIDs.answerZoneScore, ["ref": .string(ref), "score": 1])
+        try await h.run(CommandIDs.answerZoneRevealHint, ["ref": .string(ref)])
+        let revealed = try zone(h, zoneID)
+        try await h.run(CommandIDs.answerZoneScore, ["ref": .string(ref), "score": 2])
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID), "edits after the reveal can still undo")
+        XCTAssertEqual(try zone(h, zoneID).score, revealed.score)
+        XCTAssertEqual(try zone(h, zoneID).usage, revealed.usage)
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertFalse(h.app.bus.undo(Fixtures.docID), "the earlier score cannot roll back hint usage")
+        XCTAssertFalse(h.app.bus.undo(Fixtures.docID), "the earlier create cannot delete the zone")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        XCTAssertEqual(try zone(h, zoneID).revealed, 1)
+        XCTAssertEqual(try zone(h, zoneID).usage, revealed.usage)
+        // The already available redo is only the later score, never a skipped earlier step.
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        XCTAssertFalse(h.app.bus.redo(Fixtures.docID))
+        XCTAssertEqual(try zone(h, zoneID).score, 2)
+        XCTAssertEqual(try zone(h, zoneID).usage, revealed.usage)
+    }
+
     func testRevealHintOnAPageUsesTheFirstZoneWithHintsLeft() async throws {
         let h = harness()
         try await create(h, id: "ZONEB0000001", rect: [72, 400, 200, 100], hints: ["b1", "b2"])

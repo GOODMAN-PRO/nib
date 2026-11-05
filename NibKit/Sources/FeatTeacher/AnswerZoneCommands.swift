@@ -380,7 +380,7 @@ struct AnswerZoneSetHints: NibCommand {
 // MARK: - answerZone.revealHint
 
 /// Reveals the next hint of a zone and records who opened it when (`AnswerZone.usage`). The record persists without an
-/// undo step (`undoable: false`, like tape reveal), so undo never erases the fact that a hint was used.
+/// undo step (`undoable: false`, with sealed history), so earlier undo never erases the fact that a hint was used.
 ///
 /// Also the canvas tap handler for the hint widget (`content.tapHandlers`, offered every finger tap and long-press):
 /// with `point` the call comes from a finger on the canvas, and only a touch on a zone's hint widget counts
@@ -488,7 +488,7 @@ struct AnswerZoneRevealHint: NibCommand {
         }
         let by = ctx.principal.description
         var shown: Int?
-        try ctx.mutate(undoable: false) { (tx: DocTransaction) -> Void in
+        try ctx.mutate(undoable: false, nonUndoableHistory: .seal) { (tx: DocTransaction) -> Void in
             var item = try tx.item(target.doc, page: target.page, id: target.item.id)
             // Read again inside the transaction: the stored record is the one that counts.
             var current = AnswerZone.decode(item) ?? zone

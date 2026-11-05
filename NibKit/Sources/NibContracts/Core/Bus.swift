@@ -207,9 +207,13 @@ public final class CommandContext {
 
     /// Runs synchronous writes atomically. Throwing (or an invariant failure) rolls everything back.
     /// All `mutate` calls in one command (and nested commands) share the undo group.
-    /// `undoable: false` = persisted but not undoable (tape reveal, study grading, per-document view state).
+    /// `undoable: false` = persisted without an undo step. Bookkeeping rebases earlier history by default;
+    /// `nonUndoableHistory: .seal` keeps revision conflicts so earlier history cannot erase the touched records.
+    /// The policy is ignored for undoable writes and remote principals.
     @discardableResult
-    public func mutate<T>(_ label: String? = nil, undoable: Bool = true, _ body: (DocTransaction) throws -> T) throws -> T {
+    public func mutate<T>(_ label: String? = nil, undoable: Bool = true,
+                          nonUndoableHistory: NonUndoableHistoryPolicy = .rebase,
+                          _ body: (DocTransaction) throws -> T) throws -> T {
         if readOnly {
             throw NibError(.permissionDenied, "'\(commandID)' runs read-only and cannot change documents",
                            hint: "switch to Edit mode (AI), or declare the command with a mutating effect")
@@ -227,7 +231,8 @@ public final class CommandContext {
             summary.merge(Changeset.summarize(tx.mutations))
             tx.rollback()
         } else if !tx.mutations.isEmpty {
-            let cs = bus.commit(tx, label: label ?? title, command: commandID, record: undoable)
+            let cs = bus.commit(tx, label: label ?? title, command: commandID, record: undoable,
+                                nonUndoableHistory: nonUndoableHistory)
             summary.merge(cs.summary)
         }
         return result
@@ -467,11 +472,12 @@ public final class CommandBus {
     // MARK: Commit + observers
 
     @discardableResult
-    func commit(_ tx: DocTransaction, label: String, command: String, record: Bool) -> Changeset {
+    func commit(_ tx: DocTransaction, label: String, command: String, record: Bool,
+                nonUndoableHistory: NonUndoableHistoryPolicy = .rebase) -> Changeset {
         seq += 1
         let cs = Changeset(seq: seq, principal: tx.principal, group: tx.group, label: label, command: command, mutations: tx.mutations)
         if record && !cs.principal.isSync { history.record(cs) }
-        if !record && !cs.principal.isSync {
+        if !record && !cs.principal.isSync && nonUndoableHistory == .rebase {
             // Local view state and grading follow the existing undo step. Remote writes
             // and irreversible removals must still conflict. Walk backwards to include repeated writes in one tx.
             var rebase = RevRebase()

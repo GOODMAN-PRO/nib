@@ -1,5 +1,16 @@
 import Foundation
 
+/// How a local write omitted from undo history interacts with earlier undo and redo steps.
+/// Has no effect on recorded writes or remote changes.
+public enum NonUndoableHistoryPolicy: Equatable {
+    /// Bookkeeping follows the existing step by rebasing its expected revision (the default).
+    /// Irreversible removals still conflict.
+    case rebase
+    /// Keep earlier revisions stale: undo/redo skips this record and preserves the write.
+    /// Other records in the step can still be reverted; only those become a redo/undo step.
+    case seal
+}
+
 public struct UndoEntry {
     /// Stable across coalescing, revision rebasing and undo/redo.
     public let id: String
