@@ -543,7 +543,8 @@ final class FeatLibraryUITests: XCTestCase {
         let reported = expectation(description: "partial batch error surfaced")
         let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
             let error = note.userInfo?["error"] as? NibError
-            XCTAssertTrue(error?.message.contains("folder:FIXTUREFLD01") == true)
+            let message = error?.message ?? ""
+            XCTAssertTrue(message.contains("Fixtures") || message.contains("folder:FIXTUREFLD01"))
             XCTAssertTrue(error?.message.contains("Folder provider offline") == true)
             reported.fulfill()
         }

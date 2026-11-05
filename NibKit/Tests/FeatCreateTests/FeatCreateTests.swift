@@ -6,6 +6,11 @@ import NibTesting
 import NibDesign
 @testable import FeatCreate
 
+@MainActor
+private final class PreviewBox {
+    var image: UIImage?
+}
+
 /// Records the calls stand-in commands receive.
 @MainActor
 private final class CallLog {
@@ -803,21 +808,21 @@ final class FeatCreateTests: XCTestCase {
         let started = expectation(description: "old render started")
         let release = expectation(description: "old render released")
         let oldImage = UIImage(), currentImage = UIImage()
-        var preview: UIImage?
+        let box = PreviewBox()
         let old = Task {
             await TemplatePreviewPublication.render {
                 started.fulfill()
                 await self.fulfillment(of: [release], timeout: 2)
                 return oldImage
-            } publish: { preview = $0 }
+            } publish: { box.image = $0 }
         }
         await fulfillment(of: [started], timeout: 2)
-        await TemplatePreviewPublication.render { currentImage } publish: { preview = $0 }
-        XCTAssertTrue(preview === currentImage)
+        await TemplatePreviewPublication.render { currentImage } publish: { box.image = $0 }
+        XCTAssertTrue(box.image === currentImage)
         old.cancel()
         release.fulfill()
         await old.value
-        XCTAssertTrue(preview === currentImage)
+        XCTAssertTrue(box.image === currentImage)
     }
 
     func testTemplateThumbnailDrawsTheTemplateAndItsPaperColour() throws {

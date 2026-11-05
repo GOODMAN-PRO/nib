@@ -347,8 +347,9 @@ struct DropletDragLifetime {
     mutating func move(id: String, field: DropletField, start: CGPoint, location: CGPoint,
                        onDrag: ((NibDropletDrag) -> Void)?) {
         if mode == nil {
-            mode = .move
             field.beginDrag(id, at: start)
+            guard field.isDragging(id) else { return }
+            mode = .move
             onDrag?(.began(location: start))
         }
         field.drag(id, to: location)

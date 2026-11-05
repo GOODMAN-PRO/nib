@@ -5,6 +5,51 @@ import QuartzCore
 
 @MainActor
 final class AnimationIdleTests: XCTestCase {
+    func testRefusedMoveRetriesWithoutPublishingUntilDragBegins() {
+        for blockedByInking in [false, true] {
+            let field = DropletField()
+            defer { field.setInking(false); field.setActive(false) }
+            field.reduceMotion = true
+            field.register("panel", style: .floatingPanel)
+            let rest = CGRect(x: 40, y: 40, width: 300, height: 200)
+            if blockedByInking {
+                field.setRest("panel", rest, style: .floatingPanel)
+                field.setInking(true)
+            }
+            var lifetime = DropletDragLifetime()
+            var events: [String] = []
+            let callback: (NibDropletDrag) -> Void = { event in
+                switch event {
+                case .began: events.append("began")
+                case .changed: events.append("changed")
+                case .ended: events.append("ended")
+                }
+            }
+            let start = CGPoint(x: 60, y: 60)
+            lifetime.move(id: "panel", field: field, start: start,
+                          location: CGPoint(x: 80, y: 60), onDrag: callback)
+            XCTAssertNil(lifetime.mode)
+            XCTAssertFalse(field.isDragging("panel"))
+            XCTAssertTrue(events.isEmpty)
+
+            if blockedByInking {
+                field.setInking(false)
+            } else {
+                field.setRest("panel", rest, style: .floatingPanel)
+            }
+            lifetime.move(id: "panel", field: field, start: start,
+                          location: CGPoint(x: 100, y: 60), onDrag: callback)
+            XCTAssertEqual(lifetime.mode, .move)
+            XCTAssertTrue(field.isDragging("panel"))
+            XCTAssertEqual(events, ["began", "changed"])
+            lifetime.move(id: "panel", field: field, start: start,
+                          location: CGPoint(x: 120, y: 60), onDrag: callback)
+            XCTAssertEqual(events, ["began", "changed", "changed"])
+            lifetime.cancel(id: "panel", field: field)
+            XCTAssertFalse(field.isDragging("panel"))
+        }
+    }
+
     func testCancelledMoveReleasesAndNextPickupBeginsAfresh() {
         for style in [DropletStyle.floatingPanel, .palette] {
             let field = DropletField()
