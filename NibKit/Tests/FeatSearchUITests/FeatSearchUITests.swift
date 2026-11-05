@@ -1013,8 +1013,12 @@ final class FeatSearchUITests: XCTestCase {
             XCTAssertLessThanOrEqual(inputFrame.maxX, size.width - NibMetrics.chromeInset - NibMetrics.hitTarget,
                 "The query must leave room for the Close search control inside the window")
             let resultsFrame = results.convert(results.bounds, to: window)
-            let expectedWidth = size.width > size.height ? NibMetrics.searchWidth : size.width - 2 * NibMetrics.chromeInset
+            // V2:test01Library#2: library replacement content follows the 24 pt gutter in both orientations.
+            // The document HUD's separate 560 pt width contract is unchanged.
+            let expectedWidth = size.width - 2 * NibMetrics.libraryGutter
             XCTAssertEqual(resultsFrame.width, expectedWidth, accuracy: 1)
+            XCTAssertEqual(resultsFrame.minX, NibMetrics.libraryGutter, accuracy: 1)
+            XCTAssertEqual(resultsFrame.maxX, size.width - NibMetrics.libraryGutter, accuracy: 1)
             XCTAssertEqual(resultsFrame.midX, size.width / 2, accuracy: 1)
             XCTAssertGreaterThanOrEqual(resultsFrame.minX, NibMetrics.chromeInset - 1)
             XCTAssertLessThanOrEqual(resultsFrame.maxX, size.width - NibMetrics.chromeInset + 1)
