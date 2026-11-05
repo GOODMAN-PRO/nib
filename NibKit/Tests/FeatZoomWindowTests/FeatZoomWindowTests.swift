@@ -912,7 +912,7 @@ final class FeatZoomWindowTests: XCTestCase {
         var captured = 0
         view.onStroke = { _ in captured += 1; return true }
         view.canvasViewDidBeginUsingTool(view.canvas)
-        configure(pen)
+        configure(PKInkingTool(.pen, color: .black, width: 2))
         XCTAssertTrue(view.isUsingTool, "layout and box updates must not interrupt capture")
         view.canvas.drawing = PKDrawing(strokes: [PKBridge.pkStroke(stroke(120, 150))])
         configure(pencil)
@@ -922,6 +922,28 @@ final class FeatZoomWindowTests: XCTestCase {
         view.canvasViewDidBeginUsingTool(view.canvas)
         configure(pencil, erasing: true)
         XCTAssertFalse(view.isUsingTool, "the eraser disables drawing without changing the underlying inking tool")
+    }
+
+    func testConfigurationComparesRequestedToolFieldsInsteadOfCanvasReadback() {
+        let view = ZoomWritingView(frame: CGRect(x: 0, y: 0, width: 400, height: 100))
+        func configure(_ tool: PKInkingTool) {
+            view.configure(box: Rect(x: 100, y: 200, width: 200, height: 50), pageSize: .a4, tool: tool,
+                           erasing: false, policy: .anyInput, fingersDraw: true, eraserDiameter: 14, showsZone: false)
+        }
+        configure(PKInkingTool(.pen, color: .black, width: 2))
+        // Stand in for PencilKit returning a normalised width instead of the requested width.
+        view.canvas.tool = PKInkingTool(.pen, color: .black, width: 3)
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        configure(PKInkingTool(.pen, color: .black, width: 2))
+        XCTAssertTrue(view.isUsingTool, "unchanged requests must preserve capture despite canvas normalisation")
+        configure(PKInkingTool(.pen, color: .black, width: 3))
+        XCTAssertFalse(view.isUsingTool, "a requested width change must finish capture even when it matches the canvas")
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        configure(PKInkingTool(.pen, color: .red, width: 3))
+        XCTAssertFalse(view.isUsingTool, "a colour change must finish capture")
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        configure(PKInkingTool(.pencil, color: .red, width: 3))
+        XCTAssertFalse(view.isUsingTool, "an ink type change must finish capture")
     }
 
     func testHidingPaneFinishesCaptureBeforeClearingWetInk() async throws {

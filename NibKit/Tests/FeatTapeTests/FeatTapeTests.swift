@@ -48,11 +48,15 @@ final class FeatTapeTests: XCTestCase {
     func testUnreadablePatternInputsReportEveryFailure() async {
         let h = harness()
         let model = TapeSettingsModel(app: h.app, session: h.session)
-        let failed = expectation(forNotification: .nibCommandFailed, object: h.app) { notification in
-            (notification.userInfo?["command"] as? String) == "tape.importPattern"
-                && notification.userInfo?["error"] is NibError
-        }
+        let failed = expectation(description: "every unreadable pattern input reports a failure")
         failed.expectedFulfillmentCount = 4
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { notification in
+            if (notification.userInfo?["command"] as? String) == "tape.importPattern",
+               notification.userInfo?["error"] is NibError {
+                failed.fulfill()
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
         let missing = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         await model.importFile(missing)
         await model.importPhoto { nil }

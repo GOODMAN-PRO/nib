@@ -1071,6 +1071,8 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
     private var region: Rect?
     private var knownStrokes = 0
     private var ignoresChanges = false
+    /// Compare requested fields, since PencilKit may normalise the canvas tool's width.
+    private var configuredTool: PKInkingTool?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1138,12 +1140,20 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
 
     func configure(box: Rect, pageSize: PageSize, tool: PKInkingTool, erasing: Bool, policy: PKCanvasViewDrawingPolicy,
                    fingersDraw: Bool, eraserDiameter: CGFloat, showsZone: Bool) {
-        let toolChanged = (canvas.tool as? PKInkingTool) != tool
+        let toolChanged: Bool
+        if let current = configuredTool {
+            toolChanged = current.inkType != tool.inkType || current.color != tool.color || current.width != tool.width
+        } else {
+            toolChanged = true
+        }
         if toolChanged || eraser.isEnabled != erasing || canvas.drawingPolicy != policy { finishToolUse() }
         self.box = box
         self.pageSize = pageSize
         self.eraserDiameter = eraserDiameter
-        if toolChanged { canvas.tool = tool }
+        if toolChanged {
+            canvas.tool = tool
+            configuredTool = tool
+        }
         canvas.drawingPolicy = policy
         canvas.drawingGestureRecognizer.isEnabled = !erasing
         eraser.isEnabled = erasing
