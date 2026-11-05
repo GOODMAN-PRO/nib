@@ -82,6 +82,33 @@ final class FeatExportUITests: XCTestCase {
         XCTAssertTrue(presenter.filesExistedDuringDelivery)
     }
 
+    func testExportRunOwnsOmissionToastForShareAndFiles() async throws {
+        for destination in ["share", "files"] {
+            for completed in [false, true] {
+                let (h, presenter, probe) = harness()
+                let host = AttachingExportHost()
+                h.session.floatingHost = host
+                let warning = "Export completed with omitted assets."
+                probe.warning = warning
+                probe.onExport = { host.postToast(warning, actionTitle: nil, action: nil) }
+                presenter.onDelivery = { _ in completed }
+                let result = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"],
+                    "destination": .string(destination)])
+                XCTAssertEqual(result["completed"], .bool(completed))
+                XCTAssertEqual(result["warning"], .string(warning))
+                XCTAssertEqual(host.toasts, [warning], "Delivery must not repeat or overwrite export.run's warning")
+            }
+        }
+    }
+
+    func testCompletedExportWithoutOmissionsStillPostsSuccess() async throws {
+        let (h, _, _) = harness()
+        let host = AttachingExportHost()
+        h.session.floatingHost = host
+        _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"], "destination": "files"])
+        XCTAssertEqual(host.toasts.count, 1)
+    }
+
     func testOptionKeysAndExporterKindsCSVAndFolderZip() async throws {
         let (h, presenter, probe) = harness()
         _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC03"]])
@@ -628,6 +655,7 @@ final class FeatExportUITests: XCTestCase {
 
 @MainActor
 private final class AttachingExportHost: FloatingHosting {
+    var toasts: [String] = []
     var convertedRect: CGRect?
     var anchorID: String?
     private var contents: [String: AnyView] = [:]
@@ -641,7 +669,7 @@ private final class AttachingExportHost: FloatingHosting {
         return true
     }
     func removeAnchor(_ id: String) { if anchorID == id { anchorID = nil } }
-    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) { toasts.append(message) }
 }
 
 @MainActor

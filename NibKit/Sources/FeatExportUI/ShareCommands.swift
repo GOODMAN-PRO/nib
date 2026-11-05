@@ -68,9 +68,11 @@ struct PresentExport: NibCommand {
         defer { files.remove() }
         try selection.requireUnlocked(ctx)
         let completed = try await presenter.deliver(files.urls, destination: destination, ctx: ctx)
-        if completed {
+        // export.run owns omission warnings, including when delivery is cancelled.
+        // Do not repeat or replace that warning with a generic success toast.
+        if completed, result["warning"]?.stringValue == nil {
             let count = params["pages"]?.arrayValue?.count ?? selection.documents.reduce(0) { $0 + $1.pages.count }
-            ctx.activeSession?.floatingHost?.postToast(result["warning"]?.stringValue ?? (count > 0 ? String(localized: "Exported \(count) pages") : String(localized: "Exported \(selection.documents.count) documents")))
+            ctx.activeSession?.floatingHost?.postToast(count > 0 ? String(localized: "Exported \(count) pages") : String(localized: "Exported \(selection.documents.count) documents"))
         }
         return ["completed": .bool(completed), "files": result["files"] ?? .array([]),
                 "omissions": result["omissions"] ?? .array([]), "warning": result["warning"] ?? .null]
