@@ -540,6 +540,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             // Setting the offset stops any scroll animation in flight.
             isAnimatingScroll = false
             if scrollView.contentOffset != target { scrollView.contentOffset = target }
+            if !scrollView.isZoomingNow { refreshBoardAccessibility() }
         }
     }
 
@@ -641,6 +642,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         growBoardIfNeeded()
         flushSessionState()
         host.inputController?.canvasDidEndZooming(host)
+        refreshBoardAccessibility()
     }
 
     /// Centres the window on `point` of `page` (a board point).
@@ -1215,10 +1217,18 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         updateCurrentPage()
         hud.setScrolling(false, compact: isCompact)
         // A board lists the items near the window for VoiceOver: the window moved.
-        if mode.isWorld { for v in scrollView.pageViews.values { v.invalidateAccessibility() } }
+        refreshBoardAccessibility()
         growBoardIfNeeded()
         flushSessionState()
         updateAddPageIndicator()
+    }
+
+    /// Board elements are culled to the viewport when built, so changing its extent or
+    /// origin must discard that snapshot even when UIKit sends no scroll-end callback.
+    private func refreshBoardAccessibility() {
+        guard mode.isWorld else { return }
+        for view in scrollView.pageViews.values { view.invalidateAccessibility() }
+        UIAccessibility.post(notification: .layoutChanged, argument: nil)
     }
 
     func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
