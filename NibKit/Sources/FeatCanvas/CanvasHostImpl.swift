@@ -384,7 +384,7 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
         // No renderer installed (a stripped-down build): the pages show their paper, which is not a failure.
         guard let page = view.pageID, NibError.wrap(error).code != .unavailable else { return }
         CanvasHostImpl.log.error("page \(page.raw, privacy: .public) failed to render: \(NibError.wrap(error).description, privacy: .public)")
-        controller?.pageDidFail(page, reason: NibError.wrap(error).message)
+        controller?.pageDidFail(page)
     }
 
     // MARK: Live views

@@ -2299,7 +2299,7 @@ final class FeatCanvasTests: XCTestCase {
         let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.boardID])
         await waitUntil("failed renders to settle") { page.isSettled }
         XCTAssertFalse(vc.errorView.isHidden, "Settling alone is not recovery")
-        XCTAssertEqual(vc.errorView.reason, "the tile could not be drawn")
+        XCTAssertEqual(vc.errorView.reason, String(localized: "The page renderer could not finish drawing this page."))
         h.app.services.renderer = RecordingRenderer()
         page.invalidate(nil)
         await waitUntil("successful rerender") { page.isSettled && !vc.failedPages.contains(Fixtures.boardID) }
@@ -2309,6 +2309,34 @@ final class FeatCanvasTests: XCTestCase {
         vc.pageDidFail(Fixtures.boardID)
         page.invalidate(nil)
         await waitUntil("second recovery") { !vc.failedPages.contains(Fixtures.boardID) }
+        XCTAssertTrue(vc.errorView.isHidden)
+    }
+
+    func testOneFailedTileStaysReportedWhenPreviewAndSiblingTilesLand() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let renderer = OneTileFailureRenderer()
+        h.app.services.renderer = renderer
+        let vc = try makeCanvas(h)
+        defer { renderer.releaseSuccessfulRenders(); vc.closeCanvas() }
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        await waitUntil("one tile to fail") { vc.failedPages.contains(Fixtures.page1) }
+        XCTAssertFalse(vc.errorView.isHidden)
+        XCTAssertGreaterThan(page.tileKeys.count, 1)
+        XCTAssertGreaterThan(page.pendingRenders, 0, "Preview and siblings are held until after the failure")
+        renderer.releaseSuccessfulRenders()
+        await waitUntil("preview and siblings to land") { page.isSettled }
+        XCTAssertTrue(page.hasShownContent)
+        XCTAssertTrue(vc.failedPages.contains(Fixtures.page1))
+        XCTAssertFalse(vc.errorView.isHidden)
+        XCTAssertEqual(vc.errorView.actionTitles, ["Try Again"])
+
+        let failed = try XCTUnwrap(renderer.failedRegion)
+        let sibling = try XCTUnwrap(page.tileKeys.first { CanvasTileGrid.rect($0) != failed })
+        page.invalidate(CanvasTileGrid.rect(sibling).insetBy(1))
+        await waitUntil("unrelated rerender") { page.isSettled }
+        XCTAssertTrue(vc.failedPages.contains(Fixtures.page1), "Unrelated work cannot recover the failed slot")
+        page.invalidate(failed.insetBy(1))
+        await waitUntil("failed slot to recover") { page.isSettled && !vc.failedPages.contains(Fixtures.page1) }
         XCTAssertTrue(vc.errorView.isHidden)
     }
 
@@ -2530,6 +2558,57 @@ private final class RecordingRenderer: PageRenderer {
         lock.unlock()
     }
 
+    func purgeCaches() {}
+}
+
+/// Fails one screen tile once and holds successful tiles/previews until the test observes the banner.
+private final class OneTileFailureRenderer: PageRenderer {
+    private let lock = NSLock()
+    private var failed: Rect?
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private let image = FakeRenderer.blank(CGSize(width: 4, height: 4))
+
+    var failedRegion: Rect? {
+        lock.lock()
+        defer { lock.unlock() }
+        return failed
+    }
+
+    private func shouldFail(_ request: RenderRequest) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard request.page == Fixtures.page1, let region = request.region, failed == nil else { return false }
+        failed = region
+        return true
+    }
+
+    func releaseSuccessfulRenders() {
+        lock.lock()
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+        pending.forEach { $0.resume() }
+    }
+
+    func render(_ request: RenderRequest) async throws -> RenderResult {
+        if shouldFail(request) { throw NibError(.internalError, "one screen tile failed") }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if released {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
+            }
+        }
+        return RenderResult(image: image, region: request.region ?? Rect(x: 0, y: 0, width: 1, height: 1), scale: request.scale)
+    }
+
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { image }
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
     func purgeCaches() {}
 }
 

@@ -16,7 +16,8 @@ final class PenOptions: ObservableObject {
     private var pendingWrites: [String: UUID] = [:]
     private var lastWrite: Task<Void, Never>?
     @Published private var customDraft: RGBA?
-    private var customSwatch: Int?
+    private var customSwatch: (index: Int, colour: RGBA)?
+    private var customSession = UUID()
     private(set) var customSave: Task<Void, Never>?
 
     init(app: NibApp, session: EditorSession, pencil: Bool, observesWritingAids: Bool = false) {
@@ -99,6 +100,7 @@ final class PenOptions: ObservableObject {
     func chooseColour(_ colour: RGBA) {
         customSave?.cancel()
         customDraft = nil
+        beginCustomColourSession()
         changePreset {
             if let index = $0.swatches.firstIndex(where: { $0.color == colour }) { $0.selectedSwatch = index }
             else if $0.swatches.count < ToolPresets.maxSwatches {
@@ -120,30 +122,40 @@ final class PenOptions: ObservableObject {
             let rgba = RGBA(UIColor(colour))
             self.customDraft = rgba
             self.customSave?.cancel()
+            let session = self.customSession
             // Keep the final choice even if the popover closes before the drag settles.
             self.customSave = Task { @MainActor [self] in
                 do { try await Task.sleep(for: .milliseconds(400)) } catch { return }
                 changePreset { presets in
-                    if let index = customSwatch, presets.swatches.indices.contains(index) {
-                        presets.swatches[index] = PresetSwatch(color: rgba)
-                        presets.selectedSwatch = index
+                    let owned = session == customSession ? customSwatch : nil
+                    if let owned, presets.swatches.indices.contains(owned.index),
+                       presets.swatches[owned.index].color == owned.colour {
+                        presets.swatches[owned.index] = PresetSwatch(color: rgba)
+                        presets.selectedSwatch = owned.index
+                        customSwatch = (owned.index, rgba)
                     } else if let index = presets.swatches.firstIndex(where: { $0.color == rgba }) {
                         presets.selectedSwatch = index
                     } else if presets.swatches.count < ToolPresets.maxSwatches {
                         presets.swatches.append(PresetSwatch(color: rgba))
                         presets.selectedSwatch = presets.swatches.count - 1
-                        customSwatch = presets.selectedSwatch
+                        if session == customSession { customSwatch = (presets.selectedSwatch, rgba) }
                     } else {
                         let index = max(0, min(presets.selectedSwatch, presets.swatches.count - 1))
                         presets.swatches[index] = PresetSwatch(color: rgba)
                         presets.selectedSwatch = index
-                        customSwatch = index
+                        if session == customSession { customSwatch = (index, rgba) }
                     }
                 }
                 customDraft = nil
                 await lastWrite?.value
             }
         })
+    }
+
+    /// Reopening the popover or choosing a preset ends ownership of the previous custom swatch.
+    func beginCustomColourSession() {
+        customSwatch = nil
+        customSession = UUID()
     }
 
     var disconnectStylus: Binding<Bool> {
@@ -243,6 +255,7 @@ struct PenSettingsView: View {
                 .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+        .onAppear { model.beginCustomColourSession() }
         .task(id: session.document) { await model.loadWritingAids() }
     }
 

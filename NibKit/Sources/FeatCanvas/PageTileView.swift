@@ -74,10 +74,10 @@ protocol PageTileSource: AnyObject {
     func placeholderTile(page: PageID, region: Rect, scale: Double) -> CGImage?
     /// The page view finished every render it had in flight (tiles and preview).
     func pageTileViewDidSettle(_ view: PageTileView)
-    /// A real tile or preview landed, including a successful render after an earlier failure.
+    /// Failed work recovered, or a full render/configuration completed without any failed work.
     func pageTileViewDidRender(_ view: PageTileView)
     /// A render of the page (a tile or its low-resolution preview) failed, not cancelled: the canvas shows "Couldn't
-    /// show this page." Called at most once per configuration until `retry()`.
+    /// show this page." Called once per failure episode, until recovery or `retry()`.
     func pageTileView(_ view: PageTileView, didFailWith error: Error)
 }
 
@@ -142,6 +142,8 @@ final class PageTileView: UIView {
     private(set) var previewFailed = false
     /// A failed render was reported to the source since the page was configured (or since Try Again).
     private var failureReported = false
+    private var failedSlots: Set<TileKey> = []
+    private var recoveryPending = false
     private var tokenCounter = 0
     /// Region of the page the last coverage pass asked for (page coordinates).
     private var covered: Rect?
@@ -231,6 +233,8 @@ final class PageTileView: UIView {
         previewStale = true
         previewFailed = false
         failureReported = false
+        failedSlots.removeAll()
+        recoveryPending = true
         covered = nil
         for v in liveViewContainer.subviews { v.removeFromSuperview() }
         // The board's placeholders sit outside this fade and stay visible until its bitmaps land.
@@ -244,8 +248,6 @@ final class PageTileView: UIView {
     /// The first bitmap since the page was configured landed: its content fades in (`NibMotion.fade`, 120 ms). The
     /// SwiftUI timing token drives UIKit from iOS 18; iOS 17 shows it at once.
     private func contentLanded() {
-        failureReported = false
-        source?.pageTileViewDidRender(self)
         guard !hasShownContent else { return }
         hasShownContent = true
         if #available(iOS 18, *), window != nil {
@@ -340,6 +342,12 @@ final class PageTileView: UIView {
     /// screen stays until the new bitmap lands, so a commit never flickers.
     func invalidate(_ rect: Rect?) {
         guard let pageID = pageID else { return }
+        if rect == nil {
+            // A full re-render replaces even failed work from an older coverage/zoom level.
+            failedSlots.removeAll()
+            previewFailed = false
+            recoveryPending = true
+        }
         for (key, slot) in slots where rect.map({ CanvasTileGrid.rect(key).intersects($0) }) ?? true {
             if isWorld && !slot.hasImage {
                 slot.placeholder.contents = source?.placeholderTile(page: pageID, region: CanvasTileGrid.rect(key),
@@ -404,21 +412,24 @@ final class PageTileView: UIView {
                 slot.layer.contents = image
                 CATransaction.commit()
                 slot.hasImage = true
+                if self.failedSlots.remove(key) != nil { self.recoveryPending = true }
                 self.dropCoveredFallback()
                 self.contentLanded()
                 self.dropLandedPlaceholders()
             } else if let error = failure, !Task.isCancelled {
                 // The slot stays, so Try Again (`retry`) asks for this tile again.
-                self.renderFailed(error)
+                self.renderFailed(error, slot: key)
             }
             self.renderFinished()
         }
     }
 
     /// A render failed, not cancelled and not for want of a renderer (a stripped-down build shows paper): the canvas
-    /// shows "Couldn't show this page." (DESIGN.md §14.18). Reported once per configuration, until Try Again.
-    private func renderFailed(_ error: Error) {
-        guard !(error is CancellationError), NibError.wrap(error).code != .unavailable, !failureReported else { return }
+    /// shows "Couldn't show this page." (DESIGN.md §14.18). Reported once until recovery or Try Again.
+    private func renderFailed(_ error: Error, slot: TileKey? = nil) {
+        guard !(error is CancellationError), NibError.wrap(error).code != .unavailable else { return }
+        if let slot { failedSlots.insert(slot) }
+        guard !failureReported else { return }
         failureReported = true
         source?.pageTileView(self, didFailWith: error)
     }
@@ -463,7 +474,16 @@ final class PageTileView: UIView {
     }
 
     private func notifyIfSettled() {
-        if isSettled { source?.pageTileViewDidSettle(self) }
+        guard isSettled else { return }
+        // Sibling tiles and the preview cannot clear an empty failed slot. Wait for all
+        // current work as well, so a slower failing tile cannot make the banner flicker.
+        if recoveryPending, failedSlots.isEmpty, !previewFailed, hasShownContent,
+           slots.values.allSatisfy({ $0.hasImage }) {
+            recoveryPending = false
+            failureReported = false
+            source?.pageTileViewDidRender(self)
+        }
+        source?.pageTileViewDidSettle(self)
     }
 
     // MARK: Fallback tiles

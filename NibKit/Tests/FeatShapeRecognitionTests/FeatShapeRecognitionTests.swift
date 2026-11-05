@@ -415,7 +415,7 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertNil(calls.params[CommandIDs.itemTransform], "the rotation travels with the frame")
     }
 
-    /// shape.create runs before anything is deleted: when it fails, the neighbours stay and the stroke stays as ink.
+    /// Failed shape creation keeps its preview until the fallback ink commit succeeds.
     func testFailedShapeFallbackKeepsPreviewUntilInkCommitSucceeds() async throws {
         for succeeds in [false, true] {
             let h = Harness(features: [FeatShapeRecognitionFeature.self])
@@ -441,6 +441,7 @@ final class FeatShapeRecognitionTests: XCTestCase {
         }
     }
 
+    /// shape.create runs before anything is deleted: when it fails, the neighbours stay and the stroke stays as ink.
     func testFailedCreateKeepsTheNeighboursAndTheInk() async throws {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 300), to: Point(400, 300), layer: 0)])

@@ -104,6 +104,12 @@ final class StrokeInspectorModel: ObservableObject {
                 set: { self.change(["width": .number($0 * 72 / 25.4)]) })
     }
     var widthRange: ClosedRange<Double> { 0.1...max(3, style.width * 25.4 / 72) }
+    var canChangeColour: Bool {
+        !ids.contains { id in
+            guard let stroke = try? context.app.workspace.item(context.doc, page: context.page, id: id).stroke else { return false }
+            return stroke.style.tool == .tape && stroke.style.tapePattern != nil
+        }
+    }
     var swatch: Binding<String?> {
         Binding(get: { NibInk.allCases.first { RGBA($0.uiColor) == self.style.color }?.rawValue },
                 set: { name in
@@ -125,8 +131,10 @@ struct StrokeStyleInspector: View {
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
             NibStrokeWidthSlider(width: model.width, range: model.widthRange)
-            NibInspectorSection(String(localized: "Colour")) {
-                NibSwatchGrid(swatches: NibInk.allCases.map { NibSwatch(ink: $0) }, selection: model.swatch)
+            if model.canChangeColour {
+                NibInspectorSection(String(localized: "Colour")) {
+                    NibSwatchGrid(swatches: NibInk.allCases.map { NibSwatch(ink: $0) }, selection: model.swatch)
+                }
             }
             NibInspectorSection(String(localized: "Stroke pattern")) {
                 NibSegmentedControl(selection: model.pattern, options: StrokePattern.allCases, title: { $0.title })

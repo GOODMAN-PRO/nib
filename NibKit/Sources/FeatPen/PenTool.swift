@@ -70,8 +70,6 @@ final class PenTool: CanvasTool {
         let outline = PenGeometry.thinned(stroke.polyline, limit: NibLimits.maxErasePathPoints)
         let app = host.app, session = host.session, doc = host.documentID
         if settings.get(PenSettings.scribbleErase), ScribbleDetector.isScribble(outline, scale: host.zoomScale) {
-            drawStroke(stroke, page: page, host: host)
-            let layer = preview; preview = nil
             host.cancelWetStroke()
             Task { @MainActor in
                 var erased = false
@@ -85,9 +83,13 @@ final class PenTool: CanvasTool {
                 } catch {
                     Self.report(error, command: CommandIDs.inkScribbleErase, app: app)
                 }
-                if erased {
-                    host.afterNextRender(page: page) { layer?.removeFromSuperlayer() }
-                } else {
+                if !erased {
+                    // An erase can finish after a new stroke has begun. Give this fallback
+                    // its own layer without borrowing the active stroke's preview.
+                    let activePreview = self.preview
+                    self.preview = nil
+                    self.drawStroke(stroke, page: page, host: host)
+                    let layer = self.preview; self.preview = activePreview
                     host.commitStroke(stroke, page: page) { result in
                         switch result {
                         case .success:
