@@ -14,6 +14,7 @@ struct ChatPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             NibPanelHeader(title: String(localized: "Assistant"), subtitle: model.providerLabel, symbol: .assistant,
+                           handlesEscape: context.presentation == .sheet || context.presentation == .fullScreen,
                            onClose: { model.perform(ChatCommand.close) }) {
                 Menu {
                     Button(String(localized: "New conversation")) { model.perform(ChatCommand.new) }
