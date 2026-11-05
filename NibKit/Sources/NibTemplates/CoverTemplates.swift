@@ -8,14 +8,14 @@ enum CoverTemplates {
     // Keep persisted template IDs, including the default cover.solid, resolvable. Their old pattern names are
     // implementation history; the catalogue now presents the shared cloth palette in design-spec order.
     static let all: [TemplateDefinition] = [
-        cover("cover.solid", "Moss", order: 900, cloth: .moss),
-        cover("cover.band", "Carbon", order: 910, cloth: .carbon),
-        cover("cover.dots", "Terracotta", order: 920, cloth: .terracotta),
-        cover("cover.kraft", "Sand", order: 930, cloth: .sand),
-        cover("cover.stripes", "Navy", order: 940, cloth: .navy),
-        cover("cover.frame", "Oxblood", order: 950, cloth: .oxblood),
-        cover("cover.grid", "Stone", order: 960, cloth: .stone),
-        cover("cover.split", "Paper", order: 970, cloth: .paper)
+        cover("cover.solid", String(localized: "Moss"), order: 900, cloth: .moss),
+        cover("cover.band", String(localized: "Carbon"), order: 910, cloth: .carbon),
+        cover("cover.dots", String(localized: "Terracotta"), order: 920, cloth: .terracotta),
+        cover("cover.kraft", String(localized: "Sand"), order: 930, cloth: .sand),
+        cover("cover.stripes", String(localized: "Navy"), order: 940, cloth: .navy),
+        cover("cover.frame", String(localized: "Oxblood"), order: 950, cloth: .oxblood),
+        cover("cover.grid", String(localized: "Stone"), order: 960, cloth: .stone),
+        cover("cover.split", String(localized: "Paper"), order: 970, cloth: .paper)
     ]
 
     static let colorParam = TemplateParam(name: TemplateParamNames.color, title: "Cover colour", kind: "color")

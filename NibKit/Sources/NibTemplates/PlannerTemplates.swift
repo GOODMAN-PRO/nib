@@ -48,7 +48,7 @@ enum PlannerTemplates {
     static let colours: [TemplateParam] = [ParamSpec.paper, ParamSpec.line]
 
     /// Meeting notes: meeting / date / attendees fields, agenda, notes and action items with owners.
-    static let meeting = TemplateFactory.paper("builtin.meeting", "Meeting Notes", category: "Planners", order: 300,
+    static let meeting = TemplateFactory.paper("builtin.meeting", String(localized: "Meeting Notes"), category: "Planners", order: 300,
                                                params: colours) { c in
         let m = Layout.margin(c), x0 = m, x1 = c.width - m
         let s = min(24, max(14, c.height / 32))
@@ -75,7 +75,7 @@ enum PlannerTemplates {
     }
 
     /// Daily planner: date and weekday strip, an hourly schedule, priorities, to-dos and notes.
-    static let daily = TemplateFactory.paper("builtin.plannerDaily", "Daily Planner", category: "Planners", order: 310,
+    static let daily = TemplateFactory.paper("builtin.plannerDaily", String(localized: "Daily Planner"), category: "Planners", order: 310,
                                              params: colours) { c in
         let m = Layout.margin(c), x0 = m, x1 = c.width - m
         Layout.field(&c, String(localized: "Date"), x: x0, y: m, to: x0 + (x1 - x0) * 0.5, size: 11)
@@ -120,7 +120,7 @@ enum PlannerTemplates {
     }
 
     /// Weekly planner: seven day boxes and a notes box (2 × 4 in portrait, 4 × 2 in landscape).
-    static let weekly = TemplateFactory.paper("builtin.plannerWeekly", "Weekly Planner", category: "Planners", order: 320,
+    static let weekly = TemplateFactory.paper("builtin.plannerWeekly", String(localized: "Weekly Planner"), category: "Planners", order: 320,
                                               params: colours + [ParamSpec.startMonday],
                                               defaults: ["startMonday": true]) { c in
         let m = Layout.margin(c)
@@ -145,7 +145,7 @@ enum PlannerTemplates {
     }
 
     /// Monthly planner: `month` 1–12 with `year` gives a dated calendar; month 0 is an undated grid.
-    static let monthly = TemplateFactory.paper("builtin.plannerMonthly", "Monthly Planner", category: "Planners", order: 330,
+    static let monthly = TemplateFactory.paper("builtin.plannerMonthly", String(localized: "Monthly Planner"), category: "Planners", order: 330,
                                                params: colours + [
                                                    TemplateParam(name: "month", title: "Month (0 = undated)", kind: "number",
                                                                  minimum: 0, maximum: 12),
@@ -197,7 +197,7 @@ enum PlannerTemplates {
     }
 
     /// Habit tracker: a name column and 31 day columns.
-    static let habits = TemplateFactory.paper("builtin.habitTracker", "Habit Tracker", category: "Planners", order: 340,
+    static let habits = TemplateFactory.paper("builtin.habitTracker", String(localized: "Habit Tracker"), category: "Planners", order: 340,
                                               params: colours) { c in
         let m = Layout.margin(c)
         Layout.field(&c, String(localized: "Habits"), x: m, y: m, to: c.width * 0.5, size: 14)
