@@ -58,3 +58,11 @@ D:create-calendar#0/#1 and verdicts: the first early interaction missed late sys
 | --- | --- | --- |
 | Both Create Calendar tests | Calendar readiness / readiness failed / Command-N | Which alert state and Add enabled/hittable/frame preceded the editor route? |
 | Both Create Calendar tests | Calendar full access | Was the late full-access prompt explicitly accepted before event scrolling? |
+
+## C5 - native colour picker presentation and dismissal
+
+D:ink-three#1 and correction confirm remote tree instability as well as the short Sliders lookup race. Both pen slot-editor opens now wait for UIColorPicker plus a fresh hittable Sliders query before the existing action/HEX checks. D:ink-three#2 correction rejects assuming every picker has close; current highlighter source uses NibCustomColourPicker/SwiftUI ColorPicker. closeColourPicker logs the actual presented surface tree (types, labels, frames), uses its close or Done when hittable, otherwise taps outside only an identified containing native popover. A sheet without a dismissal control still fails explicitly. All routes retain the bounded picker-gone assertion and original valid/invalid colour, persistence and translucent-ink checks. CI must reveal the actual highlighter presentation, dismiss it, and reach all previously unexercised HEX steps; no current simulator presentation is assumed proven.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Ink CustomColourValidHex / HighlighterCustomColour | Colour picker controls / Colour picker dismissal | What controls and presentation type really exist, which dismissal route was used, and did the picker disappear? |

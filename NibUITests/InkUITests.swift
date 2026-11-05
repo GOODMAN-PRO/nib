@@ -267,22 +267,53 @@ final class InkUITests: XCTestCase {
 
     private var colourPicker: XCUIElement { ui.app.otherElements["UIColorPicker"].firstMatch }
 
+    private func waitForColourSliders() throws {
+        try wait("Remote colour picker and Sliders must be ready") {
+            let picker = self.colourPicker
+            let sliders = picker.buttons["Sliders"].firstMatch
+            return picker.exists && sliders.exists && sliders.isHittable
+        }
+    }
+
     private func closeColourPicker() throws {
         let picker = colourPicker
         guard picker.exists else { throw NibUI.Failure.message("Native colour picker is not presented") }
-        let done = picker.buttons.matching(NSPredicate(format: "label ==[c] 'done'")).firstMatch
-        if let candidate = try? done.snapshot(), let root = try? picker.snapshot() {
-            func parent(_ node: XCUIElementSnapshot) -> String? {
-                if node.children.contains(where: { $0.elementType == .button && $0.label == candidate.label && $0.frame == candidate.frame }) {
-                    return "type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) frame=\(node.frame)"
-                }
-                return node.children.compactMap { parent($0) }.first
+        let popover = ui.app.popovers.containing(.other, identifier: "UIColorPicker").firstMatch
+        let sheet = ui.app.sheets.containing(.other, identifier: "UIColorPicker").firstMatch
+        let isPopover = popover.exists
+        let surface = isPopover ? popover : (sheet.exists ? sheet : picker)
+        if let snapshot = try? surface.snapshot() {
+            func controls(_ node: XCUIElementSnapshot) -> [String] {
+                let own = "type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) frame=\(node.frame)"
+                return [own] + node.children.flatMap { controls($0) }
             }
-            ui.logQA("Colour picker Done candidate", "frame=\(candidate.frame) parent=\(parent(root) ?? "unobserved")")
-        } else { ui.logQA("Colour picker Done candidate", "Done or parent snapshot absent") }
-        let close = picker.buttons.matching(NSPredicate(format: "label ==[c] 'close'")).firstMatch
-        try wait("Native colour picker must expose its close control") { self.ui.hasVisibleFrame(close) && close.isHittable }
-        close.tap()
+            ui.logQA("Colour picker controls", controls(snapshot).joined(separator: "\n"))
+        }
+        let close = surface.buttons.matching(NSPredicate(format: "label ==[c] 'close'")).firstMatch
+        let done = surface.buttons.matching(NSPredicate(format: "label ==[c] 'done'")).firstMatch
+        var dismissal: XCUIElement?
+        try wait("Native colour picker must expose close, Done or a popover dismissal surface") {
+            if close.exists && close.isHittable { dismissal = close; return true }
+            if done.exists && done.isHittable { dismissal = done; return true }
+            return isPopover
+        }
+        if let dismissal {
+            ui.logQA("Colour picker dismissal", ui.elementFacts(dismissal))
+            dismissal.tap()
+        } else {
+            let window = ui.app.windows.firstMatch.frame
+            let panel = popover.frame
+            let points = [CGPoint(x: window.minX + 24, y: window.minY + 24),
+                          CGPoint(x: window.maxX - 24, y: window.minY + 24),
+                          CGPoint(x: window.minX + 24, y: window.maxY - 24),
+                          CGPoint(x: window.maxX - 24, y: window.maxY - 24)]
+            guard let point = points.first(where: { !panel.insetBy(dx: -8, dy: -8).contains($0) }) else {
+                throw NibUI.Failure.message("Colour popover has no outside dismissal point")
+            }
+            ui.logQA("Colour picker dismissal", "outside=\(point) popover=\(panel)")
+            ui.app.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(dx: point.x - ui.app.frame.minX, dy: point.y - ui.app.frame.minY)).tap()
+        }
         try wait("Native colour picker must dismiss") { !picker.exists }
     }
 
@@ -766,6 +797,7 @@ final class InkUITests: XCTestCase {
 
     func testCustomColourValidHexUpdatesSlotAndInvalidHexIsRejected() throws {
         try swatchMenu("Change Colour"); try tap("Custom Colour")
+        try waitForColourSliders()
         try ui.diagnoseAction("Colour Sliders", facts: { self.ui.elementFacts(self.ui.app.buttons["Sliders"].firstMatch, includeOverlaps: true) }) {
             try tap("Sliders")
         }
@@ -784,7 +816,9 @@ final class InkUITests: XCTestCase {
         closePopover()
         XCTAssertTrue(swatches[0].label.uppercased().contains("D03080"), "Valid HEX must update the edited slot")
         let valid = swatches[0].label
-        try swatchMenu("Change Colour"); try tap("Custom Colour"); try ui.diagnoseAction("Colour Sliders", facts: { self.ui.elementFacts(self.ui.app.buttons["Sliders"].firstMatch, includeOverlaps: true) }) {
+        try swatchMenu("Change Colour"); try tap("Custom Colour")
+        try waitForColourSliders()
+        try ui.diagnoseAction("Colour Sliders", facts: { self.ui.elementFacts(self.ui.app.buttons["Sliders"].firstMatch, includeOverlaps: true) }) {
             try tap("Sliders")
         }
         let invalid = try hexField()
