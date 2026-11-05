@@ -61,6 +61,11 @@ public struct NibPopoverPanel<Content: View>: View {
         .scrollBounceBehavior(.basedOnSize)
         .frame(width: min(width, viewport.width))
         .frame(height: min(contentHeight, maxHeight, NibMetrics.popoverMaxHeight, viewport.height))
+        // Fade the scrolling viewport, not its glass. The content's 16 pt bottom inset
+        // lets the final control scroll fully above the fade without changing scroll identity.
+        .nibFadeBottomEdge()
+        .scrollIndicators(.visible)
+        .scrollIndicatorsFlash(trigger: isPresented)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
         .accessibilityHidden(!isPresented)
@@ -481,16 +486,24 @@ struct NibSheetChrome: ViewModifier {
                 chrome(content)
             }
             .presentationSizing(.form.fitted(horizontal: true, vertical: true))
+            .scrollIndicators(.visible)
+            .scrollIndicatorsFlash(onAppear: true)
         } else {
             chrome(content)
+                .scrollIndicators(.visible)
+                .scrollIndicatorsFlash(onAppear: true)
         }
     }
 
     @ViewBuilder private func chrome(_ content: Content) -> some View {
         if #available(iOS 26.0, *) {
             content
+                .contentMargins(.bottom, NibSpacing.l, for: .scrollContent)
+                .nibFadeBottomEdge()
         } else {
             content
+                .contentMargins(.bottom, NibSpacing.l, for: .scrollContent)
+                .nibFadeBottomEdge()
                 .presentationCornerRadius(NibRadius.sheet)
                 .presentationBackground(NibColor.backgroundSecondary)
         }

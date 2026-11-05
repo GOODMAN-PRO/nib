@@ -43,4 +43,18 @@ final class PalettePopoverQualityTests: XCTestCase {
         XCTAssertEqual(NibBudPlacement.trailing.unobstructedAnchor(tool, size: size, gap: 20,
                                                                   in: bounds, avoiding: [palette]), tool)
     }
+
+    func testToolMenusFitShortSafeViewportWithoutLosingTheirPaletteGap() {
+        let bounds = CGRect(x: 0, y: 24, width: 393, height: 276)
+        for placement in [NibBudPlacement.below, .above] {
+            let anchor = CGRect(x: 120, y: placement == .below ? 40 : 220, width: 44, height: 56)
+            let available = placement.availableSize(beside: anchor, gap: 16, in: bounds)
+            let size = CGSize(width: min(312, available.width), height: min(520, available.height))
+            let centre = placement.centre(size: size, beside: anchor, gap: 16, in: bounds)
+            XCTAssertGreaterThanOrEqual(centre.y - size.height / 2, bounds.minY + 16)
+            XCTAssertLessThanOrEqual(centre.y + size.height / 2, bounds.maxY - 16)
+            if placement == .below { XCTAssertGreaterThanOrEqual(centre.y - size.height / 2, anchor.maxY + 16) }
+            else { XCTAssertLessThanOrEqual(centre.y + size.height / 2, anchor.minY - 16) }
+        }
+    }
 }
