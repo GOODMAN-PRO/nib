@@ -678,7 +678,8 @@ struct MinimapMap: View {
     /// The board render and the viewport, clipped concentrically with the outer chrome.
     private var paper: some View {
         let g = model.geometry
-        let radius = NibRadius.concentric(DropletStyle.floatingPanel.cornerRadius, inset: NibSpacing.s)
+        // The style's radius is optional (nil draws a capsule); only a fixed radius can be made concentric.
+        let radius = DropletStyle.floatingPanel.cornerRadius.map { NibRadius.concentric($0, inset: NibSpacing.s) }
         return ZStack(alignment: .topLeading) {
             Color(uiColor: model.paper.uiColor)
             if let image = model.image, let world = model.imageWorld {
