@@ -18,11 +18,32 @@ private final class VisibilityChangingRenderer: PageRenderer {
     func purgeCaches() {}
 }
 
+/// Deliberately ignores cancellation and never answers until test cleanup (or a scripted late result).
+private actor SuspendedClipboardRecognizer: TextRecognizer {
+    let started: XCTestExpectation
+    private var pending: CheckedContinuation<[TextRecognition], Never>?
+    private(set) var receivedIDs: [ElementID] = []
+    init(started: XCTestExpectation) { self.started = started }
+    func recognize(strokes: [Item], language: String) async throws -> [TextRecognition] {
+        receivedIDs = strokes.map { $0.id }
+        return await withCheckedContinuation { continuation in
+            pending = continuation
+            started.fulfill()
+        }
+    }
+    func recognize(image: CGImage, language: String) async throws -> [TextRecognition] { [] }
+    func finish() {
+        pending?.resume(returning: [TextRecognition(text: "recognised", bbox: .zero, source: "ink")])
+        pending = nil
+    }
+}
+
 /// Exercises the same provider reader as the system board without contacting the simulator's pasteboard.
 @MainActor
 private final class ProviderClipboardBoard: ClipboardBoard {
     var providers: [NSItemProvider]
     var snapshots = 0
+    var changeCount: Int { 0 }
 
     init(_ providers: [NSItemProvider]) { self.providers = providers }
     func contains(_ types: [String]) -> Bool {
@@ -195,6 +216,89 @@ final class FeatClipboardTests: XCTestCase {
         XCTAssertNotEqual(pasted.first?.id, Fixtures.shapeID)
         XCTAssertEqual(pasted.first?.shape?.frame.x ?? 0, 120, accuracy: 1e-9)
         XCTAssertEqual(pasted.first?.shape?.frame.y ?? 0, 220, accuracy: 1e-9)
+    }
+
+    func testCopyAndCutCompleteWhenRecognitionNeverAnswers() async throws {
+        for command in ["clipboard.copy", "clipboard.cut"] {
+            let board = useMemoryBoard()
+            let h = Harness(features: [FeatClipboardFeature.self])
+            h.app.services.renderer = FakeRenderer()
+            let started = expectation(description: "recognition started")
+            let recognizer = SuspendedClipboardRecognizer(started: started)
+            h.app.services.recognizer = recognizer
+            // The original export path used this command; the new path reads the same recognizer from a snapshot.
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
+                                                      summary: "Test stand-in.", effect: .read)) { _, _ in
+                _ = try await recognizer.recognize(strokes: [], language: "en-US")
+                return [:]
+            }
+            let before = try h.snapshot()
+            let completed = expectation(description: "copy or cut returned without OCR")
+            let task = Task { @MainActor in
+                do {
+                    _ = try await h.run(command, ["refs": [.string(page1 + "FIXTURESTK01")]])
+                    XCTAssertTrue(board.contains([NibFragment.typeIdentifier]))
+                    XCTAssertTrue(board.contains([UTType.png.identifier]))
+                    if command == "clipboard.cut" {
+                        XCTAssertFalse(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+                            .contains { $0.id == Fixtures.strokeID })
+                        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+                        XCTAssertEqual(try h.snapshot(), before)
+                    } else {
+                        XCTAssertEqual(try h.snapshot(), before)
+                    }
+                } catch { XCTFail("\(command): \(error)") }
+                completed.fulfill()
+            }
+            await fulfillment(of: [completed, started], timeout: 1)
+            XCTAssertTrue(board.contains([NibFragment.typeIdentifier]), "the write cannot wait for recognition")
+            let receivedIDs = await recognizer.receivedIDs
+            XCTAssertEqual(receivedIDs, [Fixtures.strokeID], "cut recognises its snapshot, not deleted refs")
+            await recognizer.finish()
+            await task.value
+            restoreBoard()
+        }
+    }
+
+    func testPromptRecognitionEnrichesTheSameFragmentAndImage() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let ink = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+        let export = ClipboardExport(fragment: NibFragment.make(items: [ink], assetData: { _ in nil }), png: Data([1, 2]), text: "")
+        board.write(export.representations)
+        let original = board.items[0][NibFragment.typeIdentifier] as? Data
+        let recognizer = FakeRecognizer([TextRecognition(text: "recognised", bbox: ink.bounds, source: "ink")])
+        let task = Clipboard.enrich(export, items: [ink], language: "en-US", recognizer: recognizer)
+        await task?.value
+        XCTAssertEqual(board.strings, ["recognised"])
+        XCTAssertEqual(board.items[0][NibFragment.typeIdentifier] as? Data, original)
+        XCTAssertEqual(board.items[0][UTType.png.identifier] as? Data, export.png)
+    }
+
+    func testLateRecognitionCannotReplaceANewerCopyOrAnExpiredEntry() async throws {
+        for replace in [true, false] {
+            let board = useMemoryBoard()
+            let h = Harness(features: [FeatClipboardFeature.self])
+            let ink = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+            let export = ClipboardExport(fragment: NibFragment.make(items: [ink], assetData: { _ in nil }), png: nil, text: "typed")
+            board.write(export.representations)
+            let started = expectation(description: "recognition started")
+            let recognizer = SuspendedClipboardRecognizer(started: started)
+            let task = Clipboard.enrich(export, items: [ink], language: "en-US", recognizer: recognizer)
+            await fulfillment(of: [started], timeout: 1)
+            if replace {
+                board.write([UTType.utf8PlainText.identifier: "new copy"])
+            } else {
+                try await Task.sleep(nanoseconds: 450_000_000)
+            }
+            let revision = board.changeCount
+            await recognizer.finish()
+            await task?.value
+            XCTAssertEqual(board.changeCount, revision)
+            XCTAssertEqual(board.strings, [replace ? "new copy" : "typed"])
+            restoreBoard()
+        }
     }
 
     func testCutRefusesLockedItems() async throws {
