@@ -300,6 +300,7 @@ public struct NibSegmentedControl<Value: Hashable>: View {
 
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.layoutDirection) private var layoutDirection
+    @Environment(\.nibMeasuresSegmentFrames) private var measuresSegmentFrames
 
     public var body: some View {
         if typeSize.isAccessibilitySize {
@@ -384,8 +385,37 @@ public struct NibSegmentedControl<Value: Hashable>: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: shape))
+        .background {
+            if measuresSegmentFrames {
+                GeometryReader { proxy in
+                    Color.clear.preference(key: NibSegmentFrames.self,
+                                           value: [title(option): proxy.frame(in: .global)])
+                }
+                .allowsHitTesting(false)
+            }
+        }
         .accessibilityLabel(title(option))
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+// Opt-in geometry for hosted regressions of production controls. No readers are
+// installed in normal use; measuring the outer control alone misses intrinsic rows.
+private struct NibMeasuresSegmentFramesKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var nibMeasuresSegmentFrames: Bool {
+        get { self[NibMeasuresSegmentFramesKey.self] }
+        set { self[NibMeasuresSegmentFramesKey.self] = newValue }
+    }
+}
+
+struct NibSegmentFrames: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 

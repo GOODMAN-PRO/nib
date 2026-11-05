@@ -2,7 +2,7 @@ import XCTest
 import SwiftUI
 import UIKit
 import NibContracts
-import NibDesign
+@testable import NibDesign
 import NibTesting
 @testable import FeatDocChrome
 
@@ -1343,6 +1343,63 @@ final class FeatDocChromeTests: XCTestCase {
             XCTAssertEqual(sidebarHost.sizeThatFits(in: proposal).height,
                            headerHeight + NibStroke.hairline, accuracy: 1,
                            "A self-headed panel contributes its own More and Close; chrome adds no blank row.")
+        }
+    }
+
+    func testSelfHeadedOutlineTabsUseFull240PointSidebarWidth() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let titles = ["Pages", "Outline", "Bookmarks"]
+        let ids = ["sidebar.pages", "outline.tab", "outline.bookmarks"]
+        let tabs = zip(ids, titles).map { id, title in
+            var descriptor = PanelDescriptor(id: id, title: title, icon: NibSymbol.outline.name,
+                placement: .sidebarTab, order: 0, owner: "tests") { _ in
+                AnyView(NibPanelHeader(title: title, symbol: .outline, onClose: {}) {
+                    NibIconButton(.more, label: "Outline Options", size: .round) {}
+                })
+            }
+            descriptor.providesHeader = true
+            return descriptor
+        }
+        let selected = tabs[1]
+        XCTAssertFalse(chrome.drawsHeader(selected), "Exercise the original host-menu branch")
+        for scheme in [ColorScheme.light, .dark] {
+            var frames: [String: CGRect] = [:]
+            let content = SidebarPanelView(chrome: chrome, side: .left, tabs: tabs, selected: selected,
+                                           mode: .sidebar, presentation: .sidebar)
+                .environment(\.dynamicTypeSize, .large)
+                .environment(\.colorScheme, scheme)
+                .environment(\.nibMeasuresSegmentFrames, true)
+                .onPreferenceChange(NibSegmentFrames.self) { frames = $0 }
+            let host = UIHostingController(rootView: content)
+            host.safeAreaRegions = []
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 240, height: 600))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            for _ in 0..<10 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            let segments = try titles.map { try XCTUnwrap(frames[$0], $0) }
+            let row = segments.reduce(CGRect.null) { $0.union($1) }
+            let inset = NibSpacing.xs + 2 // Sidebar padding and segmented-track inset.
+            XCTAssertEqual(row.minX, inset, accuracy: 1)
+            XCTAssertEqual(row.maxX, 240 - inset, accuracy: 1,
+                           "No visible host menu may consume space beside these three tabs")
+            for segment in segments {
+                XCTAssertEqual(segment.width, (240 - 2 * inset) / 3, accuracy: 1)
+                XCTAssertEqual(segment.minY, row.minY, accuracy: 1, "All tabs stay in one row")
+                XCTAssertEqual(segment.height, NibMetrics.hitTarget, accuracy: 1)
+            }
+            let bookmarks = segments[2]
+            let font = UIFont.preferredFont(forTextStyle: .footnote,
+                compatibleWith: UITraitCollection(preferredContentSizeCategory: .large))
+            let labelWidth = ("Bookmarks" as NSString).size(withAttributes: [.font: font]).width
+            let sizing = NibSegmentedControl<String>.Sizing.fitting
+            XCTAssertLessThanOrEqual(labelWidth * sizing.minimumLabelScale,
+                                    bookmarks.width - 2 * sizing.labelPadding,
+                                    "Bookmarks must fit its actual production segment without truncation")
+            // Reverting 335f219 adds a 44 pt menu here: the right edge and segment
+            // width assertions fail, as does Bookmarks' measured label budget.
         }
     }
 
