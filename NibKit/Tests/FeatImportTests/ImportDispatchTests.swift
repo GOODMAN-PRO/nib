@@ -637,6 +637,55 @@ final class ImportDispatchTests: XCTestCase {
         XCTAssertFalse(ShareHandoff.isHandoffLink("nib://open/FIXTUREDOC01"))
     }
 
+    func testInboxScanSweepsOnlyOrphanedRecoveryMarkers() throws {
+        let documents = try tempDir()
+        try LocalDocumentStorage.prepare(documents: documents)
+        let inbox = documents.appendingPathComponent("Inbox", isDirectory: true)
+        for directory in [inbox, documents] {
+            let live = directory.appendingPathComponent("live.pdf")
+            let gone = directory.appendingPathComponent("gone.pdf")
+            try Data("live".utf8).write(to: live)
+            try Data("gone".utf8).write(to: gone)
+            ShareHandoff.rememberRecoveryOriginal(live)
+            ShareHandoff.rememberRecoveryOriginal(gone)
+            try FileManager.default.removeItem(at: gone)
+            let unrelated = directory.appendingPathComponent(".keep")
+            try Data().write(to: unrelated)
+            _ = InboxFiles.entries(inboxes: [inbox], documents: documents)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: ShareHandoff.recoveryMarker(live).path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: ShareHandoff.recoveryMarker(gone).path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+            XCTAssertTrue(ShareHandoff.isRecoveryOriginal(live))
+        }
+    }
+
+    func testMarkerFailureCompletesHandoffWithoutDuplicatingOrLosingProvenance() throws {
+        let dir = try tempDir()
+        let file = dir.appendingPathComponent("shared.pdf")
+        let marker = ShareHandoff.recoveryMarker(file)
+        // A directory at the sidecar path forces the atomic marker write to fail.
+        try FileManager.default.createDirectory(at: marker, withIntermediateDirectories: true)
+        let board = UIPasteboard.general
+        let previous = board.items
+        let previousTaken = ShareHandoff.lastTaken
+        let previousDenied = ShareHandoff.deniedChangeCount
+        defer {
+            board.items = previous
+            ShareHandoff.lastTaken = previousTaken
+            ShareHandoff.deniedChangeCount = previousDenied
+            try? FileManager.default.removeItem(at: file)
+            ShareHandoff.sweepRecoveryMarkers(in: dir)
+        }
+        let bytes = Data("%PDF shared original".utf8)
+        board.items = [[ShareHandoff.nameType: "shared.pdf", ShareHandoff.dataType: bytes]]
+        XCTAssertEqual(try ShareHandoff.take(into: dir), [file])
+        XCTAssertFalse(ShareHandoff.isWaiting)
+        XCTAssertEqual(try Data(contentsOf: file), bytes)
+        XCTAssertTrue(ShareHandoff.isRecoveryOriginal(file), "A failed import must retain the original even without its marker")
+        XCTAssertEqual(try ShareHandoff.take(into: dir), [])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { !$0.hasPrefix(".") }, ["shared.pdf"])
+    }
+
     func testHandoffItemsBecomeFiles() throws {
         let dir = try tempDir()
         let pdf = Data("%PDF-1.4".utf8)

@@ -141,7 +141,7 @@ enum ShareHandoff {
         }
         // Persist provenance before clearing the only upstream copy. A later inbox scan (even after
         // relaunch) must distinguish these originals from the disposable copies iOS makes for Open In.
-        for url in urls { try Data(InboxFiles.key(url).utf8).write(to: recoveryMarker(url), options: .atomic) }
+        for url in urls { rememberRecoveryOriginal(url) }
         board.items = []
         lastTaken = Date()
         deniedChangeCount = nil
@@ -152,9 +152,68 @@ enum ShareHandoff {
         url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".nib-handoff")
     }
 
+    static let recoveryKey = SettingKey("import.handoffRecovery", default: [String: String]())
+    // Recovery also runs before feature startup (deep links) and off-main (inbox scans).
+    private static let recoveryStore: SettingsStore = {
+        let store = SettingsStore()
+        declareRecovery(in: store)
+        return store
+    }()
+    private static let recoveryLock = NSLock()
+
+    static func declareRecovery(in store: SettingsStore) {
+        store.declare(recoveryKey, summary: "Local recovery provenance for shared originals whose sidecar could not be written.",
+                      owner: "import", readOnly: true)
+    }
+
+    /// A marker failure must not leave the pasteboard populated after its files were already written.
+    /// Keep fallback provenance outside the inbox so a later failed import still preserves the originals.
+    static func rememberRecoveryOriginal(_ url: URL) {
+        let key = InboxFiles.key(url)
+        do {
+            try Data(key.utf8).write(to: recoveryMarker(url), options: .atomic)
+        } catch {
+            recoveryLock.lock()
+            defer { recoveryLock.unlock() }
+            var recovery = recoveryStore.get(recoveryKey)
+            recovery[url.standardizedFileURL.path] = key
+            recoveryStore.set(recoveryKey, recovery)
+        }
+    }
+
     static func isRecoveryOriginal(_ url: URL) -> Bool {
-        guard url.isFileURL, let data = try? Data(contentsOf: recoveryMarker(url)) else { return false }
-        return String(decoding: data, as: UTF8.self) == InboxFiles.key(url)
+        guard url.isFileURL else { return false }
+        let key = InboxFiles.key(url)
+        if let data = try? Data(contentsOf: recoveryMarker(url)), String(decoding: data, as: UTF8.self) == key { return true }
+        let recovery = recoveryStore.get(recoveryKey)
+        return recovery[url.standardizedFileURL.path] == key
+    }
+
+    /// Only called in readable hand-off directories (or loose Documents), never in recorded user folders.
+    static func sweepRecoveryMarkers(in directory: URL) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey]) else { return }
+        let suffix = ".nib-handoff"
+        for marker in entries {
+            let name = marker.lastPathComponent
+            guard name.hasPrefix("."), name.hasSuffix(suffix), name.count > suffix.count + 1,
+                  (try? marker.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
+            let originalName = String(name.dropFirst().dropLast(suffix.count))
+            let original = directory.appendingPathComponent(originalName)
+            if !fm.fileExists(atPath: original.path) { try? fm.removeItem(at: marker) }
+        }
+        recoveryLock.lock()
+        defer { recoveryLock.unlock() }
+        var recovery = recoveryStore.get(recoveryKey)
+        let orphaned = recovery.keys.filter { path in
+            let original = URL(fileURLWithPath: path)
+            return ImportLocations.canonical(original.deletingLastPathComponent()) == ImportLocations.canonical(directory)
+                && !fm.fileExists(atPath: path)
+        }
+        if !orphaned.isEmpty {
+            for path in orphaned { recovery.removeValue(forKey: path) }
+            recoveryStore.set(recoveryKey, recovery)
+        }
     }
 
     /// Writes every hand-off item (name + bytes) into `dir`; other pasteboard items are ignored.
@@ -174,7 +233,7 @@ enum ShareHandoff {
 
 // MARK: - Inbox scan
 
-/// Files waiting to be imported. Pure apart from reading directories.
+/// Files waiting to be imported. Also clears recovery markers whose originals have left.
 enum InboxFiles {
     struct Entry: Equatable {
         var url: URL
@@ -192,11 +251,13 @@ enum InboxFiles {
                         userFolders: [URL] = []) -> [Entry] {
         var out: [Entry] = []
         for inbox in inboxes where ImportLocations.isHandoffInbox(inbox, userFolders: userFolders) {
+            ShareHandoff.sweepRecoveryMarkers(in: inbox)
             for e in ArchiveIO.visibleEntries(of: inbox) {
                 guard ImportLocations.isInConsumableInbox(e.url, inboxes: [inbox], userFolders: userFolders) else { continue }
                 out.append(Entry(url: e.url, isDirectory: e.isDirectory, fromInbox: true, key: key(e.url)))
             }
         }
+        ShareHandoff.sweepRecoveryMarkers(in: documents)
         for e in ArchiveIO.visibleEntries(of: documents) {
             guard !e.isDirectory || (packagesFromDocuments && PackageImporter.isPackage(e.url)) else { continue }
             out.append(Entry(url: e.url, isDirectory: e.isDirectory, fromInbox: false, key: key(e.url)))

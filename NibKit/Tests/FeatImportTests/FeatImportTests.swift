@@ -101,6 +101,7 @@ final class FeatImportTests: XCTestCase {
 
     func testFeatureRegistersImportersMenusAndShortcut() throws {
         let h = harness()
+        XCTAssertEqual(h.app.services.settings.descriptor(ShareHandoff.recoveryKey.name)?.readOnly, true)
         for id in [ImportFormats.imageImporterID, ImportFormats.packageImporterID, ImportFormats.archiveImporterID,
                    ImportFormats.officeImporterID, ImportFormats.webImporterID] {
             XCTAssertEqual(h.app.content.importers.get(id)?.owner, FeatImportFeature.id, id)
