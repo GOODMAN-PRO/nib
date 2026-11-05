@@ -20,6 +20,7 @@ final class ChromeUITests: XCTestCase {
         ui = NibUI()
         ui.logIdleSelectors(for: String(describing: type(of: self)))
         try ui.launchFixture()
+        ui.logQA("Typed probe estimate", "Chrome toolbar/More rows use buttons; baseline Any probes ~0.99s vs present typed ~0.16s. Potential 50-70s/layout test, unmeasured; modal typed queries may remain slow.")
     }
 
     override func tearDownWithError() throws {
@@ -66,13 +67,16 @@ final class ChromeUITests: XCTestCase {
     }
 
     /// Waits for an actionable control in its containing form with bidirectional, progress-bounded scrolling.
-    private func reachable(_ name: String) throws -> XCUIElement {
-        let found = try ui.requireControl(name, scroll: true, timeout: 8)
+    private func reachable(_ name: String, type: XCUIElement.ElementType = .any) throws -> XCUIElement {
+        let toolbarButton = ["Hide ", "Show ", "Apply ", "Reset "].contains { name.hasPrefix($0) }
+            || name == "Save current layout"
+        let kind: XCUIElement.ElementType = type == .any && toolbarButton ? .button : type
+        let found = try ui.requireControl(name, type: kind, scroll: true, timeout: 8)
         guard found.isEnabled else { throw NibUI.Failure.message("Chrome control is not enabled: \(name)") }
         return found
     }
 
-    private func tap(_ name: String) throws { try reachable(name).tap() }
+    private func tap(_ name: String, type: XCUIElement.ElementType = .any) throws { try reachable(name, type: type).tap() }
     private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = []) throws {
         if try ui.state().keyResponderIsText == true {
             let field = ui.app.descendants(matching: .any).matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
@@ -113,7 +117,7 @@ final class ChromeUITests: XCTestCase {
         }
     }
     private func menu(_ id: String, _ action: String) throws { try openMenu(id); try tap(action) }
-    private func more(_ action: String) throws { try menu("more", action) }
+    private func more(_ action: String) throws { try openMenu("more"); try tap(action, type: .button) }
     private func panel(_ id: String, shown: Bool = true) throws {
         _ = try ui.waitForState(timeout: 12) { $0.openPanels.contains(id) == shown }
     }

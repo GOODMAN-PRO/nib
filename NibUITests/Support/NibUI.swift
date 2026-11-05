@@ -115,21 +115,22 @@ final class NibUI {
     }
 
     func requireControl(_ name: String, type: XCUIElement.ElementType = .any,
-                        scroll: Bool = false, timeout: TimeInterval = 3) throws -> XCUIElement {
-        if let found = findControl(name, type: type) { return found }
+                        scroll: Bool = false, timeout: TimeInterval = 3,
+                        in scope: XCUIElement? = nil) throws -> XCUIElement {
+        if let found = findControl(name, type: type, in: scope) { return found }
         if scroll {
             // Virtualized native rows do not exist until their collection view scrolls.
-            revealFormElement {
-                self.findControl(name, type: type, actionable: false)
-                    ?? self.app.descendants(matching: type).matching(NSPredicate(
+            revealFormElement(in: scope) {
+                self.findControl(name, type: type, actionable: false, in: scope)
+                    ?? (scope ?? self.app).descendants(matching: type).matching(NSPredicate(
                         format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
             }
             if let failure = formRevealFailure { throw Failure.message(failure) }
-            if let found = findControl(name, type: type) { return found }
+            if let found = findControl(name, type: type, in: scope) { return found }
         }
         var found: XCUIElement?
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            found = findControl(name, type: type)
+            found = findControl(name, type: type, in: scope)
             return found != nil
         }, object: nil)
         guard XCTWaiter.wait(for: [ready], timeout: timeout) == .completed, let found else {
