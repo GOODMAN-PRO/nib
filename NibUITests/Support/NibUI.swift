@@ -223,10 +223,14 @@ final class NibUI {
                     break
                 }
                 if rank < 8 {
-                    diagnostics.append("rank=\(rank + 1) type=\(node.elementType) label=\(node.label) frame=\(node.frame)"
-                        + " surface=\(candidate.surface) contains=\(candidate.contains) overflow=\(candidate.overflow)"
-                        + " walked=\(walked) existing=\(existing) frameMatched=\(resolved != nil)"
-                        + " exists=\(resolved == nil ? "n/a" : "true") isHittable=\(resolved.map { String($0.hittable) } ?? "n/a")")
+                    // Separate lets keep each interpolation trivial for the type checker.
+                    let matched = resolved != nil
+                    let exists = matched ? "true" : "n/a"
+                    let hittable = resolved.map { String($0.hittable) } ?? "n/a"
+                    let nodeFacts = "rank=\(rank + 1) type=\(node.elementType) label=\(node.label) frame=\(node.frame)"
+                    let rankFacts = "surface=\(candidate.surface) contains=\(candidate.contains) overflow=\(candidate.overflow)"
+                    let probeFacts = "walked=\(walked) existing=\(existing) frameMatched=\(matched) exists=\(exists) isHittable=\(hittable)"
+                    diagnostics.append([nodeFacts, rankFacts, probeFacts].joined(separator: " "))
                 }
                 guard let resolved else { continue }
                 if resolved.hittable {
