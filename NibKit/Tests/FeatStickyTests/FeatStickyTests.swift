@@ -5,6 +5,33 @@ import NibContracts
 import NibTesting
 @testable import FeatSticky
 
+/// Uses document coordinates inside a real, window-attached scrolling canvas.
+@MainActor
+private final class ScrollingEditorHost: CanvasHost {
+    let base: FakeCanvasHost
+    let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 667, height: 375))
+    var app: NibApp { base.app }
+    var session: EditorSession { base.session }
+    var documentID: DocumentID { base.documentID }
+    var zoomScale: Double { base.zoomScale }
+    var canvasView: UIView { scroll }
+    var overlayLayer: CALayer { base.overlayLayer }
+    init(_ h: Harness) {
+        base = FakeCanvasHost(h)
+        scroll.contentSize = CGSize(width: 667, height: 2000)
+        scroll.contentInsetAdjustmentBehavior = .never
+    }
+    func viewPoint(_ p: Point, page: PageID) -> CGPoint { base.viewPoint(p, page: page) }
+    func pagePoint(_ v: CGPoint) -> (page: PageID, point: Point)? { base.pagePoint(v) }
+    func pageFrame(_ page: PageID) -> CGRect? { base.pageFrame(page) }
+    func setHidden(_ ids: Set<ElementID>, page: PageID) { base.setHidden(ids, page: page) }
+    func invalidate(page: PageID, rect: Rect?) { base.invalidate(page: page, rect: rect) }
+    func commitStroke(_ stroke: Stroke, page: PageID) { base.commitStroke(stroke, page: page) }
+    func cancelWetStroke() { base.cancelWetStroke() }
+    func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { base.attachLiveView(view, item: item, page: page) }
+    func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) { body() }
+}
+
 /// A document editor stand-in so `sticky.tapAt` can reach a canvas (`EditorSession.editor` is weak: keep it alive).
 @MainActor
 private final class FakeEditor: DocumentEditing {
@@ -50,9 +77,20 @@ final class FeatStickyTests: XCTestCase {
                                   params: .obj(["ref": .ref, "text": .anything()], required: ["ref", "text"]), effect: .edit)
         h.app.commands.register(d) { json, ctx in
             guard case let .item(doc, page, id)? = NodeRef(json["ref"]?.stringValue ?? "") else { throw NibError.invalid("ref") }
-            let text = try (json["text"] ?? .null).decode(RichText.self)
+            var text = try (json["text"] ?? .null).decode(RichText.self)
+            // Model F026's normalisation boundary, including pasted font sizes above its cap.
+            for p in text.paragraphs.indices {
+                for r in text.paragraphs[p].runs.indices {
+                    if let size = text.paragraphs[p].runs[r].attrs.size {
+                        text.paragraphs[p].runs[r].attrs.size = min(max(1, size), 400)
+                    }
+                }
+            }
             try ctx.mutate { tx -> Item in
                 var it = try tx.item(doc, page: page, id: id)
+                if let value = json["expectedText"], it.sticky?.text != (try value.decode(RichText.self)) {
+                    throw NibError(.conflict, "Text changed")
+                }
                 it.sticky?.text = text
                 return try tx.put(it, doc: doc, page: page)
             }
@@ -291,6 +329,333 @@ final class FeatStickyTests: XCTestCase {
         h.app.bus.undo(Fixtures.docID)
         XCTAssertEqual(try note(h).text.plainText, "Remember")
         withExtendedLifetime(editor) {}
+    }
+
+    func testFailedSavesRetryAndRepeatedFailedClosesKeepDraft() async throws {
+        for repeated in [false, true] {
+            let h = harness()
+            installTextStandIn(h)
+            let host = FakeCanvasHost(h)
+            let editor = StickyEditor.editor(for: host)
+            var reject = true
+            h.app.bus.hooks.register(.guarding(id: "test.reject", owner: "test", commands: [CommandIDs.textSetText]) { _, _, _ in
+                if reject { throw NibError(.permissionDenied, "Rejected save") }
+                return nil
+            })
+            editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+            let view = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+            view.textView.attributedText = NSAttributedString(string: "Local draft", attributes: StickyText.typingAttributes(zoom: 1))
+            editor.saveTyping()
+            await editor.flush()
+            XCTAssertEqual(text(h), "Remember")
+            reject = repeated
+            editor.endEditing(save: true)
+            await editor.flush()
+            if repeated {
+                for _ in 0..<2 {
+                    editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+                    let recovered = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+                    XCTAssertEqual(recovered.textView.text, "Local draft")
+                    editor.detach(from: host)
+                    await editor.flush()
+                    XCTAssertEqual(text(h), "Remember")
+                }
+                reject = false
+                editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+                editor.endEditing(save: true)
+                await editor.flush()
+            }
+            XCTAssertEqual(text(h), "Local draft")
+        }
+    }
+
+    func testKeyboardRevealsLowerCaretAndAccommodatesNilSelection() async throws {
+        let h = Harness(features: [FeatStickyFeature.self])
+        h.app.commands.register(CommandDescriptor(id: "test.tallEditor", title: "Tall editor", summary: "Layout fixture.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var item = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+                item.sticky?.frame = Frame(x: 40, y: 40, w: 300, h: 600)
+                try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
+            }
+            return .null
+        }
+        try await h.run("test.tallEditor")
+        let host = ScrollingEditorHost(h)
+        host.scroll.contentInset.bottom = 13
+        let window = UIWindow(frame: host.scroll.frame)
+        let controller = UIViewController()
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.addSubview(host.scroll)
+        controller.view.layoutIfNeeded()
+        let editor = StickyEditor.editor(for: host)
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        let view = try XCTUnwrap(host.scroll.subviews.compactMap { $0 as? StickyNoteView }.last)
+        let tv = view.textView
+        defer {
+            editor.endEditing(save: false)
+            editor.detach(from: host)
+            NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        tv.attributedText = NSAttributedString(string: Array(repeating: "A lower line", count: 18).joined(separator: "\n"),
+                                               attributes: [.font: UIFont.systemFont(ofSize: 18)])
+        tv.selectedRange = NSRange(location: tv.attributedText.length, length: 0)
+        editor.textViewDidChangeSelection(tv)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        host.scroll.setContentOffset(.zero, animated: false)
+        tv.layoutIfNeeded()
+        let selection = try XCTUnwrap(tv.selectedTextRange)
+        let before = tv.convert(tv.caretRect(for: selection.end), to: window)
+        XCTAssertGreaterThan(before.maxY, 160, "The lower caret starts behind the keyboard")
+        XCTAssertGreaterThan(tv.bounds.height, 160, "Whole-object reveal cannot fit this editor")
+        let frame = window.convert(CGRect(x: 0, y: 160, width: 667, height: 215), to: window.screen.coordinateSpace)
+        let info = [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: frame)]
+        NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil, userInfo: info)
+        editor.textViewDidChangeSelection(tv)
+        let after = tv.convert(tv.caretRect(for: selection.end), to: window)
+        XCTAssertGreaterThanOrEqual(after.minY, window.safeAreaInsets.top)
+        XCTAssertLessThan(after.maxY, 160, "Reveal the caret, not the oversized object's top")
+        XCTAssertGreaterThan(host.scroll.contentOffset.y, 0)
+        let accommodatedInset = host.scroll.contentInset.bottom
+        XCTAssertGreaterThan(accommodatedInset, 13)
+
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        XCTAssertEqual(host.scroll.contentInset.bottom, 13, accuracy: 0.1)
+        tv.selectedTextRange = nil
+        XCTAssertNil(tv.selectedTextRange)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil, userInfo: info)
+        XCTAssertEqual(host.scroll.contentInset.bottom, accommodatedInset, accuracy: 0.1, "Nil selection must still accommodate the keyboard")
+    }
+
+    func testNormalisedCommitPreservesTypingAndUndoDuringSuspendedSave() async throws {
+        for undoPaste in [false, true] {
+            let h = harness()
+            installTextStandIn(h)
+            let host = FakeCanvasHost(h)
+            let editor = StickyEditor.editor(for: host)
+            editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+            let view = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+            let tv = view.textView
+            let original = NSAttributedString(attributedString: tv.attributedText)
+            let commits = h.app.bus.observeCommits { _ in editor.canvasDidChange(host) }
+            defer { commits.cancel() }
+            var failures = 0
+            let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+                failures += 1
+            }
+            defer { NotificationCenter.default.removeObserver(observer) }
+            let entered = expectation(description: "Save suspended")
+            let release = expectation(description: "Resume save")
+            var suspended = false
+            h.app.bus.hooks.register(.guarding(id: "test.normalised", owner: "test", commands: [CommandIDs.textSetText]) { _, _, _ in
+                if !suspended {
+                    suspended = true
+                    entered.fulfill()
+                    await self.fulfillment(of: [release], timeout: 2)
+                }
+                return nil
+            })
+            // Use a real undo operation to restore the exact clean comparison baseline while saving.
+            let undo = UndoManager()
+            undo.groupsByEvent = false
+            undo.beginUndoGrouping()
+            undo.registerUndo(withTarget: tv) { target in target.attributedText = original }
+            undo.endUndoGrouping()
+            tv.attributedText = NSAttributedString(string: "Pasted", attributes: [.font: UIFont.systemFont(ofSize: 500)])
+            editor.saveTyping()
+            await fulfillment(of: [entered], timeout: 2)
+            if undoPaste {
+                undo.undo()
+            } else {
+                tv.attributedText = NSAttributedString(string: "Newer typing", attributes: [.font: UIFont.systemFont(ofSize: 500)])
+            }
+            let draft = NSAttributedString(attributedString: tv.attributedText)
+            editor.textViewDidChange(tv) // schedule the real debounce, not an explicit second save
+            release.fulfill()
+            await editor.flush()
+            XCTAssertEqual(tv.attributedText, draft, "The synchronous commit callback must preserve the newer draft")
+            XCTAssertEqual((try note(h).text).plainText, "Pasted")
+            XCTAssertEqual((try note(h).text).paragraphs.first?.runs.first?.attrs.size, 400)
+            let autosaved = expectation(description: "Newer draft autosaved")
+            let saved = h.app.bus.observeCommits { _ in
+                let stored = try? h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+                if stored?.sticky?.text.plainText == draft.string { autosaved.fulfill() }
+            }
+            await fulfillment(of: [autosaved], timeout: 2)
+            saved.cancel()
+            await editor.flush()
+            XCTAssertEqual((try note(h).text).plainText, draft.string)
+            XCTAssertEqual(failures, 0)
+            h.app.bus.hooks.unregister(id: "test.normalised")
+            editor.endEditing(save: false)
+            await editor.flush()
+            editor.detach(from: host)
+        }
+    }
+
+    func testNormalisedSaveUsesStoredBaselineForNextSaveAndClose() async throws {
+        let h = harness()
+        installTextStandIn(h)
+        let host = FakeCanvasHost(h)
+        let editor = StickyEditor.editor(for: host)
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        let view = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        let commits = h.app.bus.observeCommits { _ in editor.canvasDidChange(host) }
+        defer { commits.cancel() }
+        var failures = 0
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+            failures += 1
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        for value in ["Pasted", "Edited again", "Closed"] {
+            view.textView.attributedText = NSAttributedString(string: value, attributes: [.font: UIFont.systemFont(ofSize: 500)])
+            XCTAssertEqual(StickyText.richText(view.textView.attributedText, zoom: 1).paragraphs.first?.runs.first?.attrs.size, 500)
+            if value == "Closed" { editor.endEditing(save: true) } else { editor.saveTyping() }
+            await editor.flush()
+            XCTAssertEqual(try note(h).text.plainText, value)
+            XCTAssertEqual(try note(h).text.paragraphs.first?.runs.first?.attrs.size, 400)
+        }
+        XCTAssertNil(editor.editingItem)
+        XCTAssertEqual(failures, 0)
+        editor.detach(from: host)
+    }
+
+    func testExternalTextReloadsCleanEditorAndRetainsDirtyConflict() async throws {
+        let h = harness()
+        installTextStandIn(h)
+        let host = FakeCanvasHost(h)
+        let editor = StickyEditor.editor(for: host)
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        let view = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        try await h.run(CommandIDs.textSetText, ["ref": .string(stickyRef), "text": "External clean"])
+        editor.canvasDidChange(host)
+        XCTAssertEqual(view.textView.text, "External clean")
+        view.textView.attributedText = NSAttributedString(string: "Local draft", attributes: StickyText.typingAttributes(zoom: 1))
+        var conflicts = 0
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+            conflicts += 1
+        }
+        try await h.run(CommandIDs.textSetText, ["ref": .string(stickyRef), "text": "External dirty"])
+        for _ in 0..<3 { editor.canvasDidChange(host) }
+        NotificationCenter.default.removeObserver(observer)
+        XCTAssertEqual(conflicts, 1, "Unrelated canvas refreshes must not repeat the conflict toast")
+        XCTAssertEqual(view.textView.text, "Local draft")
+        editor.endEditing(save: true)
+        await editor.flush()
+        XCTAssertEqual(text(h), "External dirty")
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        XCTAssertEqual(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last?.textView.text, "Local draft")
+        let recovered = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        recovered.textView.attributedText = NSAttributedString(string: "Recovered edit", attributes: StickyText.typingAttributes(zoom: 1))
+        editor.endEditing(save: true)
+        await editor.flush()
+        XCTAssertEqual(text(h), "Recovered edit")
+    }
+
+    func testDeletedStickyDropsItsClosedDraft() async throws {
+        let h = harness()
+        installTextStandIn(h)
+        installDeleteStandIn(h)
+        let host = FakeCanvasHost(h)
+        let editor = StickyEditor.editor(for: host)
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        let view = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        view.textView.attributedText = NSAttributedString(string: "Discard on deletion", attributes: StickyText.typingAttributes(zoom: 1))
+        h.app.bus.hooks.register(.guarding(id: "test.reject", owner: "test", commands: [CommandIDs.textSetText]) { _, _, _ in
+            throw NibError(.unavailable, "Rejected save")
+        })
+        editor.endEditing(save: true)
+        await editor.flush()
+        h.app.bus.hooks.unregister(id: "test.reject")
+        try await h.run(CommandIDs.itemDelete, ["ref": .string(stickyRef)])
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        let reopened = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        XCTAssertEqual(reopened.textView.text, "Remember", "Deleted items must release their cached drafts even without a canvas refresh")
+        editor.endEditing(save: false)
+        await editor.flush()
+    }
+
+    func testSuspendedStickySaveRejectsChangedTextAtMutation() async throws {
+        let h = harness()
+        installTextStandIn(h)
+        let host = FakeCanvasHost(h)
+        let editor = StickyEditor.editor(for: host)
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        let view = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        view.textView.attributedText = NSAttributedString(string: "Queued draft", attributes: StickyText.typingAttributes(zoom: 1))
+        let commits = h.app.bus.observeCommits { _ in editor.canvasDidChange(host) }
+        defer { commits.cancel() }
+        let entered = expectation(description: "Save suspended")
+        let release = expectation(description: "Resume save")
+        h.app.bus.hooks.register(.guarding(id: "test.suspend", owner: "test", commands: [CommandIDs.textSetText]) { _, params, _ in
+            if params["expectedText"] != nil {
+                entered.fulfill()
+                await self.fulfillment(of: [release], timeout: 1)
+            }
+            return nil
+        })
+        editor.saveTyping()
+        await fulfillment(of: [entered], timeout: 1)
+        try await h.run(CommandIDs.textSetText, ["ref": .string(stickyRef), "text": "Other window"])
+        release.fulfill()
+        await editor.flush()
+        h.app.bus.hooks.unregister(id: "test.suspend")
+        XCTAssertEqual(text(h), "Other window")
+        XCTAssertEqual(view.textView.text, "Queued draft")
+        editor.endEditing(save: true)
+        await editor.flush()
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        XCTAssertEqual(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last?.textView.text, "Queued draft")
+        editor.endEditing(save: true)
+        await editor.flush()
+        XCTAssertEqual(text(h), "Queued draft")
+    }
+
+    func testGuardedFallbackRefusesLegacyItemUpdateWithoutLosingDraft() async throws {
+        let h = harness()
+        installItemUpdateStandIn(h)
+        let before = try note(h).text
+        let saved = await StickyActions.setText(h.app, ref: stickyRef, text: RichText(plain: "Unsafe replacement"),
+                                                session: h.session, group: nil, expectedText: before)
+        XCTAssertFalse(saved)
+        XCTAssertEqual(try note(h).text, before)
+        // The legacy fallback remains available to existing callers without a precondition.
+        let unguarded = await StickyActions.setText(h.app, ref: stickyRef, text: RichText(plain: "Legacy call"),
+                                                    session: h.session, group: nil)
+        XCTAssertTrue(unguarded)
+        XCTAssertEqual(text(h), "Legacy call")
+    }
+
+    func testGuardedFallbackPassesExpectedTextToCapableItemUpdate() async throws {
+        let h = harness()
+        installTextStandIn(h)
+        let before = try note(h).text
+        h.app.commands.unregister(id: CommandIDs.textSetText)
+        var seenExpected: RichText?
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.itemUpdate, title: "Update Item", summary: "Atomic fallback stand-in.",
+            params: .obj(["ref": .ref, "patch": .anything(), "expectedText": .anything()]), effect: .edit)) { json, ctx in
+            let expected = try XCTUnwrap(json["expectedText"]).decode(RichText.self)
+            let replacement = try XCTUnwrap(json["patch"]?["sticky"]?["text"]).decode(RichText.self)
+            seenExpected = expected
+            try ctx.mutate { tx in
+                var item = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+                guard item.sticky?.text == expected else { throw NibError(.conflict, "Text changed") }
+                item.sticky?.text = replacement
+                try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
+            }
+            return [:]
+        }
+        let saved = await StickyActions.setText(h.app, ref: stickyRef, text: RichText(plain: "Safe fallback"),
+            session: h.session, group: nil, expectedText: before)
+        XCTAssertTrue(saved)
+        XCTAssertEqual(seenExpected, before)
+        let stale = await StickyActions.setText(h.app, ref: stickyRef, text: RichText(plain: "Stale fallback"),
+            session: h.session, group: nil, expectedText: before)
+        XCTAssertFalse(stale)
+        XCTAssertEqual(text(h), "Safe fallback")
     }
 
     func testTypingIsAutosavedAndOneUndoTakesBackTheWholeEditingSession() async throws {
