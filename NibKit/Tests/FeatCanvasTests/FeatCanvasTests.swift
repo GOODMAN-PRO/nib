@@ -2090,16 +2090,31 @@ final class FeatCanvasTests: XCTestCase {
 
     // MARK: HUD
 
-    func testCancelledScrubStartsAtTheCurrentPage() {
-        var state = PageScrubState()
-        state.begin(at: 2)
-        XCTAssertEqual(state.destination(current: 2, translation: 30, step: 10), 5)
-        state.begin(at: 5)
-        XCTAssertEqual(state.destination(current: 5, translation: 30, step: 10), 5)
-        // GestureState restores this value on cancellation as well as normal completion.
-        state = PageScrubState()
-        state.begin(at: 5)
-        XCTAssertEqual(state.destination(current: 5, translation: 10, step: 10), 6)
+    func testCancelledScrubStartsAtTheCurrentPage() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let hud = CanvasPageHUD(model: vc.hud)
+        // Guard the actual view's lifetime wiring too: replacing GestureState with State must
+        // fail this regression even if the pure reset handler still exists and works.
+        let storage = try XCTUnwrap(Mirror(reflecting: hud).children.first { $0.label == "_scrub" }?.value
+            as? GestureState<PageScrubState>)
+        let state = storage.wrappedValue
+        state.begin(at: 0)
+        vc.hud.go(to: state.destination(current: 0, translation: 10, step: 10))
+        await waitUntil("first scrub reaches page 2") { vc.hud.pageIndex == 1 }
+        state.begin(at: 1)
+        XCTAssertEqual(state.origin, 0, "an ongoing scrub keeps its original page")
+
+        // Invoke the production GestureState cancellation callback, without an onEnded event
+        // and without constructing a replacement state. SwiftUI supplies this same value.
+        var transaction = Transaction()
+        PageScrubState.reset(state, transaction: &transaction)
+        XCTAssertNil(state.origin)
+        state.begin(at: try XCTUnwrap(vc.hud.pageIndex))
+        vc.hud.go(to: state.destination(current: 1, translation: 10, step: 10))
+        await waitUntil("second scrub reaches page 3") { vc.hud.pageIndex == 2 }
+        XCTAssertEqual(h.session.page, Fixtures.pdfPage)
     }
 
     func testPageAndZoomHUDs() async throws {

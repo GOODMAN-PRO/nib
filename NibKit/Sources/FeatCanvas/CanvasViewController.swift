@@ -1757,17 +1757,23 @@ final class CanvasHUDModel: ObservableObject {
 /// The page HUD (DESIGN.md §14.2, D-125): the navigator glyph and "3 / 12", bottom-right, clear of the palette (the
 /// chrome places it). Tap the glyph for the page navigator; drag along the HUD to scrub pages. On a board it shows the
 /// zoom instead (§14.17). The chrome gives it its Clear droplet.
-struct PageScrubState {
+final class PageScrubState {
     private(set) var origin: Int?
-    mutating func begin(at page: Int) { if origin == nil { origin = page } }
+    func begin(at page: Int) { if origin == nil { origin = page } }
     func destination(current: Int, translation: CGFloat, step: CGFloat) -> Int {
         (origin ?? current) + Int((translation / step).rounded(.towardZero))
+    }
+
+    /// SwiftUI invokes this reset on cancellation as well as completion. Clear the reference's
+    /// transient origin before GestureState restores its initial value (the same reference).
+    static func reset(_ state: PageScrubState, transaction: inout Transaction) {
+        state.origin = nil
     }
 }
 
 struct CanvasPageHUD: View {
     @ObservedObject var model: CanvasHUDModel
-    @GestureState private var scrub = PageScrubState()
+    @GestureState(reset: PageScrubState.reset) private var scrub = PageScrubState()
     /// Points of drag per page when scrubbing along the HUD.
     private static let scrubStep = NibSpacing.xxl
     /// Movement before a press on the HUD becomes a scrub (a tap on the glyph stays a tap).
@@ -2044,6 +2050,7 @@ final class PageErrorView: UIView {
         hosting.view.backgroundColor = .clear
         // Placed by the canvas, clear of the chrome already: no safe-area padding of its own.
         hosting.safeAreaRegions = []
+        viewport.contentInsetAdjustmentBehavior = .never
         addSubview(viewport)
         viewport.addSubview(hosting.view)
         update()

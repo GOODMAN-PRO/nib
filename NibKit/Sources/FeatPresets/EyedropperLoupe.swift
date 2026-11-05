@@ -219,7 +219,6 @@ final class EyedropperAttachment: CanvasAttachment {
     private func track(page: PageID, point: Point) {
         guard isActive, !committing else { return }
         requested = (page, point)
-        loupe.position = point
         place(page: page, point: point)
         pending = (page: page, point: point)
         guard sampling == nil else { return }
@@ -312,7 +311,7 @@ final class EyedropperLoupeView: UIView {
     var onUse: (() -> Void)?
     var onCancel: (() -> Void)?
     var onMove: ((Double, Double) -> Void)?
-    var position: Point? { didSet { updateAccessibilityValue() } }
+    private(set) var position: Point?
 
     override var canBecomeFirstResponder: Bool { true }
     override var keyCommands: [UIKeyCommand]? {
@@ -427,6 +426,7 @@ final class EyedropperLoupeView: UIView {
 
     func show(_ s: EyedropperSampler.Sample) {
         colour = s.colour
+        position = s.point
         // Loupe points per page point: the lens inside the ring spans `EyedropperSampler.span` page points.
         let k = (Self.diameter - 2 * Self.ringWidth) / CGFloat(EyedropperSampler.span)
         let offset = CGPoint(x: CGFloat(s.point.x - s.region.x) * k, y: CGFloat(s.point.y - s.region.y) * k)

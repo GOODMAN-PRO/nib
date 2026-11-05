@@ -32,6 +32,7 @@ final class PenTool: CanvasTool {
         let grab: Point
         var current: Point
         var result: PenShapeResult?
+        var neighborRevisions: [String: Rev] = [:]
         var recognition: Task<Void, Never>?
         var lastTimestamp: TimeInterval?
         init(stroke: Stroke, page: PageID) {
@@ -186,6 +187,11 @@ final class PenTool: CanvasTool {
                 guard !Task.isCancelled else { return }
                 state.result = try PenShapeResult.parse(json, ink: stroke.style, doc: doc, page: page)
                 if let result = state.result {
+                    for ref in result.mergeWith {
+                        guard case let .item(d, p, id)? = NodeRef(ref),
+                              let item = try? app.workspace.item(d, page: p, id: id), !item.deleted else { continue }
+                        state.neighborRevisions[ref] = item.rev
+                    }
                     if let self, let host, self.hold === state {
                         self.drawShape(result.shape, grab: state.grab, at: state.current, page: page, host: host)
                     }
@@ -266,7 +272,15 @@ final class PenTool: CanvasTool {
                         // Create first so a failed creation preserves both the stroke and every neighbour.
                         let created = try await app.bus.execute(Invocation(command: CommandIDs.shapeCreate,
                             params: try PenShapeResult.createParams(shape, doc: doc, page: state.page), session: session, group: group))
-                        if !result.mergeWith.isEmpty {
+                        // Re-read after shape.create too: it can suspend while another editor changes a neighbour.
+                        // Missing/deleted neighbours also invalidate the entire merge; keep the new shape.
+                        let neighborsUnchanged = result.mergeWith.allSatisfy { ref in
+                            guard let expected = state.neighborRevisions[ref],
+                                  case let .item(d, p, id)? = NodeRef(ref),
+                                  let item = try? app.workspace.item(d, page: p, id: id) else { return false }
+                            return !item.deleted && item.rev == expected
+                        }
+                        if !result.mergeWith.isEmpty && neighborsUnchanged {
                             do {
                                 _ = try await app.bus.execute(Invocation(command: CommandIDs.itemDelete,
                                     params: ["refs": .array(result.mergeWith.map(JSONValue.string))], session: session, group: group))

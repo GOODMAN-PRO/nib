@@ -1002,6 +1002,41 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertNil(renderer.requests.last?.replay)
     }
 
+    func testContinuousReplayCompletesRendersBeforePublishingStops() async throws {
+        let h = harness(), renderer = ReplayCadenceRenderer()
+        h.app.services.renderer = renderer
+        let (host, overlay) = try await openWindow(h)
+        let controller = overlay.controller, view = controller.writingView()
+        let root = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        window.rootViewController = root
+        root.view.addSubview(view)
+        view.frame = root.view.bounds
+        window.makeKeyAndVisible()
+        controller.paneAppeared()
+        defer { controller.paneDisappeared(); overlay.detach(from: host); window.isHidden = true }
+        // Every tick is faster than the 40 ms render cadence. Check displayed images while
+        // publishing, not just renderer requests or a final frame after the publisher stops.
+        var previous: UIImage?
+        var displayedFrames = 0
+        for tick in 1...40 {
+            h.session.replay = ReplayState(time: Double(tick), mode: .reveal)
+            try await Task.sleep(nanoseconds: 10_000_000)
+            if let image = view.paper.image, image !== previous {
+                displayedFrames += 1
+                previous = image
+            }
+            if tick == 20 {
+                XCTAssertGreaterThan(displayedFrames, 0, "continuous replay must render before publishing stops")
+            }
+        }
+        XCTAssertGreaterThan(displayedFrames, 1, "the pane must keep rendering throughout playback")
+        for _ in 0..<100 where renderer.requests.last?.replay?.time != 40 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(renderer.requests.last?.replay, h.session.replay, "the final dirty state must also render")
+    }
+
     func testHidingPaneFinishesCaptureBeforeClearingWetInk() async throws {
         let h = harness()
         let (host, overlay) = try await openWindow(h)
@@ -1299,4 +1334,24 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertEqual(erased.params.count, 1)
         overlay.detach(from: host)
     }
+}
+
+/// A small delayed renderer makes replay ticks arrive during rendering as well as during its
+/// cadence delay. It records completed renders, and honours cancellation like a real renderer.
+private final class ReplayCadenceRenderer: PageRenderer {
+    private let lock = NSLock()
+    private var completed: [RenderRequest] = []
+    private let image = FakeRenderer.blank(CGSize(width: 2, height: 2))
+    var requests: [RenderRequest] { lock.withLock { completed } }
+
+    func render(_ request: RenderRequest) async throws -> RenderResult {
+        try await Task.sleep(nanoseconds: 15_000_000)
+        try Task.checkCancellation()
+        lock.withLock { completed.append(request) }
+        return RenderResult(image: image, region: request.region ?? .zero, scale: request.scale)
+    }
+
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { image }
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
+    func purgeCaches() {}
 }
