@@ -45,6 +45,23 @@ final class FeatTapeTests: XCTestCase {
         XCTAssertEqual(h.app.commands.descriptor("tape.setRevealed")?.undoable, false)
     }
 
+    func testUnreadablePatternInputsReportEveryFailure() async {
+        let h = harness()
+        let model = TapeSettingsModel(app: h.app, session: h.session)
+        let failed = expectation(forNotification: .nibCommandFailed, object: h.app) { notification in
+            (notification.userInfo?["command"] as? String) == "tape.importPattern"
+                && notification.userInfo?["error"] is NibError
+        }
+        failed.expectedFulfillmentCount = 4
+        let missing = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        await model.importFile(missing)
+        await model.importPhoto { nil }
+        await model.importPhoto { throw URLError(.notConnectedToInternet) }
+        await model.importFileResult(.failure(URLError(.cannotOpenFile)))
+        await fulfillment(of: [failed], timeout: 2)
+        XCTAssertTrue(model.recent.isEmpty)
+    }
+
     func testPlainTileAndHistoryClearTheStoredSlotPattern() async throws {
         let h = harness()
         let applied = expectation(description: "preset applied")
