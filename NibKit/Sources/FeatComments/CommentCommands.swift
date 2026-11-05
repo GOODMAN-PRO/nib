@@ -279,12 +279,14 @@ struct CommentEdit: NibCommand {
         var ref: String
         var message: String
         var text: String
+        var baseline: CommentMessage? = nil
     }
 
     static let descriptor = CommandDescriptor(
         id: "comment.edit", title: "Edit Comment",
         summary: "Change the text of one message in a comment thread (it shows as edited).",
-        params: .obj(["ref": .str("comment thread item:D/P/I"), "message": .str("message id"), "text": .str("new text")],
+        params: .obj(["ref": .str("comment thread item:D/P/I"), "message": .str("message id"), "text": .str("new text"),
+                      "baseline": .anything("The message originally opened for editing")],
                      required: ["ref", "message", "text"]),
         examples: [["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURECMT01", "message": "FIXTUREMSG01",
                     "text": "Check this again"]],
@@ -295,6 +297,10 @@ struct CommentEdit: NibCommand {
         try ctx.mutate { (tx: DocTransaction) -> Void in
             var thread = try CommentThreads.load(p.ref, tx)
             let i = try CommentThreads.messageIndex(thread.comment, p.message)
+            if let baseline = p.baseline, baseline != thread.comment.messages[i] {
+                throw NibError(.conflict, String(localized: "This message changed while you were editing."),
+                               hint: String(localized: "Keep your draft and reopen the current message before saving."))
+            }
             guard thread.comment.messages[i].text != text else { return }
             thread.comment.messages[i].text = text
             thread.comment.messages[i].edited = true

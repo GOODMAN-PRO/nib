@@ -79,12 +79,23 @@ final class SelectionOverlay: CanvasAttachment {
         let b = project(Point(bounds.maxX, bounds.maxY))
         let box = CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(b.x - a.x), height: abs(b.y - a.y))
         let path = CGMutablePath()
-        let lasso = selection.outline.flatMap { $0.count >= 3 ? $0 : nil }
+        let paddedBox = box.insetBy(dx: -SelectionStyle.boxPadding, dy: -SelectionStyle.boxPadding)
+        let lasso = selection.outline.flatMap { points -> [CGPoint]? in
+            guard points.count >= 3 else { return nil }
+            let projected = points.map(project)
+            let gesture = CGMutablePath()
+            gesture.addLines(between: projected)
+            // A loose completed gesture is a hit-test region, not the selected object's size.
+            // Keep intersecting/tight outlines (including transformed outlines), but replace
+            // a surrounding empty margin with the same tight box used by tap selection.
+            guard !gesture.boundingBoxOfPath.contains(paddedBox) else { return nil }
+            return projected
+        }
         if let polygon = lasso {
-            path.addLines(between: polygon.map(project))
+            path.addLines(between: polygon)
             path.closeSubpath()
         } else {
-            path.addRect(box.insetBy(dx: -SelectionStyle.boxPadding, dy: -SelectionStyle.boxPadding))
+            path.addRect(paddedBox)
         }
         view.show(SelectionOverlayView.Content(outline: path, box: box, drawsBox: lasso != nil,
                                                count: selection.items.count))

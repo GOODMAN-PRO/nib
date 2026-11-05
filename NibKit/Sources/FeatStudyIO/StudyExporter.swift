@@ -13,6 +13,11 @@ enum StudyExport {
         var cards: Int
     }
 
+    struct Snapshot {
+        var content: DocumentContent
+        var title: String
+    }
+
     static func encode(_ rows: [[String]]) -> String {
         rows.map { row in row.map { field($0) }.joined(separator: ",") + "\r\n" }.joined()
     }
@@ -36,7 +41,7 @@ enum StudyExport {
     }
 
     @MainActor
-    static func file(_ doc: DocumentID, _ ctx: CommandContext) throws -> File {
+    static func snapshot(_ doc: DocumentID, _ ctx: CommandContext) throws -> Snapshot {
         if ctx.services.lock?.isLocked(doc) == true {
             throw NibError(.locked, "doc:\(doc) is locked", hint: "unlock it first (doc.unlock)")
         }
@@ -45,43 +50,57 @@ enum StudyExport {
             throw NibError(.invalidParams, "doc:\(doc) is a \(content.meta.kind.rawValue), not a study set", path: "$.doc",
                            hint: "CSV export is for study sets; list them with library.list {\"kinds\": [\"studySet\"]}")
         }
-        let cards = content.liveCards
+        return Snapshot(content: content, title: ctx.services.library?.node(doc)?.title ?? "")
+    }
+
+    /// Only immutable values enter the worker; sorting and text extraction happen here too.
+    static func file(_ snapshot: Snapshot) -> File {
+        let cards = snapshot.content.liveCards
         let csv = encode(cards.map { [$0.front.text?.plainText ?? "", $0.back.text?.plainText ?? ""] })
-        return File(name: fileName(ctx.services.library?.node(doc)?.title ?? ""), csv: csv, cards: cards.count)
+        return File(name: fileName(snapshot.title), csv: csv, cards: cards.count)
     }
 
     /// `export.run {format: "study.csv"}`: one CSV file per study set in a fresh temporary folder.
     @MainActor
-    static func write(_ request: ExportRequest, _ ctx: CommandContext) throws -> [URL] {
-        let fm = FileManager.default
-        let dir = fm.temporaryDirectory.appendingPathComponent("studyio-" + UUID().uuidString, isDirectory: true)
-        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        var used = Set<String>()
-        var urls: [URL] = []
-        for doc in request.documents {
-            let exported = try StudyExport.file(doc, ctx)
-            var name = request.documents.count == 1 ? request.fileName.map { fileName($0) } ?? exported.name : exported.name
-            let base = (name as NSString).deletingPathExtension
-            var n = 2
-            while used.contains(name.lowercased()) {
-                name = "\(base) \(n).csv"
-                n += 1
+    static func write(_ request: ExportRequest, _ ctx: CommandContext) async throws -> [URL] {
+        let snapshots = try request.documents.map { try snapshot($0, ctx) }
+        let requestedName = request.fileName
+        return try await Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            let dir = fm.temporaryDirectory.appendingPathComponent("studyio-" + UUID().uuidString, isDirectory: true)
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            var used = Set<String>()
+            var urls: [URL] = []
+            do {
+                for snapshot in snapshots {
+                    let exported = file(snapshot)
+                    var name = snapshots.count == 1 ? requestedName.map { fileName($0) } ?? exported.name : exported.name
+                    let base = (name as NSString).deletingPathExtension
+                    var n = 2
+                    while used.contains(name.lowercased()) {
+                        name = "\(base) \(n).csv"
+                        n += 1
+                    }
+                    used.insert(name.lowercased())
+                    let url = dir.appendingPathComponent(name)
+                    try fileData(exported.csv).write(to: url, options: .atomic)
+                    urls.append(url)
+                }
+                return urls
+            } catch {
+                try? fm.removeItem(at: dir)
+                throw error
             }
-            used.insert(name.lowercased())
-            let url = dir.appendingPathComponent(name)
-            try fileData(exported.csv).write(to: url, options: .atomic)
-            urls.append(url)
-        }
-        return urls
+        }.value
     }
 
     /// Listed by Share & Export for study sets only (`docKinds`); `export.run` with another kind still fails with
-    /// invalid_params from `file(_:_:)`.
+    /// invalid_params from `snapshot(_:_:)`.
     @MainActor
     static func exporter(owner: String) -> ExporterDescriptor {
         var exporter = ExporterDescriptor(id: "study.csv", title: String(localized: "CSV"), fileExtension: "csv",
                                           utType: StudyTextFormat.csv.utType, owner: owner) { request, ctx in
-            try StudyExport.write(request, ctx)
+            try await StudyExport.write(request, ctx)
         }
         exporter.docKinds = [.studySet]
         return exporter
@@ -115,10 +134,25 @@ struct StudyExportCSV: NibCommand {
         effect: .read)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let file = try StudyExport.file(NodeRef.documentID(from: p.doc), ctx)
+        let snapshot = try StudyExport.snapshot(NodeRef.documentID(from: p.doc), ctx)
         let assets = try ctx.services.require(ctx.services.assets, "the asset store")
-        let ref = try assets.putTemporary(StudyExport.fileData(file.csv), ext: "csv")
-        var out = Output(name: file.name, asset: "tmp:" + ref.name, cards: file.cards, csv: file.csv, truncated: nil)
+        return try await Task.detached(priority: .userInitiated) {
+            let file = StudyExport.file(snapshot)
+            let ref = try assets.putTemporary(StudyExport.fileData(file.csv), ext: "csv")
+            return try output(file, asset: "tmp:" + ref.name)
+        }.value
+    }
+
+    /// Inspect at most the inline budget plus one byte before considering JSON encoding.
+    nonisolated static func inlineCandidate(_ csv: String) -> Bool {
+        csv.utf8.prefix(NibLimits.aiToolResultBytes + 1).count <= NibLimits.aiToolResultBytes
+    }
+
+    nonisolated static func output(_ file: StudyExport.File, asset: String) throws -> Output {
+        var out = Output(name: file.name, asset: asset, cards: file.cards, csv: nil, truncated: true)
+        guard inlineCandidate(file.csv) else { return out }
+        out.csv = file.csv
+        out.truncated = nil
         if try JSONEncoder().encode(out).count > NibLimits.aiToolResultBytes {
             out.csv = nil
             out.truncated = true

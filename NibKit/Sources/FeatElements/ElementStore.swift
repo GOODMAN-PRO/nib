@@ -342,16 +342,35 @@ final class ElementStore {
     /// `index` (see `load`). Any other copy stays until a later read merges it.
     private func write(_ index: CollectionIndex, to c: String, merged: Set<String>) throws {
         let dir = folder(c)
+        let ownURL = dir.appendingPathComponent("index.\(device).json")
+        let complete = try readableOwnIndex(c).map { CollectionIndex.merge([$0, index]) } ?? index
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(index).write(to: dir.appendingPathComponent("index.\(device).json"), options: .atomic)
+        try encoder.encode(complete).write(to: ownURL, options: .atomic)
         for name in merged.sorted() where ElementStore.isConflictCopy(name) {
             try? fm.removeItem(at: dir.appendingPathComponent(name))
         }
     }
 
+    /// A failed own-index read must block both index replacement and writes to its referenced fragments.
+    private func readableOwnIndex(_ c: String) throws -> CollectionIndex? {
+        do {
+            let url = folder(c).appendingPathComponent("index.\(device).json")
+            var own = try JSONDecoder().decode(CollectionIndex.self, from: Data(contentsOf: url))
+            own.collection?.id = NibID(c) // Match load: the folder supplies identity.
+            return own
+        } catch {
+            let ns = error as NSError
+            if ns.domain == NSCocoaErrorDomain,
+               ns.code == NSFileReadNoSuchFileError || ns.code == NSFileNoSuchFileError { return nil }
+            throw NibError(.unavailable, String(localized: "This collection could not be saved because its local index could not be read."),
+                           hint: String(localized: "Wait for syncing to finish, then try again."))
+        }
+    }
+
     private func writeFragment(_ fragment: NibFragment, id: String, in c: String) throws -> String {
+        _ = try readableOwnIndex(c)
         let dir = folder(c)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = "\(id).\(device).json"

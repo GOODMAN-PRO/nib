@@ -70,7 +70,7 @@ struct ImportResult: Codable, Equatable {
     var folders: [String]?
     /// Files that could not be imported while others were, and files skipped inside zips and folders.
     var failed: [ImportFailure]?
-    /// The user closed the import dialog or the Files picker.
+    /// The picker/dialog was cancelled, or import stopped early; refs still include completed documents.
     var cancelled: Bool?
 
     static let cancelledResult = ImportResult(refs: [], cancelled: true)
@@ -453,6 +453,9 @@ final class ImportReport {
     /// The folders that sit right in the destination (a dropped folder, the top level of a zip).
     private(set) var topFolders: [FolderID] = []
     var converted = false
+    /// Traversal stopped before all entries were imported; completed document refs remain valid.
+    var cancelled = false
+    var incomplete: Bool { cancelled || !skipped.isEmpty }
 
     func skip(_ entry: String, _ error: Error) {
         skipped.append(Skipped(entry: entry, error: NibError.wrap(error)))
@@ -469,6 +472,7 @@ final class ImportReport {
         for s in other.skipped { skipped.append(Skipped(entry: prefix + s.entry, error: s.error)) }
         for f in other.folders { use(f, top: top && other.topFolders.contains(f)) }
         if other.converted { converted = true }
+        if other.cancelled { cancelled = true }
     }
 }
 
@@ -719,11 +723,14 @@ enum ImportEngine {
         let total = Double(max(sources.count, 1) * 2)
         var failures: [(ImportFailure, NibError)] = []
         var staged: [StagedFile] = []
-        for (i, s) in sources.enumerated() where session?.isCancelled != true {
+        var cancelled = false
+        for (i, s) in sources.enumerated() {
+            if Task.isCancelled || session?.isCancelled == true { cancelled = true; break }
             session?.progress(Double(i) / total, label: ImportUI.progressLabel(s.name, index: i, count: sources.count))
             do {
                 staged.append(try await staging.stage(s, index: i, ctx: ctx))
             } catch {
+                if error is CancellationError { cancelled = true; break }
                 importLog.error("Import staging failed: \(String(describing: error), privacy: .public)")
                 failures.append(failure(s.original, error))
             }
@@ -737,7 +744,7 @@ enum ImportEngine {
         var importedFiles = 0
         var done = 0
         for group in groups(staged.map { (url: $0.url, isDirectory: $0.isDirectory) }, content: ctx.content) {
-            if session?.isCancelled == true { break }
+            if cancelled || Task.isCancelled || session?.isCancelled == true { cancelled = true; break }
             let files = group.indices.map { staged[$0] }
             session?.progress((Double(sources.count) + Double(done)) / total,
                               label: ImportUI.progressLabel(files[0].source.name, index: done, count: staged.count))
@@ -748,6 +755,7 @@ enum ImportEngine {
                 let docs = try await ImportReporting.$current.withValue(report) {
                     try await run(group, urls: files.map { $0.url }, target: target, ctx: ctx)
                 }
+                if Task.isCancelled || session?.isCancelled == true { report.cancelled = true }
                 for d in docs where !refs.contains(NodeRef.document(d).description) {
                     refs.append(NodeRef.document(d).description)
                 }
@@ -774,13 +782,19 @@ enum ImportEngine {
                     failures.append(failure(files[0].source.original, s.error, entry: s.entry))
                 }
                 for f in files {
-                    if report.skipped.isEmpty {
+                    if !report.incomplete {
                         consumeImported(f.source.original, converted: report.converted, library: library)
                     } else {
                         keepSource(f.source.original)
                     }
                 }
+                if report.cancelled || Task.isCancelled || session?.isCancelled == true { cancelled = true }
             } catch {
+                if error is CancellationError {
+                    for f in files { keepSource(f.source.original) }
+                    cancelled = true
+                    break
+                }
                 importLog.error("Importer failed: \(String(describing: error), privacy: .public)")
                 for f in files { failures.append(failure(f.source.original, error)) }
             }
@@ -788,19 +802,21 @@ enum ImportEngine {
         }
         let folderRefs = folders.map { NodeRef.folder($0).description }
         let failed = failures.map { $0.0 }
-        if importedFiles == 0, session == nil, let first = failures.first {
+        if !cancelled, importedFiles == 0, session == nil, let first = failures.first {
             var e = first.1
             if failures.count > 1 { e.message = "none of the \(failures.count) files could be imported; first: " + e.message }
             throw e
         }
         let result = ImportResult(refs: refs, pages: dest.doc == nil ? nil : pageRefs,
-                                  folders: folderRefs.isEmpty ? nil : folderRefs, failed: failed.isEmpty ? nil : failed)
+                                  folders: folderRefs.isEmpty ? nil : folderRefs, failed: failed.isEmpty ? nil : failed,
+                                  cancelled: cancelled ? true : nil)
         if let session = session {
-            session.finish(imported: importedFiles, failures: failed, stopped: session.isCancelled)
+            session.finish(imported: importedFiles, failures: failed, stopped: cancelled)
             // The failure is now visible. Dispose of Nib's Open In/share copies, but retain the only
             // original saved from the pasteboard, including when this is a later inbox-scan retry.
             for f in failed where f.entry == nil {
-                if let url = URL(string: f.url), ShareHandoff.isRecoveryOriginal(url) { keepSource(f.url) }
+                if cancelled { keepSource(f.url) }
+                else if let url = URL(string: f.url), ShareHandoff.isRecoveryOriginal(url) { keepSource(f.url) }
                 else { consumeInboxCopy(f.url, library: library) }
             }
         } else if ctx.principal.isUser, !failed.isEmpty {

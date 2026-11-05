@@ -671,6 +671,26 @@ final class FeatCollabTests: XCTestCase {
 
     // MARK: Files travel with their records
 
+    func testSecondJoinCannotTearDownPendingHostApproval() async throws {
+        let pair = CollabPair()
+        pair.guestService.timing.approvalTimeout = 2
+        let code = try await pair.share()
+        let first = pair.startJoin(code)
+        defer { first.cancel(); pair.guestService.leave(); pair.hostService.leave() }
+        try await pair.waitForRequest()
+        let session = try XCTUnwrap(pair.guestService.session)
+        do {
+            _ = try await pair.guest.run("collab.join", ["code": .string(code)])
+            XCTFail("a duplicate join must be refused")
+        } catch { XCTAssertEqual(NibError.wrap(error).code, .conflict) }
+        XCTAssertTrue(pair.guestService.session === session)
+        XCTAssertFalse(session.isClosed)
+        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        _ = try await first.value
+        XCTAssertEqual(session.phase, .active)
+        XCTAssertFalse(session.joinInProgress)
+    }
+
     func testJoinAndRejoinBroadcastHelloBeforeTransportPublishesPeers() async throws {
         for busy in [false, true] {
             let pair = CollabPair()

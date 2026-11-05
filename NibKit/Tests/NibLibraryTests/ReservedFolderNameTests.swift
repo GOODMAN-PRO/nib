@@ -5,6 +5,15 @@ import NibTesting
 
 @MainActor
 final class ReservedFolderNameTests: XCTestCase {
+    func testUniqueNamesReserveCaseVariantsBeforeCoordinatedMoves() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("INBOX 2"), withIntermediateDirectories: true)
+        XCTAssertEqual(FileNames.unique("Inbox", ext: nil, in: dir, reservedNames: ["inbox"]), "Inbox 3")
+        XCTAssertEqual(FileNames.unique("Inbox 2", ext: nil, in: dir,
+            ignoring: dir.appendingPathComponent("INBOX 2")), "Inbox 2")
+    }
+
     func testPackageSuffixesAreReservedOnlyForFolders() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         for title in ["Physics.nibnote", "Physics.NIBNOTE", "Physics.nib"] {

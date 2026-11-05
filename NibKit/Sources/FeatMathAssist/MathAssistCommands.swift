@@ -12,12 +12,15 @@ struct MathAssist: NibCommand {
         /// Additive correction: retain the handwritten source; evaluate the corrected recognition.
         var latex: String?
         var refs: [String]?
+        var sourceRevisions: [String]? = nil
     }
     struct Output: Codable { var refs: [String]; var answer: String; var latex: String; var line: Int }
     static let descriptor = CommandDescriptor(id: CommandIDs.mathAssist, title: String(localized: "Write Math Answer"),
         summary: "Write or update an equals-ending handwriting line's answer as ink; line is its zero-based page line index, latex corrects recognition, and format selects auto, fraction, mixed or decimal.",
         params: .obj(["page": .ref, "line": .int(min: 0), "format": .str(choices: ["auto", "fraction", "mixed", "decimal"]),
-                      "ids": .arr(.str()), "refs": .arr(.ref, "Optional source guard for a previously shown suggestion"), "latex": .str("Corrected LaTeX ending in =")], required: ["page"]),
+                      "ids": .arr(.str()), "refs": .arr(.ref, "Optional source guard for a previously shown suggestion"),
+                      "sourceRevisions": .arr(.str(), "Revisions in the same order as refs"),
+                      "latex": .str("Corrected LaTeX ending in =")], required: ["page"]),
         examples: [["page": "page:FIXTUREDOC01/FIXTUREPG001", "line": 0, "ids": ["ASSISTANSWER01"]]], effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
@@ -46,6 +49,14 @@ struct MathAssist: NibCommand {
             throw NibError.unavailable("No handwriting line ending in = was recognised")
         }
         let line = lines[index]
+        if let revisions = p.sourceRevisions {
+            guard let refs = p.refs, refs.count == revisions.count,
+                  zip(refs, revisions).allSatisfy({ ref, revision in
+                      !revision.isEmpty && line.ink.contains { $0.ref == ref && $0.revision == revision }
+                  }) else {
+                throw NibError(.conflict, String(localized: "The equation changed. Open Math Assist again before writing an answer."))
+            }
+        }
         if let refs = p.refs, !MathAssistWatcher.sameRefs(refs, line.refs) { throw NibError(.conflict, "The selected equation changed. Open Math Assist again.") }
         let source = (p.latex ?? line.latex).trimmingCharacters(in: .whitespacesAndNewlines)
         guard source.hasSuffix("="), source.count <= 8192 else {

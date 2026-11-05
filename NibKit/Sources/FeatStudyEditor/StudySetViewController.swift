@@ -423,16 +423,29 @@ final class StudySetModel: ObservableObject {
     }
 
     /// A freeform side drawn on light paper (paper is never inverted) for a list slot, cached per card revision.
-    func inkPicture(_ face: CardFace, key: String, displayScale: CGFloat) -> UIImage? {
-        if let hit = inkPictures.object(forKey: key as NSString) { return hit }
+    static func inkRenderKey(_ key: String, displayScale: CGFloat) -> String {
+        key + "/light@" + String(Double(max(displayScale, 1)))
+    }
+
+    func cachedInkPicture(_ key: String) -> UIImage? { inkPictures.object(forKey: key as NSString) }
+
+    func inkPicture(_ face: CardFace, key: String, displayScale: CGFloat) async -> UIImage? {
+        let cacheKey = Self.inkRenderKey(key, displayScale: displayScale) as NSString
+        if let hit = inkPictures.object(forKey: cacheKey) { return hit }
         guard face.kind == .ink, let strokes = face.ink, !strokes.isEmpty else { return nil }
         let size = face.size ?? CardFaces.canvas
         let scale = StudySetModel.inkThumbnailScale(canvas: size, displayScale: displayScale)
-        var image: UIImage?
-        UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
-            image = PKBridge.drawing(strokes).image(from: CGRect(x: 0, y: 0, width: size.width, height: size.height), scale: scale)
+        let worker = Task.detached(priority: .userInitiated) { () -> UIImage? in
+            guard !Task.isCancelled else { return nil }
+            var image: UIImage?
+            UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
+                image = PKBridge.drawing(strokes).image(from: CGRect(x: 0, y: 0, width: size.width, height: size.height), scale: scale)
+            }
+            return image
         }
-        if let image { inkPictures.setObject(image, forKey: key as NSString, cost: CardImages.cost(image)) }
+        let image = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
+        guard !Task.isCancelled else { return nil }
+        if let image { inkPictures.setObject(image, forKey: cacheKey, cost: CardImages.cost(image)) }
         return image
     }
 

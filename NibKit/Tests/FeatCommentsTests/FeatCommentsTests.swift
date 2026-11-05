@@ -246,6 +246,26 @@ final class FeatCommentsTests: XCTestCase {
         XCTAssertEqual(try item(h, threadRef).comment?.messages.map(\.id.raw), [replyID])
     }
 
+    func testStaleMessageDraftConflictsButUnrelatedReplyDoesNot() async throws {
+        let h = harness()
+        let baseline = try XCTUnwrap(try item(h, threadRef).comment?.messages.first)
+        var draft: [String: JSONValue] = ["ref": .string(threadRef), "message": .string(baseline.id.raw),
+            "text": "First correction", "baseline": try JSONValue.from(baseline)]
+        _ = try await h.run("comment.reply", ["ref": .string(threadRef), "text": "Unrelated reply"])
+        _ = try await h.run("comment.edit", .object(draft))
+        let depth = h.undoDepth(Fixtures.docID)
+        draft["text"] = "Stale correction"
+        await assertError(.conflict) { _ = try await h.run("comment.edit", .object(draft)) }
+        XCTAssertEqual(try item(h, threadRef).comment?.messages.map(\.text), ["First correction", "Unrelated reply"])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        // After displaying the newer message, the editor can retry the preserved draft with its fresh baseline.
+        let current = try XCTUnwrap(try item(h, threadRef).comment?.messages.first)
+        draft["baseline"] = try JSONValue.from(current)
+        _ = try await h.run("comment.edit", .object(draft))
+        XCTAssertEqual(try item(h, threadRef).comment?.messages.first?.text, "Stale correction")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
+    }
+
     func testTapOpensThePinUnderTheFingerAndSkipsHiddenResolvedThreads() async throws {
         let h = harness()
         let panels = installPanelHost(h)

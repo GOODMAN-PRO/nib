@@ -167,6 +167,7 @@ final class WebDAVSettingsModel: ObservableObject {
     }
 
     let app: NibApp
+    private let validationBundle: Bundle
     @Published var url = ""
     @Published var user = ""
     @Published var password = ""
@@ -181,8 +182,9 @@ final class WebDAVSettingsModel: ObservableObject {
     private var subscription: EventSubscription?
     private var polling: Task<Void, Never>?
 
-    init(app: NibApp) {
+    init(app: NibApp, validationBundle: Bundle = .main) {
         self.app = app
+        self.validationBundle = validationBundle
         loadFields()
     }
 
@@ -273,7 +275,7 @@ final class WebDAVSettingsModel: ObservableObject {
         defer { working = nil }
         let f = fields
         do {
-            let server = try WebDAVConfiguration.normalizeServerURL(f.url).absoluteString
+            let server = try WebDAVConfiguration.normalizeServerURL(f.url, bundle: validationBundle).absoluteString
             let draft = WebDAVConfigureCommand.stage(settings: app.settings, expected: expected, password: password)
             defer { WebDAVConfigureCommand.discard(draft) }
             _ = try await app.bus.run(WebDAVConfigureCommand.self,
