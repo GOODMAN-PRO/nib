@@ -11,6 +11,43 @@ final class CaptureReadinessTests: XCTestCase {
          .init(frame: CGRect(x: 200, y: 300, width: 100, height: 50), isAvailable: true, pixels: pixels)]
     }
 
+    @MainActor
+    func testAssistantTimeoutRecordsFailureAndPreservesDiagnostics() {
+        var diagnosed = false
+        var diagnosedBeforeFailure = false
+        let options = XCTExpectedFailure.Options()
+        options.isStrict = true
+        options.issueMatcher = { issue in
+            diagnosedBeforeFailure = diagnosed
+            return issue.compactDescription.contains("Assistant rendering readiness failed:")
+                && issue.compactDescription.contains("blank page and palette")
+        }
+        // Strict matching fails this regression if the caller swallows the timeout again.
+        XCTExpectFailure("The assistant caller must fail even when its document-state checks could pass",
+                         options: options) {
+            CaptureUITests.checkAssistantReadiness(waitUntilRendered: {
+                throw NibUI.Failure.message("blank page and palette")
+            }, diagnose: { error in
+                if let failure = error as? NibUI.Failure, case let .message(message) = failure {
+                    diagnosed = message == "blank page and palette"
+                }
+            })
+        }
+        XCTAssertTrue(diagnosed)
+        XCTAssertTrue(diagnosedBeforeFailure, "Preserve timeout evidence before recording the failure")
+    }
+
+    @MainActor
+    func testAssistantReadyReturnsWithoutFailureOrTimeoutDiagnostics() {
+        var waited = false
+        var diagnosed = false
+        CaptureUITests.checkAssistantReadiness(waitUntilRendered: {
+            waited = true
+        }, diagnose: { _ in diagnosed = true })
+        XCTAssertTrue(waited)
+        XCTAssertFalse(diagnosed)
+    }
+
     func testBlankToRenderedInBothAppearancesRequiresHalfASecond() {
         let appearances: [(UInt8, UInt8)] = [(245, 20), (20, 245)]
         for (paper, ink) in appearances {

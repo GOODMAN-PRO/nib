@@ -141,13 +141,13 @@ final class CaptureUITests: XCTestCase {
     }
 
     /// Accessibility state can precede the canvas bitmaps and palette foreground. See QA-ui-app15-strip.md
-    /// for the rendering paths and the unresolved timing diagnosis. A timeout preserves evidence and the capture.
+    /// for the rendering paths and the unresolved diagnosis. A timeout fails the test and preserves the capture.
     private func settledNotebookWithAssistant() {
         let pen = ui.app.buttons["tool.pen"]
         let note = ui.app.staticTexts.matching(NSPredicate(
             format: "label == %@ AND value == %@", "Sticky note", "Remember F = ma")).firstMatch
         var readiness = CaptureReadiness()
-        do {
+        Self.checkAssistantReadiness(waitUntilRendered: {
             try wait("Page note and palette glyph must finish presenting", timeout: 20) {
                 let time = ProcessInfo.processInfo.systemUptime
                 guard pen.exists, note.exists, pen.isHittable else {
@@ -160,12 +160,23 @@ final class CaptureUITests: XCTestCase {
                 return readiness.observe(elements, canvas: self.ui.canvas.frame,
                                          window: self.ui.app.windows.firstMatch.frame, at: time)
             }
-        } catch {
-            // Capture is evidence gathering: a strict pixel/geometry heuristic must not suppress a variant.
-            // This fallback is not evidence of successful rendering; retain the unresolved state explicitly.
+        }, diagnose: { error in
             let stem = "assistant-readiness-timeout-\(appearance)-\(orientation)"
             attach(XCTAttachment(string: "Rendering readiness unconfirmed: \(error)"), name: stem + "-reason")
             attach(XCTAttachment(screenshot: XCUIScreen.main.screenshot()), name: stem)
+            attach(XCTAttachment(string: ui.app.debugDescription), name: stem + "-hierarchy")
+        })
+    }
+
+    /// Shared by the real assistant wait and its regression tests. Keep gathering evidence after a timeout,
+    /// but never allow document/item-count assertions to turn an unrendered capture into a passing test.
+    static func checkAssistantReadiness(waitUntilRendered: () throws -> Void,
+                                        diagnose: (Error) -> Void) {
+        do {
+            try waitUntilRendered()
+        } catch {
+            diagnose(error)
+            XCTFail("Assistant rendering readiness failed: \(error)")
         }
     }
 
