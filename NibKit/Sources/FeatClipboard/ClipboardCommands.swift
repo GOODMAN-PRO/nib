@@ -13,6 +13,8 @@ protocol ClipboardBoard: AnyObject {
     func contains(_ types: [String]) -> Bool
     /// True when the board holds text (never shows the system paste prompt).
     var hasStrings: Bool { get }
+    /// Changes for every replacement, including copies made in another app.
+    var changeCount: Int { get }
     /// Snapshot the offered representations without synchronously fetching their contents. Loading a provider may
     /// show the system paste prompt, so callers must await its asynchronous data/object loading API.
     func readProviders() -> [NSItemProvider]
@@ -25,6 +27,7 @@ final class SystemClipboardBoard: ClipboardBoard {
 
     func contains(_ types: [String]) -> Bool { board.contains(pasteboardTypes: types) }
     var hasStrings: Bool { board.hasStrings }
+    var changeCount: Int { board.changeCount }
 
     func readProviders() -> [NSItemProvider] { board.itemProviders }
     func write(_ representations: [String: Any]) { board.setItems([representations], options: [:]) }
@@ -33,7 +36,8 @@ final class SystemClipboardBoard: ClipboardBoard {
 /// A pasteboard in memory: hostless tests never touch (or wait on, or prompt for) the simulator's.
 final class InMemoryClipboardBoard: ClipboardBoard {
     /// One dictionary per pasteboard item (type identifier → `Data` or `String`).
-    var items: [[String: Any]] = []
+    private(set) var changeCount = 0
+    var items: [[String: Any]] = [] { didSet { changeCount += 1 } }
 
     func contains(_ types: [String]) -> Bool { items.contains { item in types.contains { item[$0] != nil } } }
     var hasStrings: Bool { !strings.isEmpty }
@@ -60,6 +64,44 @@ enum Clipboard {
     static var board: ClipboardBoard = NibApp.isHostlessTest ? InMemoryClipboardBoard() : SystemClipboardBoard()
 
     static let log = Logger(subsystem: "app.nib", category: "clipboard")
+    /// Copy itself never waits for OCR. Late text is best-effort, while this is still the same clipboard entry.
+    static let recognitionWindow: TimeInterval = 5
+    private static var recognitionTask: Task<Void, Never>?
+    private static var recognitionDeadline: Task<Void, Never>?
+
+    @discardableResult
+    static func enrich(_ export: ClipboardExport, items: [Item], language: String, recognizer: TextRecognizer?) -> Task<Void, Never>? {
+        recognitionTask?.cancel()
+        recognitionDeadline?.cancel()
+        let ink = items.filter { ClipboardText.isHandwriting($0) }
+        guard !ink.isEmpty, let recognizer else { return nil }
+        let board = Clipboard.board
+        let revision = board.changeCount
+        let deadline = ProcessInfo.processInfo.systemUptime + recognitionWindow
+        let task = Task { @MainActor in
+            guard !Task.isCancelled else { return }
+            guard let lines = try? await recognizer.recognize(strokes: ink, language: language),
+                  !Task.isCancelled, ProcessInfo.processInfo.systemUptime <= deadline,
+                  Clipboard.board === board, board.changeCount == revision else { return }
+            var blocks: [(bbox: Rect, text: String)] = items.compactMap { item -> (bbox: Rect, text: String)? in
+                ClipboardText.typed(item).map { (bbox: item.bounds, text: $0) }
+            }
+            blocks += lines.compactMap { line -> (bbox: Rect, text: String)? in
+                let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return text.isEmpty ? nil : (bbox: line.bbox, text: text)
+            }
+            var enriched = export
+            enriched.text = ClipboardText.join(blocks)
+            if enriched.text != export.text { board.write(enriched.representations) }
+        }
+        recognitionTask = task
+        recognitionDeadline = Task { @MainActor in
+            do { try await Task.sleep(nanoseconds: UInt64(recognitionWindow * 1_000_000_000)) }
+            catch { return }
+            task.cancel()
+        }
+        return task
+    }
 }
 
 // MARK: - Reading the pasteboard
@@ -283,17 +325,22 @@ enum ClipboardCore {
         return style
     }
 
-    /// Fragment (with asset bytes), PNG (`services.renderer`) and plain text (typed text + `recognize.items`).
+    /// Fragment (with asset bytes), PNG and typed text. Recognition must never gate a pasteboard write.
     static func export(_ sel: ClipSelection, _ ctx: CommandContext) async -> ClipboardExport {
         let store = ctx.services.assets
         let doc = sel.doc
         let fragment = NibFragment.make(items: sel.items) { ref in try? store?.data(ref, doc: doc) }
         let png = await ClipboardRender.png(sel.items, doc: doc, page: sel.page, pageItems: sel.pageItems,
                                             renderer: ctx.services.renderer)
-        let text = await ClipboardText.text(for: sel.items, doc: doc, page: sel.page) { refs in
-            try? await ctx.execute(CommandIDs.recognizeItems, ["refs": .array(refs.map { .string($0) })])
-        }
+        let text = ClipboardText.join(sel.items.compactMap { item in
+            ClipboardText.typed(item).map { (bbox: item.bounds, text: $0) }
+        })
         return ClipboardExport(fragment: fragment, png: png, text: text)
+    }
+
+    static func enrich(_ export: ClipboardExport, selection: ClipSelection, _ ctx: CommandContext) {
+        let language = (try? ctx.workspace.content(selection.doc).meta.language) ?? "en-US"
+        Clipboard.enrich(export, items: selection.items, language: language, recognizer: ctx.services.recognizer)
     }
 
     /// Writes `fragment` onto a page in one undo step and returns the created refs in creation order. Assets are
@@ -356,7 +403,7 @@ struct ClipboardCopy: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "clipboard.copy", title: "Copy",
-        summary: "Copy items to the clipboard (replacing what is on it) as a Nib fragment plus a PNG and their recognised text (attached content comes along).",
+        summary: "Replace the clipboard with items (including attachments) as Nib fragment, PNG and typed text. Recognised text is added when ready (up to 5 s); output.text is typed text only.",
         params: .obj(["refs": .arr(.ref, "items to copy, all on one page")], required: ["refs"]),
         examples: [example],
         effect: .read)
@@ -374,7 +421,10 @@ struct ClipboardCopy: NibCommand {
         }
         // ponytail: every caller writes the system clipboard (the summary says so), which is what lets an AI's copy
         // then paste work; return the fragment in Output instead if callers other than the user must leave it alone.
-        if !ctx.dryRun { Clipboard.board.write(export.representations) }
+        if !ctx.dryRun {
+            Clipboard.board.write(export.representations)
+            ClipboardCore.enrich(export, selection: visible, ctx)
+        }
         return Output(count: visible.items.count, types: export.types, text: export.text.isEmpty ? nil : export.text)
     }
 }
@@ -449,7 +499,7 @@ struct ClipboardCut: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "clipboard.cut", title: "Cut",
-        summary: "Cut items: copy them to the clipboard (Nib fragment, PNG, recognised text) and delete them; connectors to them keep a free end.",
+        summary: "Copy items as Nib fragment, PNG and typed text, then delete; connectors keep free ends. Recognised text is added when ready (up to 5 s); output.text is typed text only.",
         params: .obj(["refs": .arr(.ref, "items to cut, all on one page")], required: ["refs"]),
         examples: [example],
         effect: .edit, destructive: true)
@@ -478,7 +528,10 @@ struct ClipboardCut: NibCommand {
             throw NibError(.internalError, "the items could not be copied, so nothing was cut",
                            hint: "copy them with clipboard.copy to see why, or delete them with item.delete")
         }
-        if !ctx.dryRun { Clipboard.board.write(representations) }
+        if !ctx.dryRun {
+            Clipboard.board.write(representations)
+            ClipboardCore.enrich(export, selection: sel, ctx)
+        }
         let cut = Set(sel.items.map { $0.id })
         var removed: [String] = []
         try ctx.mutate { tx in

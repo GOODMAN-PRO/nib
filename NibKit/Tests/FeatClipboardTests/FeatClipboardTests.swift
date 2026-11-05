@@ -18,11 +18,32 @@ private final class VisibilityChangingRenderer: PageRenderer {
     func purgeCaches() {}
 }
 
+/// Deliberately ignores cancellation and never answers until test cleanup (or a scripted late result).
+private actor SuspendedClipboardRecognizer: TextRecognizer {
+    let started: XCTestExpectation
+    private var pending: CheckedContinuation<[TextRecognition], Never>?
+    private(set) var receivedIDs: [ElementID] = []
+    init(started: XCTestExpectation) { self.started = started }
+    func recognize(strokes: [Item], language: String) async throws -> [TextRecognition] {
+        receivedIDs = strokes.map { $0.id }
+        return await withCheckedContinuation { continuation in
+            pending = continuation
+            started.fulfill()
+        }
+    }
+    func recognize(image: CGImage, language: String) async throws -> [TextRecognition] { [] }
+    func finish() {
+        pending?.resume(returning: [TextRecognition(text: "recognised", bbox: .zero, source: "ink")])
+        pending = nil
+    }
+}
+
 /// Exercises the same provider reader as the system board without contacting the simulator's pasteboard.
 @MainActor
 private final class ProviderClipboardBoard: ClipboardBoard {
     var providers: [NSItemProvider]
     var snapshots = 0
+    var changeCount: Int { 0 }
 
     init(_ providers: [NSItemProvider]) { self.providers = providers }
     func contains(_ types: [String]) -> Bool {
@@ -195,6 +216,109 @@ final class FeatClipboardTests: XCTestCase {
         XCTAssertNotEqual(pasted.first?.id, Fixtures.shapeID)
         XCTAssertEqual(pasted.first?.shape?.frame.x ?? 0, 120, accuracy: 1e-9)
         XCTAssertEqual(pasted.first?.shape?.frame.y ?? 0, 220, accuracy: 1e-9)
+    }
+
+    func testCopyAndCutCompleteWhenRecognitionNeverAnswers() async throws {
+        for command in ["clipboard.copy", "clipboard.cut"] {
+            let board = useMemoryBoard()
+            let h = Harness(features: [FeatClipboardFeature.self])
+            h.app.services.renderer = FakeRenderer()
+            let started = expectation(description: "recognition started")
+            let recognizer = SuspendedClipboardRecognizer(started: started)
+            h.app.services.recognizer = recognizer
+            // The original export path used this command; the new path reads the same recognizer from a snapshot.
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
+                                                      summary: "Test stand-in.", effect: .read)) { _, _ in
+                _ = try await recognizer.recognize(strokes: [], language: "en-US")
+                return [:]
+            }
+            let before = try h.snapshot()
+            let completed = expectation(description: "copy or cut returned without OCR")
+            let task = Task { @MainActor in
+                do {
+                    _ = try await h.run(command, ["refs": [.string(page1 + "FIXTURESTK01")]])
+                    XCTAssertTrue(board.contains([NibFragment.typeIdentifier]))
+                    XCTAssertTrue(board.contains([UTType.png.identifier]))
+                    if command == "clipboard.cut" {
+                        XCTAssertFalse(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+                            .contains { $0.id == Fixtures.strokeID })
+                        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+                        XCTAssertEqual(try h.snapshot(), before)
+                    } else {
+                        XCTAssertEqual(try h.snapshot(), before)
+                    }
+                } catch { XCTFail("\(command): \(error)") }
+                completed.fulfill()
+            }
+            await fulfillment(of: [completed, started], timeout: 1)
+            XCTAssertTrue(board.contains([NibFragment.typeIdentifier]), "the write cannot wait for recognition")
+            let receivedIDs = await recognizer.receivedIDs
+            XCTAssertEqual(receivedIDs, [Fixtures.strokeID], "cut recognises its snapshot, not deleted refs")
+            await recognizer.finish()
+            await task.value
+            restoreBoard()
+        }
+    }
+
+    func testPromptRecognitionEnrichesTheSameFragmentAndImage() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let ink = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+        let export = ClipboardExport(fragment: NibFragment.make(items: [ink], assetData: { _ in nil }), png: Data([1, 2]), text: "")
+        board.write(export.representations)
+        let original = board.items[0][NibFragment.typeIdentifier] as? Data
+        let recognizer = FakeRecognizer([TextRecognition(text: "recognised", bbox: ink.bounds, source: "ink")])
+        let task = Clipboard.enrich(export, items: [ink], language: "en-US", recognizer: recognizer)
+        await task?.value
+        XCTAssertEqual(board.strings, ["recognised"])
+        XCTAssertEqual(board.items[0][NibFragment.typeIdentifier] as? Data, original)
+        XCTAssertEqual(board.items[0][UTType.png.identifier] as? Data, export.png)
+    }
+
+    func testLateRecognitionCannotReplaceANewerCopyOrAnExpiredEntry() async throws {
+        for replace in [true, false] {
+            let board = useMemoryBoard()
+            let h = Harness(features: [FeatClipboardFeature.self])
+            let ink = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+            let export = ClipboardExport(fragment: NibFragment.make(items: [ink], assetData: { _ in nil }), png: nil, text: "typed")
+            board.write(export.representations)
+            let started = expectation(description: "recognition started")
+            let recognizer = SuspendedClipboardRecognizer(started: started)
+            let task = Clipboard.enrich(export, items: [ink], language: "en-US", recognizer: recognizer)
+            await fulfillment(of: [started], timeout: 1)
+            if replace {
+                board.write([UTType.utf8PlainText.identifier: "new copy"])
+            } else {
+                try await Task.sleep(nanoseconds: UInt64((Clipboard.recognitionWindow + 0.1) * 1_000_000_000))
+            }
+            let revision = board.changeCount
+            await recognizer.finish()
+            await task?.value
+            XCTAssertEqual(board.changeCount, revision)
+            XCTAssertEqual(board.strings, [replace ? "new copy" : "typed"])
+            restoreBoard()
+        }
+    }
+
+    func testRecognitionAfterTheOldWindowStillEnrichesTheUnchangedEntry() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let ink = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+        let export = ClipboardExport(fragment: NibFragment.make(items: [ink], assetData: { _ in nil }), png: Data([1, 2]), text: "")
+        board.write(export.representations)
+        let original = board.items[0][NibFragment.typeIdentifier] as? Data
+        let started = expectation(description: "recognition started")
+        let recognizer = SuspendedClipboardRecognizer(started: started)
+        let task = Clipboard.enrich(export, items: [ink], language: "en-US", recognizer: recognizer)
+        await fulfillment(of: [started], timeout: 1)
+        try await Task.sleep(nanoseconds: 800_000_000)
+        await recognizer.finish()
+        await task?.value
+        XCTAssertEqual(board.strings, ["recognised"])
+        XCTAssertEqual(board.items[0][NibFragment.typeIdentifier] as? Data, original)
+        XCTAssertEqual(board.items[0][UTType.png.identifier] as? Data, export.png)
     }
 
     func testCutRefusesLockedItems() async throws {
@@ -729,6 +853,80 @@ final class FeatClipboardTests: XCTestCase {
     }
 
     /// A drag dropped back on its own canvas moves the selection: same page = item.transform, other page = item.moveToPage.
+    func testDragTextPreparationIgnoresSelectionRestylingAndOrder() async throws {
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let host = FakeCanvasHost(h)
+        let attachment = CanvasDragDrop()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        var second = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+        second.id = ElementID("SECONDINK")
+        try await h.insert([second])
+        let first = expectation(description: "first selection recognised")
+        let repeated = expectation(description: "restyling must not recognise again")
+        repeated.isInverted = true
+        var calls = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
+                                                  summary: "Test stand-in.", effect: .read)) { _, _ in
+            calls += 1
+            if calls == 1 { first.fulfill() } else { repeated.fulfill() }
+            return ["text": "ink"]
+        }
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID, second.id])
+        attachment.canvasDidChange(host)
+        await fulfillment(of: [first], timeout: 1)
+        for width in 1...10 {
+            h.session.selection.bounds = Rect(x: 0, y: 0, width: Double(width), height: 10)
+            h.session.selection.outline = [Point(Double(width), 0)]
+            h.session.selection.items.reverse()
+            attachment.canvasDidChange(host)
+        }
+        await fulfillment(of: [repeated], timeout: 0.35)
+        XCTAssertEqual(calls, 1)
+    }
+
+    func testDragTextPreparationCancelsOldSelectionAndDebouncesNewOnes() async throws {
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let host = FakeCanvasHost(h)
+        let attachment = CanvasDragDrop()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        var second = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+        second.id = ElementID("SECONDINK")
+        try await h.insert([second])
+        let started = expectation(description: "old selection recognition started")
+        let cancelled = expectation(description: "old recognition cancelled")
+        let next = expectation(description: "new selection recognised")
+        var calls = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
+                                                  summary: "Test stand-in.", effect: .read)) { _, _ in
+            calls += 1
+            if calls == 1 {
+                started.fulfill()
+                do { try await Task.sleep(nanoseconds: 5_000_000_000) }
+                catch {
+                    XCTAssertTrue(Task.isCancelled)
+                    cancelled.fulfill()
+                }
+            } else { next.fulfill() }
+            return ["text": "ink"]
+        }
+        let old = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID])
+        let new = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [second.id])
+        h.session.selection = old
+        attachment.canvasDidChange(host)
+        await fulfillment(of: [started], timeout: 1)
+        h.session.selection = new
+        attachment.canvasDidChange(host)
+        // Changes inside the debounce window must not start intermediate requests.
+        h.session.selection = old
+        attachment.canvasDidChange(host)
+        h.session.selection = new
+        attachment.canvasDidChange(host)
+        await fulfillment(of: [cancelled, next], timeout: 1)
+        XCTAssertEqual(calls, 2)
+    }
+
     func testOwnDragDropRouting() {
         let source = CanvasDragContext(host: ObjectIdentifier(self), doc: Fixtures.docID, page: Fixtures.page1,
                                        start: Point(150, 240), bounds: Rect(x: 100, y: 200, width: 120, height: 90),

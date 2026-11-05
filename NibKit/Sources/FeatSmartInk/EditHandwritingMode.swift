@@ -682,22 +682,25 @@ final class EditHandwritingTool: CanvasTool {
     let id = FeatSmartInkFeature.toolID
     let inputMode: CanvasInputMode = .samples
     private var touch: (point: Point, time: CFTimeInterval, moved: Bool)?
-    /// The last tap handed to the model: a canvas may report one finger tap both as touches and as `tap`.
-    private var delivered: (point: Point, time: CFTimeInterval)?
+    /// End samples identify physical taps even when the canvas batches delivery or uses both callback paths.
+    /// Keep a few recent taps so interleaved callbacks cannot redeliver the first touch of a double-tap.
+    private var delivered: [(touchID: Int, page: PageID, time: CFTimeInterval)] = []
 
     private func editModel(_ host: CanvasHost) -> EditHandwritingModel { EditHandwritingModel.of(host.session) }
 
     func activate(_ host: CanvasHost) {
+        delivered.removeAll()
         editModel(host).begin(app: host.app, session: host.session, doc: host.documentID)
     }
 
     func deactivate(_ host: CanvasHost) {
         touch = nil
+        delivered.removeAll()
         editModel(host).end()
     }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
-        touch = (point: sample.location, time: CACurrentMediaTime(), moved: false)
+        touch = (point: sample.location, time: sample.timestamp, moved: false)
         let model = editModel(host)
         if model.isInsertingSpace, model.target?.page == sample.page { model.beginSpace(at: sample.location.y) }
     }
@@ -725,7 +728,7 @@ final class EditHandwritingTool: CanvasTool {
             }
             return
         }
-        if !t.moved, CACurrentMediaTime() - t.time < 0.5 { deliverTap(sample, host: host) }
+        if !t.moved, sample.timestamp - t.time < 0.5 { deliverTap(sample, host: host) }
     }
 
     func touchesCancelled(host: CanvasHost) {
@@ -739,14 +742,15 @@ final class EditHandwritingTool: CanvasTool {
     }
 
     private func deliverTap(_ sample: CanvasSample, host: CanvasHost) {
-        let now = CACurrentMediaTime()
-        if let d = delivered, now - d.time < 0.05, d.point.distance(to: sample.location) < 1 {
+        let now = sample.timestamp
+        if let d = delivered.first(where: { $0.touchID == sample.touchID && $0.page == sample.page && $0.time == now }) {
             #if DEBUG
             NSLog("%@", "[Nib QA edit] dedupe dropped point=\(sample.location) elapsed=\(now - d.time) threshold=0.05")
             #endif
             return
         }
-        delivered = (point: sample.location, time: now)
+        delivered.append((touchID: sample.touchID, page: sample.page, time: now))
+        if delivered.count > 8 { delivered.removeFirst() }
         editModel(host).tap(at: sample.location, page: sample.page, time: now)
     }
 }

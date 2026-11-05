@@ -378,6 +378,53 @@ final class FeatSmartInkTests: XCTestCase {
         XCTAssertNil(model.target)
     }
 
+    func testEditToolCountsOneTouchDeliveredByBothPathsOnlyOnce() async throws {
+        let h = Harness(features: [FeatSmartInkFeature.self])
+        let (model, tool, host) = try await editMode(h, Synth.paragraph())
+        defer { tool.deactivate(host) }
+        let word = model.layout.lines[1].words[2]
+        let began = CanvasSample(page: page, location: word.box.center, timestamp: 100, isPencil: false, touchID: 1)
+        let ended = CanvasSample(page: page, location: word.box.center, timestamp: 100.05, isPencil: false, touchID: 1)
+        tool.touchesBegan(began, host: host)
+        tool.touchesEnded(ended, host: host)
+        XCTAssertTrue(model.selectedWord.isEmpty)
+        // The tap callback can be delayed beyond the old 50 ms deduplication window.
+        try await Task.sleep(nanoseconds: 70_000_000)
+        tool.tap(ended, host: host)
+        XCTAssertTrue(model.selectedWord.isEmpty, "one physical tap is never a double-tap")
+        let second = CanvasSample(page: page, location: word.box.center, timestamp: 100.20, isPencil: false, touchID: 2)
+        tool.tap(second, host: host)
+        XCTAssertEqual(model.selectedWord, word.ids)
+        tool.tap(ended, host: host)
+        XCTAssertEqual(model.selectedWord, word.ids, "an interleaved callback from the first touch stays suppressed")
+    }
+
+    func testEditToolSelectsWordWhenPhysicalTapsAreDeliveredNineteenMillisecondsApart() async throws {
+        let h = Harness(features: [FeatSmartInkFeature.self])
+        let (model, tool, host) = try await editMode(h, Synth.paragraph())
+        defer { tool.deactivate(host) }
+        let word = model.layout.lines[1].words[2]
+        let first = CanvasSample(page: page, location: word.box.center, timestamp: 100, isPencil: false, touchID: 1)
+        let second = CanvasSample(page: page, location: word.box.center, timestamp: 100.15, isPencil: false, touchID: 2)
+        tool.tap(first, host: host)
+        XCTAssertTrue(model.selectedWord.isEmpty)
+        try await Task.sleep(nanoseconds: 19_000_000)
+        tool.tap(second, host: host)
+        XCTAssertEqual(model.selectedWord, word.ids, "touch spacing, not delivery spacing, defines a double-tap")
+        tool.tap(second, host: host)
+        XCTAssertEqual(model.selectedWord, word.ids, "the second path must not become a third tap")
+    }
+
+    func testEditToolDoesNotPairDistantPhysicalTapsDeliveredTogether() async throws {
+        let h = Harness(features: [FeatSmartInkFeature.self])
+        let (model, tool, host) = try await editMode(h, Synth.paragraph())
+        defer { tool.deactivate(host) }
+        let word = model.layout.lines[0].words[0]
+        tool.tap(CanvasSample(page: page, location: word.box.center, timestamp: 100, touchID: 1), host: host)
+        tool.tap(CanvasSample(page: page, location: word.box.center, timestamp: 101, touchID: 1), host: host)
+        XCTAssertTrue(model.selectedWord.isEmpty, "a reused touch ID with a new timestamp is a new physical tap")
+    }
+
     /// The object menu enters the mode as a temporary tool (contracts-v2 G15): the mode edits the lasso's selection as
     /// it is, and Done hands the strokes back as the selection, returns to the lasso and reports `tool.finished`.
     func testObjectMenuEntersAsATemporaryToolAndDoneReturnsToTheLasso() async throws {
