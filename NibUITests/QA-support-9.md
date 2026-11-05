@@ -144,3 +144,19 @@ These corrections supersede the round 1 ordinary-container return policy and exp
 Swift compilation and XCUITest execution are unavailable on this Windows host. CI must verify live ancestry, AX latency, native contact delivery and remote-picker timing; no runtime success or additional measured time saving is claimed.
 
 Validation: `python Scripts/lint.py` reports **0 errors, 25 warnings**; `git diff --check` passes. The source audit against the pre-round-2 HEAD preserves all **586 test declarations, 943 XCTAssert lines and 14 allowance lines**, with no skip/sleep lines added. Exactly three files changed: Support/NibUI.swift, InkUITests.swift and this report. Re-read the changed Swift blocks and shared callers, checking optional bindings, XCTest queries/waiters, closure captures, helper signatures and bounded postconditions. No Objective-C changes.
+
+## Round 9b
+
+### H1 - form focus query cost
+
+Confirmed S:selection-timeouts-and-ink#1 and its verdict against the current focus/clear/replace path: Name/Base URL/Chat model consumed 66/25/33 seconds; the success path polled global focus then built debugDescription. After a tap, focus now requires the keyboard and one responder-probe read per observation. Initial field-specific focus checks remain scoped to the presented container (so another focused editor cannot qualify); Attributes inspection remains only the occluded-editor fallback. Native Select All reuses already-verified focus, preserving empty-before-type and exact replacement postconditions. A form batch resolves the container once and each typed field once; Assistant saves with native Command-S before dismissing the keyboard and polls one typed saved-status query. Other native callers keep their signatures and selection-preservation contract.
+
+Should unblock Selection Assistant attribution; next CI must show exact three values, Provider saved and the final provenance assertions, with per-field durations materially below the baseline. A sub-10-second field / sub-100-second test is a target, not measured. Host AX inflation remains possible.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Selection Assistant attribution | Native form field duration | Which scoped field still consumes the allowance? |
+| All native replacements | Native replacement duration | How long do focus, clear, type and exact verification take? |
+
+H1 caller review: the batch also reuses its resolved container for initial field-specific focus checks; absent lazy fields retain the existing bounded reveal path. Public callers retain defaults. Native Select All tries the cheap UIKit probe first and retains the existing field-specific fallback for remote editors whose focus the Nib probe cannot classify, preserving Insert/Chrome native selection behavior.
+

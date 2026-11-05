@@ -1149,16 +1149,14 @@ final class SelectionUITests: XCTestCase {
         preset.tap()
         try tap("Custom OpenAI-compatible", scroll: true)
         ui.recordDiagnostics("Provider custom preset selected", facts: ui.elementFacts(preset), includeHierarchy: false)
-        for (label, value) in [("Name", "Selection fixture"),
-                               ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider.port))/v1"),
-                               ("Chat model", "selection-fixture")] {
-            let field = try control(label, type: .textField, scroll: true)
-            try ui.replaceNativeText(in: field, with: value)
-        }
-        // Save through the editor's real keyboard shortcut; no settings or commands are injected.
-        try ui.dismissNativeKeyboard()
-        try key("s") { try self.wait("Provider save must complete") { self.query("Provider saved.").firstMatch.exists } }
-        XCTAssertTrue(query("Provider saved.").firstMatch.waitForExistence(timeout: 10))
+        let lastField = try ui.fillNativeForm([("Name", "Selection fixture"),
+            ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider.port))/v1"),
+            ("Chat model", "selection-fixture")])
+        // Save through the native editor's shortcut while it still owns keyboard focus.
+        try ui.nativeKey("s", in: lastField)
+        let saved = ui.app.staticTexts["Provider saved."].firstMatch
+        try wait("Provider save must complete") { saved.exists }
+        XCTAssertTrue(saved.waitForExistence(timeout: 10))
         try ui.dismissSheets()
         try menu("Ask AI")
         try tap("Edit")

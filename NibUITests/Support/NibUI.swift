@@ -1384,14 +1384,15 @@ final class NibUI {
     }
 
     /// Reads XCTest's native focus diagnostic, allowing input into an already-focused but keyboard-occluded editor.
-    func isKeyboardFocused(_ field: XCUIElement, allowingAttributeFallback: Bool = false) -> Bool {
+    func isKeyboardFocused(_ field: XCUIElement, allowingAttributeFallback: Bool = false,
+                           in container: XCUIElement? = nil) -> Bool {
         guard field.exists else { return false }
         let identifier = field.identifier, label = field.label
         if !identifier.isEmpty || !label.isEmpty {
             let identity = !identifier.isEmpty ? NSPredicate(format: "identifier == %@", identifier)
                 : NSPredicate(format: "label == %@", label)
             // Query the AX snapshot, never KVC-evaluate this SDK-dependent key on XCUIElement itself.
-            let focused = app.descendants(matching: field.elementType).matching(identity)
+            let focused = (container ?? nativeFormContainer()).descendants(matching: field.elementType).matching(identity)
                 .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
             if focused.exists && focused.frame == field.frame { return true }
             // GIPHY and LaTeX expose focus in Attributes but not the predicate on this OS.
@@ -1535,12 +1536,42 @@ final class NibUI {
         }
     }
 
+    /// Resolve the presented form once for a batch; use typed queries inside it for each editor.
+    private func nativeFormContainer() -> XCUIElement {
+        for surface in [app.alerts.firstMatch, app.sheets.firstMatch, app.popovers.firstMatch] {
+            if surface.exists { return surface }
+        }
+        return app
+    }
+
+    @discardableResult
+    func fillNativeForm(_ values: [(String, String)]) throws -> XCUIElement {
+        let container = nativeFormContainer()
+        var last: XCUIElement?
+        for (name, value) in values {
+            let started = Date()
+            defer { logQA("Native form field duration", "field=\(name) seconds=\(Date().timeIntervalSince(started))") }
+            let field = container.textFields.matching(NSPredicate(
+                format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
+            if !field.exists {
+                revealFormElement { field }
+                if let failure = formRevealFailure { throw Failure.message(failure) }
+            }
+            guard field.waitForExistence(timeout: 8) else { throw Failure.message("Missing form field: " + name) }
+            try replaceNativeText(in: field, with: value, container: container)
+            last = field
+        }
+        guard let last else { throw Failure.message("Native form needs at least one field") }
+        return last
+    }
+
     /// A focused field under a floating keypad can be non-hittable and still be the correct typing target.
     func textEditor(_ name: String, timeout: TimeInterval = 8) throws -> XCUIElement {
+        let container = nativeFormContainer()
         var field: XCUIElement?
         func locate() -> Bool {
             for type in [XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField] {
-                if let found = findControl(name, type: type, actionable: false) { field = found; return true }
+                if let found = findControl(name, type: type, actionable: false, in: container) { field = found; return true }
             }
             return false
         }
@@ -1556,32 +1587,41 @@ final class NibUI {
     }
 
     /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.
-    func focusField(_ field: XCUIElement) throws {
-        if isKeyboardFocused(field) { return }
+    func focusField(_ field: XCUIElement, in container: XCUIElement? = nil) throws {
+        let scope = container ?? nativeFormContainer()
+        if isKeyboardFocused(field, in: scope) { return }
         if !hasVisibleFrame(field) || !field.isHittable {
             revealFormElement(field)
             if let failure = formRevealFailure { throw Failure.message(failure) }
         }
         guard hasVisibleFrame(field) && field.isHittable else {
             // Only a keyboard-occluded editor justifies the expensive Attributes-line check (GIPHY, LaTeX).
-            if isKeyboardFocused(field, allowingAttributeFallback: true) { return }
+            if isKeyboardFocused(field, allowingAttributeFallback: true, in: scope) { return }
             throw Failure.message("Native field cannot receive focus: \(field)")
         }
         field.tap()
-        let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in isKeyboardFocused(field) }, object: nil)
-        guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed
-                || isKeyboardFocused(field, allowingAttributeFallback: true) else {
+        // The tap identifies the target. Do not query the whole AX tree or build debugDescription
+        // to rediscover it: keyboard presence plus one UIKit responder probe proves text focus.
+        let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            app.keyboards.firstMatch.exists && (try? readState())?.keyResponderIsText == true
+        }, object: nil)
+        guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed else {
             throw Failure.message("Native field did not gain keyboard focus: \(field.debugDescription)")
         }
     }
 
     /// Delivers modifiers while preserving native focus; callers verify the relevant text or formatting result.
     func nativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command, in field: XCUIElement) throws {
+        try focusField(field)
+        try deliverNativeKey(key, modifiers, in: field)
+    }
+
+    private func deliverNativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags,
+                                  in field: XCUIElement) throws {
         try timedAction("Native key \(key), modifiers \(modifiers.rawValue)") {
-            try focusField(field)
             if key.lowercased() == "a", modifiers.contains(.command) {
-                guard isKeyboardFocused(field, allowingAttributeFallback: true)
-                        || (try? readState())?.keyResponderIsText == true else {
+                guard (try? readState())?.keyResponderIsText == true
+                        || isKeyboardFocused(field, allowingAttributeFallback: true) else {
                     throw Failure.message("Native Select All rejected: text does not have the keyboard")
                 }
             }
@@ -1599,12 +1639,12 @@ final class NibUI {
     }
 
     /// Clear is an observable prerequisite, so a failed Select All can never append replacement text.
-    func clearNativeText(in field: XCUIElement) throws {
+    func clearNativeText(in field: XCUIElement, container: XCUIElement? = nil) throws {
         // focusField taps an unfocused editor and verifies focus before nativeKey can send Select All.
-        try focusField(field)
+        try focusField(field, in: container)
         guard let value = field.value as? String else { throw Failure.message("Native editor has no readable value") }
         if value.isEmpty || value == field.placeholderValue { return }
-        try nativeKey("a", in: field)
+        try deliverNativeKey("a", .command, in: field)
         // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
         field.typeText(XCUIKeyboardKey.delete.rawValue)
         let remainingValue = field.value as? String
@@ -1623,8 +1663,10 @@ final class NibUI {
     }
 
     /// Waits for exact replacement, including empty fields, after proving the old content is gone.
-    func replaceNativeText(in field: XCUIElement, with text: String) throws {
-        try clearNativeText(in: field)
+    func replaceNativeText(in field: XCUIElement, with text: String, container: XCUIElement? = nil) throws {
+        let started = Date()
+        defer { logQA("Native replacement duration", "seconds=\(Date().timeIntervalSince(started))") }
+        try clearNativeText(in: field, container: container)
         if !text.isEmpty {
             timedAction("Native replacement delivery (\(text.count) characters)") { field.typeText(text) }
         }
