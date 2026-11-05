@@ -121,22 +121,44 @@ final class SettingsNavigationState: ObservableObject {
     @Published var detailPath: [SettingsPageLink] = []
     @Published var compactPath: [SettingsPageLink] = []
     @Published var query = ""
+    /// An explicit return to the compact index, distinct from the default section selection.
+    @Published var showsIndex = false
 
     func select(_ section: SettingsSection) {
         self.section = section
+        showsIndex = false
         detailPath = []
         compactPath = []
     }
 
-    /// Shows one page in both layouts: its section, then the page itself in the shared stack.
+    func showIndex() {
+        section = nil
+        detailPath = []
+        compactPath = []
+        showsIndex = true
+    }
+
+    /// A sole page is the shared stack's root content; only multi-page sections need a push.
     func show(page id: String, in catalog: SettingsCatalog) {
         guard let page = catalog.page(id) else { return }
         query = ""
         section = page.section
+        showsIndex = false
         var detail: [SettingsPageLink] = []
         if (catalog.group(page.section)?.pages.count ?? 0) > 1 { detail.append(SettingsPageLink(id: id)) }
         detailPath = detail
-        compactPath = [SettingsPageLink(id: id)]
+        compactPath = detail
+    }
+
+    func logSelection(in catalog: SettingsCatalog) {
+        #if DEBUG
+        let group = catalog.selected(section)
+        let selected = group?.section.rawValue ?? "none"
+        let count = group?.pages.count ?? 0
+        let path = compactPath.map(\.id).joined(separator: ",")
+        NSLog("[Nib QA settings] section=%@ pages=%ld path=[%@] index=%@",
+              selected, count, path, showsIndex ? "true" : "false")
+        #endif
     }
 }
 
@@ -298,25 +320,23 @@ struct SettingsRootView: View {
                 }
                 // Keep page-owned drafts alive when only the surrounding layout changes.
                 NavigationStack(path: $state.compactPath) {
-                    Group {
-                        if regular {
-                            SettingsSectionDetail(app: app, catalog: catalog, state: state)
-                        } else {
-                            SettingsIndexList(catalog: catalog, state: state)
-                                .navigationTitle(String(localized: "Settings"))
-                                .navigationBarTitleDisplayMode(.large)
+                    SettingsSectionDetail(app: app, catalog: catalog, state: state, regular: regular)
+                        .navigationDestination(for: SettingsPageLink.self) { link in
+                            SettingsPageHost(app: app, page: catalog.page(link.id))
+                                .settingsDoneButton(onDone)
                         }
-                    }
-                    .navigationDestination(for: SettingsPageLink.self) { link in
-                        SettingsPageHost(app: app, page: catalog.page(link.id))
-                            .settingsDoneButton(onDone)
-                    }
-                    .settingsDoneButton(onDone)
+                        .settingsDoneButton(onDone)
                 }
+            }
+            .onChange(of: regular, initial: true) { _, regular in
+                if regular { state.showsIndex = false }
             }
         }
         .background(NibColor.groupedBackground)
         .tint(NibColor.accent)
+        .onChange(of: state.section, initial: true) { _, _ in
+            state.logSelection(in: catalog)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange, object: app.ui.settingsPages)
             .receive(on: DispatchQueue.main)) { _ in
             // Plugins add, replace and remove settings pages while Settings may be open; rebuilding is cheap.
@@ -351,11 +371,7 @@ struct SettingsSidebar: View {
                     if state.query.trimmingCharacters(in: .whitespaces).isEmpty {
                         ForEach(catalog.groups) { group in
                             Button {
-                                if group.pages.count == 1, let page = group.pages.first {
-                                    state.show(page: page.id, in: catalog)
-                                } else {
-                                    state.select(group.section)
-                                }
+                                state.select(group.section)
                             } label: {
                                 NibSidebarRow(group.section.title, symbol: group.section.symbol,
                                               isSelected: group.section == selected)
@@ -438,18 +454,40 @@ struct SettingsIndexList: View {
     }
 }
 
-/// iPad detail: section pages as rows. Even a single page uses the shared pushed destination;
-/// a page owned by this layout-specific root would lose its draft when the root switches to the compact index.
+/// The same root in both layouts. A sole page stays in this branch when the sidebar disappears,
+/// preserving its SwiftUI identity and drafts without relying on a navigation push.
 @MainActor
 struct SettingsSectionDetail: View {
     let app: NibApp
     let catalog: SettingsCatalog
     @ObservedObject var state: SettingsNavigationState
+    var regular = true
 
     private var group: SettingsCatalog.SectionGroup? { catalog.selected(state.section) }
 
     var body: some View {
-        if let group {
+        content
+            .toolbar {
+                if !regular && !state.showsIndex && state.compactPath.isEmpty && group?.pages.count == 1 {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button(action: state.showIndex) {
+                            Label(String(localized: "Settings"), systemImage: NibSymbol.back.name)
+                        }
+                        .accessibilityIdentifier("settings.index")
+                    }
+                }
+            }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if let group, group.pages.count == 1, regular || !state.showsIndex {
+            SettingsPageHost(app: app, page: group.pages.first)
+        } else if !regular {
+            SettingsIndexList(catalog: catalog, state: state)
+                .navigationTitle(String(localized: "Settings"))
+                .navigationBarTitleDisplayMode(.large)
+        } else if let group {
             List {
                 Section {
                     ForEach(group.pages, id: \.id) { page in
@@ -458,6 +496,7 @@ struct SettingsSectionDetail: View {
                 }
             }
             .listStyle(.insetGrouped)
+            .accessibilityIdentifier("settings.section.pages")
             .navigationTitle(group.section.title)
             .navigationBarTitleDisplayMode(.inline)
         } else {
