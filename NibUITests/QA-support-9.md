@@ -25,3 +25,11 @@ L:#0 and verifier confirm the 1032pt collection inside a 520pt panel, and the y9
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Library AccessibleMoveEarlierLaterAndBoundaries; all reveal callers | Form container changed / Form drag point | Was the drag inside the ancestor clip, or did the original surface disappear/change? |
+
+## H4 - chord loss evidence
+
+D:capture#4 correction: no UIKit event arrived; cause and relation to the wide window are unknown. Current chord correctly excludes missing events from retry. Capture probe snapshots immediately before and after delivery, compare both log tail and optional total, and log both on no change. Existing modifier-loss retry alone remains. Current QAStateProbe exposes keyResponder/keyLog/keyLogTotal but **does not expose key-window identity or window frame**. Tests cannot obtain those app internals under the NibUITests-only rule: log these as unavailable, preserve the complete raw probe (including future fields), and separately label the first AX window frame, never claim it is the key window. This is the explicit scope-limited explanation for the unavailable part of H4. CI must show the actual responder, log totals, frames and any added probe fields in the next lost Command-comma; an app-side probe extension is needed for authoritative key-window identity/frame.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Capture PluginManager; all chord callers | Chord no new key event | Which probe responder/log and observed AX window frame bracketed delivery without a new event? |

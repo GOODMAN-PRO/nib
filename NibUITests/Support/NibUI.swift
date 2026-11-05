@@ -9,6 +9,7 @@ struct QAState: Decodable {
     let keyResponderIsText: Bool?
     /// The app's last hardware key events (fixture mode): window presses, the responder that took each, the command run.
     let keyLog: [String]?
+    let keyLogTotal: Int?
     let screen: String
     let document: String?
     let page: String?
@@ -853,8 +854,16 @@ final class NibUI {
             let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) route=runner hardware event responder=\(recipient) window=\(window.frame)\n\(probe.value ?? "missing")")
             request.lifetime = .keepAlways; activity.add(request)
             // Deliver at device level after verifying UIKit focus; non-text responders have no AX recipient.
-            let logBeforeDelivery = focused.keyLog ?? []
+            let deliveryBefore = chordProbeSnapshot()
+            let logBeforeDelivery = deliveryBefore.state?.keyLog ?? focused.keyLog ?? []
             try hardwareKey(key, modifiers)
+            let deliveryAfter = chordProbeSnapshot()
+            if let prior = deliveryBefore.state, let after = deliveryAfter.state,
+               let priorLog = prior.keyLog, let afterLog = after.keyLog,
+               priorLog == afterLog, prior.keyLogTotal == after.keyLogTotal {
+                logQA("Chord no new key event", "key=\(key) modifiers=\(modifiers.rawValue)\nbefore: "
+                    + deliveryBefore.facts + "\nafter: " + deliveryAfter.facts)
+            }
             // The app's own account of the key (window press, responder, command run) goes into the test log
             // for passing and failing chords alike.
             defer {
@@ -880,6 +889,23 @@ final class NibUI {
                 throw error
             }
         }
+    }
+
+    private func chordProbeSnapshot() -> (state: QAState?, facts: String) {
+        let raw = (try? probe.snapshot())?.value as? String
+        let decoded = raw.flatMap { try? JSONDecoder().decode(QAState.self, from: Data($0.utf8)) }
+        // Current probe exposes responder/log but not key-window identity/frame. Preserve the raw
+        // probe for future optional fields and identify the AX frame as a separate observation.
+        let object = raw.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) } as? [String: Any]
+        let keyWindowValue = object?["keyWindow"]
+        let windowFrameValue = object?["windowFrame"]
+        let keyWindow = keyWindowValue.map { String(describing: $0) } ?? "unavailable in probe"
+        let probeFrame = windowFrameValue.map { String(describing: $0) } ?? "unavailable in probe"
+        let window = app.windows.firstMatch
+        let axFrame = window.exists ? String(describing: window.frame) : "absent"
+        let facts = "keyWindow=\(keyWindow) probeWindowFrame=\(probeFrame) AXFirstWindowFrame=\(axFrame)"
+            + " responder=\(decoded?.keyResponder ?? "unavailable") probe=\(raw ?? "unavailable")"
+        return (decoded, facts)
     }
 
     private func missingChordModifiers(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags,
