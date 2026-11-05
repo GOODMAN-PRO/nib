@@ -409,3 +409,21 @@ Caller audit: re-read direct reveal calls in Create (Calendar summary), Ink (Pen
 | Existing move/reveal timing | Form move timing / Form reveal timing | Does slower homing remain within the test allowance? |
 
 Validation: `python Scripts/lint.py` reports **0 errors, 25 warnings**; `git diff --check` passes. Source review checked the changed search branches, existing hasVisibleFrame/snapshot/gesture APIs, optional and identity comparisons, explicit array typing and caller compatibility. Windows has no Swift toolchain or simulator, so compilation, sheet accessibility exposure, gesture dismissal behavior and runtime cost remain for GitHub Actions. Slow homing may add time; no speedup or runtime pass is claimed. One new round-5 commit with the requested attribution, no amendment or push.
+
+## Round 10d
+
+Merged current integration successfully before editing. Its labelled popover scrollers and direct single-page Settings sections remain authoritative; no anonymous-container lookup fallback or intermediate Plugins/Bridge row was added. Only NibUITests files are edited. Windows cannot compile Swift or run XCUITest.
+
+### 1. Close ordinary modal forms before strict popover rejection
+
+The review is confirmed by the plain-Other modal representation and NibSheetHeader's sheet.dismiss control. Strict dismissal now resolves the foreground Other subtree following PopoverDismissRegion, excludes document/library probe ancestors, and matches its own enabled close control by identity and frame before trying outside dismissal. cmd.panel.close is excluded from this form lookup. A form without a close control supplies its exclusion frame to the existing outside-region route; Replay's labelled ScrollView route remains. A bounded postcondition checks the form/cover before continuing, with facts on failure. Default advisory callers retain their old path and budgets.
+
+Re-read every dismissSheets caller in Canvas, Capture, Ink, Library, Selection, Chrome and Insert, including closeEditing, settings/provider setup, collection exports, Replay, Audio and successor share forms. Strict callers can close Document Editing through Done; closing a child still prevents closing the background Audio panel. No assertions, tests or allowances changed.
+
+| Diagnostic | Log prefix | Question answered |
+| --- | --- | --- |
+| Strict modal dismissal | Modal form close control | Which foreground form and scoped close control received the tap? |
+| Successful form dismissal | Modal form closed | Did the form and its dismissal cover disappear? |
+| Failed form dismissal | Modal form remained open / Modal form hierarchy | Which form, cover and tree survived the close action? |
+
+CI must verify plain-Other ancestry, close-button identity/frame binding, Document Editing closure and Replay/Audio ordering. Existing XCTest snapshot/query APIs are reused; no local compile/runtime pass is claimed.

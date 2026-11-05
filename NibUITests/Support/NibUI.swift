@@ -2583,9 +2583,60 @@ final class NibUI {
         }
     }
 
+    /// Nib forms are Other subtrees beside the dismissal cover, not Sheet/Popover nodes.
+    /// Exclude the underlying document/library and the cover itself before choosing the last
+    /// presented subtree. Keep snapshots for ancestry; never use child ordinals as live indices.
+    private func presentedFormSnapshot() -> XCUIElementSnapshot? {
+        let region = app.otherElements["PopoverDismissRegion"].firstMatch
+        guard hasVisibleFrame(region), let root = try? app.snapshot() else { return nil }
+        let window = app.windows.firstMatch.frame
+        func containsBackground(_ node: XCUIElementSnapshot) -> Bool {
+            ["nib.canvas", "nib.qa.state", "nib.qa.clipboard", "PopoverDismissRegion"].contains(node.identifier)
+                || node.elementType == .keyboard || node.children.contains { containsBackground($0) }
+        }
+        func hasContent(_ node: XCUIElementSnapshot) -> Bool {
+            [.button, .collectionView, .table, .scrollView].contains(node.elementType)
+                || node.children.contains { hasContent($0) }
+        }
+        var candidates: [XCUIElementSnapshot] = []
+        var passedCover = false
+        func visit(_ node: XCUIElementSnapshot) {
+            if node.identifier == "PopoverDismissRegion" { passedCover = true; return }
+            if passedCover, node.elementType == .other, node.frame.width > 100,
+               node.frame.height > 100, window.contains(node.frame),
+               !containsBackground(node), hasContent(node) {
+                candidates.append(node)
+                return // Keep the whole form, including its header, not its innermost list.
+            }
+            for child in node.children { visit(child) }
+        }
+        visit(root)
+        return candidates.last
+    }
+
+    private func formCloseControl(_ form: XCUIElementSnapshot) -> XCUIElement? {
+        var buttons: [XCUIElementSnapshot] = []
+        func visit(_ node: XCUIElementSnapshot) {
+            if node.elementType == .button { buttons.append(node) }
+            for child in node.children { visit(child) }
+        }
+        visit(form)
+        // A floating panel's cmd.panel.close is deliberately absent: it belongs to the background.
+        for name in ["sheet.dismiss", "Cancel", "Done", "Close", "Close export options"] {
+            for node in buttons where node.identifier == name || node.label == name {
+                let matches = app.buttons.matching(NSPredicate(format: "identifier == %@ AND label == %@",
+                                                               node.identifier, node.label))
+                if let button = matches.allElementsBoundByIndex.first(where: {
+                    $0.exists && $0.frame == node.frame && $0.isEnabled && $0.isHittable
+                }) { return button }
+            }
+        }
+        return nil
+    }
+
     /// Native popovers expose a dismissal region; Replay's sheet can expose only Other/ScrollView.
     /// Refuse ambiguous geometry instead of silently returning with an input cover still up.
-    private func dismissPresentedPopover() throws -> Bool {
+    private func dismissPresentedPopover(form: XCUIElementSnapshot? = nil) throws -> Bool {
         let region = app.otherElements["PopoverDismissRegion"].firstMatch
         let native = app.popovers.allElementsBoundByIndex.filter { hasVisibleFrame($0) }
         guard hasVisibleFrame(region) || !native.isEmpty else { return false }
@@ -2593,13 +2644,13 @@ final class NibUI {
             format: "identifier == %@ OR label == %@", "Replay handwriting", "Replay handwriting"))
             .allElementsBoundByIndex.filter { menuHasActiveContent($0) }
         let surfaces = native + replay
-        guard !surfaces.isEmpty else {
+        guard !surfaces.isEmpty || form != nil else {
             let facts = elementFacts(region)
             logQA("Popover still open", facts)
             throw Failure.message("Popover dismissal region is open without identifiable surface: " + facts)
         }
         let window = app.windows.firstMatch.frame
-        let frames = surfaces.map(\.frame)
+        let frames = surfaces.map(\.frame) + (form.map { [$0.frame] } ?? [])
         let points = [CGPoint(x: window.minX + 24, y: window.maxY - 24),
                       CGPoint(x: window.maxX - 24, y: window.maxY - 24),
                       CGPoint(x: window.minX + 24, y: window.minY + 24)]
@@ -2612,7 +2663,31 @@ final class NibUI {
         for surface in surfaces {
             try waitForMenuClosed(surface, named: "dismissSheets popover", dismissalCover: region)
         }
+        if let form { try waitForFormClosed(form, cover: region) }
         return true
+    }
+
+    private func waitForFormClosed(_ form: XCUIElementSnapshot, cover: XCUIElement) throws {
+        func sameContainer(_ node: XCUIElementSnapshot) -> Bool {
+            node.elementType == form.elementType && node.identifier == form.identifier
+                && node.label == form.label && node.frame == form.frame
+                && node.children.map { "\($0.elementType.rawValue)|\($0.identifier)|\($0.label)|\($0.frame)" }
+                    == form.children.map { "\($0.elementType.rawValue)|\($0.identifier)|\($0.label)|\($0.frame)" }
+        }
+        func containsForm(_ node: XCUIElementSnapshot) -> Bool {
+            sameContainer(node) || node.children.contains { containsForm($0) }
+        }
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            guard !hasVisibleFrame(cover), let root = try? app.snapshot() else { return false }
+            return !containsForm(root)
+        }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
+            let facts = "form=\(form.elementType) label=\(form.label) frame=\(form.frame) cover=" + elementFacts(cover)
+            logQA("Modal form remained open", facts)
+            logQA("Modal form hierarchy", app.debugDescription)
+            throw Failure.message("Modal form or its dismissal cover remains after close: " + facts)
+        }
+        logQA("Modal form closed", "frame=\(form.frame); form and dismissal cover gone")
     }
 
     /// Only callers requiring a closed popover opt into the round-10 closure postconditions.
@@ -2625,9 +2700,20 @@ final class NibUI {
         // the loop must not go on to close the Audio panel behind it (D:controls-forms#9).
         var dismissedSurface = false
         for _ in 0..<8 {
-            if requireClosedPopover, try dismissPresentedPopover() {
-                dismissedSurface = true
-                continue
+            if requireClosedPopover {
+                let form = presentedFormSnapshot()
+                if let form, let close = formCloseControl(form) {
+                    let region = app.otherElements["PopoverDismissRegion"].firstMatch
+                    logQA("Modal form close control", "form=\(form.frame) " + elementFacts(close))
+                    close.tap()
+                    try waitForFormClosed(form, cover: region)
+                    dismissedSurface = true
+                    continue
+                }
+                if try dismissPresentedPopover(form: form) {
+                    dismissedSurface = true
+                    continue
+                }
             }
             var close: XCUIElement?
             for id in ["sheet.dismiss", "cmd.panel.close", "Cancel", "Done", "Close", "Close export options"] {
