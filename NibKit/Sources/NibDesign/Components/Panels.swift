@@ -476,6 +476,7 @@ public extension NibRow where Accessory == EmptyView {
 /// Sheet header: Cancel (leading, accent text, ⎋), title (title3, up to 2 lines, never under the buttons), the sheet's
 /// single Tinted action (trailing, ⏎). An HStack, so at AX sizes and in German the title wraps instead of overlapping.
 public struct NibSheetHeader: View {
+    @Environment(\.isEnabled) private var isEnabled
     let title: String
     let cancelTitle: String
     let primaryTitle: String?
@@ -523,6 +524,7 @@ public struct NibSheetHeader: View {
         }
         .padding(.horizontal, NibSpacing.xl)
         .frame(minHeight: 60)
+        .nibEscapeCancellation(isEnabled: isEnabled, onCancel: onCancel)
     }
 }
 
@@ -599,6 +601,7 @@ private struct NibSheetContentLayout: Layout {
 /// disc, title (headline), subtitle (caption1 secondary), optional badge, optional More menu, round Close. At least
 /// 60 pt, growing with Dynamic Type.
 public struct NibPanelHeader<Trailing: View>: View {
+    @Environment(\.isEnabled) private var isEnabled
     let title: String
     let subtitle: String?
     let symbol: NibSymbol
@@ -638,6 +641,7 @@ public struct NibPanelHeader<Trailing: View>: View {
         .padding(.trailing, NibSpacing.xs)
         .padding(.vertical, NibSpacing.s)
         .frame(minHeight: 60)
+        .nibEscapeCancellation(isEnabled: isEnabled, onCancel: onClose)
     }
 
     private var stacked: some View {
