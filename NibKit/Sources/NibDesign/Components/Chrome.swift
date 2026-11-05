@@ -267,6 +267,9 @@ public struct NibToolOptionsBar<Content: View>: View {
 public struct NibToast: View {
     let message: String
     let action: NibAction?
+    #if DEBUG
+    @GestureState private var qaTouchActive = false
+    #endif
 
     public init(_ message: String, action: NibAction? = nil) {
         self.message = message
@@ -281,17 +284,20 @@ public struct NibToast: View {
                 .foregroundStyle(NibChromeColor(NibColor.label))
                 .lineLimit(2)
             if let action {
-                Button(action.title) {
+                Button {
                     #if DEBUG
                     NSLog("%@", String("[Nib QA toast] button action=\(action.title) message=\(message)".prefix(890)))
                     #endif
                     action.handler()
+                } label: {
+                    Text(action.title)
+                        .padding(.horizontal, NibSpacing.m)
+                        .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+                        .contentShape(Rectangle())
                 }.nibCommand(action.command)
                     .font(NibFont.button)
                     .foregroundStyle(NibColor.accent)
                     .buttonStyle(.plain)
-                    .padding(.horizontal, NibSpacing.m)
-                    .frame(minHeight: NibMetrics.hitTarget)
             }
         }
         .padding(.leading, 18)
@@ -299,6 +305,18 @@ public struct NibToast: View {
         .frame(minHeight: 48)
         .frame(maxWidth: 480)
         .accessibilityElement(children: .contain)
+        #if DEBUG
+        .simultaneousGesture(DragGesture(minimumDistance: 0)
+            .updating($qaTouchActive) { value, active, _ in
+                if !active {
+                    NSLog("%@", String("[Nib QA toast] touch began location=\(value.startLocation) message=\(message)".prefix(890)))
+                }
+                active = true
+            }
+            .onEnded { value in
+                NSLog("%@", "[Nib QA toast] touch ended location=\(value.location)")
+            })
+        #endif
     }
 }
 
