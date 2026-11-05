@@ -642,7 +642,11 @@ final class ChromeUITests: XCTestCase {
         try open(); try customize(); try saveLayout("Keep chrome"); try saveLayout("Delete chrome")
         let row = ui.app.cells.containing(.button, identifier: "Apply Delete chrome").firstMatch
         XCTAssertTrue(row.exists, "Saved layout must expose a deletable row")
-        row.swipeLeft(); try tap("Delete")
+        let remove = row.images.matching(NSPredicate(format: "label == 'remove'")).firstMatch
+        XCTAssertTrue(remove.exists && remove.isHittable, "Saved layout edit-mode minus must be available")
+        remove.tap()
+        ui.logQA("Saved layout after minus", row.debugDescription)
+        try tap("Delete")
         try wait("Delete must remove only the chosen saved layout") { !self.query("Apply Delete chrome").firstMatch.exists }
         _ = try reachable("Apply Keep chrome")
         try doneCustomizing(); try customize()
