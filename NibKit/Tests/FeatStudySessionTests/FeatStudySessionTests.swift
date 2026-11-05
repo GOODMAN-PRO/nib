@@ -201,6 +201,33 @@ final class FeatStudySessionTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(doc), 0)
     }
 
+    func testCardActionsMatchModeRevealNavigationAndBusyState() async throws {
+        let (h, runtime, _) = harness()
+        let model = runtime.model(app: h.app, doc: doc, session: h.session)
+        await model.begin("practice")
+        XCTAssertTrue(model.canFlip)
+        XCTAssertFalse(model.canGoPrevious)
+        XCTAssertTrue(model.canGoNext)
+        XCTAssertFalse(model.canGrade)
+        try model.act("flip", mode: nil, language: nil, instant: true)
+        XCTAssertTrue(model.canGrade)
+        h.session.readOnly = true
+        XCTAssertFalse(model.canGrade)
+        h.session.readOnly = false
+        for _ in 1..<model.queue.count { try model.act("next", mode: nil, language: nil, instant: true) }
+        XCTAssertTrue(model.canGoPrevious)
+        XCTAssertFalse(model.canGoNext)
+        await model.begin("smartLearn")
+        XCTAssertFalse(model.canGoPrevious)
+        XCTAssertFalse(model.canGoNext)
+        try model.act("flip", mode: nil, language: nil, instant: true)
+        model.busy = true
+        XCTAssertFalse(model.canFlip)
+        XCTAssertFalse(model.canGrade)
+        XCTAssertFalse(model.canGoPrevious)
+        XCTAssertFalse(model.canGoNext)
+    }
+
     func testSchemasPanelsShortcutsAndConformance() async throws {
         let (h, _, _) = harness()
         XCTAssertEqual(h.app.ui.panels.get(PanelIDs.studyPractice)?.placement, .fullScreen)

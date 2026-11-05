@@ -106,6 +106,10 @@ final class StudySessionModel: ObservableObject {
     }
     var paused: Bool { content.map { StudyPreferences.paused($0.meta) } ?? true }
     var readOnly: Bool { app.isReadOnly(doc) || session?.readOnly == true }
+    var canFlip: Bool { current != nil && !busy }
+    var canGoPrevious: Bool { canFlip && mode == "practice" && index > 0 }
+    var canGoNext: Bool { canFlip && mode == "practice" && index + 1 < queue.count }
+    var canGrade: Bool { canFlip && flipped && !readOnly }
     var nextReview: Double? { Scheduler.nextReview(liveCards, now: runtime.now()) }
 
     func accept(_ content: DocumentContent) {
@@ -323,11 +327,11 @@ struct StudySessionView: View {
                     NibIconButton(.back, label: String(localized: "Previous Card"), size: .panel,
                                   shortcut: KeyboardShortcut(.leftArrow, modifiers: [])) {
                         model.action("previous", instant: true)
-                    }.disabled(model.busy || model.index == 0)
+                    }.disabled(!model.canGoPrevious)
                     NibIconButton(.forward, label: String(localized: "Next Card"), size: .panel,
                                   shortcut: KeyboardShortcut(.rightArrow, modifiers: [])) {
                         model.action("next", instant: true)
-                    }.disabled(model.busy || model.index + 1 >= model.queue.count)
+                    }.disabled(!model.canGoNext)
                 }
                 NibIconButton(.more, label: String(localized: "Study options"), size: .panel) {
                     optionsPresented = true
@@ -444,16 +448,20 @@ struct StudySessionView: View {
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(.isButton)
         .accessibilityLabel(model.flipped ? String(localized: "Answer side") : String(localized: "Question side"))
-        .accessibilityAction(named: String(localized: "Flip Card")) { model.action("flip", instant: true) }
-        .accessibilityAction(named: String(localized: "Previous Card")) { if !smartLearn { model.action("previous", instant: true) } }
-        .accessibilityAction(named: String(localized: "Next Card")) { if !smartLearn { model.action("next", instant: true) } }
-        .accessibilityAction(named: String(localized: "Still Learning")) { model.grade(.again) }
-        .accessibilityAction(named: String(localized: "Knew It")) { model.grade(.good) }
+        .accessibilityActions {
+            if model.canFlip { Button(String(localized: "Flip Card")) { model.action("flip", instant: true) } }
+            if model.canGoPrevious { Button(String(localized: "Previous Card")) { model.action("previous", instant: true) } }
+            if model.canGoNext { Button(String(localized: "Next Card")) { model.action("next", instant: true) } }
+            if model.canGrade {
+                Button(String(localized: "Still Learning")) { model.grade(.again) }
+                Button(String(localized: "Knew It")) { model.grade(.good) }
+            }
+        }
     }
 
     private var flip: some View {
         NibButton(String(localized: "Flip Card"), kind: .plain,
-                  shortcut: KeyboardShortcut(.space, modifiers: [])) { model.action("flip", instant: true) }.disabled(model.busy)
+                  shortcut: KeyboardShortcut(.space, modifiers: [])) { model.action("flip", instant: true) }.disabled(!model.canFlip)
     }
 
     private var grading: some View {
@@ -481,7 +489,7 @@ struct StudySessionView: View {
         let key = String((StudyRating.allCases.firstIndex(of: rating) ?? 0) + 1)
         return StudyGradeButton(title: rating.title, detail: model.interval(rating),
             shortcut: KeyboardShortcut(KeyEquivalent(Character(key)), modifiers: [])) { model.grade(rating) }
-            .disabled(model.busy || !model.flipped || model.readOnly)
+            .disabled(!model.canGrade)
     }
 
     private var controls: some View {
