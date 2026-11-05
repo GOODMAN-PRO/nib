@@ -58,6 +58,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         var persisted: RichText
         var epoch = 0
         var stagingError: Error?
+        var failedCloseAttempts = 0
         var recoveryKey = ""
         var recoverySubscription: EventSubscription?
 
@@ -276,7 +277,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
         let model = TextFormatModel(app: app, session: host.session, editor: self)
         let bar = TextKeyboardBar(model: model)
-        bar.onDone = { [weak self] in self?.endEditing() }
+        bar.onDone = { [weak self] in self?.endEditing(allowFailedDraftClose: true) }
         bar.onMore = { [weak self] source in self?.presentInspector(from: source) }
         bar.onParagraph = { [weak self] panel, source in self?.presentInspector(from: source, panel: panel) }
         bar.onFonts = { [weak self] source in self?.presentFontPicker(from: source) }
@@ -316,14 +317,20 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
     /// Ends editing: commits the text, then removes the overlay once the commit landed so
     /// the page never shows the box twice or not at all.
-    func endEditing(commit: Bool = true, detaching: Bool = false) {
+    func endEditing(commit: Bool = true, detaching: Bool = false, allowFailedDraftClose: Bool = false) {
         guard let st = state else { return }
         debounce?.cancel()
         debounce = nil
         let text = currentRichText()
         if commit, st.stagingError != nil {
             retainDraft(st)
-            if !detaching { return }
+            st.failedCloseAttempts += 1
+            if !detaching && !(allowFailedDraftClose && st.failedCloseAttempts >= 2) {
+                if allowFailedDraftClose {
+                    report(NibError(.unavailable, String(localized: "Could not save the image. Choose Done again to close and keep your draft.")))
+                }
+                return
+            }
         }
         if commit { retainDraft(st) }
         state = nil
@@ -650,6 +657,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         do {
             try tagAttachments(st)
             st.stagingError = nil
+            st.failedCloseAttempts = 0
         } catch {
             let shouldReport = st.stagingError == nil
             st.stagingError = error

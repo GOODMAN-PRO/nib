@@ -628,6 +628,33 @@ final class FeatTextBoxTests: XCTestCase {
         editor.detach(from: host)
     }
 
+    func testDoneCanCloseRepeatedImageFailureAndRestoreBytes() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let bytes = try XCTUnwrap(UIGraphicsImageRenderer(size: CGSize(width: 2, height: 2)).image { ctx in
+            UIColor.red.setFill(); ctx.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        }.pngData())
+        editor.editingTextView?.attributedText = NSAttributedString(attachment: NSTextAttachment(data: bytes, ofType: "public.png"))
+        h.app.services.assets = RejectingTextAssets(base: h.assets)
+        editor.endEditing(allowFailedDraftClose: true)
+        XCTAssertTrue(editor.isEditing)
+        editor.endEditing(allowFailedDraftClose: true)
+        await editor.flush()
+        XCTAssertFalse(editor.isEditing)
+        XCTAssertEqual(try box(h).text, item.text?.text)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let attachment = editor.editingTextView?.textStorage.attribute(.attachment, at: 0, effectiveRange: nil) as? NSTextAttachment
+        XCTAssertEqual(attachment?.contents, bytes)
+        h.app.services.assets = h.assets
+        editor.endEditing()
+        await editor.flush()
+        let asset = try XCTUnwrap(try box(h).text.paragraphs.first?.runs.first?.attrs.attachment)
+        XCTAssertEqual(try h.assets.data(asset, doc: Fixtures.docID), bytes)
+        editor.detach(from: host)
+    }
+
     func testAttachmentWithoutDataDoesNotTrapTheEditor() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         let (host, editor) = self.editor(h)
