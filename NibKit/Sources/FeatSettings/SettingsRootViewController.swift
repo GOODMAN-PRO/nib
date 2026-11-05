@@ -534,6 +534,7 @@ extension View {
                     .keyboardShortcut(.cancelAction)
             }
         }
+        .nibEscapeCancellation(onCancel: onDone)
     }
 }
 
