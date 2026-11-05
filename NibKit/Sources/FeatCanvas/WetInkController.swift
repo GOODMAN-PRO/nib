@@ -471,6 +471,23 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                 #if DEBUG
                 let host = self?.host
                 let hit = event?.allTouches?.first?.view
+                if accepted, let canvas {
+                    // Inspect geometry without invoking hitTest recursively. RulerView is
+                    // owned by F039 and intentionally disables native hit testing.
+                    var pending: [UIView] = canvas.window.map { [$0] } ?? []
+                    var visited = 0
+                    var rulerUnderTouch = false
+                    while let view = pending.popLast(), visited < 4000 {
+                        visited += 1
+                        guard !view.isHidden, view.alpha > 0 else { continue }
+                        if NSStringFromClass(type(of: view)).hasSuffix(".RulerView"),
+                           view.bounds.contains(view.convert(point, from: canvas)) {
+                            rulerUnderTouch = true
+                        }
+                        pending.append(contentsOf: view.subviews)
+                    }
+                    NSLog("%@", "[Nib QA ruler] inkAdmitted=true rulerUnderTouch=\(rulerUnderTouch) point=\(point) touchCount=\(event?.allTouches?.count ?? 0) reason=\(reason)")
+                }
                 NSLog("%@", "[Nib QA ink] contact accepted=\(accepted) reason=\(reason) point=\(point) tool=\(host?.session.tool ?? "nil") inkEnabled=\(host?.isInkEnabled ?? false) drawingGesture=\(canvas?.drawingGestureRecognizer.isEnabled ?? false) hitView=\(String(describing: hit.map { type(of: $0) })) surfaceActive=\(surface?.active ?? false) allowedPage=\(String(describing: surface?.page)) allowedRegion=\(String(describing: surface?.region)) panels=\(String(describing: host?.session.openPanels)) presented=\(String(describing: canvas?.window?.rootViewController?.presentedViewController.map { type(of: $0) }))")
                 #endif
                 return accepted
