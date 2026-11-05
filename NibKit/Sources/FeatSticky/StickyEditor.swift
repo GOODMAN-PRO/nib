@@ -466,7 +466,10 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
             return
         }
         position(e.view, zoom: e.zoom, page: e.page, host: host)
-        keyboard.reveal(e.view.bounds, in: e.view, scrolling: scroll)
+        let textView = e.view.textView
+        guard let caret = textView.selectedTextRange?.end else { return }
+        e.view.layoutIfNeeded()
+        keyboard.reveal(textView.caretRect(for: caret), in: textView, scrolling: scroll)
     }
 
     private func open(doc: DocumentID, page: PageID, id: ElementID, note: StickyItem, placed: Bool, host: CanvasHost) {

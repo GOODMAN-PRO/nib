@@ -702,7 +702,8 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
             }
             return
         }
-        keyboard.reveal(t.textView.bounds, in: t.textView, scrolling: scroll)
+        guard let caret = t.textView.selectedTextRange?.end else { return }
+        keyboard.reveal(t.textView.caretRect(for: caret), in: t.textView, scrolling: scroll)
     }
 
     /// The shape without its text, drawn by the shape drawer itself, shown while the item is hidden for editing.
