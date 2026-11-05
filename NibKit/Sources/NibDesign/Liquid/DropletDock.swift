@@ -619,7 +619,7 @@ struct DropletDockableModifier: ViewModifier {
                 content
                     .environment(\.nibDockEdge, dock.edge)
                     .frame(width: frame.width, height: frame.height)
-                    .droplet(id, style: style, managesDrag: false)
+                    .droplet(id, style: style, managesDrag: false, layoutSize: frame.size)
                     .opacity(opacity)
                     .gesture(dragGesture(driver: driver, model: model))
                     .accessibilityActions {

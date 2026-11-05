@@ -101,6 +101,24 @@ final class GlassForegroundSnapshotTests: XCTestCase {
         XCTAssertEqual(measured.height, 44, accuracy: 0.01)
     }
 
+    func testDockAxisChangeKeepsTheNewRowSizeWhileTheFieldStillHasTheOldColumn() {
+        let field = DropletField()
+        field.usesSystemGlass = true
+        for vertical in [false, true] {
+            let next = vertical ? CGSize(width: 56, height: 415) : CGSize(width: 415, height: 56)
+            var p = DropletPresentation()
+            p.restSize = vertical ? CGSize(width: 415, height: 56) : CGSize(width: 56, height: 415)
+            p.bodySize = CGSize(width: 56, height: 56)
+            p.isDrawn = true
+            let view = Color.clear.frame(width: next.width, height: next.height)
+                .modifier(DropletBodyModifier(id: "palette", style: .palette, presentation: p,
+                                              namespace: nil, field: field, layoutSize: next))
+            let measured = NibSnapshot.fittingSize(view, width: 1376)
+            XCTAssertEqual(measured.width, next.width, accuracy: 0.01)
+            XCTAssertEqual(measured.height, next.height, accuracy: 0.01)
+        }
+    }
+
     func testDarkPaperBodyReachesTheSpecifiedOpacity() {
         let dark = UITraitCollection(userInterfaceStyle: .dark)
         let fullPaper = UIColor(NibGlassBodyTint.color(.clear, paperShare: 1)).resolvedColor(with: dark)

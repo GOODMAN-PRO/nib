@@ -20,6 +20,28 @@ final class DropletDockTests: XCTestCase {
 
     // MARK: Model
 
+    func testThirteenInchIPadFramesStayInsideEveryEdgeInBothOrientations() {
+        for size in [CGSize(width: 1376, height: 1032), CGSize(width: 1032, height: 1376)] {
+            let region = DropletDockModel.region(size: size,
+                safeArea: EdgeInsets(top: 24, leading: 0, bottom: 20, trailing: 0), compact: false)
+            let model = DropletDockModel(region: region, length: 415, thickness: 56)
+            for edge in NibDock.allCases {
+                for along in [CGFloat(0), 0.5, 1] {
+                    let frame = model.frame(for: NibPaletteDock(edge: edge, along: along))
+                    XCTAssertTrue(region.contains(frame), "\(size) \(edge) \(along): \(frame)")
+                    XCTAssertEqual(frame.size, edge.isVertical ? CGSize(width: 56, height: 415)
+                                                               : CGSize(width: 415, height: 56))
+                    switch edge {
+                    case .top: XCTAssertEqual(frame.minY, region.minY)
+                    case .bottom: XCTAssertEqual(frame.maxY, region.maxY)
+                    case .leading: XCTAssertEqual(frame.minX, region.minX)
+                    case .trailing: XCTAssertEqual(frame.maxX, region.maxX)
+                    }
+                }
+            }
+        }
+    }
+
     func testRegionSitsBelowTheBarsSixteenPointsIn() {
         XCTAssertEqual(iPad.region, CGRect(x: 16, y: 92, width: 1162, height: 706))
         XCTAssertEqual(iPhone.region, CGRect(x: 16, y: 127, width: 361, height: 683))

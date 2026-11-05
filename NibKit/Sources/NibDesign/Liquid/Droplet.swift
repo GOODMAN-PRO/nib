@@ -30,8 +30,9 @@ public extension View {
 }
 
 extension View {
-    func droplet(_ id: String, style: DropletStyle, managesDrag: Bool) -> some View {
-        modifier(DropletModifier(id: id, style: style, managesDrag: managesDrag, dragScale: 1, bondsWith: nil, onDrag: nil))
+    func droplet(_ id: String, style: DropletStyle, managesDrag: Bool, layoutSize: CGSize? = nil) -> some View {
+        modifier(DropletModifier(id: id, style: style, managesDrag: managesDrag, dragScale: 1, bondsWith: nil, onDrag: nil,
+                                 layoutSize: layoutSize))
     }
 }
 
@@ -42,6 +43,7 @@ struct DropletModifier: ViewModifier {
     let dragScale: CGFloat
     let bondsWith: String?
     let onDrag: ((NibDropletDrag) -> Void)?
+    var layoutSize: CGSize? = nil
     @Environment(DropletField.self) private var field: DropletField?
     @Environment(\.nibGlassNamespace) private var namespace
     @Environment(\.nibBud) private var bud
@@ -50,7 +52,7 @@ struct DropletModifier: ViewModifier {
         if let field {
             AttachedDroplet(content: content, id: id, style: style, managesDrag: managesDrag, dragScale: dragScale,
                             bondsWith: bondsWith, onDrag: onDrag, field: field, node: field.node(id),
-                            namespace: namespace, bud: bud)
+                            namespace: namespace, bud: bud, layoutSize: layoutSize)
         } else if bud?.isPresented.wrappedValue ?? true {
             content.nibGlass(style.glassKind, cornerRadius: style.cornerRadius, interactive: style.isInteractive)
         }
@@ -70,6 +72,7 @@ struct AttachedDroplet<Content: View>: View {
     let node: DropletNode
     let namespace: Namespace.ID?
     let bud: NibBudRequest?
+    var layoutSize: CGSize? = nil
 
     /// Presentation can lag the binding until onChange runs and throughout retraction.
     /// Retain the visual content, but release input and accessibility at dismissal.
@@ -104,7 +107,7 @@ struct AttachedDroplet<Content: View>: View {
             .opacity(p.contentOpacity)
             .transformEffect(contentTransform(p))
             .modifier(DropletBodyModifier(id: id, style: style, presentation: p, namespace: namespace, field: field,
-                                          isBud: bud != nil, requestedHidden: requestedHidden))
+                                          isBud: bud != nil, requestedHidden: requestedHidden, layoutSize: layoutSize))
             .overlay {
                 if !style.drawsBody && p.isDrawn {
                     FrameRim(style: style, presentation: p)
@@ -202,6 +205,8 @@ struct DropletBodyModifier: ViewModifier {
     let field: DropletField
     var isBud = false
     var requestedHidden = false
+    /// Docking knows the new layout synchronously, before the field's geometry callback.
+    var layoutSize: CGSize? = nil
 
     var drawsNativeBody: Bool {
         Self.drawsBody(style: style, presentation: presentation, isBud: isBud, requestedHidden: requestedHidden)
@@ -221,12 +226,19 @@ struct DropletBodyModifier: ViewModifier {
         if #available(iOS 26.0, *), field.usesSystemGlass, drawsNativeBody {
             let radius = presentation.restSize == .zero ? style.cornerRadius : presentation.cornerRadius
             let shape = NibDropletShape(cornerRadius: style.cornerRadius == nil ? nil : radius)
-            let dx = (presentation.bodySize.width - presentation.restSize.width) / 2
-            let dy = (presentation.bodySize.height - presentation.restSize.height) / 2
+            let dx = layoutSize == nil ? (presentation.bodySize.width - presentation.restSize.width) / 2 : 0
+            let dy = layoutSize == nil ? (presentation.bodySize.height - presentation.restSize.height) / 2 : 0
             NibNativeGlass(effect: field.isFrozen ? .identity : style.systemGlass, shape: shape) {
                 content
+                    .frame(width: layoutSize?.width, height: layoutSize?.height)
                     .padding(.horizontal, dx)
                     .padding(.vertical, dy)
+                    // Negative reciprocal padding clamps at zero when an axis flips:
+                    // a 56-high row minus the old 415-high column becomes negative,
+                    // then the outer padding adds 359 points back to the layout.
+                    // An explicit envelope keeps glass physics out of dock layout.
+                    .frame(width: layoutSize == nil ? nil : envelopeSize.width,
+                           height: layoutSize == nil ? nil : envelopeSize.height)
             }
             .modifier(GlassIDModifier(id: id, namespace: namespace))
             .modifier(NibGlassBackdropModifier(kind: style.glassKind, shape: shape, frozen: field.isFrozen,
@@ -241,9 +253,14 @@ struct DropletBodyModifier: ViewModifier {
             .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
             .padding(.vertical, -dy)
             .padding(.horizontal, -dx)
+            .frame(width: layoutSize?.width, height: layoutSize?.height)
         } else {
             content
         }
+    }
+
+    private var envelopeSize: CGSize {
+        presentation.restSize == .zero ? (layoutSize ?? .zero) : presentation.bodySize
     }
 }
 
