@@ -225,6 +225,30 @@ final class FeatTextBoxTests: XCTestCase {
         XCTAssertEqual(b.style.cornerRadius, 12)
     }
 
+    func testExpectedTextProtectsEveryEditableTextKindAndEmptyDeletion() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        for id in [Fixtures.textID, Fixtures.stickyID, Fixtures.shapeID, Fixtures.connectorID] {
+            let ref = NodeRef.item(Fixtures.docID, Fixtures.page1, id).description
+            let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: id)
+            let before = try XCTUnwrap(TextItems.richText(item))
+            try await h.run(CommandIDs.textSetText, ["ref": .string(ref), "text": "External version"])
+            do {
+                try await h.run(CommandIDs.textSetText, ["ref": .string(ref), "text": "Stale version",
+                    "expectedText": try JSONValue.from(before)])
+                XCTFail("Stale text must be rejected")
+            } catch { XCTAssertEqual(NibError.wrap(error).code, .conflict) }
+            XCTAssertEqual(TextItems.richText(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: id))?.plainText, "External version")
+            try await h.run(CommandIDs.textSetText, ["ref": .string(ref), "text": "Safe version", "expectedText": "External version"])
+        }
+        do {
+            try await h.run(CommandIDs.textSetText, ["ref": .string(textRef), "text": "", "expectedText": "Old text", "deleteEmpty": true])
+            XCTFail("A stale empty draft must not delete current text")
+        } catch { XCTAssertEqual(NibError.wrap(error).code, .conflict) }
+        XCTAssertEqual(try box(h).text.plainText, "Safe version")
+        try await h.run(CommandIDs.textSetText, ["ref": .string(textRef), "text": "", "expectedText": "Safe version", "deleteEmpty": true])
+        XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID))
+    }
+
     func testTextCommandsNeedAnItemWithText() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         try await h.run("text.setText", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01", "text": "Label"])
@@ -285,9 +309,11 @@ final class FeatTextBoxTests: XCTestCase {
     func testDetachSavesAfterLastEditorReferenceIsReleased() async throws {
         for existing in [false, true] {
             let h = Harness(features: [FeatTextBoxFeature.self])
-            let host = FakeCanvasHost(h)
-            var editor: TextBoxEditor? = TextBoxEditor(host: host)
-            editor?.attach(to: host)
+            h.session.activeLayer = 3
+            var host: FakeCanvasHost? = FakeCanvasHost(h)
+            weak var releasedHost = host
+            var editor: TextBoxEditor? = TextBoxEditor(host: try XCTUnwrap(host))
+            editor?.attach(to: try XCTUnwrap(host))
             if existing {
                 let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
                 XCTAssertTrue(editor?.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil) == true)
@@ -304,12 +330,179 @@ final class FeatTextBoxTests: XCTestCase {
                 }) { saved.fulfill() }
             }
             editor?.editingTextView?.attributedText = NSAttributedString(string: "Final draft")
-            editor?.detach(from: host)
+            let other = EditorSession()
+            other.document = Fixtures.docID
+            other.activeLayer = 7
+            h.app.services.sessions.add(other)
+            h.session.activeLayer = 5 // creation must retain the layer at the initial tap
+            editor?.detach(from: try XCTUnwrap(host))
+            host = nil
             editor = nil
+            XCTAssertNil(releasedHost)
             await fulfillment(of: [saved], timeout: 1)
             subscription.cancel()
+            if !existing { XCTAssertEqual(try h.app.workspace.item(doc, page: page, id: id).layer, 3) }
             XCTAssertEqual(try h.app.workspace.item(doc, page: page, id: id).text?.text.plainText, "Final draft")
         }
+    }
+
+    func testFailedAutosaveRetriesOnCloseAndRepeatedFailuresRemainRecoverable() async throws {
+        for repeated in [false, true] {
+            let h = Harness(features: [FeatTextBoxFeature.self])
+            let (host, editor) = self.editor(h)
+            var reject = true
+            h.app.bus.hooks.register(.guarding(id: "test.reject", owner: "test", commands: [CommandIDs.textSetText]) { _, _, _ in
+                if reject { throw NibError(.permissionDenied, "Rejected save") }
+                return nil
+            })
+            let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+            XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+            let tv = try XCTUnwrap(editor.editingTextView)
+            tv.attributedText = NSAttributedString(string: "Recover me", attributes: tv.typingAttributes)
+            editor.commitNow()
+            await editor.flush()
+            XCTAssertEqual(try box(h).text, item.text?.text)
+            reject = repeated
+            editor.endEditing()
+            await editor.flush()
+            if repeated {
+                for _ in 0..<2 {
+                    XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+                    XCTAssertEqual(editor.editingTextView?.text, "Recover me")
+                    editor.detach(from: host)
+                    await editor.flush()
+                    XCTAssertEqual(try box(h).text, item.text?.text)
+                }
+                reject = false
+                XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+                editor.endEditing()
+                await editor.flush()
+            }
+            XCTAssertEqual(try box(h).text.plainText, "Recover me")
+            editor.detach(from: host)
+        }
+    }
+
+    func testExternalRestyleRebasesDraftAndTypingWithoutClearingUndo() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        let st = try XCTUnwrap(editor.editingState)
+        let blue = RGBA(nibHex: "#0000FFFF")
+        let draft = RichText(paragraphs: [Paragraph(runs: [TextRun("Inherited "), TextRun("blue", TextAttributes(color: blue))])])
+        tv.attributedText = TextLayout.attributed(draft, base: st.base) { _, _ in nil }
+        tv.selectedRange = NSRange(location: 2, length: 0)
+        tv.typingAttributes = TextLayout.typingAttributes(Paragraph(), run: TextAttributes(), base: st.base)
+        var undoKept = false
+        tv.undoManager?.registerUndo(withTarget: tv) { _ in undoKept = true }
+        var changed = item
+        changed.text?.style.defaults.color = RGBA(nibHex: "#FF0000FF")
+        changed.text?.style.defaults.size = 28
+        try await h.insert([changed])
+        XCTAssertEqual(tv.text, "Inherited blue")
+        XCTAssertEqual(tv.selectedRange, NSRange(location: 2, length: 0))
+        XCTAssertEqual((tv.textStorage.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? UIColor).map { RGBA($0) }, RGBA(nibHex: "#FF0000FF"))
+        XCTAssertEqual((tv.textStorage.attribute(.foregroundColor, at: 10, effectiveRange: nil) as? UIColor).map { RGBA($0) }, blue)
+        XCTAssertEqual((tv.typingAttributes[.font] as? UIFont)?.pointSize, 28)
+        tv.undoManager?.undo()
+        XCTAssertTrue(undoKept)
+        editor.endEditing()
+        await editor.flush()
+        let saved = try box(h)
+        XCTAssertNil(saved.text.paragraphs[0].runs[0].attrs.color)
+        XCTAssertEqual(saved.text.paragraphs[0].runs.last?.attrs.color, blue)
+        XCTAssertEqual(saved.style.defaults.color, RGBA(nibHex: "#FF0000FF"))
+        editor.detach(from: host)
+    }
+
+    func testDirtyExternalReplacementAndSuspendedSaveKeepBothVersions() async throws {
+        for suspended in [false, true] {
+            let h = Harness(features: [FeatTextBoxFeature.self])
+            let (host, editor) = self.editor(h)
+            let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+            XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+            let tv = try XCTUnwrap(editor.editingTextView)
+            tv.attributedText = NSAttributedString(string: "Local draft", attributes: tv.typingAttributes)
+            let entered = expectation(description: "Save suspended")
+            let release = expectation(description: "Resume save")
+            if suspended {
+                h.app.bus.hooks.register(.guarding(id: "test.suspend", owner: "test", commands: [CommandIDs.textSetText]) { _, params, _ in
+                    if params["expectedText"] != nil {
+                        entered.fulfill()
+                        await self.fulfillment(of: [release], timeout: 1)
+                    }
+                    return nil
+                })
+                editor.commitNow()
+                await fulfillment(of: [entered], timeout: 1)
+            }
+            try await h.run(CommandIDs.textSetText, ["ref": .string(textRef), "text": "Other window"])
+            XCTAssertEqual(tv.text, "Local draft")
+            if suspended {
+                release.fulfill()
+                await editor.flush()
+                h.app.bus.hooks.unregister(id: "test.suspend")
+            }
+            editor.endEditing()
+            await editor.flush()
+            XCTAssertEqual(try box(h).text.plainText, "Other window")
+            let current = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+            XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: current, caretAt: nil))
+            XCTAssertEqual(editor.editingTextView?.text, "Local draft")
+            editor.endEditing(commit: false)
+            await editor.flush()
+            editor.detach(from: host)
+        }
+    }
+
+    func testAttachmentFailureRetainsBytesThroughDetachAndRetry() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        var host: FakeCanvasHost? = FakeCanvasHost(h)
+        var editor: TextBoxEditor? = TextBoxEditor(host: try XCTUnwrap(host))
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor?.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil) == true)
+        let bytes = try XCTUnwrap(UIGraphicsImageRenderer(size: CGSize(width: 2, height: 2)).image { ctx in
+            UIColor.red.setFill(); ctx.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        }.pngData())
+        let attachment = NSTextAttachment(data: bytes, ofType: "public.png")
+        editor?.editingTextView?.attributedText = NSAttributedString(attachment: attachment)
+        h.app.services.assets = RejectingTextAssets(base: h.assets)
+        let failed = expectation(description: "Attachment failure notified")
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in failed.fulfill() }
+        editor?.commitNow()
+        await fulfillment(of: [failed], timeout: 1)
+        NotificationCenter.default.removeObserver(observer)
+        editor?.detach(from: try XCTUnwrap(host))
+        XCTAssertEqual(attachment.contents, bytes)
+        XCTAssertEqual(try box(h).text, item.text?.text)
+        editor = nil; host = nil
+        h.app.services.assets = h.assets
+        let (retryHost, retry) = self.editor(h)
+        XCTAssertTrue(retry.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let retained = retry.editingTextView?.textStorage.attribute(.attachment, at: 0, effectiveRange: nil) as? NSTextAttachment
+        XCTAssertEqual(retained?.contents, bytes)
+        retry.endEditing()
+        await retry.flush()
+        let asset = try XCTUnwrap(try box(h).text.paragraphs.first?.runs.first?.attrs.attachment)
+        XCTAssertEqual(try h.assets.data(asset, doc: Fixtures.docID), bytes)
+        retry.detach(from: retryHost)
+    }
+
+    func testOutsidePencilIsConsumedWhileFingerCanNavigate() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let outside = CGPoint(x: 600, y: 700)
+        XCTAssertFalse(editor.hitTest(outside, isPencil: false, host: host))
+        XCTAssertTrue(editor.isEditing)
+        XCTAssertTrue(editor.hitTest(outside, isPencil: true, host: host))
+        XCTAssertTrue(editor.gesture(.tap, at: CanvasSample(page: Fixtures.page1, location: Point(600, 700), isPencil: true), host: host))
+        await editor.flush()
+        XCTAssertFalse(editor.isEditing)
+        editor.detach(from: host)
     }
 
     func testExternalMovePreservesPendingTyping() async throws {
@@ -1324,4 +1517,14 @@ final class FeatTextBoxTests: XCTestCase {
         }
         return count
     }
+}
+
+private final class RejectingTextAssets: AssetStore {
+    let base: AssetStore
+    init(base: AssetStore) { self.base = base }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { throw NibError(.unavailable, "Asset write failed") }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
 }

@@ -684,6 +684,106 @@ final class FeatShapesTests: XCTestCase {
         overlay.detach(from: host)
     }
 
+    func testFailedShapeSavesRetryAndRepeatedFailedClosesKeepDraft() async throws {
+        for repeated in [false, true] {
+            let h = Harness(features: [FeatShapesFeature.self])
+            Self.registerTextStandIn(h.app)
+            let host = FakeCanvasHost(h)
+            let overlay = ShapeEditOverlay()
+            overlay.attach(to: host)
+            h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+            var reject = true
+            h.app.bus.hooks.register(.guarding(id: "test.reject", owner: "test", commands: [CommandIDs.textSetText]) { _, _, _ in
+                if reject { throw NibError(.permissionDenied, "Rejected save") }
+                return nil
+            })
+            XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+            let editing = try XCTUnwrap(overlay.text)
+            editing.textView.attributedText = NSAttributedString(string: "Local label", attributes: editing.textView.typingAttributes)
+            overlay.saveTextNow()
+            await overlay.pendingFlush?.value
+            XCTAssertNil(try shape(h, Fixtures.shapeID).text)
+            reject = repeated
+            overlay.endTextEditing(commit: true)
+            await overlay.pendingFlush?.value
+            if repeated {
+                for _ in 0..<2 {
+                    XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+                    XCTAssertEqual(overlay.text?.textView.text, "Local label")
+                    overlay.endTextEditing(commit: true)
+                    await overlay.pendingFlush?.value
+                    XCTAssertNil(try shape(h, Fixtures.shapeID).text)
+                }
+                reject = false
+                XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+                overlay.endTextEditing(commit: true)
+                await overlay.pendingFlush?.value
+            }
+            XCTAssertEqual(try shape(h, Fixtures.shapeID).text?.plainText, "Local label")
+            overlay.detach(from: host)
+        }
+    }
+
+    func testShapeLabelFollowsExternalTextAndPreservesDirtyConflict() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        Self.registerTextStandIn(h.app)
+        let host = FakeCanvasHost(h)
+        let overlay = ShapeEditOverlay()
+        overlay.attach(to: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+        let tv = try XCTUnwrap(overlay.text?.textView)
+        try await h.run(CommandIDs.textSetText, ["ref": .string(shapeRef), "text": "External clean"])
+        overlay.canvasDidChange(host)
+        XCTAssertEqual(tv.text, "External clean")
+        tv.attributedText = NSAttributedString(string: "Local label", attributes: tv.typingAttributes)
+        try await h.run(CommandIDs.textSetText, ["ref": .string(shapeRef), "text": "External dirty"])
+        overlay.canvasDidChange(host)
+        XCTAssertEqual(tv.text, "Local label")
+        overlay.endTextEditing(commit: true)
+        await overlay.pendingFlush?.value
+        XCTAssertEqual(try shape(h, Fixtures.shapeID).text?.plainText, "External dirty")
+        XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+        XCTAssertEqual(overlay.text?.textView.text, "Local label")
+        overlay.endTextEditing(commit: false)
+        overlay.detach(from: host)
+    }
+
+    func testQueuedShapeSaveRejectsAnExternalWriteAtMutation() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        Self.registerTextStandIn(h.app)
+        let host = FakeCanvasHost(h)
+        let overlay = ShapeEditOverlay()
+        overlay.attach(to: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+        let tv = try XCTUnwrap(overlay.text?.textView)
+        tv.attributedText = NSAttributedString(string: "Queued label", attributes: tv.typingAttributes)
+        let entered = expectation(description: "Save suspended")
+        let release = expectation(description: "Resume save")
+        h.app.bus.hooks.register(.guarding(id: "test.suspend", owner: "test", commands: [CommandIDs.textSetText]) { _, params, _ in
+            if params["expectedText"] != nil {
+                entered.fulfill()
+                await self.fulfillment(of: [release], timeout: 1)
+            }
+            return nil
+        })
+        overlay.saveTextNow()
+        await fulfillment(of: [entered], timeout: 1)
+        try await h.run(CommandIDs.textSetText, ["ref": .string(shapeRef), "text": "Other window"])
+        release.fulfill()
+        await overlay.pendingFlush?.value
+        h.app.bus.hooks.unregister(id: "test.suspend")
+        XCTAssertEqual(try shape(h, Fixtures.shapeID).text?.plainText, "Other window")
+        XCTAssertEqual(tv.text, "Queued label")
+        overlay.endTextEditing(commit: true)
+        await overlay.pendingFlush?.value
+        XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+        XCTAssertEqual(overlay.text?.textView.text, "Queued label")
+        overlay.endTextEditing(commit: false)
+        overlay.detach(from: host)
+    }
+
     // MARK: Containers
 
     func testContainerPlanPicksTheSmallestEnclosingShapeAndNeverACycle() {
@@ -1189,6 +1289,9 @@ final class FeatShapesTests: XCTestCase {
             let text = try (json["text"] ?? .null).decode(RichText.self)
             try ctx.mutate { tx in
                 var item = try tx.item(doc, page: page, id: id)
+                if let value = json["expectedText"], (item.shape?.text ?? .empty) != (try value.decode(RichText.self)) {
+                    throw NibError(.conflict, "Text changed")
+                }
                 item.shape?.text = text
                 try tx.put(item, doc: doc, page: page)
             }

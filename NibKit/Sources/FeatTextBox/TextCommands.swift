@@ -605,6 +605,7 @@ struct TextCreateBox: NibCommand {
         var text: RichText?
         var style: JSONValue?
         var id: String?
+        var layer: Int?
     }
     struct Output: Codable {
         var ref: String
@@ -612,7 +613,7 @@ struct TextCreateBox: NibCommand {
     static let descriptor = CommandDescriptor(
         id: "text.createBox", title: "Add Text Box",
         summary: "Create a text box at a point [x,y] (its top-left) or in a rect [x,y,w,h]; text is rich text or a plain string, style an object or saved style name.",
-        params: .obj(["page": .ref, "at": .point, "frame": .rect,
+        params: .obj(["page": .ref, "layer": .int(min: 0), "at": .point, "frame": .rect,
                       "text": textSchema("a plain string (one paragraph per line) or {paragraphs:[{runs:[{text, attrs}], align, list, indent}]}"),
                       "style": textSchema("TextBoxStyle object (background, borderColor, borderWidth, cornerRadius, padding, shadow, autoGrow, defaults, align, lineSpacing) or a style name: title, heading, body, caption or a saved text.styles.<name>"),
                       "id": .str("your own id, [A-Za-z0-9_-]{1,64}")],
@@ -650,7 +651,7 @@ struct TextCreateBox: NibCommand {
             let fitted = TextLayout.fittedHeight(box, assets: ctx.services.assets, doc: doc)
             box.frame.h = explicitHeight ? max(frame.h, fitted) : fitted
         }
-        let layer = ctx.activeSession?.activeLayer ?? 0
+        let layer = p.layer ?? ctx.activeSession?.activeLayer ?? 0
         let item = try ctx.mutate { tx -> Item in
             var it = Item.makeText(box, layer: layer)
             if let id = p.id {
@@ -669,6 +670,8 @@ struct TextSetText: NibCommand {
     struct Params: Codable {
         var ref: String
         var text: RichText
+        var expectedText: RichText? = nil
+        var deleteEmpty: Bool? = nil
     }
     struct Output: Codable {
         var ref: String
@@ -676,7 +679,8 @@ struct TextSetText: NibCommand {
     static let descriptor = CommandDescriptor(
         id: "text.setText", title: "Edit Text",
         summary: "Replace the rich text (or a plain string) of a text box, sticky note, shape or connector label; auto-growing boxes refit.",
-        params: .obj(["ref": .ref,
+        params: .obj(["ref": .ref, "expectedText": textSchema("Only replace this text if it is still current"),
+                      "deleteEmpty": .bool("Remove an empty text box when finishing editing"),
                       "text": textSchema("a plain string (one paragraph per line) or {paragraphs:[{runs:[{text, attrs}], align, list, indent, checked, lineSpacing}]}")],
                      required: ["ref", "text"]),
         examples: [["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "text": "Hello again"],
@@ -686,7 +690,22 @@ struct TextSetText: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let text = RichTextEdit.normalized(p.text)
         let (doc, page, id) = try TextRefs.item(p.ref, path: "$.ref")
+        if p.deleteEmpty == true, text.isEmpty {
+            try ctx.mutate { tx in
+                let item = try tx.item(doc, page: page, id: id)
+                _ = try TextItems.checked(item, doc: doc, page: page, path: "$.ref")
+                if let expected = p.expectedText, TextItems.richText(item) != expected {
+                    throw NibError(.conflict, String(localized: "Text changed elsewhere. Your draft has been kept."))
+                }
+                guard item.kind == .text else { throw NibError.invalid("Only text boxes can be removed on close") }
+                try tx.delete(item: id, doc: doc, page: page)
+            }
+            return Output(ref: NodeRef.item(doc, page, id).description)
+        }
         try TextItems.edit(ctx, refs: [p.ref], path: { _ in "$.ref" }) { t in
+            if let expected = p.expectedText, TextItems.richText(t.item) != expected {
+                throw NibError(.conflict, String(localized: "Text changed elsewhere. Your draft has been kept."))
+            }
             TextItems.set(text, on: &t.item)
         }
         return Output(ref: NodeRef.item(doc, page, id).description)
@@ -881,13 +900,22 @@ struct TextTapAt: NibCommand {
         guard p.point.count == 2 else { throw NibError.invalid("point must be [x, y]", path: "$.point") }
         let point = Point(p.point[0], p.point[1])
         guard let session = ctx.activeSession, !session.readOnly else { return Output(handled: false, ref: nil) }
+        let editor = TextBoxEditor.editor(for: session)
+        if editor?.isEditing != true, let ref = p.ref {
+            guard case let .item(d, pg, id)? = NodeRef(ref), d == doc, pg == page,
+                  (try? ctx.workspace.item(doc, page: page, id: id))?.kind == .text else {
+                return Output(handled: false, ref: nil)
+            }
+        } else if editor?.isEditing != true, p.ref == nil, session.tool != TextTool.toolID,
+                  p.gesture != CanvasGesture.doubleTap.rawValue, session.selection.items.isEmpty {
+            return Output(handled: false, ref: nil)
+        }
         let items = try ctx.workspace.items(doc, page: page)
         var target: Item?
         if let r = p.ref, case let .item(d, pg, id)? = NodeRef(r), d == doc, pg == page {
             target = items.first { $0.id == id && $0.kind == .text }
         }
         if target == nil, p.ref == nil { target = TextHitTest.textItem(at: point, in: items) }
-        let editor = TextBoxEditor.editor(for: session)
         guard let item = target, item.layer == session.activeLayer, !session.hiddenLayers.contains(item.layer) else {
             if let editor, editor.isEditing {
                 editor.endEditing()

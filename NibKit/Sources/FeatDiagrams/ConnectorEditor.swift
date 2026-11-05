@@ -553,7 +553,7 @@ final class ConnectorEditor: CanvasAttachment {
             beads.append((kind: ConnectorEditor.bead(for: s.handle, of: c), at: s.view))
         }
         kit.show(layers, beads: beads)
-        updateAccessibility(t, c)
+        if drag?.moved != true { updateAccessibility(t, c) }
     }
 
     /// How a handle looks: an end attached to an item is tinted, a free end, a bend or a segment is clear, "add bend"
@@ -606,7 +606,7 @@ final class ConnectorEditor: CanvasAttachment {
             case .insert(let i):
                 let e = element("insert\(i)", at: s.view)
                 e.accessibilityLabel = String(localized: "Add Bend \(i + 1)")
-                e.onActivate = { [weak self] in self?.moveHandle(s, by: Point(0, 0), t) }
+                e.onActivate = { [weak self] in _ = self?.moveHandle(s, by: Point(0, 0), t) }
                 e.accessibilityCustomActions = movementActions(s, t)
                 list.append(e)
             case .segment(let i):
@@ -628,19 +628,19 @@ final class ConnectorEditor: CanvasAttachment {
         return moves.map { name, delta in
             UIAccessibilityCustomAction(name: name) { [weak self] _ in
                 guard let self else { return false }
-                self.moveHandle(spot, by: delta, t)
-                return true
+                return self.moveHandle(spot, by: delta, t)
             }
         }
     }
 
-    private func moveHandle(_ spot: Spot, by delta: Point, _ t: Target) {
+    @discardableResult
+    private func moveHandle(_ spot: Spot, by delta: Point, _ t: Target) -> Bool {
         var changes: [String: JSONValue] = [:]
         switch spot.handle {
         case .end(let start):
             changes[start ? "from" : "to"] = EndParam.free(spot.page + delta)
         case .bend(let i):
-            guard t.connector.bends.indices.contains(i) else { return }
+            guard t.connector.bends.indices.contains(i) else { return false }
             var bends = t.connector.bends
             bends[i] = spot.page + delta
             changes["bends"] = Self.json(bends)
@@ -652,9 +652,15 @@ final class ConnectorEditor: CanvasAttachment {
             let c = t.connector
             let frame = ConnectorRouter.elbowFrame(from: c.from.point, side: c.from.side,
                                                    to: c.to.point, side: c.to.side, bends: c.bends)
-            changes["bends"] = Self.json(Self.movedSegment(frame, index: i, delta: delta))
+            guard frame.indices.contains(i), frame.indices.contains(i + 1) else { return false }
+            let horizontal = abs(frame[i].y - frame[i + 1].y) < 0.001
+            guard horizontal ? delta.y != 0 : delta.x != 0 else { return false }
+            let bends = Self.movedSegment(frame, index: i, delta: delta)
+            guard bends != c.bends else { return false }
+            changes["bends"] = Self.json(bends)
         }
         commitAccessible(changes, t)
+        return true
     }
 
     private func attachNearest(start: Bool, _ t: Target) -> Bool {
@@ -662,11 +668,11 @@ final class ConnectorEditor: CanvasAttachment {
         let end = start ? t.connector.from : t.connector.to
         let items = (try? host.app.workspace.items(t.doc, page: t.page)) ?? []
         let candidates = items.filter { Anchoring.canAnchor($0) && $0.id != t.item.id && $0.id != end.item }
-        let nearest = candidates.compactMap { item -> (Item, ConnectorSide, Double, Double)? in
+        let best = candidates.compactMap { item -> (Item, ConnectorSide, Double, Double)? in
             guard let anchor = Anchoring.nearest(on: item, to: end.point) else { return nil }
             return (item, anchor.side, anchor.t, anchor.distance)
         }.min { $0.3 < $1.3 }
-        guard let nearest else { return false }
+        guard let nearest = best else { return false }
         commitAccessible([start ? "from" : "to": EndParam.attached(nearest.0.id, side: nearest.1, t: nearest.2)], t)
         return true
     }

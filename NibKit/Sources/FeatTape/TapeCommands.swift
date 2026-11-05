@@ -180,15 +180,15 @@ final class TapeStore {
         let id = PresetSwatch.tapePatternID(ref)
         let key = AssetKey(doc: doc.raw, ref: ref.name, pattern: id, color: color.hex)
         if let known = documentAssets[key] { return known }
-        var result: AssetRef?
+        var resolved: AssetRef?
         if let data = tile(pattern: id, color: color, in: patterns) {
             // Content-pack tiles come in at any size: normalise them like custom imports before they reach a document.
             let tile = source(of: id) == "pack" ? (TapeTile.customTile(from: data) ?? data) : data
-            result = try assets.put(tile, ext: "png", doc: doc)
+            resolved = try assets.put(tile, ext: "png", doc: doc)
         } else if (try? assets.data(ref, doc: doc)) != nil {
-            result = ref            // the swatch already points at an asset of this document (plugin or AI)
+            resolved = ref            // the swatch already points at an asset of this document (plugin or AI)
         }
-        guard let result else {
+        guard let result = resolved else {
             throw NibError(.notFound, String(localized: "Could not load the tape pattern. Choose another pattern or try again."))
         }
         if documentAssets.count >= TapeStore.cacheLimit { documentAssets.removeAll() }

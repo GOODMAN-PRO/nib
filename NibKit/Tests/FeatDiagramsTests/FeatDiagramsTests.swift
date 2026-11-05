@@ -664,6 +664,32 @@ final class FeatDiagramsTests: XCTestCase {
         XCTAssertNil(try connector(h, Fixtures.connectorID).from.item)
     }
 
+    func testAccessibleSegmentMoveAlongItsAxisIsANoOp() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let ref = NodeRef.item(Fixtures.docID, Fixtures.page1, Fixtures.connectorID).description
+        try await h.run(CommandIDs.connectorSetPath, ["ref": .string(ref), "route": "elbow",
+            "from": EndParam.free(Point(50, 50)), "to": EndParam.free(Point(550, 350)), "bends": []])
+        let host = FakeCanvasHost(h)
+        let editor = ConnectorEditor(host: host)
+        editor.attach(to: host)
+        defer { editor.detach(from: host) }
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.connectorID])
+        editor.canvasDidChange(host)
+        let before = try connector(h, Fixtures.connectorID)
+        let depth = h.undoDepth(Fixtures.docID)
+        let frame = ConnectorRouter.elbowFrame(from: before.from.point, side: before.from.side,
+            to: before.to.point, side: before.to.side, bends: before.bends)
+        XCTAssertGreaterThan(frame.count, 1)
+        let elements = host.canvasView.subviews.flatMap { $0.accessibilityElements ?? [] }.compactMap { $0 as? OverlayElement }
+        let segment = try XCTUnwrap(elements.first { $0.accessibilityLabel == String(localized: "Connector Segment \(1)") })
+        let horizontal = abs(frame[0].y - frame[1].y) < 0.001
+        let name = horizontal ? String(localized: "Move Left") : String(localized: "Move Up")
+        let action = try XCTUnwrap(segment.accessibilityCustomActions?.first { $0.name == name })
+        XCTAssertEqual(action.actionHandler?(action), false)
+        XCTAssertEqual(try connector(h, Fixtures.connectorID), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+    }
+
     func testConnectorEditorDragsAnEndOntoAnotherItem() async throws {
         let h = Harness(features: [FeatDiagramsFeature.self])
         let host = FakeCanvasHost(h)

@@ -53,6 +53,9 @@ final class FeatStickyTests: XCTestCase {
             let text = try (json["text"] ?? .null).decode(RichText.self)
             try ctx.mutate { tx -> Item in
                 var it = try tx.item(doc, page: page, id: id)
+                if let value = json["expectedText"], it.sticky?.text != (try value.decode(RichText.self)) {
+                    throw NibError(.conflict, "Text changed")
+                }
                 it.sticky?.text = text
                 return try tx.put(it, doc: doc, page: page)
             }
@@ -291,6 +294,144 @@ final class FeatStickyTests: XCTestCase {
         h.app.bus.undo(Fixtures.docID)
         XCTAssertEqual(try note(h).text.plainText, "Remember")
         withExtendedLifetime(editor) {}
+    }
+
+    func testFailedSavesRetryAndRepeatedFailedClosesKeepDraft() async throws {
+        for repeated in [false, true] {
+            let h = harness()
+            installTextStandIn(h)
+            let host = FakeCanvasHost(h)
+            let editor = StickyEditor.editor(for: host)
+            var reject = true
+            h.app.bus.hooks.register(.guarding(id: "test.reject", owner: "test", commands: [CommandIDs.textSetText]) { _, _, _ in
+                if reject { throw NibError(.permissionDenied, "Rejected save") }
+                return nil
+            })
+            editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+            let view = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+            view.textView.attributedText = NSAttributedString(string: "Local draft", attributes: StickyText.typingAttributes(zoom: 1))
+            editor.saveTyping()
+            await editor.flush()
+            XCTAssertEqual(text(h), "Remember")
+            reject = repeated
+            editor.endEditing(save: true)
+            await editor.flush()
+            if repeated {
+                for _ in 0..<2 {
+                    editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+                    let recovered = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+                    XCTAssertEqual(recovered.textView.text, "Local draft")
+                    editor.detach(from: host)
+                    await editor.flush()
+                    XCTAssertEqual(text(h), "Remember")
+                }
+                reject = false
+                editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+                editor.endEditing(save: true)
+                await editor.flush()
+            }
+            XCTAssertEqual(text(h), "Local draft")
+        }
+    }
+
+    func testExternalTextReloadsCleanEditorAndRetainsDirtyConflict() async throws {
+        let h = harness()
+        installTextStandIn(h)
+        let host = FakeCanvasHost(h)
+        let editor = StickyEditor.editor(for: host)
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        let view = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        try await h.run(CommandIDs.textSetText, ["ref": .string(stickyRef), "text": "External clean"])
+        editor.canvasDidChange(host)
+        XCTAssertEqual(view.textView.text, "External clean")
+        view.textView.attributedText = NSAttributedString(string: "Local draft", attributes: StickyText.typingAttributes(zoom: 1))
+        try await h.run(CommandIDs.textSetText, ["ref": .string(stickyRef), "text": "External dirty"])
+        editor.canvasDidChange(host)
+        XCTAssertEqual(view.textView.text, "Local draft")
+        editor.endEditing(save: true)
+        await editor.flush()
+        XCTAssertEqual(text(h), "External dirty")
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        XCTAssertEqual(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last?.textView.text, "Local draft")
+        editor.endEditing(save: false)
+        await editor.flush()
+    }
+
+    func testSuspendedStickySaveRejectsChangedTextAtMutation() async throws {
+        let h = harness()
+        installTextStandIn(h)
+        let host = FakeCanvasHost(h)
+        let editor = StickyEditor.editor(for: host)
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        let view = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        view.textView.attributedText = NSAttributedString(string: "Queued draft", attributes: StickyText.typingAttributes(zoom: 1))
+        let entered = expectation(description: "Save suspended")
+        let release = expectation(description: "Resume save")
+        h.app.bus.hooks.register(.guarding(id: "test.suspend", owner: "test", commands: [CommandIDs.textSetText]) { _, params, _ in
+            if params["expectedText"] != nil {
+                entered.fulfill()
+                await self.fulfillment(of: [release], timeout: 1)
+            }
+            return nil
+        })
+        editor.saveTyping()
+        await fulfillment(of: [entered], timeout: 1)
+        try await h.run(CommandIDs.textSetText, ["ref": .string(stickyRef), "text": "Other window"])
+        release.fulfill()
+        await editor.flush()
+        h.app.bus.hooks.unregister(id: "test.suspend")
+        XCTAssertEqual(text(h), "Other window")
+        XCTAssertEqual(view.textView.text, "Queued draft")
+        editor.endEditing(save: true)
+        await editor.flush()
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        XCTAssertEqual(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last?.textView.text, "Queued draft")
+        editor.endEditing(save: false)
+        await editor.flush()
+    }
+
+    func testGuardedFallbackRefusesLegacyItemUpdateWithoutLosingDraft() async throws {
+        let h = harness()
+        installItemUpdateStandIn(h)
+        let before = try note(h).text
+        let saved = await StickyActions.setText(h.app, ref: stickyRef, text: RichText(plain: "Unsafe replacement"),
+                                                session: h.session, group: nil, expectedText: before)
+        XCTAssertFalse(saved)
+        XCTAssertEqual(try note(h).text, before)
+        // The legacy fallback remains available to existing callers without a precondition.
+        let unguarded = await StickyActions.setText(h.app, ref: stickyRef, text: RichText(plain: "Legacy call"),
+                                                    session: h.session, group: nil)
+        XCTAssertTrue(unguarded)
+        XCTAssertEqual(text(h), "Legacy call")
+    }
+
+    func testGuardedFallbackPassesExpectedTextToCapableItemUpdate() async throws {
+        let h = harness()
+        installTextStandIn(h)
+        let before = try note(h).text
+        h.app.commands.unregister(id: CommandIDs.textSetText)
+        var seenExpected: RichText?
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.itemUpdate, title: "Update Item", summary: "Atomic fallback stand-in.",
+            params: .obj(["ref": .ref, "patch": .anything(), "expectedText": .anything()]), effect: .edit)) { json, ctx in
+            let expected = try XCTUnwrap(json["expectedText"]).decode(RichText.self)
+            let replacement = try XCTUnwrap(json["patch"]?["sticky"]?["text"]).decode(RichText.self)
+            seenExpected = expected
+            try ctx.mutate { tx in
+                var item = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+                guard item.sticky?.text == expected else { throw NibError(.conflict, "Text changed") }
+                item.sticky?.text = replacement
+                try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
+            }
+            return [:]
+        }
+        let saved = await StickyActions.setText(h.app, ref: stickyRef, text: RichText(plain: "Safe fallback"),
+            session: h.session, group: nil, expectedText: before)
+        XCTAssertTrue(saved)
+        XCTAssertEqual(seenExpected, before)
+        let stale = await StickyActions.setText(h.app, ref: stickyRef, text: RichText(plain: "Stale fallback"),
+            session: h.session, group: nil, expectedText: before)
+        XCTAssertFalse(stale)
+        XCTAssertEqual(text(h), "Safe fallback")
     }
 
     func testTypingIsAutosavedAndOneUndoTakesBackTheWholeEditingSession() async throws {

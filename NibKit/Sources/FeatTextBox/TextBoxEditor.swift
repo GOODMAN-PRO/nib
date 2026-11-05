@@ -27,6 +27,8 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
     private struct WeakEditor { weak var editor: TextBoxEditor? }
     private static var live: [WeakEditor] = []
+    // Failed closes survive canvas/host teardown, including original attachment objects and their bytes.
+    private static var drafts: [String: EditState] = [:]
 
     /// The editor on the canvas showing `session`'s document.
     static func editor(for session: EditorSession) -> TextBoxEditor? {
@@ -53,6 +55,12 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         var base: TextAttributes
         let darkPaper: Bool
         var lastCommitted: RichText?
+        var persisted: RichText
+        var epoch = 0
+        var stagingError: Error?
+        var recoveryKey = ""
+        var session: EditorSession?
+        var layer = 0
         /// The plain text when editing started: typed URLs are linked only when the text changed, so a link the user
         /// removed on purpose stays removed.
         let openedText: String
@@ -75,6 +83,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             self.exists = exists
             self.createdByTool = createdByTool
             self.box = box
+            self.persisted = box.text
             self.base = TextLayout.base(box.style, darkPaper: darkPaper)
             self.darkPaper = darkPaper
             self.openedText = exists ? box.text.plainText : ""
@@ -170,6 +179,14 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         return st.container.bounds.insetBy(dx: -6, dy: -6).contains(local)
     }
 
+    func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool {
+        if isPencil, state != nil, !hitTest(viewPoint, host: host) {
+            endEditing()
+            return true // Own the whole dismissal stream; it must never reach a drawing tool.
+        }
+        return hitTest(viewPoint, host: host)
+    }
+
     // UITextView already handled these contacts, including double-tap word selection.
     func gesture(_ gesture: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool { true }
 
@@ -187,6 +204,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
                 return true
             }
             endEditing()
+            guard state == nil else { return false }
         }
         start(doc: doc, page: page, id: item.id, exists: true, createdByTool: false, box: box, caret: point)
         return true
@@ -196,6 +214,11 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     func beginNewBox(page: PageID, at point: Point) {
         guard let host = host, !host.session.readOnly else { return }
         if state != nil { endEditing() }
+        guard state == nil else { return }
+        if let draft = Self.drafts.values.first(where: { $0.recoveryKey.hasPrefix("\(host.session.id.raw):") && $0.doc == host.documentID && $0.page == page && !$0.exists }) {
+            start(doc: draft.doc, page: page, id: draft.id, exists: false, createdByTool: true, box: draft.box, caret: nil)
+            return
+        }
         let style = TextStyles.defaultStyle(app.settings)
         let record = (try? app.workspace.content(host.documentID))?.page(page)
         let base = TextLayout.base(style.box, darkPaper: false)
@@ -257,11 +280,25 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         let st = EditState(doc: doc, page: page, id: id, exists: exists, createdByTool: createdByTool, box: box,
                            darkPaper: paperIsDark(doc: doc, page: page), container: container, chrome: chrome,
                            outline: outline, textView: tv, model: model, popover: TextPopoverState())
+        st.recoveryKey = "\(host.session.id.raw):\(st.ref)"
+        st.session = host.session
+        st.layer = host.session.activeLayer
         state = st
         remember(st.group)
         applyInsets(st)
         render(box.text, selection: nil)
         st.lastCommitted = exists ? currentRichText() : nil
+        if let draft = Self.drafts.removeValue(forKey: st.recoveryKey) {
+            st.textView.attributedText = draft.textView.attributedText
+            st.textView.typingAttributes = draft.textView.typingAttributes
+            st.textView.selectedRange = draft.textView.selectedRange
+            st.base = draft.base
+            st.box = draft.box
+            st.persisted = draft.persisted
+            st.lastCommitted = draft.lastCommitted
+            st.exists = draft.exists
+            st.layer = draft.layer
+        }
         if exists { hide(id, page: page) }
         host.session.selection = Selection()
         host.session.isEditingText = true
@@ -278,6 +315,11 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         debounce?.cancel()
         debounce = nil
         let text = currentRichText()
+        if commit, st.stagingError != nil {
+            Self.drafts[st.recoveryKey] = st
+            return
+        }
+        if commit { Self.drafts[st.recoveryKey] = st }
         state = nil
         st.textView.delegate = nil
         dismissFloatingInspector(st)
@@ -292,20 +334,19 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         removeKeyboardInset()
         if commit {
             if st.exists {
-                if text.isEmpty {
-                    deleteEmptyBox(st)
-                } else {
-                    if text != st.lastCommitted { submit(text, for: st) }
-                    if text.plainText != st.openedText { autodetectLinks(text, for: st) }
-                }
+                submit(text, for: st, finishing: true)
+                if text.plainText != st.openedText { autodetectLinks(text, for: st) }
             } else if !text.isEmpty {
-                submit(text, for: st)
+                submit(text, for: st, finishing: true)
                 autodetectLinks(text, for: st)
             }
         }
-        enqueue { [weak self] in
+        enqueue { [self] in
+            if !commit || (!st.exists && text.isEmpty) || (st.lastCommitted == text && st.stagingError == nil) {
+                if Self.drafts[st.recoveryKey] === st { Self.drafts[st.recoveryKey] = nil }
+            }
             st.container.removeFromSuperview()
-            self?.unhide(st.id, page: st.page)
+            unhide(st.id, page: st.page)
         }
         revertTool(st)
         changes.send()
@@ -317,7 +358,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
               !app.settings.get(TextSettings.pinned) else { return }
         let previous = session.previousTool.flatMap { $0 == TextTool.toolID ? nil : $0 } ?? "pen"
         enqueue { [weak self] in
-            await self?.execute(CommandIDs.toolSelect, ["tool": .string(previous)])
+            await self?.execute(CommandIDs.toolSelect, ["tool": .string(previous)], session: st.session)
         }
     }
 
@@ -342,65 +383,58 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             return
         }
         let text = currentRichText()
-        guard text != st.lastCommitted, st.exists || !text.isEmpty else { return }
+        guard st.stagingError == nil, text != st.lastCommitted || queue != nil, st.exists || !text.isEmpty else { return }
         submit(text, for: st)
     }
 
-    private func submit(_ text: RichText, for st: EditState) {
-        st.lastCommitted = text
-        let textJSON = (try? JSONValue.from(text)) ?? .string(text.plainText)
-        if st.exists {
-            let params: JSONValue = ["ref": .string(st.ref), "text": textJSON]
-            enqueue { [self] in
-                if await execute(CommandIDs.textSetText, params, group: st.group) { st.box.text = text }
-            }
-            return
-        }
-        st.exists = true
-        let f = st.box.frame
-        let params: JSONValue = [
-            "page": .string(NodeRef.page(st.doc, st.page).description),
-            "frame": .array([.number(f.x), .number(f.y), .number(f.w), .number(f.h)]),
-            "text": textJSON,
-            // Every field explicit: the style is merged over the default, and a fill (or border) the user took off
-            // before this first commit must not come back from it.
-            "style": SavedTextStyle(box: st.box.style).json,
-            "id": .string(st.id.raw)
-        ]
+    private func submit(_ text: RichText, for st: EditState, finishing: Bool = false) {
+        let epoch = st.epoch
         enqueue { [self] in
-            if await self.execute(CommandIDs.textCreateBox, params, group: st.group) {
-                st.box.text = text
-                if self.state === st {
-                    self.hide(st.id, page: st.page)
-                    self.publishFocus()
-                }
+            guard st.stagingError == nil else { return }
+            guard st.epoch == epoch else {
+                report(NibError(.conflict, String(localized: "Text changed elsewhere. Your draft has been kept.")))
+                return
+            }
+            let deleting = finishing && st.exists && text.isEmpty && app.commands.descriptor(CommandIDs.itemDelete) != nil
+            guard text != st.lastCommitted || deleting else { return }
+            let textJSON = (try? JSONValue.from(text)) ?? .string(text.plainText)
+            let command: String
+            let params: JSONValue
+            if st.exists {
+                command = CommandIDs.textSetText
+                params = ["ref": .string(st.ref), "text": textJSON,
+                          "expectedText": (try? JSONValue.from(st.persisted)) ?? .string(st.persisted.plainText),
+                          "deleteEmpty": .bool(deleting)]
             } else {
-                st.exists = false
-                st.lastCommitted = nil
+                let f = st.box.frame
+                command = CommandIDs.textCreateBox
+                params = ["page": .string(NodeRef.page(st.doc, st.page).description),
+                          "frame": .array([.number(f.x), .number(f.y), .number(f.w), .number(f.h)]),
+                          "text": textJSON, "style": SavedTextStyle(box: st.box.style).json,
+                          "id": .string(st.id.raw), "layer": .number(Double(st.layer))]
+            }
+            if await execute(command, params, group: st.group, session: st.session) {
+                st.exists = !deleting
+                st.lastCommitted = text
+                st.persisted = text
+                st.box.text = text
+                if state === st { hide(st.id, page: st.page); publishFocus() }
             }
         }
     }
 
-    /// A box left empty goes, in the session's undo step. `item.delete` belongs to the object menu feature (an optional
-    /// dependency): without it the box is kept, emptied.
-    private func deleteEmptyBox(_ st: EditState) {
-        let ref = st.ref
-        let canDelete = app.commands.descriptor(CommandIDs.itemDelete) != nil
-        enqueue { [self] in
-            if canDelete {
-                await self.execute(CommandIDs.itemDelete, ["refs": [.string(ref)]], group: st.group)
-            } else {
-                await self.execute(CommandIDs.textSetText, ["ref": .string(ref), "text": ""], group: st.group)
-            }
-        }
+    private func report(_ error: Error) {
+        NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                        userInfo: ["command": CommandIDs.textSetText, "error": NibError.wrap(error)])
     }
 
     /// Typed URLs become links (F029's `link.autodetect`, when installed) once editing ends, in the session's undo step.
     private func autodetectLinks(_ text: RichText, for st: EditState) {
         guard TextBoxEditor.hasUnlinkedURL(text), app.commands.descriptor(CommandIDs.linkAutodetect) != nil else { return }
         let ref = st.ref
-        enqueue { [weak self] in
-            await self?.execute(CommandIDs.linkAutodetect, ["ref": .string(ref)], group: st.group)
+        enqueue { [self] in
+            guard st.lastCommitted == text else { return }
+            await execute(CommandIDs.linkAutodetect, ["ref": .string(ref)], group: st.group, session: st.session)
         }
     }
 
@@ -434,12 +468,12 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     /// (`own`), and follows every other change of the box, so a command that edits the text for it (an edit-menu
     /// entry) passes `own: false`. False when it failed (logged and toasted by the shell).
     @discardableResult
-    private func execute(_ command: String, _ params: JSONValue, group: String? = nil, own: Bool = true) async -> Bool {
+    private func execute(_ command: String, _ params: JSONValue, group: String? = nil, own: Bool = true, session: EditorSession? = nil) async -> Bool {
         let group = group ?? NibID.make().raw
         if own { remember(group) }
         do {
             _ = try await app.bus.execute(Invocation(command: command, params: params, principal: .user,
-                                                     session: host?.session, group: group))
+                                                     session: session ?? host?.session, group: group))
             return true
         } catch {
             textLog.error("\(command, privacy: .public) failed: \(String(describing: error), privacy: .public)")
@@ -478,23 +512,62 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
     private func reload(_ box: TextBoxItem) {
         guard let st = state else { return }
-        // Geometry/style commits carry the stored text too. They must not replace the live draft or its undo stack.
-        let sameText = box.text == st.box.text || box.text == st.lastCommitted
-        if sameText && (box.style == st.box.style || currentRichText() != st.lastCommitted) {
-            st.box = box
-            st.base = TextLayout.base(box.style, darkPaper: st.darkPaper)
-            applyInsets(st)
+        let draft = currentRichText()
+        guard st.stagingError == nil else { return }
+        let sameText = box.text == st.persisted
+        if !sameText && draft != st.lastCommitted {
+            debounce?.cancel()
+            report(NibError(.conflict, String(localized: "Text changed elsewhere. Your draft has been kept.")))
+            return
+        }
+        let oldStyle = st.box.style
+        let oldBase = st.base
+        st.box = box
+        st.base = TextLayout.base(box.style, darkPaper: st.darkPaper)
+        applyInsets(st)
+        if sameText {
+            if oldStyle != box.style { rebase(st, from: oldBase) }
             layoutEditing()
             changes.send()
             return
         }
+        st.epoch += 1
         debounce?.cancel()
-        let selection = modelSelection()
-        st.box = box
-        st.base = TextLayout.base(box.style, darkPaper: st.darkPaper)
-        applyInsets(st)
-        render(box.text, selection: selection)
+        render(box.text, selection: modelSelection())
+        st.persisted = box.text
         st.lastCommitted = currentRichText()
+    }
+
+    /// Change inherited UIKit attributes in place. No character replacement, selection reset or undo purge.
+    private func rebase(_ st: EditState, from oldBase: TextAttributes) {
+        let tv = st.textView
+        let selection = tv.selectedRange
+        func attributes(_ old: [NSAttributedString.Key: Any]) -> [NSAttributedString.Key: Any] {
+            let run = TextLayout.relativeAttributes(old, base: oldBase)
+            let paragraph = TextLayout.paragraphAttributes(old)
+            var result = old
+            let fresh = TextLayout.typingAttributes(paragraph, run: run, base: st.base)
+            let keys: [NSAttributedString.Key] = [.font, .foregroundColor, .backgroundColor, .underlineStyle,
+                .strikethroughStyle, .baselineOffset, .link, .nibModelFont, .nibModelTraits]
+            for key in keys { result[key] = fresh[key] }
+            for (key, value) in fresh { result[key] = value }
+            Self.setShadow(&result, st.box.style)
+            return result
+        }
+        let typing = attributes(tv.typingAttributes)
+        var replacements: [(NSRange, [NSAttributedString.Key: Any])] = []
+        tv.textStorage.enumerateAttributes(in: NSRange(location: 0, length: tv.textStorage.length), options: []) { old, range, _ in
+            replacements.append((range, attributes(old)))
+        }
+        isRendering = true
+        tv.undoManager?.disableUndoRegistration()
+        tv.textStorage.beginEditing()
+        for (range, value) in replacements { tv.textStorage.setAttributes(value, range: range) }
+        tv.textStorage.endEditing()
+        tv.selectedRange = selection
+        tv.typingAttributes = typing
+        tv.undoManager?.enableUndoRegistration()
+        isRendering = false
     }
 
     // MARK: Text view ⇄ model
@@ -503,7 +576,13 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     func currentRichText() -> RichText {
         guard let st = state else { return .empty }
         richTextConversionCount += 1
-        tagAttachments(st)
+        do {
+            try tagAttachments(st)
+            st.stagingError = nil
+        } catch {
+            st.stagingError = error
+            report(error)
+        }
         let s = st.textView.textStorage
         return TextLayout.richText(from: s, base: st.base) { index in
             (s.attribute(TextLayout.assetKey, at: index, effectiveRange: nil) as? String).map { AssetRef($0) }
@@ -511,10 +590,10 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     }
 
     /// Stores new inline images (stickers, Genmoji, pasted images) as document assets and tags their characters.
-    private func tagAttachments(_ st: EditState) {
-        guard let assets = app.services.assets else { return }
+    private func tagAttachments(_ st: EditState) throws {
         let s = st.textView.textStorage
         var found: [(NSRange, AssetRef)] = []
+        var failure: Error?
         s.enumerateAttributes(in: NSRange(location: 0, length: s.length), options: []) { a, range, _ in
             guard a[TextLayout.assetKey] == nil, TextLayout.isAttachment(a) else { return }
             var data: Data?
@@ -530,8 +609,14 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
                     data = png
                 }
             }
-            if let d = data, let ref = try? assets.put(d, ext: ext, doc: st.doc) { found.append((range, ref)) }
+            do {
+                guard let d = data, let assets = self.app.services.assets else {
+                    throw NibError(.unavailable, String(localized: "Could not save the attachment. Your draft has been kept."))
+                }
+                found.append((range, try assets.put(d, ext: ext, doc: st.doc)))
+            } catch { failure = error }
         }
+        if let failure { throw failure }
         guard !found.isEmpty else { return }
         s.beginEditing()
         for (range, ref) in found { s.addAttribute(TextLayout.assetKey, value: ref.name, range: range) }
@@ -551,7 +636,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
     /// Shows `text` in the text view with `selection` (model offsets; nil = caret at the end).
     private func render(_ text: RichText, selection: NSRange?) {
-        guard let st = state else { return }
+        guard let st = state, st.stagingError == nil else { return }
         let tv = st.textView
         isRendering = true
         defer { isRendering = false }
