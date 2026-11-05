@@ -776,8 +776,8 @@ protocol NotificationScheduling: AnyObject {
     func authorization() async -> NotificationAuthorization
     /// Shows the system prompt; call only for a user action.
     func requestAuthorization() async -> Bool
-    /// Removes pending notifications whose id starts with `prefix` and schedules `reminders`.
-    func replace(prefix: String, with reminders: [PlannedReminder]) async
+    /// Replaces desired identifiers before removing obsolete requests. Failures preserve existing requests.
+    func replace(prefix: String, with reminders: [PlannedReminder]) async throws
 }
 
 final class NoNotifications: NotificationScheduling {
@@ -786,11 +786,30 @@ final class NoNotifications: NotificationScheduling {
     func replace(prefix: String, with reminders: [PlannedReminder]) async {}
 }
 
+/// Injectable request operations; tests never need the system notification service.
+@MainActor
+protocol CalendarNotificationRequests: AnyObject {
+    func pendingIdentifiers() async -> [String]
+    func add(_ request: UNNotificationRequest) async throws
+    func remove(_ identifiers: [String])
+}
+
+@MainActor
+private final class SystemCalendarNotificationRequests: CalendarNotificationRequests {
+    let center: UNUserNotificationCenter
+    init(_ center: UNUserNotificationCenter) { self.center = center }
+    func pendingIdentifiers() async -> [String] { await center.pendingNotificationRequests().map(\.identifier) }
+    func add(_ request: UNNotificationRequest) async throws { try await center.add(request) }
+    func remove(_ identifiers: [String]) { center.removePendingNotificationRequests(withIdentifiers: identifiers) }
+}
+
 /// `UNUserNotificationCenter`: reminders carry the "Take Notes" action (category `calendar.event`). Main-actor
-/// isolated, so `categoryRegistered` and the remove-then-add in `replace` never run on two threads at once.
+/// isolated; CalendarStore serializes complete rebuilds, including their suspensions.
 @MainActor
 final class UserNotificationScheduler: NotificationScheduling {
     private var categoryRegistered = false
+    private let requests: CalendarNotificationRequests?
+    init(requests: CalendarNotificationRequests? = nil) { self.requests = requests }
 
     func authorization() async -> NotificationAuthorization {
         let settings = await UNUserNotificationCenter.current().notificationSettings()
@@ -811,12 +830,18 @@ final class UserNotificationScheduler: NotificationScheduling {
         }
     }
 
-    func replace(prefix: String, with reminders: [PlannedReminder]) async {
-        let center = UNUserNotificationCenter.current()
-        await registerCategory(center)
-        let pending = await center.pendingNotificationRequests()
-        let stale = pending.map { $0.identifier }.filter { $0.hasPrefix(prefix) }
-        if !stale.isEmpty { center.removePendingNotificationRequests(withIdentifiers: stale) }
+    func replace(prefix: String, with reminders: [PlannedReminder]) async throws {
+        let requests: CalendarNotificationRequests
+        if let injected = self.requests { requests = injected }
+        else {
+            let center = UNUserNotificationCenter.current()
+            await registerCategory(center)
+            requests = SystemCalendarNotificationRequests(center)
+        }
+        let pending = await requests.pendingIdentifiers()
+        let desired = Set(reminders.map(\.identifier))
+        let stale = pending.filter { $0.hasPrefix(prefix) && !desired.contains($0) }
+        var failures = 0
         let calendar = Calendar.current
         for r in reminders {
             let content = UNMutableNotificationContent()
@@ -830,10 +855,15 @@ final class UserNotificationScheduler: NotificationScheduling {
             let request = UNNotificationRequest(identifier: r.identifier, content: content,
                                                 trigger: UNCalendarNotificationTrigger(dateMatching: when, repeats: false))
             do {
-                try await center.add(request)
+                try await requests.add(request)
             } catch {
+                failures += 1
                 calendarLog.error("reminder not scheduled: \(error.localizedDescription, privacy: .public)")
             }
+        }
+        if !stale.isEmpty { requests.remove(stale) }
+        if failures > 0 {
+            throw NibError(.unavailable, String(localized: "Some event reminders could not be scheduled. Try scheduling reminders again."))
         }
     }
 
@@ -963,6 +993,7 @@ final class CalendarStore: ObservableObject {
     private(set) var startTask: Task<Void, Never>?
 
     private var providerStorage: CalendarProvider?
+    @Published private(set) var reminderError: String?
     private var notifierStorage: NotificationScheduling?
     private var observers: [NSObjectProtocol] = []
     private var providerToken: AnyObject?
@@ -1371,14 +1402,19 @@ final class CalendarStore: ObservableObject {
         let status = await notifier.authorization()
         notifications = status
         guard status == .authorized else { return }
-        guard minutes > 0, access == .granted else {
-            await notifier.replace(prefix: CalendarReminderNames.identifierPrefix, with: [])
-            return
+        let plan: [PlannedReminder]
+        if minutes > 0, access == .granted {
+            let now = Date()
+            let events = cache.events(overlapping: now, now.addingTimeInterval(CalendarReminderPlanner.window))
+            plan = CalendarReminderPlanner.plan(events, minutesBefore: minutes, now: now)
+        } else { plan = [] }
+        do {
+            try await notifier.replace(prefix: CalendarReminderNames.identifierPrefix, with: plan)
+            reminderError = nil
+        } catch {
+            reminderError = NibError.wrap(error).message
+            report(error, command: CalendarEvents.descriptor.id)
         }
-        let now = Date()
-        let events = cache.events(overlapping: now, now.addingTimeInterval(CalendarReminderPlanner.window))
-        let plan = CalendarReminderPlanner.plan(events, minutesBefore: minutes, now: now)
-        await notifier.replace(prefix: CalendarReminderNames.identifierPrefix, with: plan)
     }
 
     /// Settings and the Calendar tab's "Remind Me" menu: asks for notification permission (a user action) before

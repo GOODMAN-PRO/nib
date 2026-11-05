@@ -718,6 +718,29 @@ final class FeatCalendarTests: XCTestCase {
         XCTAssertEqual(notifier.replaced, [[soon.id], []], "the later rebuild (off) lands last")
     }
 
+    func testFailedReminderReplacementPreservesOldRequestAndRetryClearsError() async throws {
+        let soon = event("Soon", Date().addingTimeInterval(3 * 3_600))
+        let (h, store, _) = harness([soon])
+        let requests = FailingCalendarRequests()
+        let scheduler = UserNotificationScheduler(requests: requests)
+        let plan = CalendarReminderPlanner.plan([soon], minutesBefore: 10, now: Date())
+        try await scheduler.replace(prefix: CalendarReminderNames.identifierPrefix, with: plan)
+        let id = try XCTUnwrap(plan.first?.identifier)
+        let original = try XCTUnwrap(requests.pending[id])
+        requests.fail = true
+        store.notifier = TestCalendarScheduler(scheduler)
+        store.cache.store([soon], from: Date().addingTimeInterval(-3_600), to: Date().addingTimeInterval(Self.day), at: Date())
+        h.app.settings.set(CalendarSettings.reminderMinutes, 30)
+        await store.rescheduleReminders()
+        XCTAssertNotNil(store.reminderError)
+        XCTAssertTrue(requests.pending[id] === original)
+        requests.fail = false
+        await store.rescheduleReminders()
+        XCTAssertNil(store.reminderError)
+        XCTAssertFalse(requests.pending[id] === original)
+        XCTAssertEqual(requests.pending.count, 1)
+    }
+
     // MARK: The cache horizon
 
     func testSyncedRangesAreClippedToTheHorizon() {
@@ -875,5 +898,28 @@ final class FeatCalendarTests: XCTestCase {
             XCTAssertGreaterThan(NibSnapshot.fittingSize(view, width: 640, variant: .largeText).height,
                                  NibSnapshot.fittingSize(view, width: 640).height, "\(access): AX3 text grows the tab")
         }
+    }
+}
+
+@MainActor
+private final class FailingCalendarRequests: CalendarNotificationRequests {
+    var pending: [String: UNNotificationRequest] = [:]
+    var fail = false
+    func pendingIdentifiers() async -> [String] { Array(pending.keys) }
+    func add(_ request: UNNotificationRequest) async throws {
+        if fail { throw NibError.unavailable("test scheduling failure") }
+        pending[request.identifier] = request
+    }
+    func remove(_ identifiers: [String]) { for id in identifiers { pending[id] = nil } }
+}
+
+@MainActor
+private final class TestCalendarScheduler: NotificationScheduling {
+    let scheduler: UserNotificationScheduler
+    init(_ scheduler: UserNotificationScheduler) { self.scheduler = scheduler }
+    func authorization() async -> NotificationAuthorization { .authorized }
+    func requestAuthorization() async -> Bool { true }
+    func replace(prefix: String, with reminders: [PlannedReminder]) async throws {
+        try await scheduler.replace(prefix: prefix, with: reminders)
     }
 }
