@@ -675,6 +675,8 @@ struct DocConvertToWhiteboard: NibCommand {
         /// The new boards (one unless the notebook holds more than a board's item limit).
         var boards: [String]
         var pages: Int
+        /// Original one-based page numbers whose image assets were retained without a readable raster.
+        var unreadableBackgroundPages: [Int]
     }
 
     static let descriptor = CommandDescriptor(
@@ -703,15 +705,17 @@ struct DocConvertToWhiteboard: NibCommand {
         let slots = Dictionary(uniqueKeysWithValues: plan.joined().map { ($0.page, $0) })
 
         // Slow work before the transaction: each page's paper becomes a card. Backgrounds are rendered one at a
-        // time, off the main actor; a page that cannot be rendered stops the conversion before anything is written.
+        // time, off the main actor. Unreadable PDFs stop conversion; unavailable images keep their asset reference.
         let templates = ctx.content.templates
         var cards: [PageID: Item] = [:]
         var pdfURLs: [String: URL] = [:]
+        var unreadableBackgroundPages: [Int] = []
         for (index, page) in pages.enumerated() {
             guard let slot = slots[page.id] else { continue }
             var raster: AssetRef?
             if page.background.kind == .pdf || page.background.kind == .image {
                 raster = try await PageCards.rasteriseBackground(page, number: index + 1, doc: doc, ctx: ctx, urls: &pdfURLs)
+                if page.background.kind == .image, raster == nil { unreadableBackgroundPages.append(index + 1) }
             }
             cards[page.id] = PageCards.card(for: page, number: index + 1, frame: slot.frame, raster: raster,
                                             templates: templates)
@@ -791,8 +795,15 @@ struct DocConvertToWhiteboard: NibCommand {
             try tx.putMeta(meta)
             return created
         }
+        if !ctx.dryRun, !unreadableBackgroundPages.isEmpty {
+            let numbers = unreadableBackgroundPages.map { String($0) }.joined(separator: ", ")
+            ctx.activeSession?.floatingHost?.postToast(
+                String(localized: "Pages \(numbers) had no readable image background. Their original image references were kept."),
+                actionTitle: nil, action: nil)
+        }
         return Output(doc: NodeRef.document(doc).description,
-                      boards: boards.map { NodeRef.page(doc, $0).description }, pages: pages.count)
+                      boards: boards.map { NodeRef.page(doc, $0).description }, pages: pages.count,
+                      unreadableBackgroundPages: unreadableBackgroundPages)
     }
 }
 
@@ -870,8 +881,8 @@ enum PageCards {
     static func card(for page: PageRecord, number: Int, frame: Frame, raster: AssetRef?,
                      templates: Registry<TemplateDefinition>) -> Item {
         let title = page.title ?? String(localized: "Page \(number)")
-        if let raster {
-            return locked(.makeImage(ImageItem(frame: frame, asset: raster, altText: title)))
+        if let asset = raster ?? (page.background.kind == .image ? page.background.asset : nil) {
+            return locked(.makeImage(ImageItem(frame: frame, asset: asset, altText: title)))
         }
         let data: JSONValue = ["title": .string(title), "page": .string(page.id.raw),
                                "background": (try? JSONValue.from(page.background)) ?? .null]
@@ -904,14 +915,25 @@ enum PageCards {
 
     /// Renders only a page's PDF or image background to a PNG: through the renderer, else straight from its asset.
     /// Rendering and PNG encoding run off the main actor. A page neither can draw (damaged or locked PDF,
-    /// missing asset) throws `unavailable`, so a conversion never trades a PDF page for blank paper.
+    /// missing asset) throws `unavailable` for PDFs. An unreadable image returns nil to retain its original asset.
     static func rasteriseBackground(_ page: PageRecord, number: Int, doc: DocumentID, ctx: CommandContext,
-                                 urls: inout [String: URL]) async throws -> AssetRef {
+                                 urls: inout [String: URL]) async throws -> AssetRef? {
         let failure = NibError(.unavailable,
                                String(localized: "The background of page \(number) could not be rendered. The notebook was not converted."),
                                path: "$.doc", hint: String(localized: "Check that the page background opens in Nib, or move that page out of the notebook and convert again."))
-        let assets = try ctx.services.require(ctx.services.assets, "the asset store")
         let size = page.size ?? .a4
+        // A renderer may draw only white paper when an image has not downloaded. Do not freeze that as its card.
+        var imageFallback: Data?
+        if page.background.kind == .image {
+            guard let assets = ctx.services.assets, let ref = page.background.asset,
+                  let url = assets.url(ref, doc: doc) else { return nil }
+            let scale = pdfScale
+            imageFallback = await Task.detached(priority: .userInitiated) {
+                PageRaster.imagePage(url: url, size: size, scale: scale, rotation: page.rotation).flatMap(PageRaster.png)
+            }.value
+            guard imageFallback != nil else { return nil }
+        }
+        let assets = try ctx.services.require(ctx.services.assets, "the asset store")
         var png: Data?
         if let renderer = ctx.services.renderer {
             do {
@@ -923,6 +945,7 @@ enum PageCards {
                 Whiteboard.log.error("rendering page \(page.id.raw, privacy: .public) for the whiteboard failed: \(error.localizedDescription, privacy: .public)")
             }
         }
+        if png == nil { png = imageFallback }
         if png == nil, let ref = page.background.asset {
             if urls[ref.name] == nil { urls[ref.name] = assets.url(ref, doc: doc) }
             if let url = urls[ref.name] {

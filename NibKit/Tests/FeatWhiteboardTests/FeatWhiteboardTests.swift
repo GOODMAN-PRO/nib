@@ -37,6 +37,7 @@ private final class MinimapTestFloatingHost: FloatingHosting {
     var entries: [String: AnyView] = [:]
     var origin = CGPoint(x: 24, y: 48)
     var canConvert = true
+    var toasts: [String] = []
 
     func present(_ id: String, content: AnyView) { entries[id] = content }
     func dismiss(_ id: String) { entries[id] = nil }
@@ -47,7 +48,7 @@ private final class MinimapTestFloatingHost: FloatingHosting {
         guard canConvert else { return nil }
         return rect.offsetBy(dx: origin.x - view.bounds.minX, dy: origin.y - view.bounds.minY)
     }
-    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) { toasts.append(message) }
 }
 
 @MainActor
@@ -334,16 +335,41 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertEqual(try pixel(2, 20), [255, 255, 255, 255], "aspect-fit leaves a white paper margin")
     }
 
-    func testConvertRefusesAnUnreadableImageBackgroundWithoutWriting() async throws {
-        let h = harness()
-        var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
-        head.pages[0].background = .ofImage(Fixtures.pngAsset)
-        h.persistence.heads[Fixtures.docID] = head
-        h.assets.install(Data("not an image".utf8), as: Fixtures.pngAsset, doc: Fixtures.docID)
-        let before = try h.snapshot()
-        await expectError(.unavailable) { _ = try await h.run("doc.convertToWhiteboard", ["doc": "doc:FIXTUREDOC01"]) }
-        XCTAssertEqual(try h.snapshot(), before)
-        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    func testConvertKeepsUnavailableImageReferencesReportsPagesAndUndoes() async throws {
+        for unavailable in ["missing", "undecodable", "no asset service"] {
+            let h = harness()
+            let host = MinimapTestFloatingHost()
+            h.session.floatingHost = host
+            // Even a renderer returning blank paper must not replace an unavailable asset with a blank PNG.
+            h.app.services.renderer = FakeRenderer()
+            var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+            let asset = unavailable == "missing" ? AssetRef("missing.png") : Fixtures.pngAsset
+            head.pages[0].background = .ofImage(asset)
+            head.pages[1].background = .ofImage(AssetRef("pending-download.png"))
+            head.pages[2].background = .ofTemplate(TemplateIDs.whiteboardDots)
+            h.persistence.heads[Fixtures.docID] = head
+            if unavailable == "undecodable" {
+                h.assets.install(Data("not an image".utf8), as: Fixtures.pngAsset, doc: Fixtures.docID)
+            } else if unavailable == "no asset service" {
+                h.app.services.assets = nil
+            }
+            let before = try h.snapshot()
+            let out = try await h.run("doc.convertToWhiteboard", ["doc": "doc:FIXTUREDOC01"])
+            XCTAssertEqual(out["unreadableBackgroundPages"], .array([1, 2]))
+            let content = try h.app.workspace.content(Fixtures.docID)
+            XCTAssertEqual(content.meta.kind, .whiteboard)
+            let board = try XCTUnwrap(content.livePages.first)
+            let items = try h.app.workspace.items(Fixtures.docID, page: board.id)
+            let cards = items.filter(\.locked).sorted { $0.bounds.x < $1.bounds.x }
+            XCTAssertEqual(items.count, 13, "all live content and all three page cards survive")
+            XCTAssertEqual(cards[0].image?.asset, asset)
+            XCTAssertEqual(cards[1].image?.asset, AssetRef("pending-download.png"))
+            XCTAssertEqual(host.toasts.count, 1)
+            XCTAssertTrue(host.toasts[0].contains("1, 2"))
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), before)
+        }
     }
 
     func testPDFBackgroundFallbackHonoursPageRotation() throws {
