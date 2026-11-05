@@ -327,7 +327,14 @@ final class InsertUITests: XCTestCase {
     /// Waits for the committed text's live visible position after keyboard scrolling, editing or undo.
     private func visibleCanvasText(_ value: String) throws -> XCUIElement {
         let text = ui.canvas.staticTexts.matching(NSPredicate(format: "value == %@", value)).firstMatch
+        var ready = false
+        defer {
+            if !ready {
+                ui.recordDiagnostics("Committed Text wait failed", facts: ui.elementFacts(text, includeOverlaps: true))
+            }
+        }
         try wait("Committed text must be visible at its current canvas position") { text.exists && text.isHittable }
+        ready = true
         ui.recordGeometry("Committed text position", touches: [CGPoint(x: text.frame.midX, y: text.frame.midY)], selection: text.frame)
         return text
     }
