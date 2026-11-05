@@ -103,6 +103,7 @@ final class StrokeInspectorModel: ObservableObject {
         Binding(get: { self.style.width * 25.4 / 72 },
                 set: { self.change(["width": .number($0 * 72 / 25.4)]) })
     }
+    var widthRange: ClosedRange<Double> { 0.1...max(3, style.width * 25.4 / 72) }
     var swatch: Binding<String?> {
         Binding(get: { NibInk.allCases.first { RGBA($0.uiColor) == self.style.color }?.rawValue },
                 set: { name in
@@ -123,7 +124,7 @@ struct StrokeStyleInspector: View {
     }
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
-            NibStrokeWidthSlider(width: model.width, range: 0.1...3)
+            NibStrokeWidthSlider(width: model.width, range: model.widthRange)
             NibInspectorSection(String(localized: "Colour")) {
                 NibSwatchGrid(swatches: NibInk.allCases.map { NibSwatch(ink: $0) }, selection: model.swatch)
             }

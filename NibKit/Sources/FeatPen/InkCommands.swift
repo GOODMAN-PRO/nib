@@ -518,7 +518,10 @@ struct InkStylePatch: Equatable {
         if let t = tool { style.tool = t }
         if let t = pen { style.pen = t }
         style.pen = style.tool == .pen ? (style.pen ?? .fountain) : nil
-        if let c = color { style.color = c }
+        if let c = color, !(style.tool == .tape && style.tapePattern != nil) {
+            style.color = style.tool == .highlighter && c.a == 255
+                ? RGBA(c.r, c.g, c.b, RGBA.highlighterAlpha) : c
+        }
         if let w = width { style.width = w }
         if let t = pattern { style.pattern = t }
         if let v = tipSharpness { style.tipSharpness = v }
