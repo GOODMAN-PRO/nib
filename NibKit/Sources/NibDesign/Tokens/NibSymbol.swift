@@ -217,7 +217,7 @@ public struct NibSymbol: Hashable, Sendable {
     /// Recording preferences, distinct from Record and the transcript's captions bubble.
     public static let recordingSettings = NibSymbol("waveform.circle")
     /// Start Quick Lesson, distinct from exporting or sharing a document.
-    public static let lesson = NibSymbol("play.rectangle")
+    public static let lesson = NibSymbol("graduationcap")
     public static let profile = NibSymbol("person.crop.circle")
     public static let language = NibSymbol("globe")
     public static let notifications = NibSymbol("bell.badge")

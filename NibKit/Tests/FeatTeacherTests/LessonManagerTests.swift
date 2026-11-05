@@ -358,6 +358,7 @@ final class LessonManagerTests: XCTestCase {
         let (doc, _, _, _) = try source(h)
         let context = MenuContext(app: h.app, session: h.session, doc: doc)
         let menu = try XCTUnwrap(h.app.ui.menus.get("teacherlessons.quickLesson"))
+        XCTAssertEqual(menu.icon, NibSymbol.lesson.name)
         let calls = try XCTUnwrap(menu.params(context)["calls"]?.arrayValue)
         XCTAssertEqual(calls.count, 2)
         XCTAssertEqual(calls[0]["command"]?.stringValue, CommandIDs.collabHost)

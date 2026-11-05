@@ -31,7 +31,7 @@ public enum FeatTranscriptionFeature: NibFeature {
         panel.providesHeader = true
         app.ui.panels.register(panel)
         app.ui.settingsPages.register(SettingsPageDescriptor(id: "transcription.recording", title: String(localized: "Recording Settings"),
-            icon: NibSymbol.transcript.name, section: .general, order: 350, owner: id) { app in
+            icon: NibSymbol.recordingSettings.name, section: .general, order: 350, owner: id) { app in
                 AnyView(TranscriptRecordingSettings(app: app))
             })
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "transcription.drop", owner: id) { _ in TranscriptDropAttachment() })

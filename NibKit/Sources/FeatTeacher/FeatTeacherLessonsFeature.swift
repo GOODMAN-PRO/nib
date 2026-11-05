@@ -41,7 +41,7 @@ public enum FeatTeacherLessonsFeature: NibFeature {
                 }, submenu: String(localized: "Teaching Mode")))
         }
         app.ui.menus.register(MenuItemDescriptor(
-            id: "teacherlessons.quickLesson", title: String(localized: "Start Quick Lesson"), icon: NibSymbol.share.name,
+            id: "teacherlessons.quickLesson", title: String(localized: "Start Quick Lesson"), icon: NibSymbol.lesson.name,
             location: .shareExport, order: 715, owner: id, command: CommandIDs.batch,
             params: { context in
                 guard let doc = context.doc else { return [:] }
@@ -325,7 +325,7 @@ private struct LessonPanel: View {
     }
     private var liveButtons: some View {
         Group {
-            NibButton(String(localized: "Start Quick Lesson"), symbol: .share) {
+            NibButton(String(localized: "Start Quick Lesson"), symbol: .lesson) {
                 run(CommandIDs.collabHost, ["doc": .string(doc)]) { value in
                     Task { await loadLiveSession() }
                     liveCode = value["code"]?.stringValue
