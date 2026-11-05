@@ -293,17 +293,17 @@ final class ProviderHTTP {
 // MARK: - Errors (docs/AI.md §2.4)
 
 enum ProviderErrors {
-    static let checkKeyHint = "check the API key in Settings › AI"
-    static let pickModelHint = "pick a model from the list"
-    static let rateLimitedHint = "rate limited — retry later"
-    static let checkBaseURLHint = "check the base URL in Settings › AI"
+    static let checkKeyHint = String(localized: "check the API key in Settings › AI")
+    static let pickModelHint = String(localized: "pick a model from the list")
+    static let rateLimitedHint = String(localized: "rate limited — retry later")
+    static let checkBaseURLHint = String(localized: "check the base URL in Settings › AI")
     /// The exact hint for a key lost from the Keychain (ARCHITECTURE.md §19: re-signing changes the access group).
-    static let reenterKeyHint = "re-enter the API key"
+    static let reenterKeyHint = String(localized: "re-enter the API key")
 
     /// A key that was saved once is gone from the Keychain.
     static func missingKey(_ providerName: String) -> NibError {
         NibError(.permissionDenied,
-                 "The API key for “\(providerName)” is missing from the Keychain (credentials missing — this happens when the app is re-signed).",
+                 String(localized: "The API key for “\(providerName)” is missing from the Keychain (credentials missing — this happens when the app is re-signed)."),
                  hint: reenterKeyHint)
     }
 
@@ -314,10 +314,10 @@ enum ProviderErrors {
         case let e as HTTPStatusError: return http(e, ctx)
         case let e as URLError: return transport(e, ctx)
         case is CancellationError:
-            return NibError(.userDenied, "The request to \(ctx.providerName) was cancelled.")
+            return NibError(.userDenied, String(localized: "The request to \(ctx.providerName) was cancelled."))
         case is DecodingError:
-            return NibError(.unavailable, "\(ctx.providerName) sent an answer Nib could not read.",
-                            hint: "check that the provider kind matches the server (Anthropic, OpenAI-compatible or Nib HTTP)")
+            return NibError(.unavailable, String(localized: "\(ctx.providerName) sent an answer Nib could not read."),
+                            hint: String(localized: "check that the provider kind matches the server (Anthropic, OpenAI-compatible or Nib HTTP)"))
         default:
             let ns = error as NSError
             if ns.domain == NSURLErrorDomain { return transport(URLError(URLError.Code(rawValue: ns.code)), ctx) }
@@ -326,8 +326,8 @@ enum ProviderErrors {
     }
 
     static func http(_ e: HTTPStatusError, _ ctx: ProviderCallContext) -> NibError {
-        let detail = message(from: e.body).map { ": \($0)" } ?? "."
-        let prefix = "\(ctx.providerName) answered HTTP \(e.status)"
+        let detail = message(from: e.body).map { "\n" + $0 } ?? ""
+        let prefix = String(localized: "\(ctx.providerName) answered HTTP \(e.status).")
         switch e.status {
         case 401, 403:
             return NibError(.permissionDenied, prefix + detail, hint: checkKeyHint)
@@ -336,65 +336,92 @@ enum ProviderErrors {
             if ctx.call == .chat && e.mentions("model") { hint = pickModelHint } else { hint = checkBaseURLHint }
             return NibError(.notFound, prefix + detail, hint: hint)
         case 408:
-            return NibError(.timeout, prefix + detail, hint: "retry; if it keeps happening, check the network")
+            return NibError(.timeout, prefix + detail, hint: String(localized: "retry; if it keeps happening, check the network"))
         case 413:
             return NibError(.unsupported, prefix + detail,
-                            hint: ctx.call == .transcription ? "use a shorter recording" : "use a smaller scope or fewer images")
+                            hint: ctx.call == .transcription ? String(localized: "use a shorter recording") : String(localized: "use a smaller scope or fewer images"))
         case 429:
-            let wait = e.retryAfter.map { " (retry after \($0) s)" } ?? ""
+            let wait = e.retryAfter.flatMap { retryDuration($0) }.map {
+                "\n" + String(localized: "Retry after \($0).")
+            } ?? ""
             return NibError(.unavailable, prefix + detail + wait, hint: rateLimitedHint)
         case 500...599:
-            return NibError(.unavailable, prefix + detail, hint: "the provider is having problems — retry later")
+            return NibError(.unavailable, prefix + detail, hint: String(localized: "the provider is having problems — retry later"))
         default:
             if e.mentions("context") && (e.mentions("length") || e.mentions("window") || e.mentions("too long")) {
-                return NibError(.invalidParams, prefix + detail, hint: "start a new chat or use a smaller scope")
+                return NibError(.invalidParams, prefix + detail, hint: String(localized: "start a new chat or use a smaller scope"))
             }
             return NibError(.invalidParams, prefix + detail,
-                            hint: "check the model and the provider settings in Settings › AI")
+                            hint: String(localized: "check the model and the provider settings in Settings › AI"))
         }
     }
 
     static func transport(_ e: URLError, _ ctx: ProviderCallContext) -> NibError {
         switch e.code {
         case .timedOut:
-            let hint = ctx.isLocal ? "the model may still be loading — retry, or check that the server is running"
-                : "check the network and the base URL, then retry"
-            return NibError(.timeout, "\(ctx.providerName) did not answer within \(Int(ctx.timeout)) s.", hint: hint)
+            let hint = ctx.isLocal ? String(localized: "the model may still be loading — retry, or check that the server is running")
+                : String(localized: "check the network and the base URL, then retry")
+            let duration = duration(ctx.timeout)
+            return NibError(.timeout, String(localized: "\(ctx.providerName) did not answer within \(duration)."), hint: hint)
         case .cancelled:
-            return NibError(.userDenied, "The request to \(ctx.providerName) was cancelled.")
+            return NibError(.userDenied, String(localized: "The request to \(ctx.providerName) was cancelled."))
         case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed, .internationalRoamingOff,
              .callIsActive:
-            return NibError(.unavailable, "No network connection to \(ctx.host).", hint: "check the connection and retry")
+            return NibError(.unavailable, String(localized: "No network connection to \(ctx.host)."), hint: String(localized: "check the connection and retry"))
         case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed, .resourceUnavailable:
             let hint = ctx.isLocal
-                ? "check that the server is running and reachable from this device (same network or Tailscale)"
+                ? String(localized: "check that the server is running and reachable from this device (same network or Tailscale)")
                 : checkBaseURLHint
-            return NibError(.unavailable, "Nib can’t reach \(ctx.host).", hint: hint)
+            return NibError(.unavailable, String(localized: "Nib can’t reach \(ctx.host)."), hint: hint)
         case .secureConnectionFailed, .serverCertificateUntrusted, .serverCertificateHasBadDate,
              .serverCertificateNotYetValid, .serverCertificateHasUnknownRoot, .clientCertificateRejected,
              .clientCertificateRequired:
-            return NibError(.unavailable, "The secure connection to \(ctx.host) failed.",
-                            hint: "check the base URL and the server's certificate")
+            return NibError(.unavailable, String(localized: "The secure connection to \(ctx.host) failed."),
+                            hint: String(localized: "check the base URL and the server's certificate"))
         case .appTransportSecurityRequiresSecureConnection:
-            return NibError(.unavailable, "This build does not allow plain http to \(ctx.host).",
-                            hint: "use an https base URL")
+            return NibError(.unavailable, String(localized: "This build does not allow plain http to \(ctx.host)."),
+                            hint: String(localized: "use an https base URL"))
         case .badURL, .unsupportedURL:
-            return NibError(.invalidParams, "The base URL of \(ctx.providerName) is not valid.", path: "$.baseURL",
+            return NibError(.invalidParams, String(localized: "The base URL of \(ctx.providerName) is not valid."), path: "$.baseURL",
                             hint: checkBaseURLHint)
         case .badServerResponse, .cannotParseResponse, .cannotDecodeRawData, .cannotDecodeContentData,
              .zeroByteResource:
-            return NibError(.unavailable, "\(ctx.host) sent a response Nib could not read.", hint: checkBaseURLHint)
+            return NibError(.unavailable, String(localized: "\(ctx.host) sent a response Nib could not read."), hint: checkBaseURLHint)
         default:
             return NibError(.unavailable, "\(ctx.providerName): \(e.localizedDescription)",
-                            hint: "check the network and the base URL, then retry")
+                            hint: String(localized: "check the network and the base URL, then retry"))
         }
+    }
+
+    static func duration(_ seconds: TimeInterval, locale: Locale = .current) -> String {
+        let formatter = DateComponentsFormatter()
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = locale
+        formatter.calendar = calendar
+        formatter.allowedUnits = [.hour, .minute, .second]
+        formatter.unitsStyle = .full
+        formatter.maximumUnitCount = 2
+        let bounded = seconds.isFinite ? min(max(0, seconds), 31_536_000) : 0
+        return formatter.string(from: bounded) ?? bounded.formatted(.number.locale(locale))
+    }
+
+    static func retryDuration(_ raw: String, locale: Locale = .current) -> String? {
+        if let seconds = TimeInterval(raw), seconds.isFinite, seconds >= 0 {
+            return duration(seconds, locale: locale)
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let date = formatter.date(from: raw) else { return nil }
+        return duration(max(0, date.timeIntervalSinceNow), locale: locale)
     }
 
     /// An error reported inside a successful stream (Anthropic `event: error`, an OpenAI-style `{"error": …}`
     /// chunk): the error type or code is mapped onto the HTTP status it stands for.
     static func streamError(_ error: JSONValue, _ ctx: ProviderCallContext) -> NibError {
         let type = (error["type"]?.stringValue ?? "") + " " + (error["code"]?.stringValue ?? "")
-        let text = error["message"]?.stringValue ?? error.stringValue ?? "the provider reported an error"
+        let text = error["message"]?.stringValue ?? error.stringValue ?? String(localized: "the provider reported an error")
         let status: Int
         switch type.lowercased() {
         case let t where t.contains("authentication") || t.contains("invalid_api_key") || t.contains("unauthorized"):

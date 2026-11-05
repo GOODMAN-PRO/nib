@@ -457,6 +457,15 @@ final class NibAIProvidersTests: XCTestCase {
         XCTAssertEqual(StopReasons.normalized("pause_turn", sawToolCalls: false), "pause_turn")
     }
 
+    func testRecoveryDurationsUseLocaleAndRejectMalformedRetryAfter() {
+        let french = Locale(identifier: "fr_FR")
+        XCTAssertTrue(ProviderErrors.duration(12, locale: french).contains("secondes"))
+        XCTAssertEqual(ProviderErrors.retryDuration("12", locale: french), ProviderErrors.duration(12, locale: french))
+        XCTAssertNil(ProviderErrors.retryDuration("12 seconds of server text", locale: french))
+        XCTAssertNil(ProviderErrors.retryDuration("nan", locale: french))
+        XCTAssertNil(ProviderErrors.retryDuration("-1", locale: french))
+    }
+
     func testErrorBodiesMapToNibErrorsWithHints() {
         let config = AIProviderConfig(name: "P", kind: .openAICompatible, baseURL: URL(string: "https://api.openai.com/v1")!, model: "m")
         let ctx = ProviderCallContext(call: .chat, config: config, timeout: 120)
