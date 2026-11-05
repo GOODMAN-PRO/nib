@@ -1054,14 +1054,19 @@ final class CreateUITests: XCTestCase {
         if continueButton.waitForExistence(timeout: 3) { continueButton.tap(); calendar.tap() }
         try NibUI.openCalendarEvent(in: calendar) { self.ui.logQA($0, $1) }
         let title = calendar.textFields["Title"]
-        try replace(title, with: eventTitle, in: calendar)
+        try require(title, "Calendar event must expose Title")
+        if !ui.isKeyboardFocused(title, in: calendar) { title.tap() }
+        try ui.fillNativeForm([("Title", eventTitle)], in: calendar)
         try dismissKeyboard(in: calendar)
         let save = calendar.buttons["add-button"]
         try require(save, "Calendar must expose its observed add-button (Done)")
         XCTAssertTrue(save.isEnabled)
         save.tap()
         try wait("Calendar must save the event and close its editor") { !title.exists }
+        let activationStarted = Date()
+        ui.logQA("Calendar activation boundary", "before Nib activate")
         ui.app.activate()
+        ui.logQA("Calendar activation duration", "seconds=\(Date().timeIntervalSince(activationStarted))")
         try tap("Calendar")
         let connect = button("Connect Calendars")
         if connect.exists { connect.tap() }
@@ -1104,7 +1109,10 @@ final class CreateUITests: XCTestCase {
     private func tapEventAction(_ action: String, eventTitle: String) throws {
         let summary = ui.app.descendants(matching: .any)
             .matching(NSPredicate(format: "label BEGINSWITH %@", eventTitle)).firstMatch
-        try scrollTo(summary, name: eventTitle)
+        ui.revealFormElement(summary)
+        if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
+        try require(summary, "Calendar event must be revealed: " + eventTitle)
+        XCTAssertTrue(summary.isHittable, "Calendar event must be visible before its action")
         // Scope to the smallest event container so repeated suite runs cannot act on an older event.
         let containers = ui.app.otherElements.containing(NSPredicate(format: "label BEGINSWITH %@", eventTitle))
             .allElementsBoundByIndex.filter { $0.buttons[action].firstMatch.isHittable }

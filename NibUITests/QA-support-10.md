@@ -244,3 +244,13 @@ The proven diagnostic race is removed: initial keyboard buttons come from one im
 | --- | --- | --- |
 | CustomSize; InvalidCustomSizePreventsCreation | Decimal clear stage / Decimal clear key log | What exact value/scalars and delivered keys remain after each clear action? |
 | Same | Width keyboard after Hide / after docked Hide / completion / frame | Did the keyboard disappear, without dereferencing a vanished descendant? |
+
+### K2 - Calendar setup cost and environment boundary
+
+Confirmed create#2 correction: the observed 52.9-second activation/sample timeout is an environment event, not a diagnosed app problem. At current HEAD, the claimed existence-only grant loop is **already resolved**: eventNote explicitly taps SpringBoard Allow Full Access during the bounded 15-second readiness poll and then allows lazy-row scrolling. Kept that behavior and the allowance. Calendar Title now uses the existing scoped form batch after one cheap foreign-app focus check, eliminating the generic creation scroll/duplicate focus path. Event reveal uses 10a's bounded list helper; unique-event action scoping and all linked-package/count/reopen assertions remain.
+
+Logged immediately before activate and elapsed wall time after it returns; a synchronous XCTest activate cannot be forcibly timed out safely by this runner helper. CI must show prompt acceptance during readiness, completed Title entry, bounded reveal and original note creation/reuse. No claim to fix host latency.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Both Calendar note tests | Calendar activation boundary / Calendar activation duration; Native form field duration; Form reveal timing | Did time disappear inside activation, title entry or event reveal? |
