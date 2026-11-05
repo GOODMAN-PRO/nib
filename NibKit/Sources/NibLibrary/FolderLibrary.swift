@@ -192,6 +192,7 @@ final class FolderLibrary: LibraryService {
     /// Bumped by every catalog change, so a background scan that raced a change is not applied over it.
     private var generation: UInt64 = 0
     private var rootEpoch = UUID()
+    private(set) var lastRefreshRanOffMain = false
     private var scanning = false
     private var rebuilding = false
     private var rescanRequested = false
@@ -865,6 +866,36 @@ final class FolderLibrary: LibraryService {
     }
 
     // MARK: LibraryService — refresh and root
+
+    /// Awaitable incremental refresh for sync. Scanning and preference reads run off-main; catalogue publication
+    /// is retried after intervening edits and refused after a root switch (including switching away and back).
+    func refreshCatalog() async throws {
+        let epoch = rootEpoch
+        let prefs = self.prefs
+        while true {
+            try Task.checkCancellation()
+            let gen = generation
+            let job = scanner(previous: catalog.byPath)
+            let (result, names, offMain) = try await Task.detached(priority: .utility) {
+                _ = try FileManager.default.contentsOfDirectory(at: job.root, includingPropertiesForKeys: nil)
+                return (job.scanAll(), prefs.reload(), !Thread.isMainThread)
+            }.value
+            guard rootEpoch == epoch else {
+                throw NibError(.conflict, String(localized: "The library changed while refreshing. Try syncing again."))
+            }
+            guard generation == gen else { continue }
+            try Task.checkCancellation()
+            loaded = true
+            lastRefreshRanOffMain = offMain
+            apply(result)
+            guard rootEpoch == epoch else {
+                throw NibError(.conflict, String(localized: "The library changed while refreshing. Try syncing again."))
+            }
+            scheduleCacheSave()
+            postSettingsChanges(names)
+            return
+        }
+    }
 
     /// A synchronous rescan (after sync, import or repair). Incremental while the cached catalog file exists; when it
     /// is gone (deleted by a repair, never written) every head and folder record is read again and the file is

@@ -860,10 +860,11 @@ final class NibLibraryTests: XCTestCase {
         let moved = trash.appendingPathComponent(package.lastPathComponent, isDirectory: true)
         var closed: [DocumentID] = []
         var locationAtClose: URL?
+        let locator = lib.h.app.services.packages
         let subscription = lib.h.app.events.subscribe { event in
             if event.type == NibEventType.docClosed, let id = event.doc {
                 closed.append(id)
-                locationAtClose = lib.h.app.services.packages.url(id)
+                locationAtClose = locator.url(id)
             }
         }
         defer { subscription.cancel() }
@@ -1440,6 +1441,26 @@ final class NibLibraryTests: XCTestCase {
         XCTAssertEqual(emptied["skippedLocked"]?.intValue, 1)
         XCTAssertTrue(lib.exists(".nib-library/trash/Diary.nibnote"), "emptying the Trash keeps the locked document")
         XCTAssertEqual(lib.library.trashedNodes().map { $0.id }, [d])
+    }
+
+    func testAwaitedCatalogueRefreshScansTwoThousandDocumentsOffMain() async throws {
+        let lib = try await makeLibrary()
+        let root = lib.root
+        try await Task.detached {
+            for index in 0..<2_000 {
+                let package = root.appendingPathComponent("Remote\(index).nibnote", isDirectory: true)
+                try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+                let head = DocumentContent(meta: DocumentMeta(id: NibID("REMOTE\(index)"), kind: .notebook))
+                try PackageIO.encoder().encode(head).write(to: package.appendingPathComponent("doc.0000000b.json"))
+            }
+        }.value
+        let refresh = try XCTUnwrap(lib.h.app.services.get(NibLibraryFeature.catalogRefreshKey,
+                                                          as: NibLibraryFeature.CatalogRefresh.self))
+        let refreshed = try await refresh()
+        XCTAssertTrue(refreshed)
+        XCTAssertTrue(lib.library.lastRefreshRanOffMain)
+        XCTAssertEqual(lib.library.allNodes().filter { $0.kind == .document }.count, 2_000)
+        XCTAssertNotNil(lib.h.app.services.packages.url("REMOTE1999"))
     }
 
     func testABackgroundScanThatRacedAChangeIsThrownAwayAndRedone() async throws {

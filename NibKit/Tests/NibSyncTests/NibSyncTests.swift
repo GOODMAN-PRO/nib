@@ -382,6 +382,38 @@ final class NibSyncTests: XCTestCase {
 
     /// Documents and folders added elsewhere rescan the library; what this device's own library commands did (already
     /// in the catalog) does not.
+    func testStructuralChangeAwaitsBackgroundRefreshServiceAndRetriesFailure() async throws {
+        let root = try temporaryFolder()
+        let pkg = root.appendingPathComponent("Shared.nibnote", isDirectory: true)
+        try seedNotebook(in: pkg)
+        let a = try device(7, root: root, pkg: pkg)
+        _ = await a.watcher.check()
+        let remote = root.appendingPathComponent("Remote.nibnote", isDirectory: true)
+        try FileManager.default.createDirectory(at: remote, withIntermediateDirectories: true)
+        try FolderTestPersistence.writeHead(DocumentContent(meta: DocumentMeta(id: "REMOTEDOC001", kind: .notebook)),
+                                            device: "00000008", into: remote)
+        let failing: FolderWatcher.CatalogRefresh = { throw NibError.unavailable("injected refresh failure") }
+        a.app.services.set(failing as AnyObject, for: FolderWatcher.catalogRefreshKey)
+        let failed = await a.watcher.check()
+        XCTAssertFalse(failed.refreshed)
+        XCTAssertFalse(failed.errors.isEmpty)
+        XCTAssertEqual(a.library.refreshes, 0)
+        var completed = false
+        let refresh: FolderWatcher.CatalogRefresh = {
+            await Task.yield()
+            a.library.scanDisk()
+            completed = true
+            return true
+        }
+        a.app.services.set(refresh as AnyObject, for: FolderWatcher.catalogRefreshKey)
+        let report = await a.watcher.check()
+        XCTAssertTrue(completed)
+        XCTAssertTrue(report.refreshed)
+        XCTAssertTrue(report.errors.isEmpty)
+        XCTAssertEqual(a.library.refreshes, 0, "sync must not repeat the service scan synchronously")
+        XCTAssertTrue(a.library.allNodes().contains { $0.path == "Remote.nibnote" })
+    }
+
     func testStructuralChangesRefreshTheLibraryOnlyWhenTheCatalogMissesThem() async throws {
         let root = try temporaryFolder()
         let pkg = root.appendingPathComponent("Shared.nibnote", isDirectory: true)

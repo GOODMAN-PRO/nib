@@ -13,6 +13,9 @@ public enum NibLibraryFeature: NibFeature {
     /// successful cache write; false means the active library is not this feature's folder library.
     public typealias CatalogRebuild = @MainActor () async throws -> Bool
     public static let catalogRebuildKey = "library.rebuildCatalog"
+    /// Incremental, awaited scan for sync callers. Uses the same optional-service convention as catalogue repair.
+    public typealias CatalogRefresh = @MainActor () async throws -> Bool
+    public static let catalogRefreshKey = "library.refreshCatalog"
 
     /// Re-reads package heads and folder records, updates package locations, and awaits catalogue persistence.
     /// Package contents and document undo history are preserved. Cache I/O failures propagate to the caller.
@@ -39,6 +42,12 @@ public enum NibLibraryFeature: NibFeature {
             return try await rebuildCatalog(app)
         }
         app.services.set(rebuild as AnyObject, for: catalogRebuildKey)
+        let refresh: CatalogRefresh = { [weak app] in
+            guard let library = app?.services.library as? FolderLibrary else { return false }
+            try await library.refreshCatalog()
+            return true
+        }
+        app.services.set(refresh as AnyObject, for: catalogRefreshKey)
         app.settings.syncedBackend = library.prefs
         LibraryCommands.register(app.commands)
     }
