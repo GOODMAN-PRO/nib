@@ -2545,6 +2545,8 @@ final class FeatCanvasTests: XCTestCase {
         let last = try XCTUnwrap(actions.last?.view)
         XCTAssertGreaterThan(last.convert(last.bounds, to: error.viewport).maxY, error.viewport.bounds.maxY,
                              "The regression must start with a recovery control below the visible paper")
+        XCTAssertLessThanOrEqual(last.convert(last.bounds, to: error.viewport).maxY, 2 * error.viewport.bounds.height,
+                                 "Tiny paper must offer both recovery actions before the long AX5 explanation")
         for action in actions {
             let target = try XCTUnwrap(action.view)
             // SwiftUI can publish the native target before assigning its final bounds.
@@ -2552,7 +2554,10 @@ final class FeatCanvasTests: XCTestCase {
             error.layoutIfNeeded()
             error.hosting.view.layoutIfNeeded()
             XCTAssertFalse(target.bounds.isEmpty, "Lay out the recovery target before scrolling to it")
-            error.viewport.scrollRectToVisible(target.convert(target.bounds, to: error.viewport), animated: false)
+            var reveal = target.convert(target.bounds, to: error.viewport)
+            // UIKit may align the bottom of an oversized rectangle. Reveal the top portion instead.
+            reveal.size.height = min(reveal.height, error.viewport.bounds.height)
+            error.viewport.scrollRectToVisible(reveal, animated: false)
             for _ in 0..<5 {
                 error.layoutIfNeeded(); error.hosting.view.layoutIfNeeded()
                 try await Task.sleep(for: .milliseconds(20))
@@ -2563,15 +2568,65 @@ final class FeatCanvasTests: XCTestCase {
             let geometry = "button=\(frame), error=\(error.bounds), host=\(error.hosting.view.frame), fitted=\(fitted)"
             let scrolling = "viewport=\(error.viewport.bounds), content=\(error.viewport.contentSize)"
             let insets = "adjusted=\(error.viewport.adjustedContentInset), safe=\(vc.view.safeAreaInsets), paper=\(visiblePaper)"
-            XCTAssertTrue(error.bounds.insetBy(dx: -1, dy: -1).contains(frame),
-                          "Show the whole recovery button: \(geometry); \(scrolling); \(insets)")
-            let point = target.convert(CGPoint(x: target.bounds.midX, y: target.bounds.midY), to: window)
+            let visible = frame.intersection(error.bounds)
+            let message = "Show a tappable recovery button: \(geometry); \(scrolling); \(insets)"
+            if frame.height <= error.bounds.height {
+                XCTAssertTrue(error.bounds.insetBy(dx: -1, dy: -1).contains(frame), message)
+            } else {
+                XCTAssertEqual(frame.minY, error.bounds.minY, accuracy: 1, message)
+                XCTAssertEqual(visible.height, error.bounds.height, accuracy: 1, message)
+                XCTAssertGreaterThanOrEqual(frame.minX, error.bounds.minX - 1, message)
+                XCTAssertLessThanOrEqual(frame.maxX, error.bounds.maxX + 1, message)
+            }
+            XCTAssertFalse(visible.isNull || visible.isEmpty, message)
+            let point = error.convert(CGPoint(x: visible.midX, y: visible.midY), to: window)
             let hit = try XCTUnwrap(window.hitTest(point, with: nil))
             XCTAssertTrue(hit === target || hit.isDescendant(of: target), "Recovery receives the touch instead of the canvas")
             action.activate()
         }
         XCTAssertEqual(retried, 1)
         XCTAssertEqual(restored, 1)
+    }
+
+    func testTinyErrorPaperKeepsAX5ActionsAheadOfExplanationInBothOrientationsAndAppearances() async throws {
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            for size in [CGSize(width: 87, height: 123), CGSize(width: 123, height: 87)] {
+                let controller = UIViewController()
+                let error = PageErrorView(frame: CGRect(origin: .zero, size: size))
+                error.showsRestore = true
+                controller.addChild(error.hosting)
+                controller.view.addSubview(error)
+                error.hosting.didMove(toParent: controller)
+                let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 667, height: 375))
+                window.rootViewController = controller
+                window.overrideUserInterfaceStyle = style
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                error.hosting.traitOverrides.preferredContentSizeCategory = .accessibilityExtraExtraExtraLarge
+                func targets(in view: UIView) -> [UIView] {
+                    let own = (view.gestureRecognizers ?? []).contains { $0 is NibActionTapRecognizer } ? [view] : []
+                    return own + view.subviews.flatMap { targets(in: $0) }
+                }
+                for _ in 0..<50 {
+                    error.setNeedsLayout(); error.layoutIfNeeded(); error.hosting.view.layoutIfNeeded()
+                    let laidOut = targets(in: error.hosting.view)
+                    if laidOut.count == 2, laidOut.allSatisfy({ !$0.bounds.isEmpty }) { break }
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                let buttons = targets(in: error.hosting.view)
+                XCTAssertEqual(buttons.count, 2)
+                for button in buttons {
+                    let frame = button.convert(button.bounds, to: error.viewport)
+                    let geometry = "button=\(frame), paper=\(size), content=\(error.viewport.contentSize), style=\(style.rawValue)"
+                    XCTAssertGreaterThanOrEqual(frame.width, NibMetrics.hitTarget - 1, geometry)
+                    XCTAssertGreaterThanOrEqual(frame.height, NibMetrics.hitTarget - 1, geometry)
+                    XCTAssertLessThanOrEqual(frame.height, NibMetrics.hitTarget + 1, geometry)
+                    XCTAssertGreaterThanOrEqual(frame.minX, -1, geometry)
+                    XCTAssertLessThanOrEqual(frame.maxX, size.width + 1, geometry)
+                    XCTAssertLessThanOrEqual(frame.maxY, 2 * size.height, geometry)
+                }
+            }
+        }
     }
 
     func testSuccessfulRerenderClearsFailureWithoutTryAgain() async throws {

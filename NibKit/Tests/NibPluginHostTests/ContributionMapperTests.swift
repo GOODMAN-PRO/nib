@@ -364,6 +364,7 @@ final class ContributionMapperTests: XCTestCase {
 
     func testPluginBlockResizeKeepsRightHandMarkerReachableByScrolling() throws {
         let h = Harness(features: [])
+        let marker = CGRect(x: 500, y: 20, width: 20, height: 20)
         var block = TextBlock(kind: .custom)
         block.custom = CustomBlock(owner: Self.pid, type: "marker", height: 120,
             display: DisplayList(ops: [DisplayOp(op: .rect, rect: Rect(x: 500, y: 20, width: 20, height: 20),
@@ -372,26 +373,60 @@ final class ContributionMapperTests: XCTestCase {
                                        heightChanged: { _ in })
         let view = PluginBlockView(context: context, command: "test.edit", title: "Marker", defaultHeight: 120)
         view.frame = CGRect(x: 0, y: 0, width: 640, height: 120)
+        // Render a fixed viewport, as the block's host does. Rendering the scroll layer as the
+        // root leaves its nonzero bounds origin in the bitmap's coordinate system after scrolling.
+        let viewport = UIView(frame: view.frame)
+        viewport.clipsToBounds = true
+        viewport.addSubview(view)
         view.layoutIfNeeded()
-        XCTAssertTrue(try containsRedMarker(view))
+        var sample = try redMarkerSample(in: viewport, scrollView: view, marker: marker)
+        XCTAssertGreaterThan(sample.count, 0, sample.diagnostics)
         view.frame.size.width = 288
+        viewport.frame.size.width = 288
         view.setNeedsLayout()
         view.layoutIfNeeded()
         XCTAssertGreaterThanOrEqual(view.contentSize.width, 520)
         XCTAssertEqual(view.contentSize.height, 120)
-        XCTAssertFalse(try containsRedMarker(view), "The marker starts outside the narrow viewport")
+        sample = try redMarkerSample(in: viewport, scrollView: view, marker: marker)
+        XCTAssertEqual(sample.count, 0, "The marker starts outside the narrow viewport: \(sample.diagnostics)")
         XCTAssertTrue(view.accessibilityScroll(.left), "Scrolling must expose the preserved drawing width")
         view.layoutIfNeeded()
         XCTAssertGreaterThan(view.contentOffset.x, 0)
-        XCTAssertTrue(try containsRedMarker(view), "The actual drawing, not just contentSize, must survive resizing")
+        sample = try redMarkerSample(in: viewport, scrollView: view, marker: marker)
+        XCTAssertTrue(viewport.bounds.contains(view.convert(marker, to: viewport)), sample.diagnostics)
+        XCTAssertGreaterThan(sample.count, 0,
+                             "The actual drawing, not just contentSize, must survive resizing: \(sample.diagnostics)")
         view.frame.size.width = 640
+        viewport.frame.size.width = 640
         view.setNeedsLayout()
         view.layoutIfNeeded()
         XCTAssertEqual(view.contentOffset.x, 0, accuracy: 0.5)
-        XCTAssertTrue(try containsRedMarker(view))
+        sample = try redMarkerSample(in: viewport, scrollView: view, marker: marker)
+        XCTAssertGreaterThan(sample.count, 0, sample.diagnostics)
     }
 
-    private func containsRedMarker(_ view: UIView) throws -> Bool {
+    func testMarkerSnapshotUsesVisibleScrollViewportCoordinates() throws {
+        // Calibrate the pixel oracle with UIKit alone, independently of PluginBlockSurface.draw.
+        let viewport = UIView(frame: CGRect(x: 0, y: 0, width: 288, height: 120))
+        viewport.clipsToBounds = true
+        let scroll = UIScrollView(frame: viewport.bounds)
+        scroll.contentInsetAdjustmentBehavior = .never
+        scroll.contentSize = CGSize(width: 520, height: 120)
+        viewport.addSubview(scroll)
+        let marker = UIView(frame: CGRect(x: 500, y: 20, width: 20, height: 20))
+        marker.backgroundColor = .red
+        scroll.addSubview(marker)
+        let before = try redMarkerSample(in: viewport, scrollView: scroll, marker: marker.frame)
+        XCTAssertEqual(before.count, 0, before.diagnostics)
+        scroll.setContentOffset(CGPoint(x: 232, y: 0), animated: false)
+        let after = try redMarkerSample(in: viewport, scrollView: scroll, marker: marker.frame)
+        XCTAssertEqual(scroll.convert(marker.frame, to: viewport), CGRect(x: 268, y: 20, width: 20, height: 20))
+        XCTAssertGreaterThan(after.count, 0, after.diagnostics)
+    }
+
+    private func redMarkerSample(in view: UIView, scrollView: UIScrollView,
+                                 marker: CGRect) throws -> (count: Int, diagnostics: String) {
+        XCTAssertEqual(view.bounds.origin, .zero, "The snapshot root must be a fixed viewport")
         func display(_ child: UIView) {
             child.setNeedsDisplay()
             child.layer.displayIfNeeded()
@@ -412,9 +447,19 @@ final class ContributionMapperTests: XCTestCase {
                 bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue))
             bitmap.draw(cgImage, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
         }
-        return stride(from: 0, to: pixels.count, by: 4).contains {
-            pixels[$0] > 200 && pixels[$0 + 1] < 30 && pixels[$0 + 2] < 30 && pixels[$0 + 3] > 200
+        let expected = scrollView.convert(marker, to: view)
+        var count = 0, expectedCount = 0
+        for index in stride(from: 0, to: pixels.count, by: 4) {
+            if pixels[index] > 200 && pixels[index + 1] < 30 && pixels[index + 2] < 30 && pixels[index + 3] > 200 {
+                count += 1
+                let pixel = index / 4
+                let point = CGPoint(x: CGFloat(pixel % width) + 0.5, y: CGFloat(pixel / width) + 0.5)
+                if expected.contains(point) { expectedCount += 1 }
+            }
         }
+        let geometry = "offset=\(scrollView.contentOffset), content=\(scrollView.contentSize), viewport=\(view.bounds)"
+        let drawing = "expected marker=\(expected), red pixels=\(count), red pixels in expected rect=\(expectedCount)"
+        return (count, "\(geometry); \(drawing)")
     }
 
     func testSliderDisplayHidesFloatingPointNoiseWithoutRoundingDrafts() {

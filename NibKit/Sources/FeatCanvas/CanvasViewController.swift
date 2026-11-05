@@ -2038,6 +2038,7 @@ final class PageErrorView: UIView {
     let viewport = UIScrollView()
     /// The actions the empty state shows, primary first (tests and host inspection).
     private(set) var actions: [NibAction] = []
+    private var compact = false
     /// `NibEmptyState` is at most 420 pt wide inside its own padding.
     static let maxWidth: CGFloat = 420 + 2 * NibSpacing.xxl
 
@@ -2060,6 +2061,14 @@ final class PageErrorView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        // The empty state's generous margins leave almost no text column on zoomed-out paper.
+        // Put labelled glyph actions first there; the full explanation remains scrollable below.
+        let needsCompact = bounds.width < 3 * NibMetrics.hitTarget + 2 * NibSpacing.xxl
+        if compact != needsCompact {
+            compact = needsCompact
+            update()
+            viewport.contentOffset = .zero
+        }
         let size = fittingSize(width: min(bounds.width, Self.maxWidth))
         viewport.frame = bounds
         viewport.isScrollEnabled = size.height > bounds.height
@@ -2079,7 +2088,7 @@ final class PageErrorView: UIView {
         let restore = showsRestore
             ? NibAction(String(localized: "Restore from Backup")) { [weak self] in self?.onRestore?() } : nil
         actions = [retry] + (restore.map { [$0] } ?? [])
-        hosting.rootView = PageErrorContent(reason: reason, actions: actions)
+        hosting.rootView = PageErrorContent(reason: reason, actions: actions, compact: compact)
         setNeedsLayout()
     }
 
@@ -2097,7 +2106,37 @@ final class PageErrorView: UIView {
 struct PageErrorContent: View {
     let reason: String
     let actions: [NibAction]
+    var compact = false
     var body: some View {
+        if compact {
+            compactContent
+        } else {
+            fullContent
+        }
+    }
+
+    private var compactContent: some View {
+        VStack(spacing: NibSpacing.s) {
+            Image(nib: .warningTriangle)
+                .font(NibFont.glyph(.bar))
+                .foregroundStyle(NibColor.label)
+                .frame(height: NibMetrics.hitTarget)
+                .accessibilityLabel(String(localized: "Couldn't show this page."))
+            ForEach(Array(actions.enumerated()), id: \.offset) { index, action in
+                NibIconButton(index == 0 ? .retry : .backup, label: action.title, action: action.handler)
+                    .nibNativeAction(action.handler)
+            }
+            Text(String(localized: "Couldn't show this page."))
+                .font(NibFont.emptyTitle)
+            Text(reason)
+                .font(NibFont.callout)
+        }
+        .foregroundStyle(NibColor.label)
+        .multilineTextAlignment(.center)
+        .padding(NibSpacing.s)
+    }
+
+    private var fullContent: some View {
         VStack(spacing: NibSpacing.s) {
             NibEmptyState(symbol: .warningTriangle, title: String(localized: "Couldn't show this page."), message: reason)
             VStack(spacing: NibSpacing.s) {
