@@ -282,6 +282,9 @@ final class LiveTranscriber {
     var regenerating = Set<String>()
     private var cursors: [String: Double] = [:]
     private var previewDates: [String: Date] = [:]
+    var emptyWindowDelay: @MainActor () async throws -> Void = {
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+    }
 
     init(app: NibApp, speech: TranscriptSpeechBackend) { self.app = app; self.speech = speech }
 
@@ -307,7 +310,13 @@ final class LiveTranscriber {
                 if cloud { try await self.cloudRecording(payload.clip) }
                 else { try await self.localRecording(payload.clip) }
             } catch is CancellationError { }
-            catch { self.report(error, clip: payload.clip) }
+            catch {
+                if self.recordingWasRemoved(payload.clip) {
+                    self.clearError(for: payload.clip)
+                } else {
+                    self.report(error, clip: payload.clip)
+                }
+            }
         }
     }
 
@@ -373,7 +382,6 @@ final class LiveTranscriber {
                 if !lines.isEmpty { try await append(Self.offset(lines, start: windowStart, index: windowIndex), ref: ref) }
                 current.cancel(); session = nil; cursors[ref] = cursor
                 emptyWindows = cursor > windowStart ? 0 : emptyWindows + 1
-                try await backOffEmptyWindow(emptyWindows, ref: ref)
                 windowStart = cursor
             }
             if !enabled { return }
@@ -391,6 +399,8 @@ final class LiveTranscriber {
                     try await Task.sleep(nanoseconds: 1_000_000_000)
                     continue
                 }
+                try await backOffEmptyWindow(emptyWindows, ref: ref)
+                guard app.settings.get(TranscriptSettings.live) else { return }
                 committed = try await store.read(clip)
                 windowIndex = try await nextIndex(clip, store: store)
                 session = try speech.session(language: language) { [weak self] lines in
@@ -419,7 +429,6 @@ final class LiveTranscriber {
                 if !lines.isEmpty { try await append(Self.offset(lines, start: windowStart, index: windowIndex), ref: ref) }
                 current.cancel(); session = nil; cursors[ref] = cursor
                 emptyWindows = cursor > windowStart ? 0 : emptyWindows + 1
-                try await backOffEmptyWindow(emptyWindows, ref: ref)
                 windowStart = cursor
                 if state.state == "stopped" && drained { return }
                 continue
@@ -438,12 +447,18 @@ final class LiveTranscriber {
         }
     }
 
+    private func recordingWasRemoved(_ ref: String) -> Bool {
+        guard let app, case let .audio(doc, id)? = NodeRef(ref),
+              let head = try? app.workspace.content(doc) else { return false }
+        return !head.liveAudio.contains { $0.id == id }
+    }
+
     private func backOffEmptyWindow(_ count: Int, ref: String) async throws {
-        guard count > 0 else { return }
+        guard count > 0, app?.settings.get(TranscriptSettings.live) == true else { return }
         if count >= 3 {
             throw errors[ref] ?? NibError(.unavailable, String(localized: "Speech did not accept recorded audio. Try regenerating the transcript."))
         }
-        try await Task.sleep(nanoseconds: 1_000_000_000)
+        try await emptyWindowDelay()
     }
 
     private func finish(_ session: TranscriptSpeechSession, seconds: Double, ref: String,

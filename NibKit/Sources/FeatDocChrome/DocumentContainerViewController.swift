@@ -949,7 +949,6 @@ struct ChromeRootView: View {
         let motion: Animation? = state.animatesChanges ? NibMotion.sheet.animation : nil
         ZStack(alignment: .topLeading) {
             NibColor.desk
-                .fullScreenCover(isPresented: coverBinding) { coverContent }
             EditorHost(controller: editor, insets: layout.editorInsets, viewportWidth: layout.editor.width)
                 .frame(width: layout.editor.width, height: layout.editor.height)
                 .position(x: layout.editor.midX, y: layout.editor.midY)
@@ -980,6 +979,7 @@ struct ChromeRootView: View {
         .ignoresSafeArea(.container)
         .ignoresSafeArea(.keyboard)
         .nibSheet(isPresented: sheetBinding(compact: layout.isCompact)) { sheetContent }
+        .fullScreenCover(isPresented: coverBinding) { coverContent }
         .onChange(of: paletteCorrection(layout), initial: true) { _, correction in
             guard let correction else { return }
             chrome.run(CommandIDs.toolbarDock, ["dock": .string(correction.edge.commandValue),
@@ -1234,11 +1234,17 @@ struct ChromeRootView: View {
         })
     }
 
-    @ViewBuilder
     private var coverContent: some View {
-        if let id = state.cover, let panel = chrome.app.ui.panels.get(id) {
-            panel.makeView(chrome.panelContext(id, presentation: .fullScreen))
+        Group {
+            if let id = state.cover, let panel = chrome.app.ui.panels.get(id) {
+                panel.makeView(chrome.panelContext(id, presentation: .fullScreen))
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Only the opaque backdrop extends beyond the modal's safe area. Panel controls
+        // use the presented window's bounds, not the editor's chrome/palette insets.
+        .background { NibColor.desk.ignoresSafeArea() }
+        .presentationBackground(NibColor.desk)
     }
 }
 

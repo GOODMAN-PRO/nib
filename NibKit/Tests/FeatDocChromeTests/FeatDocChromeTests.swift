@@ -8,7 +8,7 @@ import NibTesting
 
 @MainActor
 final class FeatDocChromeTests: XCTestCase {
-    func testModalBlocksCanvasAndPlainKeysButKeepsGlobalCommandKeys() {
+    func testModalBlocksAllUnderlyingShellKeys() {
         let delete = KeyCommandDescriptor(id: "delete", title: "Delete", shortcut: KeyShortcut("delete", []),
                                           command: "keyboard.delete", scope: .canvas, owner: "tests")
         let select = KeyCommandDescriptor(id: "select", title: "Select", shortcut: KeyShortcut("a", [.command]),
@@ -17,17 +17,34 @@ final class FeatDocChromeTests: XCTestCase {
                                          command: "toolbar.key.e", scope: .global, owner: "tests")
         let global = KeyCommandDescriptor(id: "global", title: "Search", shortcut: KeyShortcut("f", [.command]),
                                           command: "search.open", scope: .global, owner: "tests")
-        for key in [delete, select, plain] {
+        for key in [delete, select, plain, global] {
             XCTAssertFalse(ShellChromePolicy.permits(key, hasModal: true))
             XCTAssertTrue(ShellChromePolicy.permits(key, hasModal: false))
         }
-        XCTAssertTrue(ShellChromePolicy.permits(global, hasModal: true))
         let root = UIViewController()
         let child = ModalControllerProbe()
         root.addChild(child)
         XCTAssertFalse(ShellChromePolicy.hasModal(root))
         child.modal = UIViewController()
         XCTAssertTrue(ShellChromePolicy.hasModal(root))
+    }
+
+    func testModalDoesNotPromoteSharedShortcutToAnotherScope() {
+        let context = KeyCommandContext(docKind: .notebook)
+        let descriptors = [KeyScope.global, .document, .canvas].map { scope in
+            KeyCommandDescriptor(id: scope.rawValue, title: "Shared", shortcut: KeyShortcut("a", [.command]),
+                                 command: "test." + scope.rawValue, scope: scope, owner: "tests")
+        }
+        let active = KeyCommandRouting.active(descriptors, in: context)
+        XCTAssertEqual(active.map(\.id), [KeyScope.canvas.rawValue])
+        let allowed = descriptors.filter { ShellChromePolicy.permits($0, hasModal: true) }
+        XCTAssertTrue(KeyCommandRouting.active(allowed, in: context).isEmpty)
+        XCTAssertNil(KeyCommandRouting.unhandledPress(KeyShortcut("a", [.command]), descriptors: allowed, in: context))
+        for descriptor in descriptors {
+            XCTAssertFalse(ShellChromePolicy.permits(descriptor, hasModal: true), "stale key commands must also be refused")
+        }
+        let restored = descriptors.filter { ShellChromePolicy.permits($0, hasModal: false) }
+        XCTAssertEqual(KeyCommandRouting.active(restored, in: context).map(\.id), active.map(\.id))
     }
 
     func testTabBarIsRequestedForRemainingTabsBehindLibrary() {

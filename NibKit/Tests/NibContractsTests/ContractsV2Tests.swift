@@ -1,7 +1,7 @@
 import XCTest
 import UIKit
 import SwiftUI
-import NibContracts
+@testable import NibContracts
 import NibTesting
 
 /// contracts-v2: regression tests for the DocTransaction.revert fixes and coverage of the APIs added in the v2 pass
@@ -39,6 +39,65 @@ final class ContractsV2Tests: XCTestCase {
     private let mathRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01"
 
     // MARK: Undo / revert regressions
+
+    func testNonUndoableAudioDeletionAfterRenameDoesNotResurrectClip() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h)
+        let clip = try XCTUnwrap(try ctx.workspace.content(doc).liveAudio.first { $0.id == Fixtures.audioID })
+        let audio = try h.persistence.fileURL(doc, relativePath: clip.file)
+        try FileManager.default.createDirectory(at: audio.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("recording".utf8).write(to: audio)
+        // Exercise AudioRename / AudioDelete's transactions at the shared bus boundary;
+        // this target cannot import feature modules.
+        try ctx.mutate { tx in
+            var renamed = clip
+            renamed.name = "Renamed recording"
+            try tx.put(renamed, doc: self.doc)
+        }
+        XCTAssertEqual(h.undoDepth(doc), 1)
+        try ctx.mutate(undoable: false) { tx in
+            var gone = try XCTUnwrap(try tx.content(self.doc).liveAudio.first { $0.id == clip.id })
+            gone.deleted = true
+            try tx.put(gone, doc: self.doc)
+        }
+        try FileManager.default.removeItem(at: audio)
+
+        XCTAssertFalse(h.app.bus.undo(doc))
+        let gone = try XCTUnwrap(try h.app.workspace.content(doc).audio.first { $0.id == clip.id })
+        XCTAssertTrue(gone.deleted, "undo must not resurrect a recording whose file was permanently deleted")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audio.path))
+        XCTAssertEqual(h.undoDepth(doc), 0, "the skipped rename must not leave a ghost undo step")
+        XCTAssertFalse(h.app.bus.history.canRedo(doc), "a skipped undo must not create a ghost redo step")
+    }
+
+    func testNonUndoableLocalRestampsPreserveCreateUndoAndRedo() async throws {
+        for writes in [1, 2] {
+            let h = Harness()
+            let ctx = try await probeContext(h)
+            let id: ElementID = "LOCALCREATE1"
+            try ctx.mutate { tx in
+                var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+                item.id = id
+                try tx.put(item, doc: self.doc, page: self.page1)
+            }
+            try ctx.mutate(undoable: false) { tx in
+                for layer in 1...writes {
+                    var item = try tx.item(self.doc, page: self.page1, id: id)
+                    item.layer = layer
+                    try tx.put(item, doc: self.doc, page: self.page1)
+                }
+            }
+            XCTAssertEqual(h.undoDepth(doc), 1)
+            XCTAssertTrue(h.app.bus.undo(doc))
+            XCTAssertThrowsError(try h.app.workspace.item(doc, page: page1, id: id))
+            let redo = try XCTUnwrap(h.app.bus.history.popRedo(doc))
+            XCTAssertFalse(redo.mutations.isEmpty)
+            XCTAssertNil(h.app.bus.history.popRedo(doc), "exactly one redo entry")
+            h.app.bus.history.pushRedo(redo, doc: doc)
+            XCTAssertTrue(h.app.bus.redo(doc))
+            XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: id).layer, writes)
+        }
+    }
 
     /// F031 (FeatShapesTests.testDroppingAnItemIntoAShapeAttachesItInTheSameUndoStep): a commit observer attaches the
     /// moved item with `item.update` in the move's own undo group; one undo must revert BOTH the attach and the move.
@@ -230,6 +289,34 @@ final class ContractsV2Tests: XCTestCase {
         let r = h.app.bus.revert(group: first.group, doc: doc)
         XCTAssertEqual(r?.skipped, 1)
         XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).layer, 3)
+    }
+
+    func testEntirelySkippedSelectiveRevertKeepsItsPositionAndCanBeRetried() async throws {
+        let h = Harness()
+        let first = try await probeContext(h)
+        try first.mutate { tx in
+            var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+            item.locked = true
+            try tx.put(item, doc: self.doc, page: self.page1)
+        }
+        let later = try await probeContext(h)
+        try later.mutate { tx in
+            var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+            item.layer = 3
+            try tx.put(item, doc: self.doc, page: self.page1)
+        }
+        let groups = h.app.bus.history.entries(doc).map(\.group)
+        let params: JSONValue = ["doc": .string(NodeRef.document(doc).description), "group": .string(first.group)]
+        let skipped = try await h.run(CommandIDs.revertGroup, params)
+        XCTAssertEqual(skipped["reverted"]?.intValue, 0)
+        XCTAssertEqual(skipped["skipped"]?.intValue, 1)
+        XCTAssertNotNil(skipped["reason"]?.stringValue)
+        XCTAssertEqual(h.app.bus.history.entries(doc).map(\.group), groups)
+        XCTAssertTrue(h.app.bus.undo(doc), "the later step remains on top")
+        let retried = try await h.run(CommandIDs.revertGroup, params)
+        XCTAssertEqual(retried["reverted"]?.intValue, 1)
+        XCTAssertEqual(retried["skipped"]?.intValue, 0)
+        XCTAssertFalse(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).locked)
     }
 
     func testLinkedUndoAcrossDocuments() async throws {

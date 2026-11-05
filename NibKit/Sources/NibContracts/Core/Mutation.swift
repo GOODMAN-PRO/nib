@@ -55,6 +55,19 @@ public enum Mutation {
         }
     }
 
+    /// Revision replaced by this write, or nil for an insertion.
+    var beforeRev: Rev? {
+        switch self {
+        case let .item(_, _, b, _): return b?.rev
+        case let .page(_, b, _): return b?.rev
+        case let .meta(_, b, _): return b.rev
+        case let .block(_, b, _): return b?.rev
+        case let .card(_, b, _): return b?.rev
+        case let .audio(_, b, _): return b?.rev
+        case let .outline(_, b, _): return b?.rev
+        }
+    }
+
     /// Revision of the written value (`after.rev`).
     var afterRev: Rev {
         switch self {
