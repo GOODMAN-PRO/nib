@@ -478,6 +478,26 @@ final class NibLibraryTests: XCTestCase {
 
     // MARK: Duplicate
 
+    func testDuplicateCompletionAfterLibrarySwitchCannotPublishGhosts() async throws {
+        let lib = try await makeLibrary()
+        let source = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Original"]))
+        let job = try lib.library.prepareDuplicate(source, as: "LATECOPY")
+        let other = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: other) }
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        try lib.library.setRoot(other)
+        await lib.library.waitForScans()
+        try await Task.detached { try job.run() }.value
+        XCTAssertThrowsError(try lib.library.finishDuplicate(job, top: "LATECOPY"))
+        XCTAssertTrue(lib.library.allNodes().isEmpty)
+        XCTAssertNil(lib.h.app.services.packages.url("LATECOPY"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: job.destination.path))
+        try lib.library.setRoot(lib.root)
+        await lib.library.waitForScans()
+        XCTAssertNotNil(lib.library.node("LATECOPY"), "the original library discovers the completed copy")
+        XCTAssertThrowsError(try lib.library.finishDuplicate(job, top: "LATECOPY"), "switching away and back still invalidates completion")
+    }
+
     func testDuplicateGetsANewIDAndOnlyThisDevicesHead() async throws {
         let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Lab Report"]))

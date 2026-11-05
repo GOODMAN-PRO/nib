@@ -191,6 +191,7 @@ final class FolderLibrary: LibraryService {
     private var started = false
     /// Bumped by every catalog change, so a background scan that raced a change is not applied over it.
     private var generation: UInt64 = 0
+    private var rootEpoch = UUID()
     private var scanning = false
     private var rebuilding = false
     private var rescanRequested = false
@@ -567,7 +568,7 @@ final class FolderLibrary: LibraryService {
     func duplicate(_ id: NibID) throws -> NibID {
         let job = try prepareDuplicate(id, as: nil)
         try job.run()
-        return finishDuplicate(job, top: job.topID ?? id)
+        return try finishDuplicate(job, top: job.topID ?? id)
     }
 
     /// Duplicates a document (new id in this device's head, other heads removed) or a folder (new ids for every folder
@@ -575,10 +576,10 @@ final class FolderLibrary: LibraryService {
     func duplicate(_ id: NibID, as newID: NibID?) async throws -> NibID {
         let job = try prepareDuplicate(id, as: newID)
         try await Task.detached(priority: .userInitiated) { try job.run() }.value
-        return finishDuplicate(job, top: job.topID ?? id)
+        return try finishDuplicate(job, top: job.topID ?? id)
     }
 
-    private func prepareDuplicate(_ id: NibID, as newID: NibID?) throws -> CopyJob {
+    func prepareDuplicate(_ id: NibID, as newID: NibID?) throws -> CopyJob {
         ensureLoaded()
         guard let e = catalog.entry(id: id) else { throw NibError.notFound("library item \(id.raw)") }
         guard !e.inTrash else {
@@ -597,10 +598,13 @@ final class FolderLibrary: LibraryService {
         let name = uniqueName(base, ext: ext, in: dir)
         let destination = dir.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
         return CopyJob(source: source, destination: destination, topID: top, device: device, clock: clock,
-                       taken: Set(catalog.entries.map { $0.node.id }), collapseHeads: true)
+                       taken: Set(catalog.entries.map { $0.node.id }), collapseHeads: true, rootEpoch: rootEpoch)
     }
 
-    private func finishDuplicate(_ job: CopyJob, top fallback: NibID) -> NibID {
+    func finishDuplicate(_ job: CopyJob, top fallback: NibID) throws -> NibID {
+        guard job.rootEpoch == rootEpoch else {
+            throw NibError(.conflict, String(localized: "The library changed while duplicating. The copy remains in the original library."))
+        }
         let added = scanner(previous: [:]).scanItem(at: job.destination, inTrash: false, trashTop: false,
                                                     existing: catalog.byPath)
         for entry in added {
@@ -1092,6 +1096,7 @@ final class FolderLibrary: LibraryService {
         scopedRoot?.stopAccessingSecurityScopedResource()
         scopedRoot = scoped ? url : nil
         rootURL = target
+        rootEpoch = UUID()
         rootUnavailable = false
         LibrarySettings.saveRoot(bookmark, settings)
         try? FileOps.createDirectory(metadataURL)
@@ -1354,6 +1359,7 @@ struct CopyJob {
     let taken: Set<NibID>
     /// Duplicates: every document gets a new id and keeps only this device's head.
     let collapseHeads: Bool
+    var rootEpoch: UUID? = nil
 
     /// Copies, then re-identifies; a copy that cannot get its own identity is removed again.
     func run() throws {
