@@ -951,13 +951,17 @@ final class NibUI {
         if value.isEmpty || value == field.placeholderValue { return }
         // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
         field.typeText(XCUIKeyboardKey.delete.rawValue)
-        guard let remaining = field.value as? String else { throw Failure.message("Native editor lost its value after deletion") }
+        let remainingValue = field.value as? String
+        guard let remaining = remainingValue ?? (field.elementType == .textView ? "" : nil) else {
+            throw Failure.message("Native editor lost its value after deletion")
+        }
         if !remaining.isEmpty && remaining != field.placeholderValue {
-            // Collapse any selection to its right edge and move beyond every remaining character.
-            // Plain arrow events do not depend on Command-A or the app's command routing.
-            guard remaining.count <= 4096 else { throw Failure.message("Native clear exceeds bounded editor length") }
-            field.typeText(String(repeating: XCUIKeyboardKey.rightArrow.rawValue, count: remaining.count + 1))
-            field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: remaining.count))
+            // typeText inserts arrow raw values literally. Place the caret after the text with a real tap.
+            field.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: field.elementType == .textView ? 0.98 : 0.5)).tap()
+            guard let current = (field.value as? String) ?? (field.elementType == .textView ? "" : nil),
+                  current.count <= 4096 else { throw Failure.message("Native clear needs a readable bounded value after caret tap") }
+            logQA("Native clear", "field=\(field.identifier) frame=\(field.frame) deleteCount=\(current.count)")
+            if !current.isEmpty { field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count)) }
         }
         try waitForNativeText(in: field, equals: "")
     }
@@ -974,7 +978,8 @@ final class NibUI {
     /// Waits for the native editor's actual text; a placeholder represents an empty value, not user content.
     func waitForNativeText(in field: XCUIElement, equals text: String) throws {
         func matches() -> Bool {
-            guard let value = field.value as? String else { return false }
+            guard field.exists else { return false }
+            guard let value = field.value as? String else { return text.isEmpty && field.elementType == .textView }
             return value == text || (text.isEmpty && value == field.placeholderValue)
         }
         if matches() { return }
