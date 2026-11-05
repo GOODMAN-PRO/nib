@@ -609,6 +609,11 @@ final class ChromeUITests: XCTestCase {
         }
         try ui.selectTool("highlighter"); _ = try reachable("menu.toolSettings")
         try settings("highlighter")
+        outside()
+        try wait("Highlighter settings must close before using the quick strip") {
+            !self.ui.app.scrollViews.matching(NSPredicate(format: "label == %@", "Highlighter"))
+                .allElementsBoundByIndex.contains { self.ui.hasVisibleFrame($0) && $0.isHittable }
+        }
         try ui.diagnoseAction("Thickness 2 after settings", facts: { self.ui.elementFacts(self.query("Thickness 2").firstMatch, includeOverlaps: true) }) {
             try tap("Thickness 2")
         }

@@ -166,3 +166,7 @@ D:controls-forms#11 confirms the open thread menu and two cmd.panel.close button
 ## C7 - geometry-aware Chrome outside tap
 
 D:app-round-4#3 arithmetic proves (0.83,0.82) is inside the right-docked Fountain Pen settings. Chrome outside now selects a canvas point excluded by live popover/settings-sized scroll frames from one snapshot, with the old point only as a verified-free fallback. Failure to find geometry fails without a guessed tap. Existing callers retain their own state/content assertions. Expected DockRight dismissal before ink; CI must show settings close and the stroke/undo checks, across dock geometries.
+
+## C6 - close settings before quick width
+
+D:controls-menus#5 proves Highlighter settings covers Thickness 2. PageScrollCollapsesOptionsAndChoosingToolRestoresThem now dismisses settings and waits until no visible Highlighter settings scroll view is hittable before the same quick-strip tap. Existing before/after overlap diagnostics and ink checks remain. CI must show closed settings and a successful Thickness 2 action.
