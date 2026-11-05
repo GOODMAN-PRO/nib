@@ -231,7 +231,7 @@ final class PackagePersistence: DocumentPersistence {
         }
         var copies = read.copies
         for (page, items) in recovered where NibID.isValid(page.raw) {
-            let disk = mergedPage(doc, pkg, page, now: now)
+            let disk = try mergedPage(doc, pkg, page, now: now)
             recovered[page] = LWW.merge(disk.items, items)
             copies += disk.read.copies
         }
@@ -249,7 +249,7 @@ final class PackagePersistence: DocumentPersistence {
     func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
         guard NibID.isValid(page.raw) else { throw NibError.invalid("invalid page id '\(page.raw)'") }
         let pkg = try files.package(doc)
-        let disk = mergedPage(doc, pkg, page, now: PackageCodec.ms(Date()))
+        let disk = try mergedPage(doc, pkg, page, now: PackageCodec.ms(Date()))
         let items = disk.items
         seen[doc, default: [:]].merge(disk.read.stamps) { _, new in new }
         known[doc]?.itemRevs[page] = PackageCodec.revs(items)
@@ -268,12 +268,15 @@ final class PackagePersistence: DocumentPersistence {
     /// Pending snapshots hold what is not queued yet.
     /// Unreadable and clock-skewed files are reported.
     private func mergedPage(_ doc: DocumentID, _ pkg: URL, _ page: PageID,
-                            now: UInt64) -> (items: [Item], read: PackageFiles.ReadResult<[Item]>) {
+                            now: UInt64) throws -> (items: [Item], read: PackageFiles.ReadResult<[Item]>) {
         let queued = readable.snapshot(doc)
         let logged = wal.read(doc)
         let read = files.read(files.pageSources(pkg, page: page), in: PackageCodec.pageDirectory(page),
                               decode: PackageCodec.decodeItems) { PackageCodec.hasFutureRev($0, now: now) }
         report(doc, read)
+        guard read.ownFailures.isEmpty else {
+            throw NibError(.internalError, String(localized: "This page could not be read. Try opening it again before editing."))
+        }
         var items = PackageCodec.mergeItems(read.values)
         for entry in logged { if let changed = entry.pages[page.raw] { items = LWW.merge(items, changed) } }
         if let kept = queued?.pages[page] { items = LWW.merge(items, kept) }
@@ -515,7 +518,7 @@ final class PackagePersistence: DocumentPersistence {
                 p.head = PackageCodec.mergeHeads([k.head] + (p.head.map { [$0] } ?? []), now: now)
             }
             for (page, urls) in pageCopies {
-                p.pages[page] = LWW.merge(mergedPage(doc, pkg, page, now: now).items, p.pages[page] ?? [])
+                p.pages[page] = LWW.merge(try mergedPage(doc, pkg, page, now: now).items, p.pages[page] ?? [])
                 p.copies.formUnion(urls)
             }
             p.copies.formUnion(headCopies)

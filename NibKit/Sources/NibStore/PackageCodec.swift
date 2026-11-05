@@ -544,6 +544,8 @@ struct PackageFiles {
         var futureFiles: [String] = []
         /// Package-relative paths of files that exist but could not be decoded.
         var failures: [String] = []
+        /// An unreadable own-device file must never be replaced using a partial merged snapshot.
+        var ownFailures: [String] = []
         /// Stamps of every non-own file listed (decodable or not), keyed by package-relative path.
         var stamps: [String: Stamp] = [:]
     }
@@ -599,10 +601,15 @@ struct PackageFiles {
                 if isFuture(value) { r.futureFiles.append(key) }
                 if case .conflictCopy = s.role { r.copies.append(s.url) }
             } catch let e as CocoaError where e.code == .fileReadNoSuchFile {
+                if s.isOwn {
+                    r.failures.append(key)
+                    r.ownFailures.append(key)
+                }
                 continue // removed between listing and reading (a merged conflict copy)
             } catch {
                 PackageFiles.log.error("cannot read \(key, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 r.failures.append(key)
+                if s.isOwn { r.ownFailures.append(key) }
             }
         }
         return r

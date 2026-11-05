@@ -64,6 +64,33 @@ final class NibStoreTests: XCTestCase {
         }
     }
 
+    func testUnreadableOwnPageIsNotCachedAndRecoveredInkSurvivesEditing() throws {
+        let lib = TestLibrary()
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+        let url = pageFile(pkg, Fixtures.page1)
+        let original = try Data(contentsOf: url)
+        try Data("temporarily unreadable".utf8).write(to: url)
+        let workspace = Workspace(clock: HLCClock(device: 10), persistence: store, events: EventBus())
+        XCTAssertThrowsError(try workspace.allItems(doc, page: Fixtures.page1))
+        XCTAssertFalse(workspace.isPageCached(doc, page: Fixtures.page1))
+        store.flush(doc)
+        XCTAssertEqual(try Data(contentsOf: url), Data("temporarily unreadable".utf8))
+
+        try original.write(to: url)
+        var recovered = try workspace.allItems(doc, page: Fixtures.page1)
+        let added = walStroke("AFTERREADRECOVERY")
+        recovered.append(added)
+        store.didChange(doc, head: nil, pages: [Fixtures.page1: recovered])
+        store.flush(doc)
+        let saved = try lib.store("0000000a").loadItems(doc, page: Fixtures.page1)
+        XCTAssertEqual(Set(saved.map(\.id)), Set((items[Fixtures.page1] ?? []).map(\.id) + [added.id]))
+    }
+
     func testCompactPointsAreLossless() throws {
         var points: [StrokePoint] = []
         for i in 0..<50 {
