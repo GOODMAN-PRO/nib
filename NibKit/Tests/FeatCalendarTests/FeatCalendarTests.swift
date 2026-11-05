@@ -562,6 +562,73 @@ final class FeatCalendarTests: XCTestCase {
                                    calendar: cal).pages.count, PlannerPlan.maxDays)
     }
 
+    func testOtherEventsIgnoresAnOlderSuccessAfterTheNewDayFinishes() async throws {
+        let model = OtherEventsModel()
+        model.date = date(2026, 9, 29)
+        let oldEvent = event("Old day", date(2026, 9, 29, 10))
+        let newEvent = event("New day", date(2026, 9, 30, 10))
+        var pending: CheckedContinuation<[CalendarEvent], Error>?
+        let old = Task { @MainActor in
+            await model.load { _, _ in try await withCheckedThrowingContinuation { pending = $0 } }
+        }
+        await eventually { pending != nil }
+        let continuation = try XCTUnwrap(pending)
+        model.date = date(2026, 9, 30)
+        await model.load { _, _ in [newEvent] }
+        continuation.resume(returning: [oldEvent])
+        await old.value
+        XCTAssertEqual(model.events.map(\.id), [newEvent.id])
+        XCTAssertNil(model.failure)
+        XCTAssertFalse(model.loading)
+    }
+
+    func testOtherEventsOldFailureCannotClearTheNewDaysLoadingState() async throws {
+        let model = OtherEventsModel()
+        model.date = date(2026, 9, 29)
+        var first: CheckedContinuation<[CalendarEvent], Error>?
+        var second: CheckedContinuation<[CalendarEvent], Error>?
+        let old = Task { @MainActor in
+            await model.load { _, _ in try await withCheckedThrowingContinuation { first = $0 } }
+        }
+        await eventually { first != nil }
+        let firstRead = try XCTUnwrap(first)
+        model.date = date(2026, 9, 30)
+        let latest = Task { @MainActor in
+            await model.load { _, _ in try await withCheckedThrowingContinuation { second = $0 } }
+        }
+        await eventually { second != nil }
+        let latestRead = try XCTUnwrap(second)
+        firstRead.resume(throwing: NibError.unavailable("old calendar read"))
+        await old.value
+        XCTAssertTrue(model.loading)
+        XCTAssertNil(model.failure)
+        XCTAssertTrue(model.events.isEmpty)
+        let current = event("Current day", date(2026, 9, 30, 10))
+        latestRead.resume(returning: [current])
+        await latest.value
+        XCTAssertEqual(model.events.map(\.id), [current.id])
+        XCTAssertFalse(model.loading)
+        model.date = date(2026, 10, 1)
+        XCTAssertTrue(model.events.isEmpty, "the heading must never show the previous day's rows")
+    }
+
+    func testOtherEventsCancelledReadCannotPublishResults() async throws {
+        let model = OtherEventsModel()
+        var pending: CheckedContinuation<[CalendarEvent], Error>?
+        let task = Task { @MainActor in
+            await model.load { _, _ in try await withCheckedThrowingContinuation { pending = $0 } }
+        }
+        await eventually { pending != nil }
+        let continuation = try XCTUnwrap(pending)
+        task.cancel()
+        continuation.resume(throwing: NibError.unavailable("cancelled calendar read"))
+        await task.value
+        XCTAssertTrue(model.events.isEmpty)
+        XCTAssertNil(model.failure)
+        await model.load { _, _ in [] }
+        XCTAssertFalse(model.loading)
+    }
+
     func testUpcomingEventsGroupByDay() {
         let window = CalendarDates.upcomingWindow(now: date(2026, 9, 30, 8))
         let a = event("A", date(2026, 9, 30, 9))
