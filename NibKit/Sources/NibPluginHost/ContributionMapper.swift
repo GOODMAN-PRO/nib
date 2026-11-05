@@ -669,8 +669,8 @@ enum SchemaConverter {
         case "string"?:
             return .str(description, choices: enumStrings)
         case "integer"?:
-            return .int(description, min: o["minimum"]?.doubleValue.map { Int($0.rounded(.up)) },
-                        max: o["maximum"]?.doubleValue.map { Int($0.rounded(.down)) })
+            return .int(description, min: o["minimum"]?.doubleValue.flatMap { Int(exactly: $0.rounded(.up)) },
+                        max: o["maximum"]?.doubleValue.flatMap { Int(exactly: $0.rounded(.down)) })
         case "number"?:
             return .num(description, min: o["minimum"]?.doubleValue, max: o["maximum"]?.doubleValue)
         case "boolean"?:
@@ -1648,26 +1648,24 @@ struct SchemaFieldControl: View {
                 Text(verbatim: field.title)
             }
         case let .number(min, max, integer):
-            if let lo = min, let hi = max, hi > lo {
+            if let lo = min, let hi = max, lo.isFinite, hi.isFinite, hi > lo,
+               (hi - lo).isFinite, (hi - lo) / 100 > 0 {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text(verbatim: field.title)
                         Spacer()
-                        Text(verbatim: format(number, integer: integer)).monospacedDigit()
+                        Text(verbatim: PluginNumberField.format(number, integer: integer)).monospacedDigit()
                     }
                     Slider(value: $number, in: lo...hi, step: integer ? 1 : (hi - lo) / 100) { editing in
                         if !editing { commit(field.key, .number(integer ? number.rounded() : number)) }
                     }
                     .accessibilityLabel(Text(verbatim: field.title))
-                    .accessibilityValue(Text(verbatim: format(number, integer: integer)))
+                    .accessibilityValue(Text(verbatim: PluginNumberField.format(number, integer: integer)))
                 }
                 .frame(minWidth: compact ? 180 : nil)
             } else {
                 textField(keyboard: .numbersAndPunctuation) {
-                    guard let n = Double(draft.replacingOccurrences(of: ",", with: ".")) else { return nil }
-                    if let lo = min, n < lo { return nil }
-                    if let hi = max, n > hi { return nil }
-                    return .number(integer ? n.rounded() : n)
+                    PluginNumberField.parse(draft, min: min, max: max, integer: integer)
                 }
             }
         case .text:
@@ -1720,7 +1718,7 @@ struct SchemaFieldControl: View {
         switch field.kind {
         case .number:
             number = value?.doubleValue ?? 0
-            draft = value?.doubleValue.map { format($0, integer: false) } ?? ""
+            draft = value?.doubleValue.map { PluginNumberField.format($0, integer: false) } ?? ""
         case .text:
             draft = value?.stringValue ?? ""
         case .json:
@@ -1732,9 +1730,22 @@ struct SchemaFieldControl: View {
         }
     }
 
-    private func format(_ n: Double, integer: Bool) -> String {
-        if integer || n == n.rounded() { return String(Int(n.rounded())) }
+}
+
+/// Keep legacy large values readable without converting an untrusted Double with a trapping initializer.
+enum PluginNumberField {
+    static func format(_ n: Double, integer: Bool) -> String {
+        guard n.isFinite, let whole = Int(exactly: n.rounded()) else { return String(format: "%g", n) }
+        if integer || n == n.rounded() { return String(whole) }
         return String(format: "%.2f", n)
+    }
+
+    static func parse(_ draft: String, min: Double?, max: Double?, integer: Bool) -> JSONValue? {
+        guard let n = Double(draft.replacingOccurrences(of: ",", with: ".")), n.isFinite else { return nil }
+        let value = integer ? n.rounded() : n
+        if let lo = min, value < lo { return nil }
+        if let hi = max, value > hi { return nil }
+        return .number(value)
     }
 }
 

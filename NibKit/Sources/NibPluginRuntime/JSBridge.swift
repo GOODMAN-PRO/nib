@@ -140,11 +140,11 @@ final class JSBridge {
             self?.onDone?(token, ok, json)
         }
         let timer: @convention(block) (String, Double, Double, Bool) -> Bool = { [weak self] op, id, ms, repeats in
-            guard let self = self else { return false }
+            guard let self = self, let timerID = PluginTimers.identifier(id) else { return false }
             switch op {
-            case "set": return self.timers.set(id: Int(id), milliseconds: ms, repeats: repeats)
+            case "set": return self.timers.set(id: timerID, milliseconds: ms, repeats: repeats)
             default:
-                self.timers.clear(id: Int(id))
+                self.timers.clear(id: timerID)
                 return true
             }
         }

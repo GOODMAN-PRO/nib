@@ -315,6 +315,33 @@ final class ContributionMapperTests: XCTestCase {
         XCTAssertThrowsError(try PluginPaths.resolve("/etc/hosts", in: empty, path: "$"))
     }
 
+    func testNumberFieldsKeepLargeStoredValuesReadableAndRejectNonFiniteEdits() {
+        for n in [1e30, -1e30, Double(Int.max), Double.infinity, -Double.infinity, Double.nan] {
+            XCTAssertFalse(PluginNumberField.format(n, integer: false).isEmpty)
+            XCTAssertFalse(PluginNumberField.format(n, integer: true).isEmpty)
+        }
+        XCTAssertEqual(PluginNumberField.format(42, integer: false), "42")
+        XCTAssertEqual(PluginNumberField.format(1.25, integer: false), "1.25")
+        XCTAssertEqual(PluginNumberField.parse("1e30", min: nil, max: nil, integer: false), .number(1e30))
+        for text in ["inf", "-inf", "nan", "1e999"] {
+            XCTAssertNil(PluginNumberField.parse(text, min: nil, max: nil, integer: false))
+        }
+    }
+
+    func testIntegerSchemaBoundsOutsideIntRangeDoNotTrapDuringManifestValidation() throws {
+        for n in [1e30, -1e30, Double(Int.max), Double.infinity, -Double.infinity, Double.nan] {
+            let schema = SchemaConverter.schema(["type": "integer", "minimum": .number(n), "maximum": .number(n)])
+            XCTAssertTrue(schema.validate(1).isEmpty, "unrepresentable bounds are omitted")
+        }
+        let kit = PluginTestKit()
+        let value = kit.manifest("dev.test.bounds", contributes: ["commands": [[
+            "id": "dev.test.bounds.run", "title": "Run", "summary": "Run.", "effect": "read",
+            "params": ["type": "object", "properties": ["n": ["type": "integer", "minimum": 1e30, "maximum": 1e31]]]
+        ]]])
+        let manifest = try value.decode(PluginManifest.self)
+        XCTAssertTrue(ManifestValidator.problems(manifest, folder: nil).isEmpty)
+    }
+
     func testSchemaConversionKeepsTypesBoundsAndDefaults() throws {
         let schema = SchemaConverter.schema(try JSONValue.parse(#"""
         {"type": "object", "required": ["page"], "properties": {

@@ -198,6 +198,13 @@ final class NibPluginRuntimeTests: XCTestCase {
 
     // MARK: Timers
 
+    func testNativeTimerIdentifiersRejectNonRepresentableNumbers() {
+        for value in [1e30, -1e30, Double(Int.max), Double.infinity, -Double.infinity, Double.nan, 1.5] {
+            XCTAssertNil(PluginTimers.identifier(value))
+        }
+        XCTAssertEqual(PluginTimers.identifier(42), 42)
+    }
+
     func testTimerDelaysAreClamped() {
         XCTAssertEqual(PluginTimers.delay(milliseconds: 250, repeats: false), 0.25, accuracy: 1e-9)
         XCTAssertEqual(PluginTimers.delay(milliseconds: -5, repeats: false), 0)
