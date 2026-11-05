@@ -345,9 +345,7 @@ struct StudySessionView: View {
             if !model.started || model.mode != mode { await model.begin(mode) }
         }
         .sheet(isPresented: Binding(get: { model.scratchPresented }, set: { if !$0 { model.action("closeScratch") } })) {
-            if let descriptor = model.app.ui.panels.get("studyeditor.scratch") {
-                descriptor.makeView(scratchContext)
-            }
+            scratchContent
         }
         .onDisappear {
             dragState.activityChanged(false)
@@ -355,6 +353,13 @@ struct StudySessionView: View {
             if !model.scratchPresented && !optionsPresented {
                 model.app.perform(StudySessionAction.id, ["doc": .string(model.docRef), "action": "end"], session: model.session)
             }
+        }
+    }
+
+    // Keep the sheet's descriptor boundary hostable without a UIKit presentation.
+    @ViewBuilder var scratchContent: some View {
+        if let descriptor = model.app.ui.panels.get("studyeditor.scratch") {
+            descriptor.makeView(scratchContext)
         }
     }
 
