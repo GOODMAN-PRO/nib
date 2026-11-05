@@ -88,6 +88,53 @@ final class FeatLayersTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
     }
 
+    func testReadOnlyWindowAndDocumentBlockEveryLayerEdit() async throws {
+        let h = harness()
+        h.app.gateway.grants = { principal in
+            if case .plugin = principal { return [.documentRead, .documentWrite] }
+            return Gateway.defaultGrants(principal)
+        }
+        let before = try h.snapshotAll()
+        let rename: JSONValue = ["doc": "doc:FIXTUREDOC01", "layer": 1, "name": "Blocked"]
+        let move: JSONValue = ["refs": [.string(ref(Fixtures.strokeID))], "layer": 2]
+        h.session.readOnly = true
+        for (command, params) in [(CommandIDs.layerRename, rename), (CommandIDs.layerMoveItems, move)] {
+            await assertError(.permissionDenied) { _ = try await h.run(command, params) }
+        }
+        XCTAssertEqual(try h.snapshotAll(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+
+        h.session.readOnly = false
+        h.app.services.set(NSMutableSet(array: [Fixtures.docID.raw]), for: ServiceKeys.storeReadOnly)
+        for (command, params) in [(CommandIDs.layerRename, rename), (CommandIDs.layerMoveItems, move)] {
+            for principal in [Principal.user, .ai("test"), .plugin("test")] {
+                await assertError(.permissionDenied) { _ = try await h.run(command, params, as: principal) }
+            }
+        }
+        XCTAssertEqual(try h.snapshotAll(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
+    func testLayerEditsUseInvokingWindowAndDoNotBlockOtherPrincipals() async throws {
+        let h = harness()
+        h.app.gateway.grants = { principal in
+            if case .plugin = principal { return [.documentRead, .documentWrite] }
+            return Gateway.defaultGrants(principal)
+        }
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        other.readOnly = true
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        _ = try await h.run(CommandIDs.layerRename, ["doc": "doc:FIXTUREDOC01", "layer": 1, "name": "Writable"])
+        XCTAssertEqual(try layerName(h, 1), "Writable")
+        h.session.readOnly = true
+        _ = try await h.run(CommandIDs.layerRename, ["doc": "doc:FIXTUREDOC01", "layer": 1, "name": "AI"], as: .ai("test"))
+        _ = try await h.run(CommandIDs.layerMoveItems, ["refs": [.string(ref(Fixtures.strokeID))], "layer": 2], as: .plugin("test"))
+        XCTAssertEqual(try layerName(h, 1), "AI")
+        XCTAssertEqual(try item(h, Fixtures.strokeID).layer, 2)
+    }
+
     // MARK: Move items
 
     func testMoveItemsUndoRoundTripWithAttachedChildren() async throws {

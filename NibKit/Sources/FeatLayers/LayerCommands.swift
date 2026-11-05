@@ -347,6 +347,16 @@ struct LayerSetVisible: NibCommand {
     }
 }
 
+@MainActor
+private enum LayerEditing {
+    static func ensureWritable(_ doc: DocumentID, _ ctx: CommandContext) throws {
+        if ctx.isReadOnly(doc) || (ctx.principal.isUser && ctx.activeSession?.document == doc
+                                  && ctx.activeSession?.readOnly == true) {
+            throw NibError(.permissionDenied, String(localized: "This document is read-only."))
+        }
+    }
+}
+
 struct LayerRename: NibCommand {
     struct Params: Codable {
         /// The user may omit it: the invoking window's document (§6.1 session defaults).
@@ -370,6 +380,7 @@ struct LayerRename: NibCommand {
         try LayerModel.check(p.layer, path: "$.layer")
         let name = try LayerModel.cleanName(p.name, layer: p.layer)
         let doc = try ctx.documentOrSession(p.doc)
+        try LayerEditing.ensureWritable(doc, ctx)
         try ctx.mutate { (tx: DocTransaction) -> Void in
             var meta = try tx.content(doc).meta
             guard LayerModel.documentKinds.contains(meta.kind) else {
@@ -428,6 +439,7 @@ struct LayerMoveItems: NibCommand {
                 groups.append(Group(doc: doc, page: page, ids: [entry]))
             }
         }
+        for doc in Set(groups.map(\.doc)) { try LayerEditing.ensureWritable(doc, ctx) }
         let moved = try ctx.mutate { (tx: DocTransaction) -> Set<ElementID> in
             var moved = Set<ElementID>()
             for g in groups {

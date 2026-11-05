@@ -172,7 +172,9 @@ struct LayersPanel: View {
         return ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
                 ForEach(rows) { row in
-                    LayerRowView(row: row, isBoard: meta.kind == .whiteboard, canMoveSelection: !selection.isEmpty,
+                    LayerRowView(row: row, isBoard: meta.kind == .whiteboard,
+                                 canRename: !session.readOnly && !app.isReadOnly(doc),
+                                 canMoveSelection: !session.readOnly && !app.isReadOnly(doc) && !selection.isEmpty,
                                  onActivate: { run(CommandIDs.layerSetActive, ["layer": .number(Double(row.index))]) },
                                  onToggleVisible: {
                                      run(CommandIDs.layerSetVisible, ["layer": .number(Double(row.index)),
@@ -186,6 +188,7 @@ struct LayersPanel: View {
                 }
                 if !selection.isEmpty {
                     selectionSection(rows: rows, selection: selection)
+                        .disabled(session.readOnly || app.isReadOnly(doc))
                         .padding(.top, NibSpacing.m)
                 }
                 Text(String(localized: "Hidden layers stay hidden on this device only and are left out when you export."))
@@ -201,6 +204,7 @@ struct LayersPanel: View {
         .alert(String(localized: "Rename Layer"), isPresented: isRenaming) {
             TextField(String(localized: "Layer name"), text: $draftName)
             Button(String(localized: "Rename")) { commitRename(doc: doc) }
+                .disabled(session.readOnly || app.isReadOnly(doc))
             Button(String(localized: "Cancel"), role: .cancel) { renaming = nil }
         } message: {
             Text(String(localized: "Everyone who opens this document sees the new name."))
@@ -265,6 +269,7 @@ struct LayersPanel: View {
 struct LayerRowView: View {
     let row: LayerRow
     let isBoard: Bool
+    let canRename: Bool
     let canMoveSelection: Bool
     let onActivate: () -> Void
     let onToggleVisible: () -> Void
@@ -306,6 +311,7 @@ struct LayerRowView: View {
             .accessibilityAddTraits(row.isActive ? .isSelected : [])
             .accessibilityActions {
                 Button(String(localized: "Rename"), action: onRename)
+                    .disabled(!canRename)
                 if canMoveSelection {
                     Button(String(localized: "Move Selection Here"), action: onMoveSelection)
                 }
@@ -337,6 +343,7 @@ struct LayerRowView: View {
             Button(action: onRename) {
                 Label { Text(String(localized: "Rename…")) } icon: { Image(nib: .pencil) }
             }
+            .disabled(!canRename)
             if canMoveSelection {
                 Button(action: onMoveSelection) {
                     Label { Text(String(localized: "Move Selection Here")) } icon: { Image(nib: .lasso) }

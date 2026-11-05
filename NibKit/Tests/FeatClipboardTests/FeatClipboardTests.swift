@@ -763,6 +763,41 @@ final class FeatClipboardTests: XCTestCase {
         XCTAssertEqual(combined.assets.count, 1)
     }
 
+    func testUnreadableDroppedFragmentFallsBackToOneImageAndUndoes() async throws {
+        let h = Harness(features: [FeatClipboardFeature.self])
+        for bytes in [Data("{not a fragment".utf8), Data("{\"format\":\"nib-fragment/2\",\"items\":[],\"assets\":[]}".utf8)] {
+            let provider = NSItemProvider()
+            DragFlavours.now(provider, NibFragment.typeIdentifier, visibility: .all, data: bytes)
+            DragFlavours.now(provider, UTType.png.identifier, visibility: .all, data: Fixtures.pngData)
+            let payload = await DropReader.load([provider], style: TextBoxStyle(), limits: PasteLimits(page: .a4))
+            XCTAssertEqual(payload.fragments.map { $0.items.first?.kind }, [.image])
+            XCTAssertTrue(payload.files.isEmpty)
+            XCTAssertFalse(payload.hasUnreadableFragment)
+            let before = try h.snapshot()
+            await CanvasDragDrop.apply(payload, doc: Fixtures.docID, page: Fixtures.page1, at: Point(100, 100),
+                                       app: h.app, session: h.session)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), before)
+        }
+    }
+
+    func testUnreadableDropWithoutFallbackReportsFailureBeforeAnyWrite() async throws {
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let broken = NSItemProvider()
+        DragFlavours.now(broken, NibFragment.typeIdentifier, visibility: .all, data: Data("broken".utf8))
+        let text = NSItemProvider(object: "Keep at source" as NSString)
+        let payload = await DropReader.load([text, broken], style: TextBoxStyle(), limits: PasteLimits(page: .a4))
+        XCTAssertTrue(payload.hasUnreadableFragment)
+        let before = try h.snapshot()
+        let failure = expectation(forNotification: .nibCommandFailed, object: h.app)
+        await CanvasDragDrop.apply(payload, doc: Fixtures.docID, page: Fixtures.page1, at: Point(100, 100),
+                                   app: h.app, session: h.session)
+        await fulfillment(of: [failure], timeout: 1)
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
     func testDragAndDropAttachment() throws {
         let h = Harness(features: [FeatClipboardFeature.self])
         let host = FakeCanvasHost(h)

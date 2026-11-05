@@ -97,7 +97,7 @@ struct PDFMarkSelection: NibCommand {
                            hint: "call pdf.text for the page's text and pass points that lie on its lines")
         }
         let strokes = PDFMarkGeometry.strokes(over: found.lines, style: style)
-        let layer = ctx.activeSession?.activeLayer ?? 0
+        let layer = (ctx.activeSession?.document == doc ? ctx.activeSession?.activeLayer : nil) ?? 0
         if !ids.isEmpty {
             let taken = try Set(ctx.workspace.allItems(doc, page: page).map { $0.id.raw })
             for (i, id) in ids.enumerated() where taken.contains(id) {

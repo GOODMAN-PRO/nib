@@ -183,15 +183,22 @@ struct SearchOpen: NibCommand {
         // Reveal the fixed header and pending-state copy before the index query suspends.
         app.ui.setNeedsChromeUpdate(session)
         let requestedQuery = state.query
-        if changed || scopeChanged || state.matches.isEmpty || p.refresh == true || (p.match == nil && p.filter == nil) {
+        let shouldLoad = changed || scopeChanged || state.matches.isEmpty || p.refresh == true || (p.match == nil && p.filter == nil)
+        // load increments once before its first suspension. Keep that generation across every await, including
+        // the initial query, so dismissing and reopening the same query cannot revive an old match request.
+        let generation = state.generation + (shouldLoad ? 1 : 0)
+        if shouldLoad {
             try await runtime.load(state, context: ctx)
         }
         if let index = p.match {
-            guard state.isPresented, state.scope == scope, state.query == requestedQuery, !Task.isCancelled else { return output(state) }
+            guard state.isPresented, state.generation == generation, state.scope == scope,
+                  state.query == requestedQuery, !Task.isCancelled else { return output(state) }
             while !state.visibleMatches.indices.contains(index), state.cursor != nil, !state.loading {
+                guard state.isPresented, state.generation == generation, !Task.isCancelled else { return output(state) }
                 try await runtime.loadMore(state, context: ctx)
             }
-            guard state.isPresented, state.scope == scope, state.query == requestedQuery, !Task.isCancelled else { return output(state) }
+            guard state.isPresented, state.generation == generation, state.scope == scope,
+                  state.query == requestedQuery, !Task.isCancelled else { return output(state) }
             guard state.visibleMatches.indices.contains(index) else {
                 throw NibError(.invalidParams, "The search result no longer exists.", path: "$.match", hint: "Call search.open with the query again.")
             }

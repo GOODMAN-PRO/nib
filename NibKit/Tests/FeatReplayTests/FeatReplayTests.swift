@@ -53,7 +53,9 @@ enum ReplayQueryTestFeature: NibFeature {
                 guard let clip = content.liveAudio.first(where: { $0.id == id }) else { throw NibError.notFound(raw) }
                 return try JSONValue.from(clip).merging(["ref": .string(raw)])
             case let .page(_, page):
-                guard let record = content.page(page) else { throw NibError.notFound(raw) }
+                guard let record = content.page(page), !record.deleted || record.trashedAt != nil else {
+                    throw NibError.notFound(raw)
+                }
                 var result: JSONValue = ["ref": .string(raw), "kind": "page"]
                 if record.deleted { result = result.merging(["trashed": true]) }
                 if depth > 0 {
@@ -212,6 +214,30 @@ final class FeatReplayTests: XCTestCase {
         player.clip = nil
         await controller.refresh()
         XCTAssertNil(h.session.replay)
+    }
+
+    func testPlaybackStopEventClearsRevealAndSpotlightWithoutExplicitRefresh() async throws {
+        for mode in [ReplayMode.reveal, .spotlight] {
+            let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
+            let player = ReplayPlayerFake(); player.install(h.app)
+            let controller = try XCTUnwrap(ReplayController.of(h.app.services))
+            controller.configure(h.session, mode: mode, enabled: true, followAlong: false)
+            await controller.refresh()
+            XCTAssertNotNil(h.session.replay)
+            let ref = try XCTUnwrap(player.clip)
+            player.playing = false
+            player.t = 120
+            let cleared = expectation(description: "Unload clears replay")
+            let closeObserver = h.session.$replay.dropFirst().sink { replay in
+                if replay == nil { cleared.fulfill() }
+            }
+            player.clip = nil
+            controller.receive(h.app.events.emit(AudioPlaybackPayload(clip: ref, t: 120, playing: false, rate: 0)))
+            await fulfillment(of: [cleared], timeout: 2)
+            closeObserver.cancel()
+            XCTAssertNil(h.session.replay)
+            XCTAssertFalse(controller.playing)
+        }
     }
 
     func testEventOnlyInterpolationLoadsClipWithoutAudioCommands() async throws {
@@ -425,6 +451,45 @@ final class FeatReplayTests: XCTestCase {
         XCTAssertEqual(documentReads, 1)
         XCTAssertEqual(pageReads, ["page:FIXTUREDOC01/FIXTUREPG001", "page:FIXTUREDOC01/FIXTUREPG002", "page:FIXTUREDOC01/FIXTUREPG002"])
         XCTAssertEqual(h.session.page, Fixtures.page1)
+    }
+
+    func testPurgedPageDoesNotPreventFollowingSubsequentInk() async throws {
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
+        let player = ReplayPlayerFake(); player.install(h.app)
+        let controller = try XCTUnwrap(ReplayController.of(h.app.services))
+        var ink = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+        ink.id = "REPLAYPURGED"; ink.stroke?.t0 = 1_700_000_250
+        try await h.insert([ink], page: Fixtures.page2)
+        _ = try await h.run(CommandIDs.replaySetMode, ["mode": "spotlight", "followAlong": true])
+        player.t = 260; await controller.refresh()
+        XCTAssertEqual(h.session.page, Fixtures.page2)
+
+        h.app.commands.register(CommandDescriptor(id: "test.purgeReplayPage", title: "Purge Page",
+            summary: "Write the tombstone used by purge and page.move.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                guard var page = try tx.content(Fixtures.docID).page(Fixtures.page2) else {
+                    throw NibError.notFound("page")
+                }
+                page.deleted = true
+                page.trashedAt = nil
+                try tx.put(page, doc: Fixtures.docID)
+            }
+            return [:]
+        }
+        _ = try await h.run("test.purgeReplayPage")
+        controller.receive(h.app.events.emit(NibEventType.committed, doc: Fixtures.docID,
+            changes: ChangeSummary(removed: [NodeRef.page(Fixtures.docID, Fixtures.page2).description])))
+        await controller.refresh()
+        XCTAssertEqual(h.session.page, Fixtures.page1, "Remove links to the purged page")
+
+        ink.id = "REPLAYAFTERPURGE"; ink.stroke?.t0 = 1_700_000_300
+        try await h.insert([ink], page: Fixtures.pdfPage)
+        controller.receive(h.app.events.emit(NibEventType.committed, doc: Fixtures.docID,
+            changes: ChangeSummary(created: [NodeRef.item(Fixtures.docID, Fixtures.pdfPage, ink.id).description])))
+        player.t = 310; await controller.refresh()
+        XCTAssertEqual(h.session.page, Fixtures.pdfPage, "A dead dirty page must not poison later rebuilds")
+        player.t = 260; await controller.refresh()
+        XCTAssertEqual(h.session.page, Fixtures.page1, "Rewinding must not reveal the purged page")
     }
 
     func testReplayMenusRequireAudioAndLinkedStrokeAndShowKeyHints() throws {

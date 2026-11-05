@@ -93,6 +93,26 @@ final class ReplayPageLinkTests: XCTestCase {
         XCTAssertEqual(inks.map(\.isTape), [false, true])
     }
 
+    func testPageDisappearingDuringPaginationDropsAllItsInk() async throws {
+        let h = Harness(features: [FeatReplayFeature.self])
+        var calls = 0
+        let query: ReplayReader.Query = { _, params in
+            calls += 1
+            if params["cursor"] != nil { throw NibError.notFound("purged page") }
+            return ["items": [["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01", "kind": "stroke",
+                               "stroke": ["t0": 100]]], "cursor": "next"]
+        }
+        let inks = try await ReplayReader.inks(Fixtures.docID, page: Fixtures.page1, app: h.app, query: query)
+        XCTAssertTrue(inks.isEmpty)
+        XCTAssertEqual(calls, 2)
+        do {
+            _ = try await ReplayReader.inks(Fixtures.docID, page: Fixtures.page1, app: h.app) { _, _ in
+                throw NibError(.unavailable, "Retry this read")
+            }
+            XCTFail("Transient failures must remain retryable")
+        } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+    }
+
     func testTapQueryUsesPageAndFindSummariesWithoutT0() async throws {
         let h = Harness(features: [FeatReplayFeature.self])
         var calls: [String] = []

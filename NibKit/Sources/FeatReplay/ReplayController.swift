@@ -100,7 +100,14 @@ enum ReplayReader {
             var params: JSONValue = ["ref": .string(NodeRef.page(doc, page).description), "depth": 2,
                                      "fields": ["kind", "stroke", "bbox", "deleted"]]
             if let cursor { params = params.merging(["cursor": .string(cursor)]) }
-            let result = try await query(CommandIDs.queryGet, params)
+            let result: JSONValue
+            do {
+                result = try await query(CommandIDs.queryGet, params)
+            } catch let error as NibError where error.code == .notFound {
+                // Purged and moved pages have no readable record. Discard even earlier batches if the page
+                // disappeared during pagination; other errors still propagate so the controller can retry.
+                return []
+            }
             try requireExpanded(result)
             if result["trashed"]?.boolValue == true || result["deleted"]?.boolValue == true { return [] }
             for row in result["items"]?.arrayValue ?? [] {
@@ -249,6 +256,11 @@ final class ReplayController: NSObject, ObservableObject {
                 }
             }
             tick()
+            // Pause and unload share the same event. Coalesce a status read to distinguish them: a paused
+            // clip keeps replay at its position; Close Player, deletion and recording unload it entirely.
+            if !payload.playing {
+                Task { @MainActor [weak self] in await self?.refresh() }
+            }
         } else if event.type == NibEventType.committed, event.doc == NodeRef(clipRef ?? "")?.documentID {
             for ref in event.changes?.all ?? [] {
                 if let page = NodeRef(ref)?.pageID { dirtyPages.insert(page) }

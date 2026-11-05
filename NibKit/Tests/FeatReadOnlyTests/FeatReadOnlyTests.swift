@@ -162,6 +162,17 @@ final class FeatReadOnlyTests: XCTestCase {
         await assertThrows(.conflict) { try await h.run("pdf.markSelection", params) }
     }
 
+    func testMarkSelectionDoesNotBorrowAnotherDocumentsActiveLayer() async throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.activeLayer = 3
+        let result = try await h.run("pdf.markSelection", PDFMarkSelection.highlightExample, as: .ai("test"))
+        XCTAssertEqual(result["refs"]?.arrayValue?.count, 1)
+        XCTAssertEqual(try pdfItems(h).first?.layer, 0)
+        XCTAssertEqual(h.session.activeLayer, 3)
+        XCTAssertEqual(h.session.document, Fixtures.whiteboardID)
+    }
+
     func testMarkSelectionRejectsBadInputAndNeedsThePDFEngine() async {
         let h = harness()
         let onRuledPage: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG001", "from": [80, 100], "to": [300, 100],
