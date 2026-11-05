@@ -121,6 +121,28 @@ struct LibrarySearchOverlay: View {
     }
 }
 
+/// Search occupies the host proposal. Neither a droplet's ideal size nor result text may
+/// feed back into the next host width, including during an unspecified-size hosting probe.
+struct LibrarySearchViewportLayout: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        Self.size(for: proposal)
+    }
+
+    static func size(for proposal: ProposedViewSize) -> CGSize {
+        func finite(_ value: CGFloat?) -> CGFloat {
+            guard let value, value.isFinite else { return 0 }
+            return max(0, value)
+        }
+        return CGSize(width: finite(proposal.width), height: finite(proposal.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for view in subviews {
+            view.place(at: bounds.origin, anchor: .topLeading, proposal: ProposedViewSize(bounds.size))
+        }
+    }
+}
+
 @MainActor
 struct LibrarySearchFloatingContent: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -138,6 +160,15 @@ struct LibrarySearchFloatingContent: View {
     }
 
     var body: some View {
+        LibrarySearchViewportLayout {
+            content
+        }
+        .onReceive(contentBoundsPublisher ?? Just<CGRect?>(nil).eraseToAnyPublisher()) { bounds in
+            if libraryContentBounds != bounds { libraryContentBounds = bounds }
+        }
+    }
+
+    private var content: some View {
         GeometryReader { geometry in
             let hostBounds = SearchViewport.hostBounds(proposedSize: geometry.size, viewport: viewport)
             let measuredColumn = belowBars ? nil : libraryContentBounds
@@ -189,9 +220,6 @@ struct LibrarySearchFloatingContent: View {
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
-        }
-        .onReceive(contentBoundsPublisher ?? Just<CGRect?>(nil).eraseToAnyPublisher()) { bounds in
-            if libraryContentBounds != bounds { libraryContentBounds = bounds }
         }
     }
     private var presentationBinding: Binding<Bool> {

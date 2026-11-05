@@ -24,7 +24,7 @@ private struct SeedItems: NibCommand {
 
 /// Stand-in for F003's `item.update` (not linked into this test target) with the part the editor uses: it applies
 /// `patch.text.text` and, like the real command, checks the document lock only, never `item.locked`.
-/// The expectedText guard models the required F003 contract; production ItemUpdate still needs this guard.
+/// The expectedText guard models F003's transactional conflict check.
 private struct FakeItemUpdate: NibCommand {
     struct Params: Codable {
         struct Patch: Codable {
@@ -63,6 +63,19 @@ private struct FlakyItemUpdate: NibCommand {
     static func run(_ p: FakeItemUpdate.Params, _ ctx: CommandContext) async throws -> NoResult {
         if failing { throw NibError(.conflict, "the store is busy") }
         return try await FakeItemUpdate.run(p, ctx)
+    }
+}
+
+/// Holds the command result after its transaction and synchronous commit notification have completed.
+private struct PausedAfterCommitItemUpdate: NibCommand {
+    @MainActor static var afterCommit: (@MainActor () async throws -> Void)?
+
+    static let descriptor = FakeItemUpdate.descriptor
+
+    static func run(_ p: FakeItemUpdate.Params, _ ctx: CommandContext) async throws -> NoResult {
+        let result = try await FakeItemUpdate.run(p, ctx)
+        if p.expectedText != nil, let afterCommit { try await afterCommit() }
+        return result
     }
 }
 
@@ -605,6 +618,88 @@ final class FeatPageTextTests: XCTestCase {
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertEqual(boxText(h, page, id)?.plainText, "Mine")
         XCTAssertEqual(tv.text, "Mine")
+    }
+
+    func testCommittedAutosaveAwaitingReturnReloadsOutsideTextAndSeparatesUndo() async throws {
+        for remote in [false, true] {
+            try await checkOutsideChangeAfterAutosaveCommit(remote: remote, pendingTyping: false)
+        }
+    }
+
+    func testCommittedAutosaveAwaitingReturnPreservesNewTypingAndReportsConflictOnce() async throws {
+        for remote in [false, true] {
+            try await checkOutsideChangeAfterAutosaveCommit(remote: remote, pendingTyping: true)
+        }
+    }
+
+    private func checkOutsideChangeAfterAutosaveCommit(remote: Bool, pendingTyping: Bool) async throws {
+        let h = Harness(features: [FeatPageTextFeature.self])
+        h.app.commands.register(PausedAfterCommitItemUpdate.self)
+        let host = FakeCanvasHost(h)
+        let editor = PageTextEditor()
+        editor.attach(to: host)
+        defer { editor.finish(commit: false); editor.detach(from: host) }
+        let (page, id) = try await start(h, page2Ref)
+        let tv = try XCTUnwrap(textView(host))
+        var committed = false
+        var released = false
+        PausedAfterCommitItemUpdate.afterCommit = {
+            committed = true
+            for _ in 0..<300 where !released { try await Task.sleep(nanoseconds: 10_000_000) }
+            guard released else { throw NibError(.unavailable, "committed autosave gate timed out") }
+        }
+        defer { released = true; PausedAfterCommitItemUpdate.afterCommit = nil }
+        let reports = Counter()
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+            reports.count += 1
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        XCTAssertTrue(typeText("Mine", editor, tv))
+        let autosave = Task { await editor.commitNow() }
+        let paused = await eventually { committed }
+        XCTAssertTrue(paused)
+        XCTAssertEqual(boxText(h, page, id)?.plainText, "Mine")
+        if pendingTyping { XCTAssertTrue(typeText(" pending", editor, tv)) }
+        let depth = h.undoDepth(Fixtures.docID)
+        if remote {
+            var item = try h.app.workspace.item(Fixtures.docID, page: page, id: id)
+            item.rev = Rev(wallMs: item.rev.wallMs, counter: item.rev.counter + 1, device: 99)
+            item.text?.text = RichText(plain: "Theirs")
+            let patch = DocumentPatch(doc: Fixtures.docID, items: [page.raw: [item]])
+            XCTAssertEqual(h.app.bus.applyRemote(patch, origin: "test").updated.count, 1)
+        } else {
+            let ref = NodeRef.item(Fixtures.docID, page, id).description
+            try await h.run(CommandIDs.itemUpdate, ["ref": .string(ref), "patch": ["text": ["text": "Theirs"]]])
+        }
+        XCTAssertEqual(boxText(h, page, id)?.plainText, "Theirs")
+        XCTAssertEqual(tv.text, pendingTyping ? "Mine pending" : "Theirs")
+        XCTAssertEqual(reports.count, pendingTyping ? 1 : 0)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + (remote ? 0 : 1))
+        released = true
+        await autosave.value // bounded gate; resumes the old task after the outside commit
+        PausedAfterCommitItemUpdate.afterCommit = nil
+
+        if pendingTyping {
+            await editor.commitNow()
+            editor.finish()
+            XCTAssertEqual(reports.count, 1, "the completed old save must not clear the reported conflict")
+            XCTAssertEqual(boxText(h, page, id)?.plainText, "Theirs")
+            let current = try h.app.workspace.item(Fixtures.docID, page: page, id: id)
+            editor.beginEditing(current, doc: Fixtures.docID, page: page)
+            XCTAssertEqual(textView(host)?.text, "Mine pending", "the local draft remains available to copy")
+        } else {
+            let outsideDepth = h.undoDepth(Fixtures.docID)
+            tv.selectedRange = NSRange(location: (tv.text as NSString).length, length: 0)
+            XCTAssertTrue(typeText("!", editor, tv))
+            await editor.commitNow()
+            XCTAssertEqual(boxText(h, page, id)?.plainText, "Theirs!")
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), outsideDepth + 1)
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(boxText(h, page, id)?.plainText, "Theirs", "undo removes only the next local change")
+            XCTAssertEqual(tv.text, "Theirs")
+            XCTAssertEqual(reports.count, 0)
+        }
     }
 
     func testPendingAutosavePreservesExternalTextAndLocalDraft() async throws {

@@ -101,6 +101,9 @@ final class FeatSettingsTests: XCTestCase {
         var enteredDraft = false
         for (width, size) in [(CGFloat(900), DynamicTypeSize.large), (390, .large),
                               (900, .large), (900, .accessibility5), (900, .large)] {
+            let beforeResize = settingsDraftSnapshot(
+                field: settingsSubviews(host.view).compactMap { $0 as? UITextField }.first { $0.isSecureTextEntry },
+                model: probe.models.last)
             window.frame.size.width = width
             host.view.frame = window.bounds
             host.traitOverrides.horizontalSizeClass = width < 600 ? .compact : .regular
@@ -114,13 +117,12 @@ final class FeatSettingsTests: XCTestCase {
             let field = try XCTUnwrap(settingsSubviews(host.view).compactMap { $0 as? UITextField }
                 .first { $0.isSecureTextEntry })
             if !enteredDraft {
-                field.text = "unsaved password"
-                field.sendActions(for: .editingChanged)
-                try await Task.sleep(for: .milliseconds(20))
+                try await enterSettingsDraft("unsaved password", field: field, model: draft)
                 enteredDraft = true
             }
-            XCTAssertEqual(draft.password, "unsaved password")
-            XCTAssertEqual(field.text, "unsaved password", "the visible field must retain the draft")
+            let diagnostic = settingsDraftSnapshot(field: field, model: draft)
+            XCTAssertEqual(draft.password, "unsaved password", "width=\(width), type=\(size); before=\(beforeResize); after=\(diagnostic)")
+            XCTAssertEqual(field.text, "unsaved password", "the visible field must retain the draft; before=\(beforeResize); after=\(diagnostic)")
         }
     }
 
@@ -201,13 +203,16 @@ final class FeatSettingsTests: XCTestCase {
         let draftPage = try XCTUnwrap(catalog.page("test.draft"))
         SettingsPageRow(page: draftPage, catalog: catalog, state: root.state).open()
         try await hosted.settle()
-        try await hosted.enterDraft("multi-page draft")
+        let draft = try XCTUnwrap(probe.models.first)
+        try await hosted.enterDraft("multi-page draft", model: draft)
         for width in [CGFloat(390), 900] {
+            let before = settingsDraftSnapshot(field: hosted.draftFields.first, model: draft)
             hosted.resize(width: width)
             try await hosted.settle()
             XCTAssertEqual(probe.models.count, 1)
-            XCTAssertEqual(probe.models.first?.password, "multi-page draft")
-            XCTAssertEqual(hosted.draftFields.first?.text, "multi-page draft")
+            let diagnostic = "before=\(before); after=\(settingsDraftSnapshot(field: hosted.draftFields.first, model: probe.models.last))"
+            XCTAssertEqual(probe.models.first?.password, "multi-page draft", diagnostic)
+            XCTAssertEqual(hosted.draftFields.first?.text, "multi-page draft", diagnostic)
         }
         root.state.compactPath = [] // Native Back returns to the section's rows.
         try await hosted.settle()
@@ -229,7 +234,9 @@ final class FeatSettingsTests: XCTestCase {
         defer { firstHost.close() }
         try await firstHost.settle()
         try assertSolePageIsVisible(firstHost)
-        try await firstHost.enterDraft("first window draft")
+        let firstDraft = try XCTUnwrap(probe.models.last)
+        try await firstHost.enterDraft("first window draft", model: firstDraft)
+        let firstBefore = settingsDraftSnapshot(field: firstHost.draftFields.first, model: firstDraft)
 
         let second = RecordingNavigator(h)
         h.app.ui.activeNavigator = second
@@ -240,15 +247,21 @@ final class FeatSettingsTests: XCTestCase {
         defer { secondHost.close() }
         try await secondHost.settle()
         try assertSolePageIsVisible(secondHost)
-        try await secondHost.enterDraft("second window draft")
+        let secondDraft = try XCTUnwrap(probe.models.last)
+        try await secondHost.enterDraft("second window draft", model: secondDraft)
+        let secondBefore = settingsDraftSnapshot(field: secondHost.draftFields.first, model: secondDraft)
         firstHost.resize(width: 390)
         secondHost.resize(width: 900)
         try await firstHost.settle()
         try await secondHost.settle()
         XCTAssertEqual(firstRoot.state.section, .plugins)
         XCTAssertEqual(secondRoot.state.section, .bridge)
-        XCTAssertEqual(firstHost.draftFields.first?.text, "first window draft")
-        XCTAssertEqual(secondHost.draftFields.first?.text, "second window draft")
+        let firstDiagnostic = "before=\(firstBefore); after=\(settingsDraftSnapshot(field: firstHost.draftFields.first, model: firstDraft))"
+        let secondDiagnostic = "before=\(secondBefore); after=\(settingsDraftSnapshot(field: secondHost.draftFields.first, model: secondDraft))"
+        XCTAssertEqual(firstDraft.password, "first window draft", firstDiagnostic)
+        XCTAssertEqual(secondDraft.password, "second window draft", secondDiagnostic)
+        XCTAssertEqual(firstHost.draftFields.first?.text, "first window draft", firstDiagnostic)
+        XCTAssertEqual(secondHost.draftFields.first?.text, "second window draft", secondDiagnostic)
         XCTAssertEqual(probe.models.count, 2)
         XCTAssertEqual(first.requestedPages, ["test.draft"])
         XCTAssertEqual(second.requestedPages, ["test.bridge"])
@@ -873,12 +886,8 @@ private final class HostedSettings {
         }
     }
 
-    func enterDraft(_ text: String) async throws {
-        let field = try XCTUnwrap(draftFields.first)
-        field.text = text
-        field.sendActions(for: .editingChanged)
-        try await settle()
-        XCTAssertEqual(field.text, text)
+    func enterDraft(_ text: String, model: SettingsDraftModel) async throws {
+        try await enterSettingsDraft(text, field: XCTUnwrap(draftFields.first), model: model)
     }
 
     func close() {
@@ -891,6 +900,35 @@ private final class HostedSettings {
 private func settingsSubviews(_ view: UIView) -> [UIView] {
     [view] + view.subviews.flatMap { settingsSubviews($0) }
 }
+
+@MainActor
+private func settingsDraftSnapshot(field: UITextField?, model: SettingsDraftModel?) -> String {
+    "field=\(String(reflecting: field?.text)), model=\(String(reflecting: model?.password)), responder=\(field?.isFirstResponder ?? false)"
+}
+
+/// Exercise UIKit's text-input path and SwiftUI's delegate callback. Assigning `text` and sending
+/// editingChanged alone may leave SecureField's binding untouched on iOS 26. Request focus when
+/// the host permits it; the binding assertions below diagnose a scene-less input failure separately.
+@MainActor
+private func enterSettingsDraft(_ text: String, field: UITextField, model: SettingsDraftModel) async throws {
+    let before = settingsDraftSnapshot(field: field, model: model)
+    _ = field.becomeFirstResponder()
+    field.selectedTextRange = field.textRange(from: field.beginningOfDocument, to: field.endOfDocument)
+    field.insertText(text)
+    field.sendActions(for: .editingChanged)
+    field.delegate?.textFieldDidChangeSelection?(field)
+    let deadline = Date().addingTimeInterval(2)
+    while model.password != text && Date() < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    let diagnostic = "draft input before=\(before); after=\(settingsDraftSnapshot(field: field, model: model))"
+    XCTAssertEqual(field.text, text, diagnostic)
+    XCTAssertEqual(model.password, text, diagnostic)
+    // Stop here if input failed: a resize assertion must never misreport an unentered draft as state loss.
+    guard field.text == text, model.password == text else { throw SettingsDraftInputError.bindingDidNotUpdate }
+}
+
+private enum SettingsDraftInputError: Error { case bindingDidNotUpdate }
 
 @MainActor
 private final class SettingsDraftProbe {
