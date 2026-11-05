@@ -132,6 +132,13 @@ final class FeatSearchUITests: XCTestCase {
         }
     }
 
+    func testSearchContinuationExplainsClippedRowsAndDisappearsAtTheEnd() {
+        XCTAssertFalse(SearchScrollContinuation.isVisible(contentBottom: 400, viewportHeight: 0))
+        XCTAssertTrue(SearchScrollContinuation.isVisible(contentBottom: 400, viewportHeight: 160))
+        XCTAssertFalse(SearchScrollContinuation.isVisible(contentBottom: 160, viewportHeight: 160))
+        XCTAssertFalse(SearchScrollContinuation.isVisible(contentBottom: 120, viewportHeight: 160))
+    }
+
     func testMatchControlsDisableForEmptyPendingFailedAndFilteredResults() {
         let state = SearchState()
         state.scope = NodeRef.document(Fixtures.docID).description

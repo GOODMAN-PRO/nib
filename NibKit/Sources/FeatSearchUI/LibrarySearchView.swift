@@ -215,6 +215,12 @@ struct SearchResults: View {
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
+    @Namespace private var scrollSpace
+    @State private var contentBottom: CGFloat = 0
+    @State private var viewportHeight: CGFloat = 0
+    private var showsContinuation: Bool {
+        SearchScrollContinuation.isVisible(contentBottom: contentBottom, viewportHeight: viewportHeight)
+    }
     var body: some View {
         VStack(spacing: 0) {
             if !state.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -288,8 +294,27 @@ struct SearchResults: View {
                     }
                     .foregroundStyle(NibColor.label)
                     .padding(NibSpacing.l)
+                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(scrollSpace)).maxY } action: {
+                        contentBottom = $0
+                    }
                 }
+                .coordinateSpace(name: scrollSpace)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { viewportHeight = $0 }
                 .scrollBounceBehavior(.basedOnSize)
+                .scrollIndicators(.visible)
+                .nibFadeBottomEdge(showsContinuation ? NibSpacing.l : 0)
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    if showsContinuation {
+                        HStack(spacing: NibSpacing.xs) {
+                            Image(nib: .chevronDown).accessibilityHidden(true)
+                            Text(String(localized: "Scroll for more results"))
+                        }
+                        .font(NibFont.footnote)
+                        .foregroundStyle(NibColor.labelSecondary)
+                        .padding(.bottom, NibSpacing.s)
+                        .frame(maxWidth: .infinity)
+                    }
+                }
                 .onChange(of: state.selectedID) { _, id in
                     if let id { proxy.scrollTo(id, anchor: .center) }
                 }
@@ -298,6 +323,12 @@ struct SearchResults: View {
     }
     private func loadMore() {
         app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "more": true], session: session)
+    }
+}
+
+enum SearchScrollContinuation {
+    static func isVisible(contentBottom: CGFloat, viewportHeight: CGFloat) -> Bool {
+        viewportHeight > 0 && contentBottom > viewportHeight + NibSpacing.xxs
     }
 }
 
