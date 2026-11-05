@@ -780,7 +780,31 @@ final class NibUI {
     }
 
     /// Runner-only hardware delivery, also usable for native popover dismissal without inventing AX focus.
+    /// XCTest's synthesized keyboard loses the modifier keys of the first key event a newly launched app process
+    /// receives: in runs 41924805545, 41947110795 and 41948098661, 73 of 74 chords sent as the first key of a
+    /// process arrived bare or not at all (the app's keyLog shows no modifier press), while every later chord
+    /// in the same process arrived intact. So before the first key of a process, open the route with one unbound
+    /// plain key and wait until the app reports a press. Skipped while text has the keyboard: it would be typed.
+    private func openHardwareKeyRoute() throws {
+        let before = try state()
+        guard before.keyResponderIsText != true, let log = before.keyLog, log.isEmpty else { return }
+        for attempt in 1...3 {
+            try sendHardwareKey(";", [])
+            if (try? waitForState(timeout: 3) { !($0.keyLog ?? []).isEmpty }) != nil {
+                logQA("Hardware key route opened", "attempt \(attempt)")
+                return
+            }
+        }
+        // A press delivered to another window of the app is not in keyLog; the caller's postcondition decides.
+        logQA("Hardware key route unobserved", "no window press reported after three unbound keys")
+    }
+
     func hardwareKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = []) throws {
+        try openHardwareKeyRoute()
+        try sendHardwareKey(key, modifiers)
+    }
+
+    private func sendHardwareKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags) throws {
         try XCTContext.runActivity(named: "Hardware key \(key), modifiers \(modifiers.rawValue)") { activity in
             let route = XCTAttachment(string: "route=NibTouchPaths key=\(key) modifiers=\(modifiers.rawValue); SPI route is in runner log")
             route.lifetime = .keepAlways; activity.add(route)
