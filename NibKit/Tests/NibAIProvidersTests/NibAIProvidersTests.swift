@@ -483,7 +483,12 @@ final class NibAIProvidersTests: XCTestCase {
         "the model may still be loading — retry, or check that the server is running" = "le modèle charge peut-être encore — réessayez ou vérifiez le serveur";
         """#
         try strings.write(to: language.appendingPathComponent("Localizable.strings"), atomically: true, encoding: .utf8)
-        let bundle = try XCTUnwrap(Bundle(url: language))
+        let info: [String: Any] = ["CFBundleIdentifier": "app.nib.tests.french-errors",
+                                   "CFBundlePackageType": "BNDL", "CFBundleDevelopmentRegion": "fr",
+                                   "CFBundleLocalizations": ["fr"]]
+        let plist = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try plist.write(to: root.appendingPathComponent("Info.plist"))
+        let bundle = try XCTUnwrap(Bundle(url: root))
         let locale = Locale(identifier: "fr_FR")
         let config = AIProviderConfig(name: "P", kind: .openAICompatible,
                                       baseURL: URL(string: "https://api.example.com/v1")!, model: "m")

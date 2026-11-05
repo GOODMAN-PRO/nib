@@ -508,6 +508,43 @@ final class NibAIAgentTests: XCTestCase {
         XCTAssertEqual(store(dir, device: 0x0B).messages(chat).map(\.id), [record.id])
     }
 
+    func testRepeatedConflictScansKeepOnePendingMergePerSnapshot() throws {
+        let dir = tempFolder()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let writer = store(dir, device: 0x0A)
+        let chat = "CHATMERGEQUEUE"
+        let first = writer.makeMessage(role: "user", text: "First conflict record")
+        let second = writer.makeMessage(role: "assistant", text: "Later conflict record")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let conflict = dir.appendingPathComponent("\(chat).0000000a 2.jsonl")
+        let destination = dir.appendingPathComponent(writer.ownFileName(chat))
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try ChatStore.encodeLines([first]).write(to: conflict)
+        for _ in 0..<10 {
+            writer.refresh(force: true)
+            XCTAssertNotNil(writer.flush())
+            XCTAssertEqual(writer.pendingWriteCount, 1, "An unchanged blocked merge must not accumulate snapshots")
+        }
+        // A newer synced copy must still be queued, even while the older snapshot is blocked.
+        try ChatStore.encodeLines([first, second]).write(to: conflict)
+        for _ in 0..<10 {
+            writer.refresh(force: true)
+            XCTAssertEqual(writer.pendingWriteCount, 2)
+        }
+        try FileManager.default.removeItem(at: destination)
+        XCTAssertNil(writer.flush())
+        XCTAssertEqual(writer.pendingWriteCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
+        XCTAssertEqual(store(dir, device: 0x0B).messages(chat).map(\.id), [first.id, second.id])
+
+        // Successful completion releases the deduplication key for a later sync conflict.
+        try ChatStore.encodeLines([first, second]).write(to: conflict)
+        writer.refresh(force: true)
+        XCTAssertNil(writer.flush())
+        XCTAssertEqual(writer.pendingWriteCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
+    }
+
     func testUnreadableConflictCopyIsRetried() throws {
         let dir = tempFolder()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -838,7 +875,7 @@ final class NibAIAgentTests: XCTestCase {
         XCTAssertTrue(staticPart.contains("Cite sources as markdown links to nib://open/<doc>/<page>"))
         XCTAssertTrue(staticPart.contains("Reply in the user's language."))
         XCTAssertTrue(staticPart.contains("- edit (2): edit.redo, edit.undo"))
-        XCTAssertTrue(staticPart.contains("- ai (5): ai.ask, ai.chat.delete, ai.chat.feedback"))
+        XCTAssertTrue(staticPart.contains("- ai (6): ai.ask, ai.chat.delete, ai.chat.feedback"))
         XCTAssertTrue(staticPart.contains("- Prefer dev.nib.cards.fromSelection for flashcards."))
         XCTAssertFalse(staticPart.contains("plugin.install"), "the plugin-authoring rule needs plugin.install")
         XCTAssertEqual(staticPart, SystemPrompt.staticPart(registry: h.app.commands, exposure: .ai,

@@ -158,23 +158,41 @@ struct ChatState {
 /// Retrying an atomic replacement cannot append a partial record twice.
 private final class ChatWrites {
     let queue = DispatchQueue(label: "app.nib.aiagent.chats", qos: .utility)
-    private var pending: [() throws -> Void] = []
+    struct MergeKey: Hashable {
+        let destination: URL
+        let data: Data
+        let conflicts: Set<URL>
+    }
+    private struct Job {
+        let merge: MergeKey?
+        let write: () throws -> Void
+    }
+    private var pending: [Job] = []
+    private var pendingMerges = Set<MergeKey>()
+    var pendingCount: Int { pending.count } // Accessed only on queue.
 
     func enqueue(_ write: @escaping () throws -> Void) {
         queue.async { self.enqueueOnQueue(write) }
     }
 
     /// Called only on queue, including by the archive scanner.
-    func enqueueOnQueue(_ write: @escaping () throws -> Void) {
-        pending.append(write)
+    func enqueueOnQueue(merge: MergeKey? = nil, _ write: @escaping () throws -> Void) {
+        // Refresh can rediscover the same conflict while storage is blocked. Retain one
+        // snapshot per identical merge, but keep genuinely changed contents in order.
+        if let merge, !pendingMerges.insert(merge).inserted {
+            _ = retry()
+            return
+        }
+        pending.append(Job(merge: merge, write: write))
         _ = retry()
     }
 
     func retry() -> NibError? {
-        while let write = pending.first {
+        while let job = pending.first {
             do {
-                try write()
+                try job.write()
                 pending.removeFirst()
+                if let merge = job.merge { pendingMerges.remove(merge) }
             } catch {
                 return NibError(.unavailable, String(localized: "The conversation could not be saved."),
                                 hint: String(localized: "Free some storage and try again. Unsaved messages are kept for retry while Nib is open."))
@@ -216,6 +234,7 @@ final class ChatStore {
     /// Durable message bodies are loaded on demand; unsaved bodies are pinned until flush succeeds.
     static let messageCacheLimit = 4
     var cachedChatIDs: Set<String> { Set(chats.keys) }
+    var pendingWriteCount: Int { io.sync { writes.pendingCount } }
 
     struct Overview {
         // Metadata is small and preserves ownership/deletion if a synced file is temporarily unreadable.
@@ -585,7 +604,8 @@ final class ChatStore {
                 let records = state.isDeleted ? state.meta.map { [$0] } ?? [] : ordered(state)
                 let data = encodeLines(records)
                 let destination = dir.appendingPathComponent("\(chat).\(device).\(fileExtension)")
-                writes.enqueueOnQueue {
+                let merge = ChatWrites.MergeKey(destination: destination, data: data, conflicts: Set(conflicts))
+                writes.enqueueOnQueue(merge: merge) {
                     try fm.createDirectory(at: dir, withIntermediateDirectories: true)
                     try data.write(to: destination, options: .atomic)
                     for url in conflicts where fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
