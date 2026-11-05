@@ -57,6 +57,48 @@ enum CropEditing {
     }
 }
 
+/// Named action equivalents for translating the crop and moving each edge independently.
+enum CropAdjustment: CaseIterable {
+    case moveLeft, moveRight, moveUp, moveDown
+    case leftOut, leftIn, rightIn, rightOut, topOut, topIn, bottomIn, bottomOut
+
+    var title: String {
+        switch self {
+        case .moveLeft: return String(localized: "Move crop left")
+        case .moveRight: return String(localized: "Move crop right")
+        case .moveUp: return String(localized: "Move crop up")
+        case .moveDown: return String(localized: "Move crop down")
+        case .leftOut: return String(localized: "Move left edge left")
+        case .leftIn: return String(localized: "Move left edge right")
+        case .rightIn: return String(localized: "Move right edge left")
+        case .rightOut: return String(localized: "Move right edge right")
+        case .topOut: return String(localized: "Move top edge up")
+        case .topIn: return String(localized: "Move top edge down")
+        case .bottomIn: return String(localized: "Move bottom edge up")
+        case .bottomOut: return String(localized: "Move bottom edge down")
+        }
+    }
+
+    func apply(to rect: Rect) -> Rect {
+        let delta: (handle: CropHandle?, dx: Double, dy: Double)
+        switch self {
+        case .moveLeft: delta = (nil, -0.05, 0)
+        case .moveRight: delta = (nil, 0.05, 0)
+        case .moveUp: delta = (nil, 0, -0.05)
+        case .moveDown: delta = (nil, 0, 0.05)
+        case .leftOut: delta = (.left, -0.05, 0)
+        case .leftIn: delta = (.left, 0.05, 0)
+        case .rightIn: delta = (.right, -0.05, 0)
+        case .rightOut: delta = (.right, 0.05, 0)
+        case .topOut: delta = (.top, 0, -0.05)
+        case .topIn: delta = (.top, 0, 0.05)
+        case .bottomIn: delta = (.bottom, 0, -0.05)
+        case .bottomOut: delta = (.bottom, 0, 0.05)
+        }
+        return CropEditing.drag(rect, handle: delta.handle, dx: delta.dx, dy: delta.dy)
+    }
+}
+
 /// A gesture owns its preview only. The gesture-lifetime reset discards it on cancellation;
 /// completed geometry lives separately.
 struct CropGestureDraft {
@@ -212,8 +254,16 @@ struct ImageCropSheet: View {
         .frame(width: size.width, height: size.height)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(String(localized: "Crop area"))
-        .accessibilityValue(String(localized: "\(Int((rect.width * 100).rounded())) per cent wide, \(Int((rect.height * 100).rounded())) per cent tall"))
-        .accessibilityHint(String(localized: "Swipe up or down to grow or shrink the crop."))
+        .accessibilityValue(cropAccessibilityValue)
+        .accessibilityHint(String(localized: "Swipe up or down to grow or shrink the crop. Use Actions to move the crop or its edges."))
+        .accessibilityActions {
+            ForEach(CropAdjustment.allCases, id: \.self) { adjustment in
+                Button(adjustment.title) {
+                    rect = adjustment.apply(to: rect)
+                    aspect = nil
+                }
+            }
+        }
         .accessibilityAdjustableAction { direction in
             switch direction {
             case .increment: rect = CropEditing.scaled(rect, by: 1.1)
@@ -222,6 +272,12 @@ struct ImageCropSheet: View {
             }
             aspect = nil
         }
+    }
+
+    private var cropAccessibilityValue: String {
+        let x = Int((rect.x * 100).rounded()), y = Int((rect.y * 100).rounded())
+        let width = Int((rect.width * 100).rounded()), height = Int((rect.height * 100).rounded())
+        return String(localized: "\(x) per cent from left, \(y) per cent from top, \(width) per cent wide, \(height) per cent tall")
     }
 
     private func drag(_ handle: CropHandle?, _ size: CGSize) -> some Gesture {

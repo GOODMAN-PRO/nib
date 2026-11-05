@@ -41,6 +41,23 @@ final class ImageAssetSpy: AssetStore {
 
 @MainActor
 final class ImageImportRegressionTests: XCTestCase {
+    func testAccessibleActionsCanKeepAnOffCentreSubjectAndAdjustEveryEdge() {
+        var rect = CropEditing.scaled(ImageGeometry.unit, by: 0.5)
+        for _ in 0..<5 {
+            rect = CropAdjustment.moveLeft.apply(to: rect)
+            rect = CropAdjustment.moveUp.apply(to: rect)
+        }
+        XCTAssertEqual(rect.x, 0, accuracy: 1e-12)
+        XCTAssertEqual(rect.y, 0, accuracy: 1e-12)
+        XCTAssertEqual(rect.width, 0.5, accuracy: 1e-12)
+        XCTAssertEqual(rect.height, 0.5, accuracy: 1e-12)
+        for action in CropAdjustment.allCases {
+            let centred = Rect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+            XCTAssertNotEqual(action.apply(to: centred), centred)
+            XCTAssertFalse(action.title.isEmpty)
+        }
+    }
+
     func testCancelledRectanglePreviewCannotBecomeTheNextDragOrigin() {
         let committed = Rect(x: 0.2, y: 0.2, width: 0.5, height: 0.5)
         var draft = CropGestureDraft()
