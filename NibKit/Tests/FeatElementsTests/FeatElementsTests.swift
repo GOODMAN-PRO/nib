@@ -11,10 +11,12 @@ import NibDesign
 final class FakeGiphyTransport: GiphyTransport {
     var status = 200
     var body = Data()
+    var failure: Error?
     private(set) var requests: [URLRequest] = []
 
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
         requests.append(request)
+        if let failure { throw failure }
         guard let url = request.url,
               let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil) else {
             throw URLError(.badURL)
@@ -1098,6 +1100,29 @@ final class FeatElementsTests: XCTestCase {
         await model.searchGIFs()
         XCTAssertEqual(model.gifState, .loaded)
         XCTAssertEqual(model.gifQuery, "physics")
+    }
+
+    func testGiphyFailuresUseLocalisedPresentationCopy() async throws {
+        let h = harness()
+        let originalKey = GiphyKey.load()
+        defer { GiphyKey.save(originalKey) }
+        XCTAssertTrue(GiphyKey.save("unit-test-key"))
+        let transport = FakeGiphyTransport()
+        let runtime = try XCTUnwrap(h.app.services.get(ElementsRuntime.key, as: ElementsRuntime.self))
+        runtime.giphy = GiphyClient(transport: transport)
+        let model = ElementsModel(app: h.app, session: h.session)
+        defer { model.stop() }
+        model.gifQuery = "physics"
+        for (status, message) in [(403, String(localized: "GIPHY did not accept the API key")),
+                                  (429, String(localized: "GIPHY's search limit for this key is used up"))] {
+            transport.status = status
+            await model.searchGIFs()
+            XCTAssertEqual(model.gifState, .failed(message))
+            XCTAssertEqual(GiphyClient.error(status: status).code, .unavailable)
+        }
+        transport.failure = NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "raw transport diagnostic"])
+        await model.searchGIFs()
+        XCTAssertEqual(model.gifState, .failed(String(localized: "GIPHY could not be reached")))
     }
 
     func testGIFLinkPromptDispatchesOneAnimatedInsertAndRejectsInvalidInput() async throws {

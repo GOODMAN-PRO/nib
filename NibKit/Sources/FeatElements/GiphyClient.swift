@@ -78,18 +78,18 @@ final class GiphyClient {
 
     func search(_ query: String, kind: GiphyKind, limit: Int, offset: Int) async throws -> GiphyPage {
         guard let key = key() else {
-            throw NibError(.unavailable, "GIPHY search needs your GIPHY API key",
-                           hint: "add a key in Settings › Elements and GIFs; GIFs from Files or a link work without one")
+            throw NibError(.unavailable, String(localized: "GIPHY search needs your GIPHY API key"),
+                           hint: String(localized: "add a key in Settings › Elements and GIFs; GIFs from Files or a link work without one"))
         }
         guard let request = GiphyClient.request(query: query, key: key, kind: kind, limit: limit, offset: offset) else {
-            throw NibError.invalid("the search could not be sent", path: "$.query")
+            throw NibError.invalid(String(localized: "the search could not be sent"), path: "$.query")
         }
         let reply: (Data, URLResponse)
         do {
             reply = try await transport.data(for: request)
         } catch {
-            throw NibError(.unavailable, "GIPHY could not be reached (\(error.localizedDescription))",
-                           hint: "check the connection and search again")
+            throw NibError(.unavailable, String(localized: "GIPHY could not be reached"),
+                           hint: String(localized: "check the connection and search again"))
         }
         if let http = reply.1 as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw GiphyClient.error(status: http.statusCode)
@@ -119,11 +119,11 @@ final class GiphyClient {
     static func error(status: Int) -> NibError {
         switch status {
         case 401, 403:
-            return NibError(.unavailable, "GIPHY did not accept the API key", hint: "check the key in Settings › Elements and GIFs")
+            return NibError(.unavailable, String(localized: "GIPHY did not accept the API key"), hint: String(localized: "check the key in Settings › Elements and GIFs"))
         case 429:
-            return NibError(.unavailable, "GIPHY's search limit for this key is used up", hint: "wait a minute, then search again")
+            return NibError(.unavailable, String(localized: "GIPHY's search limit for this key is used up"), hint: String(localized: "wait a minute, then search again"))
         default:
-            return NibError(.unavailable, "GIPHY answered with HTTP \(status)", hint: "search again later")
+            return NibError(.unavailable, String(localized: "GIPHY answered with HTTP \(status)"), hint: String(localized: "search again later"))
         }
     }
 
@@ -186,7 +186,7 @@ final class GiphyClient {
         do {
             wire = try JSONDecoder().decode(Wire.self, from: data)
         } catch {
-            throw NibError(.unavailable, "GIPHY sent a reply Nib could not read", hint: "search again later")
+            throw NibError(.unavailable, String(localized: "GIPHY sent a reply Nib could not read"), hint: String(localized: "search again later"))
         }
         let gifs = wire.data.compactMap { g -> GiphyGIF? in
             let original = g.images["original"] ?? g.images["downsized"]
