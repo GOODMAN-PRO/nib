@@ -60,3 +60,12 @@ Confirmed chrome-timeouts#3/#4, create#3 and insert-timeouts-state#1 corrections
 ### C1 - tabs fixture prerequisites
 
 Confirmed chrome-timeouts#5: eight New Notebook UI creations at 26–46 seconds each structurally exceed the allowance. Added explicit tabsOverflow cases to the runner and app scenario enums; only this test selects the scenario in setup, matching Canvas's existing launch pattern. The fixture creates eight extra persisted notebooks. Offscreen fixture cards are revealed through the bounded shared list helper before the existing clipped card tap. The test opens all nine through actual library cards, retaining overflow selection, all Command-1…8/9 assertions and hidden/restored-tabs checks. No tab state is injected. Grepped all scenario references: no exhaustive switch over either enum exists; notebookPageCount remains unchanged. CI must show eight library opens, no New Notebook loop, all nine distinct switches, and completion under the original allowance (diagnosis target <120 seconds is unmeasured).
+
+### C2 - Time Keeper routes and form expectations
+
+Confirmed chrome-timeouts#6 correction and chrome-singles#6–9 corrections against FeatTimeKeeperFeature, TimerCommands and TimeKeeperView. Plain K opens the idle panel; Command-Option-K records a lap. Current source also shows K toggles only the running bar, whose summary button opens details, so active-session setup uses that real button. Already-open setup reuses the panel. The stopwatch test retains its deliberate More re-open and now checks H4 independently of openPanels. Timer fields use one explicit Time Keeper container and batch, with scoped typed Start lookup. All six distinct history sessions and assertions remain. Empty Duration now explicitly requires disabled Start Timer; saved 150 seconds requires 02:30. NibChip already adds the selected trait on its button; read that typed button over a bounded two-second wait and log every sample. CI must complete the same timer/history/lap flows within unchanged allowances; selection timing vs trait failure remains diagnostic, not a claimed cause. Savings from the 74–80-second setup baseline are unmeasured.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| TimerPresetStartsCountdownAndCustomNameAdvances | Timer preset selection | Does the typed chip acquire Selected during the bounded observation? |
+| Stopwatch deliberate More reopen | Menu remained open / State step | Did the menu actually disappear even if the panel was already open? |

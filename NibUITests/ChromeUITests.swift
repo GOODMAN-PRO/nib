@@ -1108,15 +1108,28 @@ final class ChromeUITests: XCTestCase {
     }
 
     // timer.panel/start/control/modes/history; stopwatch.start/lap
-    private func timeKeeper() throws { try more("Time Keeper"); try panel("timekeeper") }
+    private func timeKeeper() throws {
+        try ui.waitForMenuClosed(ui.app.scrollViews["More"].firstMatch, named: "More before Time Keeper")
+        if try !ui.state().openPanels.contains("timekeeper") {
+            // K opens the idle panel. During a session K toggles the bar; its clock opens details.
+            if clockValue.exists { clockValue.tap() }
+            else { try key("k") }
+        }
+        try panel("timekeeper")
+    }
     private var clockValue: XCUIElement {
         ui.app.descendants(matching: .any).matching(NSPredicate(format: "label ENDSWITH ' remaining' OR label ENDSWITH ' elapsed'")).firstMatch
     }
     private func timer(_ duration: String = "1:30", name: String = "Chrome countdown") throws {
-        try timeKeeper(); try replace("Duration", duration); try replace("Timer name", name)
+        try timeKeeper()
+        let form = ui.app.scrollViews["Time Keeper"].firstMatch
+        XCTAssertTrue(form.waitForExistence(timeout: 8))
+        try ui.fillNativeForm([("Duration", duration), ("Timer name", name)], in: form)
         // End field editing before a global canvas shortcut can be interpreted as text.
         try key(XCUIKeyboardKey.escape.rawValue)
-        try tap("Start Timer")
+        let start = try ui.requireControl("Start Timer", type: .button, scroll: true, in: form)
+        guard start.isEnabled else { throw NibUI.Failure.message("Start Timer must be enabled for the entered duration") }
+        start.tap()
         try ui.handleAuthorizationAlerts(waitForCountdown: { self.clockValue.exists })
         try wait("Countdown must expose a running clock") { self.clockValue.exists }
         try ui.handleAuthorizationAlerts()
@@ -1134,7 +1147,13 @@ final class ChromeUITests: XCTestCase {
     }
     func testTimerPresetStartsCountdownAndCustomNameAdvances() throws {
         try open(); try timeKeeper(); try tap("5 min")
-        XCTAssertTrue(try require("5 min").isSelected)
+        let chip = ui.app.buttons["5 min"].firstMatch
+        try wait("5 min chip must report Selected", timeout: 2) {
+            guard let snapshot = try? chip.snapshot() else { return false }
+            self.ui.logQA("Timer preset selection", "type=\(snapshot.elementType) label=\(snapshot.label) selected=\(snapshot.isSelected) value=\(String(describing: snapshot.value))")
+            return snapshot.isSelected
+        }
+        XCTAssertTrue(chip.isSelected)
         try replace("Timer name", "Preset countdown"); try tap("Start Timer")
         try ui.handleAuthorizationAlerts(waitForCountdown: { self.clockValue.exists })
         try wait("Preset countdown must run") { self.clockValue.exists }
@@ -1168,7 +1187,9 @@ final class ChromeUITests: XCTestCase {
         _ = try require("Start Again", timeout: 20)
         try tap("Done"); try timeKeeper()
         _ = try reachable("Short countdown")
-        _ = try reachable("Start Timer")
+        let start = try ui.requireControl("Start Timer", type: .button, scroll: true)
+        XCTAssertFalse(start.isEnabled, "An empty Duration must not start a timer")
+        try ui.waitForNativeText(in: ui.app.textFields["Duration"].firstMatch, equals: "")
     }
     func testStopwatchAdvancesPauseRetainsElapsedAndLapsDoNotReset() throws {
         try open(); try timeKeeper(); let modes = ui.app.buttons.matching(NSPredicate(format: "label == 'Timer or stopwatch'"))
@@ -1180,7 +1201,8 @@ final class ChromeUITests: XCTestCase {
         let start = clockValue.label
         try wait("Stopwatch elapsed time must advance") { self.clockValue.label != start }
         try tap("Record Lap"); try key("k", [.command, .option])
-        try timeKeeper()
+        // Keep the deliberate More re-open coverage; closure is independent of panel state.
+        try more("Time Keeper"); try panel("timekeeper")
         let laps = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Lap ' AND label CONTAINS 'total'"))
         XCTAssertEqual(laps.count, 2, "Tap and Option-Command-K each record one lap")
         try tap("Pause"); let paused = clockValue.label
@@ -1197,7 +1219,7 @@ final class ChromeUITests: XCTestCase {
         _ = try reachable("Delete Chrome study")
         try tap("cmd.panel.close"); try timeKeeper()
         try tap("Chrome study")
-        XCTAssertEqual(try require("Duration").value as? String, "2:30")
+        XCTAssertEqual(try require("Duration").value as? String, "02:30")
         try tap("Delete Chrome study"); try tap("Delete Mode")
         try wait("Delete Mode must remove the saved preset") { !self.query("Delete Chrome study").firstMatch.exists }
         try tap("cmd.panel.close"); try timeKeeper()
