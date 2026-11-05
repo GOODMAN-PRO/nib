@@ -1158,7 +1158,8 @@ final class NibUI {
 
     /// Prefer the native dismissal control; floating number pads can expose an unusable AX frame.
     /// Escape is a fallback only. Synthesis completion is not proof that the keyboard disappeared.
-    func dismissNativeKeyboard(in application: XCUIApplication? = nil, diagnoseWidth: Bool = false) throws {
+    func dismissNativeKeyboard(in application: XCUIApplication? = nil, diagnoseWidth: Bool = false,
+                               inertHeader: XCUIElement? = nil) throws {
         let source = application ?? app
         guard source.keyboards.firstMatch.exists else { return }
         let viewport = source.windows.firstMatch.frame
@@ -1166,7 +1167,9 @@ final class NibUI {
             format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).allElementsBoundByIndex.prefix(8).first {
                 hasVisibleFrame($0, in: viewport)
             }
-        let route = hide == nil ? "hardware Escape (no hittable dismissal control)" : "native Hide/Dismiss keyboard button"
+        let route = inertHeader != nil ? "inert sheet header" :
+            (hide == nil ? "hardware Escape (no hittable dismissal control)" : "native Hide/Dismiss keyboard button")
+        let keyboardBefore = source.keyboards.firstMatch.frame
         func inspect(_ stage: String) {
             guard diagnoseWidth else { return }
             for button in source.keyboards.buttons.allElementsBoundByIndex {
@@ -1178,11 +1181,27 @@ final class NibUI {
                 includeHierarchy: false)
         }
         inspect("before Hide")
-        defer { inspect("completion") }
+        defer {
+            inspect("completion")
+            if diagnoseWidth {
+                let after = source.keyboards.firstMatch.exists ? String(describing: source.keyboards.firstMatch.frame) : "absent"
+                logQA("Width keyboard frame", "route=\(route) before=\(keyboardBefore) after=\(after)")
+            }
+        }
         try XCTContext.runActivity(named: "Dismiss native keyboard") { activity in
             let attachment = XCTAttachment(string: "route=\(route)")
             attachment.lifetime = .keepAlways; activity.add(attachment)
-            if let hide {
+            if let inertHeader {
+                guard hasVisibleFrame(inertHeader), inertHeader.elementType == .staticText else {
+                    throw Failure.message("Numeric keyboard dismissal requires the inert sheet heading")
+                }
+                let frame = inertHeader.frame
+                guard !frame.intersects(keyboardBefore) else {
+                    throw Failure.message("Numeric keyboard covers the sheet heading")
+                }
+                source.coordinate(withNormalizedOffset: .zero).withOffset(
+                    CGVector(dx: frame.midX - source.frame.minX, dy: frame.midY - source.frame.minY)).tap()
+            } else if let hide {
                 // Floating keypad keys can report an invalid activation point: isHittable and tap() then record
                 // "Failed to determine hittability". Tap the visible frame's centre by coordinate instead.
                 let centre = CGPoint(x: hide.frame.midX, y: hide.frame.midY)

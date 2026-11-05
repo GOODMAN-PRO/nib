@@ -104,3 +104,11 @@ Previously passing by accident: Selection testRectangleSelectsAnIntersectingStro
 ## H7 - guard native Select All focus
 
 D:app-round-4#6 verifies the second Folder name Cmd-A reached the shell and selected five library items. clearNativeText explicitly focuses the field (tapping when needed); nativeKey now rejects Command-A unless that field reports keyboard focus or the probe reports a text responder immediately before delivery. It never falls back to global routing. All nativeKey/clear/replace callers retain exact text and selection checks. Expected Library MoveFolder and other native replacement paths avoid shell Select All. Next CI must show the folder editor focused and Destination opening normally after Move Here. A text probe alone cannot identify the particular field, so focusField still verifies that field first.
+
+## H9 - numeric keyboard dismissal
+
+D:keyboard-and-state#8 proves the Hide key tap leaves Width focused and the keyboard present; why remains unknown. Both Create custom-size tests now explicitly dismiss through the visible inert New Notebook heading, using its live frame centre (the existing inert-header pattern), then retain the bounded keyboard-gone wait. Other dismissNativeKeyboard callers keep their route. Round 7 before/after/completion screenshots and button/focus facts remain, with the route updated. No Return/Escape delivery changes or allowances. CI must show keyboard absent after both dimensions and exact size/invalid-create outcomes.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Create CustomSize / InvalidCustomSize | Width keyboard frame | What are keyboard frames before and after the inert-header dismissal? |
