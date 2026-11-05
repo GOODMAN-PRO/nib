@@ -162,3 +162,7 @@ D:controls-forms#10 correction confirms Show hidden is a Switch, Imported second
 ## C5 - dismiss thread menu before closing panel
 
 D:controls-forms#11 confirms the open thread menu and two cmd.panel.close buttons; the Edit Message absence predicate was vacuous. The resolve/filter/reopen test now taps outside and waits for its actual Show on Page row to disappear, then scopes close by both command ID and the observed thread-specific Close Comment label (excluding Close Comments). Escape transport remains untouched. CI must reach second-page navigation and Show on Page back to the original page.
+
+## C7 - geometry-aware Chrome outside tap
+
+D:app-round-4#3 arithmetic proves (0.83,0.82) is inside the right-docked Fountain Pen settings. Chrome outside now selects a canvas point excluded by live popover/settings-sized scroll frames from one snapshot, with the old point only as a verified-free fallback. Failure to find geometry fails without a guessed tap. Existing callers retain their own state/content assertions. Expected DockRight dismissal before ink; CI must show settings close and the stroke/undo checks, across dock geometries.

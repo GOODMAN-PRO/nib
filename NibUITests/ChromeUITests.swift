@@ -82,7 +82,24 @@ final class ChromeUITests: XCTestCase {
         }
     }
     private func escape() throws { try key(XCUIKeyboardKey.escape.rawValue) }
-    private func outside() { ui.coordinate(CGPoint(x: 0.83, y: 0.82)).tap() }
+    private func outside() {
+        guard let snapshot = try? ui.app.snapshot() else { XCTFail("Outside tap needs live geometry"); return }
+        let canvas = ui.canvas.frame
+        func obstructions(_ node: XCUIElementSnapshot) -> [CGRect] {
+            let settings = node.elementType == .scrollView && node.identifier != "nib.canvas"
+                && node.frame.height > 80 && node.frame.width < canvas.width * 0.85
+            let own = settings || node.elementType == .popover ? [node.frame] : []
+            return own + node.children.flatMap { obstructions($0) }
+        }
+        let frames = obstructions(snapshot)
+        let candidates = [CGPoint(x: 0.5, y: 0.85), CGPoint(x: 0.5, y: 0.35),
+                          CGPoint(x: 0.2, y: 0.85), CGPoint(x: 0.8, y: 0.35), CGPoint(x: 0.83, y: 0.82)]
+        guard let point = candidates.first(where: { normalized in
+            let point = ui.interfacePoint(normalized)
+            return canvas.contains(point) && !frames.contains { $0.contains(point) }
+        }) else { XCTFail("No canvas point outside presented popovers/settings"); return }
+        ui.coordinate(point).tap()
+    }
     private func open(_ title: String? = nil) throws {
         try ui.openDocument(title ?? notebook)
         XCTAssertTrue(ui.canvas.waitForExistence(timeout: 15))
