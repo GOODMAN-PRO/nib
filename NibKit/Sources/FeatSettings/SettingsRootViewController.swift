@@ -124,6 +124,7 @@ final class SettingsNavigationState: ObservableObject {
     func select(_ section: SettingsSection) {
         self.section = section
         detailPath = []
+        compactPath = []
     }
 
     /// Shows one page in both layouts: its section, then the page itself (pushed, unless it is the section's only
@@ -287,10 +288,31 @@ struct SettingsRootView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            if proxy.size.width >= NibMetrics.compactBreakpoint && !typeSize.isAccessibilitySize {
-                regular
-            } else {
-                compact
+            let regular = proxy.size.width >= NibMetrics.compactBreakpoint && !typeSize.isAccessibilitySize
+            HStack(spacing: 0) {
+                if regular {
+                    SettingsSidebar(catalog: catalog, state: state)
+                        .frame(width: NibMetrics.settingsSectionListWidth)
+                        .background(NibColor.backgroundSecondary)
+                    Divider()
+                }
+                // Keep page-owned drafts alive when only the surrounding layout changes.
+                NavigationStack(path: $state.compactPath) {
+                    Group {
+                        if regular {
+                            SettingsSectionDetail(app: app, catalog: catalog, state: state)
+                        } else {
+                            SettingsIndexList(catalog: catalog, state: state)
+                                .navigationTitle(String(localized: "Settings"))
+                                .navigationBarTitleDisplayMode(.large)
+                        }
+                    }
+                    .navigationDestination(for: SettingsPageLink.self) { link in
+                        SettingsPageHost(app: app, page: catalog.page(link.id))
+                            .settingsDoneButton(onDone)
+                    }
+                    .settingsDoneButton(onDone)
+                }
             }
         }
         .background(NibColor.groupedBackground)
@@ -299,36 +321,6 @@ struct SettingsRootView: View {
             .receive(on: DispatchQueue.main)) { _ in
             // Plugins add, replace and remove settings pages while Settings may be open; rebuilding is cheap.
             catalog = SettingsCatalog(pages: app.ui.settingsPages.all)
-        }
-    }
-
-    private var regular: some View {
-        HStack(spacing: 0) {
-            SettingsSidebar(catalog: catalog, state: state)
-                .frame(width: NibMetrics.settingsSectionListWidth)
-                .background(NibColor.backgroundSecondary)
-            Divider()
-            NavigationStack(path: $state.detailPath) {
-                SettingsSectionDetail(app: app, catalog: catalog, state: state)
-                    .navigationDestination(for: SettingsPageLink.self) { link in
-                        SettingsPageHost(app: app, page: catalog.page(link.id))
-                            .settingsDoneButton(onDone)
-                    }
-                    .settingsDoneButton(onDone)
-            }
-        }
-    }
-
-    private var compact: some View {
-        NavigationStack(path: $state.compactPath) {
-            SettingsIndexList(catalog: catalog, state: state)
-                .navigationTitle(String(localized: "Settings"))
-                .navigationBarTitleDisplayMode(.large)
-                .navigationDestination(for: SettingsPageLink.self) { link in
-                    SettingsPageHost(app: app, page: catalog.page(link.id))
-                        .settingsDoneButton(onDone)
-                }
-                .settingsDoneButton(onDone)
         }
     }
 }
@@ -359,7 +351,11 @@ struct SettingsSidebar: View {
                     if state.query.trimmingCharacters(in: .whitespaces).isEmpty {
                         ForEach(catalog.groups) { group in
                             Button {
-                                state.select(group.section)
+                                if group.pages.count == 1, let page = group.pages.first {
+                                    state.show(page: page.id, in: catalog)
+                                } else {
+                                    state.select(group.section)
+                                }
                             } label: {
                                 NibSidebarRow(group.section.title, symbol: group.section.symbol,
                                               isSelected: group.section == selected)
@@ -453,20 +449,16 @@ struct SettingsSectionDetail: View {
 
     var body: some View {
         if let group {
-            if group.pages.count == 1 {
-                SettingsPageHost(app: app, page: group.pages[0])
-            } else {
-                List {
-                    Section {
-                        ForEach(group.pages, id: \.id) { page in
-                            SettingsPageRow(page: page, catalog: catalog, state: state)
-                        }
+            List {
+                Section {
+                    ForEach(group.pages, id: \.id) { page in
+                        SettingsPageRow(page: page, catalog: catalog, state: state)
                     }
                 }
-                .listStyle(.insetGrouped)
-                .navigationTitle(group.section.title)
-                .navigationBarTitleDisplayMode(.inline)
             }
+            .listStyle(.insetGrouped)
+            .navigationTitle(group.section.title)
+            .navigationBarTitleDisplayMode(.inline)
         } else {
             NibEmptyState(symbol: .settings, title: String(localized: "No settings yet"),
                           message: String(localized: "Settings from features and plugins appear here."))
