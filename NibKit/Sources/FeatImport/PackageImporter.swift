@@ -124,7 +124,7 @@ enum PackageImporter {
     /// Hands what a zip or folder import did to the engine (`ImportReporting.current`) and returns its documents.
     /// When nothing at all came in (no document, no folder), the first reason is thrown instead.
     private static func deliver(_ docs: [DocumentID], _ report: ImportReport, source: String) throws -> [DocumentID] {
-        if docs.isEmpty, report.folders.isEmpty, let first = report.skipped.first {
+        if !report.cancelled, docs.isEmpty, report.folders.isEmpty, let first = report.skipped.first {
             var e = first.error
             let reason = "\(first.entry): \(e.message)"
             e.message = report.skipped.count == 1 ? reason
@@ -148,7 +148,7 @@ enum PackageImporter {
         var docs: [DocumentID] = []
         var files: [(url: URL, isDirectory: Bool)] = []
         for entry in ArchiveIO.visibleEntries(of: dir) {
-            guard !Task.isCancelled else { return docs }
+            guard !Task.isCancelled, !report.cancelled else { report.cancelled = true; return docs }
             let name = entry.url.lastPathComponent
             do {
                 if entry.isDirectory && isPackage(entry.url) {
@@ -166,13 +166,13 @@ enum PackageImporter {
                     files.append(entry)
                 }
             } catch {
-                if error is CancellationError { return docs }
+                if error is CancellationError { report.cancelled = true; return docs }
                 report.skip(prefix + name, error)
                 importLog.error("skipped \(name, privacy: .private): \(error.localizedDescription, privacy: .public)")
             }
         }
         for group in ImportEngine.groups(files, content: ctx.content) {
-            guard !Task.isCancelled else { return docs }
+            guard !Task.isCancelled, !report.cancelled else { report.cancelled = true; return docs }
             let urls = group.indices.map { files[$0].url }
             guard group.kind != .unsupported else {
                 for url in urls { report.skip(prefix + url.lastPathComponent, ImportEngine.unsupported(url, content: ctx.content)) }
@@ -186,12 +186,14 @@ enum PackageImporter {
                     try await ImportEngine.run(group, urls: urls, target: target, ctx: ctx)
                 }
                 report.absorb(nested, prefix: prefix, top: top)
+                if report.cancelled { return docs }
             } catch {
-                if error is CancellationError { return docs }
+                if error is CancellationError { report.cancelled = true; return docs }
                 for url in urls { report.skip(prefix + url.lastPathComponent, error) }
                 importLog.error("skipped a file: \(error.localizedDescription, privacy: .public)")
             }
         }
+        if Task.isCancelled { report.cancelled = true }
         return docs
     }
 

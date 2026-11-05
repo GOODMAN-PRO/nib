@@ -248,11 +248,11 @@ struct MathAssistOptions: View {
     }
 
     static func writeParameters(page: String, index: Int, line: AssistLine, latex: String, format: String) -> JSONValue {
-        var params: JSONValue = ["page": .string(page), "line": .number(Double(index)), "format": .string(format),
+        var params: [String: JSONValue] = ["page": .string(page), "line": .number(Double(index)), "format": .string(format),
             "refs": .array(line.refs.map(JSONValue.string)),
             "sourceRevisions": .array(line.ink.map { .string($0.revision) })]
         if latex != line.latex { params["latex"] = .string(latex) }
-        return params
+        return .object(params)
     }
 
     private func dismiss() {

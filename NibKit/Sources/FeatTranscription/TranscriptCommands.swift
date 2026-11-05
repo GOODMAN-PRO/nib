@@ -53,7 +53,12 @@ struct TranscriptEditSegment: NibCommand {
         if let rev = line.rev { ctx.workspace.clock.observe(rev) }
         line.text = p.text
         line.rev = ctx.workspace.clock.tick()
-        try await store.persist([line], clip: clip, ctx: ctx, expected: expected)
+        do {
+            try await store.persist([line], clip: clip, ctx: ctx, expected: expected)
+        } catch let error as NibError where error.code == .conflict {
+            throw NibError(.conflict, String(localized: "This transcript changed while you were saving your edit."),
+                           hint: String(localized: "Keep your draft and reopen the current line before saving."))
+        }
         return line
     }
 }

@@ -379,6 +379,7 @@ struct CommentThreadView: View {
     @State private var editing: NibID?
     @State private var editText = ""
     @State private var editBaseline: CommentMessage?
+    @State private var editConflictText: String?
     @State private var lastMessagePendingDelete: NibID?
     @FocusState private var composerFocused: Bool
 
@@ -529,6 +530,11 @@ struct CommentThreadView: View {
                 .font(NibFont.caption1Emphasis)
                 .foregroundStyle(NibColor.labelSecondary)
             if isEditing {
+                if let current = editConflictText {
+                    Text(String(localized: "Current message: \(current)"))
+                        .font(NibFont.caption1Emphasis)
+                        .foregroundStyle(NibColor.labelSecondary)
+                }
                 NibField(text: $editText, prompt: String(localized: "Message"), lines: 1...8)
                     .onKeyPress(.return, phases: .down) { press in
                         guard press.modifiers.contains(.command) else { return .ignored }
@@ -573,6 +579,7 @@ struct CommentThreadView: View {
             Button {
                 editText = message.text
                 editBaseline = message
+                editConflictText = nil
                 editing = message.id
             } label: {
                 Label { Text(String(localized: "Edit Message")) } icon: { Image(nib: .pencil) }
@@ -641,7 +648,9 @@ struct CommentThreadView: View {
         Task {
             if !(await model.edit(id, text: text, baseline: baseline)) {
                 editText = text
-                editBaseline = baseline
+                let current = thread?.messages.first { $0.id == id } ?? baseline
+                editBaseline = current
+                if current != baseline { editConflictText = current.text }
                 editing = id
             }
         }
