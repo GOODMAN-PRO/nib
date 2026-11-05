@@ -250,6 +250,28 @@ final class FeatTeacherTests: XCTestCase {
         }
     }
 
+    func testHintDraftBaselineDoesNotOverwriteAnotherWindowsHints() async throws {
+        let h = harness()
+        let ref = try await create(h)
+        let baseline = try zone(h, zoneID).hints
+        let untouched = baseline.map { AnswerZoneHintDraft(text: $0) }
+        try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": ["First", "Changed elsewhere"]])
+        XCTAssertNil(AnswerZoneHintDraft.editedHints(untouched, baseline: baseline), "blur and dismissal of an untouched draft must not save")
+        var edited = untouched
+        edited[0].text = "My edit"
+        let hints = try XCTUnwrap(AnswerZoneHintDraft.editedHints(edited, baseline: baseline))
+        let before = try h.snapshot()
+        await expectError(.conflict) {
+            try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": .array(hints.map(JSONValue.string)),
+                                                          "expectedHints": .array(baseline.map(JSONValue.string))])
+        }
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(try zone(h, zoneID).hints, ["First", "Changed elsewhere"])
+        try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": ["My edit", "Changed elsewhere"],
+                                                      "expectedHints": ["First", "Changed elsewhere"]])
+        XCTAssertEqual(try zone(h, zoneID).hints, ["My edit", "Changed elsewhere"])
+    }
+
     func testSetHintsKeepsOrResetsTheRecordOfShownHints() async throws {
         let h = harness()
         let ref = try await create(h, hints: ["A", "B", "C"])
