@@ -28,8 +28,9 @@ struct PluginLimits {
     var startTimeout: TimeInterval = 30
     /// `nib.storage`, per plugin (live keys and values as JSON).
     var storageBytes = 5 * 1_048_576
-    /// `nib.storage` changes wait this long before the file is written (one write for a burst of changes).
-    var storageWriteDelay: TimeInterval = 0.25
+    /// Acknowledged storage operations are durable before their JavaScript promise resolves.
+    /// Explicit batching remains available to storage tests, but production never delays these writes.
+    var storageWriteDelay: TimeInterval = 0
     /// `nib.storage` lists its (synced) folder for other devices' changes at most this often.
     var storageRefreshInterval: TimeInterval = 1
     /// The entry bundle.

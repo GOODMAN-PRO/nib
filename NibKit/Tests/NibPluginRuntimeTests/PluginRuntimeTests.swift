@@ -469,6 +469,24 @@ final class PluginRuntimeTests: XCTestCase {
 
     // MARK: Storage, settings, UI
 
+    func testStoragePromiseRejectsFailedReplacementWithProductionLimits() async throws {
+        // Keep the already-readable snapshot so this exercises replacement failure, not a read guard.
+        let s = try await start("", configure: { $0.limits.storageRefreshInterval = 3_600 })
+        let first = await s.plugin.evaluate("nib.storage.set('saved', 1).then(() => 'saved')")
+        XCTAssertEqual(first, "saved")
+        let storage = try XCTUnwrap(s.runtime.storage(for: Self.pluginID))
+        storage.flushAndWait()
+        let file = s.h.library.metadataURL.appendingPathComponent("plugin-data/\(Self.pluginID)/storage.\(s.h.app.deviceHex).json")
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+        let result = await s.plugin.evaluate("nib.storage.set('saved', 2).then(() => 'success', () => 'rejected')")
+        XCTAssertEqual(result, "rejected")
+        let value = await s.plugin.evaluate("nib.storage.get('saved')")
+        XCTAssertEqual(value, "1", "Failed writes must roll back the live value")
+        let removal = await s.plugin.evaluate("nib.storage.remove('saved').then(() => 'success', () => 'rejected')")
+        XCTAssertEqual(removal, "rejected")
+    }
+
     func testStorageRoundTripOutsideThePluginFolder() async throws {
         let s = try await start("""
         nib.commands.register("dev.test.plugin.store", async () => {
