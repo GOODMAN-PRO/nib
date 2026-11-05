@@ -145,7 +145,7 @@ struct PluginListView: View {
                 }
             }
         }
-        .background(NibColor.backgroundSecondary)
+        .background(NibColor.groupedBackground)
         .frame(idealWidth: NibMetrics.pluginManagerSheetSize.width, idealHeight: NibMetrics.pluginManagerSheetSize.height)
         .tint(NibColor.accent)
         .nibSheet(isPresented: $showURL) { PluginURLSheet(model: model) }
@@ -190,6 +190,7 @@ struct PluginListView: View {
                 NibEmptyState(symbol: .puzzle, title: String(localized: "No plugins yet"),
                     message: String(localized: "Plugins add tools, panels and templates."),
                     primary: NibAction(String(localized: "Browse Gallery"), command: CommandIDs.panelOpen) { app.perform(CommandIDs.panelOpen, ["id": .string(PanelIDs.gallery)]) })
+                    .listRowBackground(NibColor.backgroundTertiary)
             }
             ForEach(model.plugins) { plugin in
                 HStack(spacing: NibSpacing.s) {
@@ -205,10 +206,12 @@ struct PluginListView: View {
                         model.perform(CommandIDs.pluginEnable, ["id": .string(plugin.id), "enabled": .bool(enabled)])
                     })).labelsHidden().disabled(model.busy || plugin.needsReview)
                 }.padding(.vertical, NibSpacing.xs)
+                    .listRowBackground(NibColor.backgroundTertiary)
             }
             Section(String(localized: "Galleries")) {
                 GallerySettingsView(model: model)
             }
+            .listRowBackground(NibColor.backgroundTertiary)
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
