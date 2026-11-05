@@ -91,6 +91,7 @@ final class ChromeState: ObservableObject {
     private(set) var lastTabs: [SidebarSide: String] = [:]
     private var animateUntil: TimeInterval = 0
     private weak var session: EditorSession?
+    private var mirroredPanels: Set<String> = []
 
     /// `session`: the window this state belongs to; nil keeps it to itself (layout tests).
     init(session: EditorSession? = nil) {
@@ -214,7 +215,13 @@ final class ChromeState: ObservableObject {
         if params.keys.contains(where: { !open.contains($0) }) {
             params = params.filter { open.contains($0.key) }
         }
-        if let session, session.openPanels != open { session.openPanels = open }
+        if let session {
+            // In the library only replace ids previously mirrored by this chrome. Library-owned ids survive
+            // every caller, including panel.close probing a panel that the chrome never opened.
+            let wanted = session.document == nil ? session.openPanels.subtracting(mirroredPanels).union(open) : open
+            if session.openPanels != wanted { session.openPanels = wanted }
+        }
+        mirroredPanels = open
     }
 
     private func detach(_ id: String) {
@@ -285,7 +292,8 @@ final class ChromeStateStore {
                 }
             }
         }
-        state.syncSession()
+        // The library owns the session's panel ids while no document is showing.
+        if session.document != nil { state.syncSession() }
     }
 }
 

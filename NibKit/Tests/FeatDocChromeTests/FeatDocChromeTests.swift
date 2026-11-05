@@ -8,6 +8,20 @@ import NibTesting
 
 @MainActor
 final class FeatDocChromeTests: XCTestCase {
+    func testLibraryPanelIDsSurviveAdoptionWhileRemovedChromePanelsClose() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let state = try chromeState(h)
+        state.open("test.chrome", at: .left, params: ["test": true])
+        h.session.document = nil
+        h.session.openPanels = ["lib.panel"]
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(h.session.openPanels, ["lib.panel"])
+        XCTAssertTrue(state.openPanels.isEmpty)
+        XCTAssertTrue(state.params.isEmpty)
+        XCTAssertFalse(state.close("lib.absent"))
+        XCTAssertEqual(h.session.openPanels, ["lib.panel"], "Closing a library panel must preserve other library ids")
+    }
+
     func testFeatureID() {
         XCTAssertEqual(FeatDocChromeFeature.id, "chrome")
     }
