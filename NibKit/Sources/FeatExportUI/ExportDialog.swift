@@ -289,7 +289,9 @@ struct ExportDialog: View {
                             ForEach(selection.pageScopes, id: \.self) { scope in Text(scope.title(board: selection.isBoard)).tag(scope) }
                         }.font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
                     } else {
-                        NibSegmentedControl(selection: $draft.scope, options: selection.pageScopes) { $0.title(board: selection.isBoard) }
+                        NibSegmentedControl(selection: $draft.scope, options: selection.pageScopes, sizing: .fitting) {
+                            $0.title(board: selection.isBoard)
+                        }
                     }
                 }
             }
