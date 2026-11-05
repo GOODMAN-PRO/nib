@@ -229,6 +229,52 @@ final class FeatTemplateUITests: XCTestCase {
         XCTAssertTrue(live.isEmpty)
     }
 
+    func testImportRejectsUnsupportedImageAndPDFPageSizesWithAnExplanation() async throws {
+        let h = harness()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let tiny = UIGraphicsImageRenderer(size: CGSize(width: 20, height: 20), format: format).image { context in
+            UIColor.white.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 20, height: 20))
+        }
+        let pdf = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 20_000, height: 100)).pdfData { $0.beginPage() }
+        for (index, file) in [(try XCTUnwrap(tiny.pngData()), "png"), (pdf, "pdf")].enumerated() {
+            let ref = try h.assets.putTemporary(file.0, ext: file.1)
+            do {
+                _ = try await h.run(CommandIDs.templateImport,
+                    ["url": .string("tmp:" + ref.name), "kind": "paper", "id": .string("invalid\(index)")])
+                XCTFail("Expected an unsupported page size error")
+            } catch let error as NibError {
+                XCTAssertEqual(error.code, .invalidParams)
+                XCTAssertEqual(error.path, "$.url")
+                XCTAssertTrue(error.message.contains("36"))
+                XCTAssertTrue(error.message.contains("14400"))
+            }
+        }
+        let groups = try await store(h).groups()
+        XCTAssertTrue(groups.flatMap(\.liveTemplates).isEmpty)
+    }
+
+    func testPreviouslyImportedUnsupportedSizeRemainsSelectableAndApplicable() async throws {
+        let h = harness(); registerPages(h)
+        _ = try await h.run(CommandIDs.templateImport, ["url": .string(try image(h)), "kind": "paper", "id": "legacy"])
+        let customStore = store(h)
+        var group = try await customStore.group("custom")
+        let index = try XCTUnwrap(group.templates.firstIndex { $0.id == "legacy" })
+        group.templates[index].size = PageSize(20, 20)
+        group.templates[index].rev = h.app.clock.tick()
+        try await customStore.write(group)
+        let model = TemplateBrowserModel(app: h.app, session: h.session, size: .letter)
+        model.groups = try await customStore.groups()
+        let legacy = try await customStore.locate("legacy").1
+        model.select(legacy.id, size: legacy.size)
+        let choice = try XCTUnwrap(model.choice)
+        XCTAssertEqual(choice.size, .letter)
+        try await TemplateChange.apply(choice, kind: "paper", pages: ["page:FIXTUREDOC01/FIXTUREPG002"],
+                                       doc: Fixtures.docID, model: model)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).page(Fixtures.page2)?.background.kind, .image)
+    }
+
     func testPDFFirstPageAndAssetCopySurviveLibraryDeletion() async throws {
         let h = harness()
         let data = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 612, height: 792)).pdfData { context in

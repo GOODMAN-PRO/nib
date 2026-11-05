@@ -133,7 +133,10 @@ final class TemplateBrowserModel: ObservableObject {
     }
     func select(_ id: String, size intrinsic: PageSize? = nil) {
         selection = id
-        if let intrinsic { size = TemplateSizing.oriented(intrinsic, landscape: size.isLandscape) }
+        // Older imports may have an unsupported intrinsic size. Keep the chosen page size so they remain usable.
+        if let intrinsic, (try? TemplateSizing.parse([intrinsic.width, intrinsic.height])) != nil {
+            size = TemplateSizing.oriented(intrinsic, landscape: size.isLandscape)
+        }
     }
     func changeKind(_ value: String) { kind = value; category = ""; selection = nil; color = nil; seededColour = false; Task { await load() } }
     func setDefault() {
