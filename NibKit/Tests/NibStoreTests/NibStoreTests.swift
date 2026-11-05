@@ -425,6 +425,25 @@ final class NibStoreTests: XCTestCase {
 
     /// Same interleaving, but the failed page still cannot be written. The flush then fails as a whole and truncates
     /// nothing, so every logged change is recovered from the log after a crash.
+    func testCheckpointThrowsUntilFailedPageWriteIsDurable() throws {
+        let lib = TestLibrary()
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        try store.checkpoint(doc)
+        let blocked = try blockPageFolder(pkg, Fixtures.page2)
+        let stroke = walStroke("CHECKPOINTINK")
+        store.didChange(doc, head: nil, pages: [Fixtures.page2: [stroke]])
+        XCTAssertThrowsError(try store.checkpoint(doc))
+        XCTAssertFalse(store.wal.read(doc).isEmpty)
+        try FileManager.default.removeItem(at: blocked)
+        try store.checkpoint(doc)
+        XCTAssertTrue(store.wal.read(doc).isEmpty)
+        XCTAssertEqual(try lib.store("0000000a").loadItems(doc, page: Fixtures.page2), [stroke])
+    }
+
     func testLogIsNotTruncatedWhileFailedChangesAreNotOnDisk() throws {
         let lib = TestLibrary()
         let (content, items) = Fixtures.sampleContent()

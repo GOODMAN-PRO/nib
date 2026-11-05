@@ -590,7 +590,7 @@ final class FolderLibrary: LibraryService {
         guard catalog.entry(id: top) == nil else {
             throw NibError(.conflict, "the library already has an item with id \(top.raw)", hint: "omit ids to get fresh ones")
         }
-        flushDocuments(under: e)
+        try checkpointDocuments(under: e)
         let source = url(of: e)
         let dir = source.deletingLastPathComponent()
         let ext: String? = e.isDocument ? NibFormat.packageExtension : nil
@@ -1283,6 +1283,17 @@ final class FolderLibrary: LibraryService {
             try? FileOps.remove(file)
         }
         return record
+    }
+
+    /// Requires durable source bytes before copying, including failed writes retained after a document closed.
+    private func checkpointDocuments(under entry: CatalogEntry) throws {
+        // Matches NibStoreFeature.Checkpoint, like the optional catalogue-rebuild service: no feature import.
+        typealias Checkpoint = @MainActor (DocumentID) throws -> Bool
+        let checkpoint = services?.get("store.checkpoint", as: Checkpoint.self)
+        for e in catalog.subtree(path: entry.node.path) where e.isDocument {
+            if let checkpoint, try checkpoint(e.node.id) { continue }
+            workspace.persistence.flush(e.node.id)
+        }
     }
 
     /// Writes pending changes of open documents at or under `entry` (before their package moves).

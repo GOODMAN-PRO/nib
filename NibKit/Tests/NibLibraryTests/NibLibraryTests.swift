@@ -498,6 +498,26 @@ final class NibLibraryTests: XCTestCase {
         XCTAssertThrowsError(try lib.library.finishDuplicate(job, top: "LATECOPY"), "switching away and back still invalidates completion")
     }
 
+    func testDuplicateRefusesFailedCheckpointBeforeCopying() async throws {
+        let lib = try await makeLibrary()
+        let source = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Unsaved"]))
+        typealias Checkpoint = @MainActor (DocumentID) throws -> Bool
+        var checked: [DocumentID] = []
+        let checkpoint: Checkpoint = { doc in
+            checked.append(doc)
+            throw NibError(.unavailable, "injected checkpoint failure")
+        }
+        lib.h.app.services.set(checkpoint as AnyObject, for: "store.checkpoint")
+        do {
+            _ = try await lib.library.duplicate(source, as: "STALECOPY")
+            XCTFail("Duplication must not copy stale bytes after a failed checkpoint")
+        } catch {}
+        XCTAssertEqual(checked, [source])
+        XCTAssertNil(lib.library.node("STALECOPY"))
+        XCTAssertFalse(lib.exists("Unsaved copy.nibnote"))
+        XCTAssertNotNil(lib.library.node(source))
+    }
+
     func testDuplicateGetsANewIDAndOnlyThisDevicesHead() async throws {
         let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Lab Report"]))

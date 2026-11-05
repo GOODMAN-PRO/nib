@@ -339,6 +339,12 @@ final class PackagePersistence: DocumentPersistence {
         write(doc, synchronously: true)
     }
 
+    /// Operations that copy package bytes must know that every pending edit reached those bytes.
+    func checkpoint(_ doc: DocumentID) throws {
+        if gate.contains(doc) { throw ReadOnlyGate.refusal(doc) }
+        if let error = write(doc, synchronously: true) { throw error }
+    }
+
     /// Writes every document with pending or unsaved changes (the app is leaving the foreground).
     func flushAll() {
         let unsaved = self.unsaved
@@ -367,18 +373,19 @@ final class PackagePersistence: DocumentPersistence {
     /// Hands the pending changes of `doc` to `io` and writes them there, together with whatever earlier writes left
     /// unsaved; `synchronously` waits for the write. The log is truncated only when that combined write succeeds.
     /// Internal so tests can start a background write the way the debounce timer does.
-    func write(_ doc: DocumentID, synchronously: Bool) {
+    @discardableResult
+    func write(_ doc: DocumentID, synchronously: Bool) -> Error? {
         timers.removeValue(forKey: doc)?.cancel()
         let job = pending.removeValue(forKey: doc) ?? PendingWrite()
         // Clean page eviction must not wait behind another document's coordinated write. Every queued or failed
         // write has a readable snapshot until it succeeds, so this check does not skip a durability obligation.
-        if job.isEmpty && readable.snapshot(doc) == nil { return }
+        if job.isEmpty && readable.snapshot(doc) == nil { return nil }
         guard !gate.contains(doc) else {
             if !job.isEmpty {
                 log.error("not saving \(doc.raw, privacy: .public): \(ReadOnlyGate.refusal(doc).message, privacy: .public)")
             }
             if synchronously { io.sync {} }
-            return
+            return nil
         }
         let files = self.files, wal = self.wal, unsaved = self.unsaved, readable = self.readable
         let token = readable.submit(job, for: doc)
@@ -400,13 +407,17 @@ final class PackagePersistence: DocumentPersistence {
             }
         }
         if synchronously {
-            if let error = io.sync(execute: run) { failed(doc, error) }
+            if let error = io.sync(execute: run) {
+                failed(doc, error)
+                return error
+            }
         } else {
             io.async {
                 guard let error = run() else { return }
                 Task { @MainActor in self.failed(doc, error) }
             }
         }
+        return nil
     }
 
     /// Reports a failed write. The unsaved writes hold its changes, and so does the log; the next write of `doc`
