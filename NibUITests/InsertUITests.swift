@@ -858,7 +858,7 @@ final class InsertUITests: XCTestCase {
         let after = ui.app.buttons.allElementsBoundByIndex.map(\.label).filter { collectionLabels.contains($0) }
         XCTAssertLessThan(try XCTUnwrap(after.firstIndex(of: "Renamed Lab")), try XCTUnwrap(before.firstIndex(of: "Renamed Lab")))
         try tap("Collection Options"); try tap("Delete Collection")
-        try tap("Cancel")
+        try ui.cancelConfirmation(action: "Delete Collection")
         try wait("Collection confirmation must dismiss") { !self.ui.app.buttons["Delete Collection"].exists }
         XCTAssertTrue(query("Renamed Lab").firstMatch.exists)
         try tap("Collection Options"); try tap("Delete Collection"); try tap("Delete Collection")
@@ -874,7 +874,7 @@ final class InsertUITests: XCTestCase {
         try collectionPrompt("Lab Node", fieldName: "Element name", action: "Rename")
         try tap("Lab Node"); try counts(6)
         try elements(); try tap("My Objects", scroll: true)
-        try ui.timedAction("Element Lab Node context menu") { try self.control("Lab Node").press(forDuration: 0.8) }; try tap("Delete"); try tap("Cancel")
+        try ui.timedAction("Element Lab Node context menu") { try self.control("Lab Node").press(forDuration: 0.8) }; try tap("Delete"); try ui.cancelConfirmation(action: "Delete Element")
         XCTAssertTrue(query("Lab Node").firstMatch.exists)
         try ui.timedAction("Element Lab Node context menu") { try self.control("Lab Node").press(forDuration: 0.8) }; try tap("Delete"); try tap("Delete Element")
         try wait("Only confirmed element is removed") { !self.query("Lab Node").firstMatch.exists }
@@ -1183,7 +1183,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertTrue(try message("Check the units").exists)
         try message("Check the units").press(forDuration: 0.8); try tap("Edit Message")
         try replace(try commentEditor("Check the units"), with: "Confirmed edit"); try tap("Save")
-        try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try tap("Cancel")
+        try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try ui.cancelConfirmation(action: "Delete Thread")
         XCTAssertTrue(try message("Confirmed edit").exists)
         try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try tap("Delete Thread")
         try counts(4); try ui.tapCommand("edit.undo"); try counts(5)
@@ -1355,7 +1355,7 @@ final class InsertUITests: XCTestCase {
         row.press(forDuration: 0.8); try tap("Share Audio File")
         XCTAssertTrue(query("Save to Files").firstMatch.waitForExistence(timeout: 10), "Share must expose a real audio file")
         try ui.dismissSheets(); try control("Motion lecture").tap(); try tap("Pause")
-        try control("Motion lecture").press(forDuration: 0.8); try tap("Delete Recording"); try tap("Cancel")
+        try control("Motion lecture").press(forDuration: 0.8); try tap("Delete Recording"); try ui.cancelConfirmation(action: "Delete Recording")
         XCTAssertTrue(query("Playback position").firstMatch.exists)
         XCTAssertEqual(try control("Motion lecture").value as? String, duration)
         try control("Motion lecture").press(forDuration: 0.8); try tap("Delete Recording"); try tap("Delete Recording")

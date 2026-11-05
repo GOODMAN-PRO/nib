@@ -1719,6 +1719,36 @@ final class NibUI {
         if let failure { throw failure }
     }
 
+    func cancelConfirmation(action: String) throws {
+        let surface = app.sheets.allElementsBoundByIndex.first {
+            hasVisibleFrame($0) && $0.buttons[action].exists
+        } ?? app.popovers.allElementsBoundByIndex.first {
+            hasVisibleFrame($0) && $0.buttons[action].exists
+        }
+        guard let surface else { throw Failure.message("Missing confirmation for \(action)") }
+        let heading = surface.label
+        guard !heading.isEmpty else { throw Failure.message("Confirmation must expose its heading") }
+        if let cancel = findControl("Cancel", type: .button, in: surface), cancel.isEnabled && cancel.isHittable {
+            cancel.tap()
+        } else {
+            let region = app.otherElements["PopoverDismissRegion"].firstMatch
+            let window = app.windows.firstMatch.frame
+            let surfaces = app.popovers.allElementsBoundByIndex.map(\.frame) + [surface.frame]
+            let points = [CGPoint(x: window.minX + 24, y: window.maxY - 24),
+                          CGPoint(x: window.maxX - 24, y: window.minY + 24)]
+            guard region.exists, let point = points.first(where: { point in
+                region.frame.contains(point) && !surfaces.contains { $0.contains(point) }
+            }) else { throw Failure.message("Confirmation has no safe outside dismissal point") }
+            app.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+        }
+        let title = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", heading)).firstMatch
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !title.exists }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
+            throw Failure.message("Cancelled confirmation heading remains: \(heading)")
+        }
+    }
+
     func dismissSheets() throws {
         for _ in 0..<8 {
             let surfaces = app.sheets.allElementsBoundByIndex + app.popovers.allElementsBoundByIndex

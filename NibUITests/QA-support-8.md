@@ -134,3 +134,7 @@ D:controls-forms#4 correction and D:controls-menus#1 show keyboard overlap/degen
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Four covered-control callers | Covered control preparation | Which target/keyboard frames or number-pad surface justified dismissal? |
+
+## C1 - cancel iPad confirmations
+
+D:controls-forms#6 shows destructive-only confirmation Sheets, with cancellation through PopoverDismissRegion. Shared cancelConfirmation scopes Cancel to the presented confirmation, otherwise taps its live dismiss region outside all popovers, and waits for the captured heading to disappear. Applied to the four Insert destructive-cancel paths and Pages group/batch-trash cancellation. The already-correct Pages purge path retains its geometric assertions and outside cancellation. No ordinary edit Cancel changed. CI must reach the original retained-content checks, then confirmed deletion, with heading disappearance on cancel.

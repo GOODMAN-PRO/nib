@@ -290,7 +290,7 @@ final class PagesUITests: XCTestCase {
         XCTAssertEqual(Set(try ids()).intersection(before).count, 4)
         try tap("Done"); try closeNavigator(); try ui.tapCommand("edit.undo"); try count(4)
         try pages(window: true); try beginSelection(); try tapThumb(1); try tapThumb(2)
-        try selectionAction("Move to Trash"); try tap("Cancel")
+        try selectionAction("Move to Trash"); try ui.cancelConfirmation(action: "Move to Trash")
         XCTAssertEqual(try ids(), before)
         try selectionAction("Move to Trash"); try confirm("Move to Trash"); try count(2)
         XCTAssertEqual(try ids(), Array(before.suffix(2)))
@@ -513,7 +513,7 @@ final class PagesUITests: XCTestCase {
         let id = try XCTUnwrap(groups().first { $0["title"] as? String == "Research papers" }?["id"] as? String)
         try replace(ui.app.textFields["Group title"], "Lab papers"); try tap("Rename Group")
         try wait("Rename must preserve group identity") { (try? self.groups().contains { $0["title"] as? String == "Lab papers" && $0["id"] as? String == id }) == true }
-        try tap("Delete Group"); try tap("Cancel")
+        try tap("Delete Group"); try ui.cancelConfirmation(action: "Delete Group")
         XCTAssertTrue(try groups().contains { $0["id"] as? String == id })
         try tap("Delete Group")
         try confirm("Delete Group")
