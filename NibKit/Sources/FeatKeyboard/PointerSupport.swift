@@ -554,7 +554,11 @@ enum CanvasKeyboardFocus {
 
     static func mayReplace(_ responder: UIResponder?, canvas: UIView) -> Bool {
         guard let responder else { return true }
-        guard !isTextInput(responder) else { return false }
+        // Opt-in responder capability shared by selector, without importing another feature.
+        // A panel answers true only while it owns the keyboard (e.g. thumbnail select mode).
+        let focusOwner = NSSelectorFromString("nibOwnsKeyboardFocus:")
+        guard !responder.canPerformAction(focusOwner, withSender: nil),
+              !isTextInput(responder) else { return false }
         if let view = responder as? UIView {
             return !(view is UIControl) && (view.isDescendant(of: canvas) || canvas.isDescendant(of: view))
         }

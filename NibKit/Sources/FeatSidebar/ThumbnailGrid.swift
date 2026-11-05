@@ -1049,6 +1049,14 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     override var canBecomeFirstResponder: Bool { model.isSelecting }
 
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        // Canvas focus recovery queries this capability through UIKit's responder API.
+        // No feature-to-feature import or process-wide focus state is needed.
+        if action == NSSelectorFromString("nibOwnsKeyboardFocus:") { return model.isSelecting }
+        return super.canPerformAction(action, withSender: sender)
+    }
+
+
     override var keyCommands: [UIKeyCommand]? {
         guard model.isSelecting else { return nil }
         let selectAll = UIKeyCommand(title: String(localized: "Select All Pages"), action: #selector(selectAllPages),

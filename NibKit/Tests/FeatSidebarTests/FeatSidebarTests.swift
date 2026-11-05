@@ -1070,6 +1070,21 @@ final class FeatSidebarTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(doc), before, "a canvas receives an image copy; the source page is retained")
     }
 
+    func testThumbnailGridOwnsKeyboardFocusOnlyWhileSelecting() {
+        let h = harness()
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        let grid = laidOutGrid(model)
+        let marker = NSSelectorFromString("nibOwnsKeyboardFocus:")
+        XCTAssertFalse(grid.canPerformAction(marker, withSender: nil))
+        model.setSelecting(true)
+        XCTAssertTrue(grid.canPerformAction(marker, withSender: nil))
+        model.setSelection([p1, p2])
+        model.refreshNow()
+        XCTAssertTrue(grid.canPerformAction(marker, withSender: nil), "Batch refresh keeps select mode's focus")
+        model.setSelecting(false)
+        XCTAssertFalse(grid.canPerformAction(marker, withSender: nil))
+    }
+
     func testGridShowsEveryPageAndAddPageAndTakesKeysInSelectMode() throws {
         let h = harness()
         let model = PagesPanelModel(app: h.app, session: h.session)
