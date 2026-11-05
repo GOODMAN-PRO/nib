@@ -276,13 +276,14 @@ final class FeatTransformTests: XCTestCase {
         }
     }
 
-    func testNudgeAndPageMoveRejectHiddenSelectedOrAttachedContent() async throws {
+    func testNudgeAndPageMoveProtectHiddenTargetsButMoveHiddenDependants() async throws {
         for hiddenTarget in [true, false] {
             let h = Harness(features: [FeatTransformFeature.self])
             edit(h, Fixtures.imageID) { image in
                 image.layer = 2
                 if !hiddenTarget { image.attachedTo = Fixtures.shapeID }
             }
+            edit(h, Fixtures.connectorID) { $0.layer = 2 }
             h.session.hiddenLayers = [2]
             h.session.selection = Selection(doc: doc, page: page1,
                                               items: [hiddenTarget ? Fixtures.imageID : Fixtures.shapeID])
@@ -292,14 +293,34 @@ final class FeatTransformTests: XCTestCase {
                 ("item.moveToPage", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
             ]
             for (command, params) in commands {
-                do {
+                if hiddenTarget {
+                    do {
+                        try await h.run(command, params)
+                        XCTFail("explicit hidden targets must be protected")
+                    } catch let error as NibError {
+                        XCTAssertEqual(error.code, .invalidParams)
+                    }
+                    XCTAssertEqual(try h.snapshot(), before)
+                    XCTAssertEqual(h.undoDepth(doc), 0)
+                } else {
+                    let oldChild = try item(h, Fixtures.imageID)
                     try await h.run(command, params)
-                    XCTFail("hidden selected items and hidden attached children must be protected")
-                } catch let error as NibError {
-                    XCTAssertEqual(error.code, .invalidParams)
+                    let destination = command == "item.transform" ? page1 : page2
+                    let child = try item(h, Fixtures.imageID, on: destination)
+                    XCTAssertEqual(child.attachedTo, Fixtures.shapeID)
+                    XCTAssertEqual(child.frame?.x, (oldChild.frame?.x ?? 0) + (command == "item.transform" ? 1 : 0))
+                    if command == "item.transform" {
+                        let shape = try item(h, Fixtures.shapeID)
+                        let connector = try XCTUnwrap(try item(h, Fixtures.connectorID).connector)
+                        XCTAssertEqual(connector.from.point, shape.anchorPoint(side: 1, t: 0.5))
+                        XCTAssertEqual(connector.from.item, shape.id)
+                    }
+                    XCTAssertEqual(h.undoDepth(doc), 1)
+                    XCTAssertTrue(h.app.bus.undo(doc))
+                    XCTAssertEqual(try h.snapshot(), before)
+                    // Undo does not restore session selection; select the original for the next command.
+                    h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
                 }
-                XCTAssertEqual(try h.snapshot(), before)
-                XCTAssertEqual(h.undoDepth(doc), 0)
             }
         }
     }

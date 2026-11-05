@@ -210,6 +210,7 @@ struct ItemDelete: NibCommand {
         try ItemTargets.ensureWritable(groups, ctx)
         var deleted: [(doc: DocumentID, page: PageID, ids: [ElementID])] = []
         var detached: [String] = []
+        var hiddenAffected = 0
         try ctx.mutate { tx in
             for g in groups {
                 let items = try tx.items(g.doc, page: g.page)
@@ -217,11 +218,13 @@ struct ItemDelete: NibCommand {
                 let plan = DeletePlan.make(targets: g.targets.map { $0.id }, items: items)
                 if ctx.principal.isUser, let session = ctx.activeSession, session.document == g.doc,
                    !session.hiddenLayers.isEmpty {
-                    let changed = Set(plan.deleted + plan.updated.map(\.id))
-                    if items.contains(where: { changed.contains($0.id) && session.hiddenLayers.contains($0.layer) }) {
+                    let selected = Set(g.targets.map(\.id))
+                    if items.contains(where: { selected.contains($0.id) && session.hiddenLayers.contains($0.layer) }) {
                         throw NibError(.invalidParams, String(localized: "This deletion would change content on a hidden layer."),
                                        path: "$.refs", hint: String(localized: "Show the layer before deleting this selection."))
                     }
+                    let changed = Set(plan.deleted + plan.updated.map(\.id))
+                    hiddenAffected += items.filter { changed.contains($0.id) && session.hiddenLayers.contains($0.layer) }.count
                 }
                 try tx.put(plan.updated, doc: g.doc, page: g.page)
                 try tx.delete(items: plan.deleted, doc: g.doc, page: g.page)
@@ -232,6 +235,11 @@ struct ItemDelete: NibCommand {
         ItemTargets.linkIfNeeded(groups, ctx)
         if !ctx.dryRun {
             for d in deleted { SelectionPruning.remove(d.ids, doc: d.doc, page: d.page, ctx) }
+            if hiddenAffected > 0 {
+                ctx.activeSession?.floatingHost?.postToast(
+                    String(localized: "Deleting this selection also affected \(hiddenAffected) attached items on hidden layers. Undo restores them."),
+                    actionTitle: nil, action: nil)
+            }
         }
         let refs = deleted.flatMap { d in d.ids.map { NodeRef.item(d.doc, d.page, $0).description } }
         return Output(deleted: refs, detached: detached)

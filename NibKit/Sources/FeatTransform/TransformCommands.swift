@@ -225,14 +225,13 @@ enum TransformTargets {
             }
             return TargetRef(doc: doc, page: page, id: id, path: "$.refs[\(i)]")
         }
-        // A drag may outlive a layer visibility change. Include attached content and connector ends, too.
+        // A drag may outlive a layer visibility change. Protect explicit targets; dependants must still follow.
         if ctx.principal.isUser, let session = ctx.activeSession, !session.hiddenLayers.isEmpty {
             for group in byPage(targets) where session.document == group.doc {
                 let items = try ctx.workspace.items(group.doc, page: group.page)
-                let travelling = TransformGraph.closure(Set(group.refs.map(\.id)), in: items)
+                let selected = Set(group.refs.map(\.id))
                 let hiddenChange = items.contains { item in
-                    session.hiddenLayers.contains(item.layer) &&
-                        (travelling.contains(item.id) || TransformGraph.anchors(item).contains { travelling.contains($0) })
+                    session.hiddenLayers.contains(item.layer) && selected.contains(item.id)
                 }
                 if hiddenChange {
                     throw NibError(.invalidParams, String(localized: "This transform would change content on a hidden layer."),
