@@ -4,24 +4,24 @@ import ImageIO
 import NibContracts
 
 /// Page thumbnails and previews (library grid, page sidebar): an in-memory `NSCache` in front of PNG files in
-/// `Caches/Nib/previews/<doc>/<page>/<rev>_<px>.png`. `rev` is the page's content revision: the newest of the page
-/// record's rev and `Workspace.contentRevision` (contracts-v2 G9), so a disk hit never loads the page's items when
-/// persistence knows that revision. Ids and revisions only, never Swift `Hasher` values, so a file stays valid across
+/// `Caches/Nib/previews/<doc>/<page>/<rev>_<fingerprint>_<px>.png`. The key includes every merged item revision and
+/// tombstone as well as the page record's revision, so offline edits below the maximum revision invalidate it.
+/// Stable fingerprints only, never Swift `Hasher` values, so a file stays valid across
 /// launches. Writing a key removes the page's other files. Next to them, `looks.txt` lists the registry entries the
 /// render used (`PageLooks` keys), so a template or drawer change after launch drops exactly the pages it affects.
 ///
-/// A merged record older than the page's newest one does not move the content revision. The renderer drops the
-/// page's files when such a merge is committed (see `NibPageRenderer.invalidate(after:)`).
+/// The renderer also drops old files when a remote merge is committed (`NibPageRenderer.invalidate(after:)`).
 final class ThumbnailCache {
     struct Key {
         let doc: DocumentID
         let page: PageID
         let rev: Rev
         let size: Int
+        var fingerprint: String = "legacy"
 
         var pageKey: String { TileCache.pageKey(doc, page) }
-        /// "<rev>_": every file of this page content, whatever its size.
-        var contentPrefix: String { rev.description + "_" }
+        /// Every file of this exact page content, whatever its size.
+        var contentPrefix: String { rev.description + "_" + fingerprint + "_" }
         var memoryKey: String { pageKey + "|" + contentPrefix + String(size) }
         var fileName: String { contentPrefix + String(size) + ".png" }
     }

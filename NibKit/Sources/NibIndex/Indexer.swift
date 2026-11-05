@@ -17,7 +17,7 @@ enum IndexKeys {
     static let service = "index.indexer"
     /// Device setting: OCR inserted images and text-less PDF pages for search.
     static let ocrImages = SettingKey("search.ocrImages", default: false)
-    static let schema = 1
+    static let schema = 2
 }
 
 extension String {
@@ -641,8 +641,7 @@ final class Indexer {
         guard let record = head.page(page), !record.deleted else { return nil }
         let all = try reader.allItems(doc, page: page)
         let live = all.filter { !$0.deleted }
-        let maxRev = all.map { $0.rev }.max() ?? .zero
-        let version = ["p\(IndexKeys.schema)", record.rev.description, maxRev.description, String(live.count),
+        let version = ["p\(IndexKeys.schema)", record.rev.description, LWW.fingerprint(all), String(live.count),
                        head.meta.language, pageFlags(record, items: live, includeInk: includeInk)].joined(separator: "|")
         return PageSnapshot(doc: doc, page: record, pageIndex: head.pageIndex(page) ?? 0, docKind: head.meta.kind,
                             language: head.meta.language, items: live, version: version)
@@ -656,15 +655,17 @@ final class Indexer {
             transcripts[clip.id] = TranscriptFiles.urls(in: legacy.deletingLastPathComponent(),
                                                         base: legacy.deletingPathExtension().lastPathComponent)
         }
-        let revs: [Rev] = [head.meta.rev] + head.outline.map { $0.rev } + head.blocks.map { $0.rev }
-            + head.cards.map { $0.rev } + head.audio.map { $0.rev }
-        let counts = "\(head.outline.count).\(head.blocks.count).\(head.cards.count).\(head.audio.count)"
-        let version = ["d\(IndexKeys.schema)", (revs.max() ?? .zero).description, counts, head.meta.language,
+        let version = ["d\(IndexKeys.schema)", documentRecordsVersion(head), head.meta.language,
                        docFlags(head, includeInk: indexInk), TranscriptFiles.stamp(transcripts.values.flatMap { $0 })]
             .joined(separator: "|")
         return DocSnapshot(doc: doc, kind: head.meta.kind, language: head.meta.language, outline: head.liveOutline,
                            blocks: head.liveBlocks, cards: head.liveCards, clips: head.liveAudio, transcripts: transcripts,
                            version: version)
+    }
+
+    private func documentRecordsVersion(_ head: DocumentContent) -> String {
+        [head.meta.rev.description, LWW.fingerprint(head.outline), LWW.fingerprint(head.blocks),
+         LWW.fingerprint(head.cards), LWW.fingerprint(head.audio)].joined(separator: "|")
     }
 
     /// Fingerprint of what a sweep pass over a document depends on: the settings, the head (every record's rev) and
@@ -676,10 +677,7 @@ final class Indexer {
         guard let files = files else { return nil }
         var parts = [head.meta.rev.description, head.meta.language, head.meta.kind.rawValue]
         parts += head.pages.map { $0.id.raw + ":" + $0.rev.description + ($0.deleted ? "d" : "") }.sorted()
-        let records: [Rev] = head.outline.map { $0.rev } + head.blocks.map { $0.rev } + head.cards.map { $0.rev }
-            + head.audio.map { $0.rev }
-        parts.append((records.max() ?? .zero).description)
-        parts.append("\(head.outline.count).\(head.blocks.count).\(head.cards.count).\(head.audio.count)")
+        parts.append(documentRecordsVersion(head))
         return ["s\(IndexKeys.schema)", globalFlags(), StableHash.hex(parts.joined(separator: ",")), files].joined(separator: "|")
     }
 

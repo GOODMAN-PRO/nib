@@ -71,6 +71,21 @@ final class NibContractsTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode([Rev].self, from: data), [a])
     }
 
+    func testRecordFingerprintTracksEveryRevisionAndTombstoneIndependentOfOrder() {
+        var a = PageRecord(id: "FINGERPRINTA", order: "V")
+        var b = PageRecord(id: "FINGERPRINTB", order: "W")
+        a.rev = Rev(wallMs: 100, counter: 0, device: 7)
+        b.rev = Rev(wallMs: 10, counter: 0, device: 8)
+        let original = LWW.fingerprint([a, b])
+        XCTAssertEqual(original, LWW.fingerprint([b, a]))
+        b.rev = Rev(wallMs: 50, counter: 0, device: 8)
+        XCTAssertNotEqual(original, LWW.fingerprint([a, b]))
+        let edited = LWW.fingerprint([a, b])
+        b.deleted = true
+        XCTAssertNotEqual(edited, LWW.fingerprint([a, b]))
+        XCTAssertNotEqual(original, LWW.fingerprint([a]))
+    }
+
     func testStrokeCodecBothForms() throws {
         let s = Stroke(style: InkStyle(), points: [StrokePoint(x: 1, y: 2, t: 0.5, force: 0.7), StrokePoint(x: 3, y: 4)], t0: 100)
         let plain = try JSONValue.from(s)

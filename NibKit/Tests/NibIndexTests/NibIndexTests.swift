@@ -855,6 +855,49 @@ final class NibIndexTests: XCTestCase {
 
     // MARK: Versions, sweeps and concurrency
 
+    func testIntermediateRemoteRevisionsRefreshSearchAndPageText() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        let page = Fixtures.page2
+        var high = Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 10, w: 100, h: 30), text: RichText(plain: "Fixedmaximum")))
+        high.rev = Rev(wallMs: 100, counter: 0, device: 7)
+        var lower = Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 50, w: 100, h: 30), text: RichText(plain: "Oldquokka")))
+        lower.rev = Rev(wallMs: 10, counter: 0, device: 8)
+        h.persistence.pageItems[doc, default: [:]][page] = [high, lower]
+        _ = try h.app.workspace.content(doc)
+        await indexer.indexDocument(doc)
+        lower.rev = Rev(wallMs: 50, counter: 0, device: 8)
+        lower.text?.text = RichText(plain: "Newquokka")
+        _ = h.app.bus.applyRemote(DocumentPatch(doc: doc, items: [page.raw: [lower]]), origin: "offline-device")
+        await indexer.indexDocument(doc)
+        let text = try await indexer.pageText(doc, page)
+        XCTAssertTrue(text.blocks.contains { $0.text == "Newquokka" })
+        XCTAssertFalse(text.blocks.contains { $0.text == "Oldquokka" })
+        let hits = results(try await h.run("search.text", ["query": "Newquokka"]))
+        XCTAssertFalse(hits.isEmpty)
+        let oldHits = results(try await h.run("search.text", ["query": "Oldquokka"]))
+        XCTAssertTrue(oldHits.isEmpty)
+    }
+
+    func testIntermediateDocumentRecordRevisionRefreshesDocumentText() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.textDocID
+        var head = try XCTUnwrap(h.persistence.heads[doc])
+        head.blocks[0].rev = Rev(wallMs: 100, counter: 0, device: 7)
+        head.blocks[1].rev = Rev(wallMs: 10, counter: 0, device: 8)
+        head.blocks[1].text = RichText(plain: "Oldwombat")
+        h.persistence.heads[doc] = head
+        await indexer.indexDocument(doc)
+        head.blocks[1].rev = Rev(wallMs: 50, counter: 0, device: 8)
+        head.blocks[1].text = RichText(plain: "Newwombat")
+        h.persistence.heads[doc] = head
+        await indexer.indexDocument(doc)
+        let hits = results(try await h.run("search.text", ["query": "Newwombat"]))
+        XCTAssertFalse(hits.isEmpty)
+        let oldHits = results(try await h.run("search.text", ["query": "Oldwombat"]))
+        XCTAssertTrue(oldHits.isEmpty)
+    }
+
     func testPageVersionsDependOnlyOnSettingsThatApplyToThePage() throws {
         let (h, indexer) = harness()
         let head = try h.app.workspace.content(Fixtures.docID)

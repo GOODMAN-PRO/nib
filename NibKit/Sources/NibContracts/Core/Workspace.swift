@@ -25,12 +25,16 @@ public protocol DocumentPersistence: AnyObject {
     /// contracts-v2: the highest revision of a page's items (tombstones included) as stored, WITHOUT loading the items
     /// into memory (thumbnail and index validity checks). nil = unknown (the caller loads the page). Default: nil.
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev?
+    /// Stable `LWW.fingerprint` of every merged item (including pending writes and tombstones), if available
+    /// without loading the page. Unlike the maximum revision, this detects intermediate-revision remote edits.
+    func contentFingerprint(_ doc: DocumentID, page: PageID) -> String?
 }
 
 @MainActor
 public extension DocumentPersistence {
     func isReadOnly(_ doc: DocumentID) -> Bool { false }
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? { nil }
+    func contentFingerprint(_ doc: DocumentID, page: PageID) -> String? { nil }
 }
 
 @MainActor
@@ -157,6 +161,12 @@ public final class Workspace {
     public func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
         if let items = pageItems[doc]?[page] { return items.map { $0.rev }.max() ?? .zero }
         return persistence.contentRevision(doc, page: page)
+    }
+
+    public func contentFingerprint(_ doc: DocumentID, page: PageID) throws -> String {
+        if let items = pageItems[doc]?[page] { return LWW.fingerprint(items) }
+        if let fingerprint = persistence.contentFingerprint(doc, page: page) { return fingerprint }
+        return LWW.fingerprint(try allItems(doc, page: page))
     }
 
     /// contracts-v2: true when persistence refuses to write the document (see `DocumentPersistence.isReadOnly`).

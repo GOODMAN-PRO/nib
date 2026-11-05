@@ -271,7 +271,7 @@ final class NibPageRenderer: PageRenderer {
 
     func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? {
         guard maxPixelSize > 0, let probe = try? await thumbnailProbe(doc: doc, page: page) else { return nil }
-        let key = ThumbnailCache.Key(doc: doc, page: page, rev: probe.rev, size: maxPixelSize)
+        let key = ThumbnailCache.Key(doc: doc, page: page, rev: probe.rev, size: maxPixelSize, fingerprint: probe.fingerprint)
         if let image = thumbnails.memoryImage(key) { return image }
         // A disk hit counts only if nothing outdated the page (a commit, a template or drawer change) meanwhile.
         if let hit = try? await run({ self.thumbnails.diskImage(key) }), tiles.generation(key.pageKey) == probe.generation {
@@ -379,18 +379,19 @@ final class NibPageRenderer: PageRenderer {
 
     // MARK: Snapshot (main actor)
 
-    /// The thumbnail key's revision (the newest of the page record's rev and the page's content revision) and the
-    /// page's tile-cache generation. The page's items are loaded only when persistence cannot say their revision.
+    /// The key combines the record revision and every item revision. Persistence may supply the fingerprint;
+    /// otherwise loading items is necessary to detect offline changes below the maximum revision.
     @MainActor
-    func thumbnailProbe(doc: DocumentID, page: PageID) throws -> (rev: Rev, generation: TileCache.Generation) {
+    func thumbnailProbe(doc: DocumentID, page: PageID) throws -> (rev: Rev, fingerprint: String, generation: TileCache.Generation) {
         guard let app = app else { throw NibError.unavailable("page renderer") }
         guard let record = try app.workspace.content(doc).page(page) else {
             throw NibError.notFound("page \(page.raw) in document \(doc.raw)")
         }
         let generation = tiles.generation(TileCache.pageKey(doc, page))
+        let fingerprint = try app.workspace.contentFingerprint(doc, page: page)
         let itemsRev = try app.workspace.contentRevision(doc, page: page)
             ?? app.workspace.allItems(doc, page: page).map { $0.rev }.max() ?? .zero
-        return (max(record.rev, itemsRev), generation)
+        return (max(record.rev, itemsRev), record.rev.description + "_" + fingerprint, generation)
     }
 
     /// Everything a worker needs, captured on the main actor: the page record, its z-ordered items (the workspace's

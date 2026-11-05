@@ -209,7 +209,7 @@ final class NibRenderTests: XCTestCase {
                 let pageKey = TileCache.pageKey(doc, page)
                 let file = try XCTUnwrap(thumbnailFile(renderer, doc, page, size: 160))
                 let probe = try renderer.thumbnailProbe(doc: doc, page: page)
-                let key = ThumbnailCache.Key(doc: doc, page: page, rev: probe.rev, size: 160)
+                let key = ThumbnailCache.Key(doc: doc, page: page, rev: probe.rev, size: 160, fingerprint: probe.fingerprint)
                 // Exercise both the cached tile path and direct compositing (hidden-item requests).
                 for direct in [false, true] {
                     var request = RenderRequest(doc: doc, page: page, scale: 1)
@@ -582,7 +582,38 @@ final class NibRenderTests: XCTestCase {
         let synced = try XCTUnwrap(syncedThumb)
         XCTAssertNotEqual(bitmap(synced).bytes, bitmap(edited).bytes, "the merged ink shows, not the stale file")
         await diskSettled(renderer)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: editedFile.path), "rewritten with the merged ink")
+        let syncedFile = try XCTUnwrap(thumbnailFile(renderer, doc, page, size: 120))
+        XCTAssertNotEqual(syncedFile, editedFile, "the complete revision fingerprint changes")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: syncedFile.path), "written with the merged ink")
+    }
+
+    func testRestartRejectsThumbnailAfterAnIntermediateRevisionOfflineEdit() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+        var high = shortStroke()
+        high.rev = Rev(wallMs: 100, counter: 0, device: 7)
+        var changed = Item.makeStroke(Stroke(style: .defaultPen,
+            points: [StrokePoint(x: 20, y: 150), StrokePoint(x: 220, y: 150)]))
+        changed.rev = Rev(wallMs: 10, counter: 0, device: 8)
+        let (doc, page) = try makePage(h, items: [high, changed])
+        let originalImage = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 120)
+        let original = try XCTUnwrap(originalImage)
+        let oldProbe = try renderer.thumbnailProbe(doc: doc, page: page)
+        await diskSettled(renderer)
+        h.app.workspace.close(doc)
+        var items = try XCTUnwrap(h.persistence.pageItems[doc]?[page])
+        let index = try XCTUnwrap(items.firstIndex { $0.id == changed.id })
+        items[index].deleted = true
+        items[index].rev = Rev(wallMs: 50, counter: 0, device: 8)
+        h.persistence.pageItems[doc]?[page] = items
+        let restarted = NibPageRenderer(app: h.app, thumbnailDirectory: renderer.thumbnails.directory)
+        let newProbe = try restarted.thumbnailProbe(doc: doc, page: page)
+        XCTAssertEqual(newProbe.rev, oldProbe.rev)
+        XCTAssertNotEqual(newProbe.fingerprint, oldProbe.fingerprint)
+        let refreshedImage = await restarted.thumbnail(doc: doc, page: page, maxPixelSize: 120)
+        let refreshed = try XCTUnwrap(refreshedImage)
+        XCTAssertNotEqual(bitmap(refreshed).bytes, bitmap(original).bytes)
+        await diskSettled(restarted)
     }
 
     func testTemplateChangeDropsOnlyThePagesUsingItAndTheirFilesOnceStarted() async throws {
@@ -783,16 +814,16 @@ final class NibRenderTests: XCTestCase {
     /// Where the page's current thumbnail of `size` px lives on disk.
     private func thumbnailFile(_ renderer: NibPageRenderer, _ doc: DocumentID, _ page: PageID, size: Int) throws -> URL? {
         let probe = try renderer.thumbnailProbe(doc: doc, page: page)
-        let key = ThumbnailCache.Key(doc: doc, page: page, rev: probe.rev, size: size)
+        let key = ThumbnailCache.Key(doc: doc, page: page, rev: probe.rev, size: size, fingerprint: probe.fingerprint)
         XCTAssertTrue(key.fileName.hasPrefix(probe.rev.description + "_"))
         return renderer.thumbnails.fileURL(key)
     }
 
     /// Waits for the thumbnail file writes and deletions queued so far (the renderer's disk queue is serial).
     private func diskSettled(_ renderer: NibPageRenderer) async {
-        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
-            renderer.disk.addBarrierBlock { done.resume() }
-        }
+        let settled = expectation(description: "Thumbnail disk queue settled")
+        renderer.disk.addBarrierBlock { settled.fulfill() }
+        await fulfillment(of: [settled], timeout: 5)
     }
 
     private func shortStroke() -> Item {
@@ -955,5 +986,10 @@ private final class CountingPersistence: DocumentPersistence {
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
         guard knowsRevisions, let items = base.pageItems[doc]?[page] else { return nil }
         return items.map { $0.rev }.max() ?? .zero
+    }
+
+    func contentFingerprint(_ doc: DocumentID, page: PageID) -> String? {
+        guard knowsRevisions, let items = base.pageItems[doc]?[page] else { return nil }
+        return LWW.fingerprint(items)
     }
 }
