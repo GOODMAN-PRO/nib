@@ -44,10 +44,16 @@ struct PluginRecord: Equatable {
 /// Paths inside a plugin folder: relative, no "..", no absolute paths or backslashes, and (symlinks resolved) still
 /// inside the folder.
 enum PluginPaths {
+    /// Hidden paths are excluded from the approval hash, so no manifest may reference them.
+    static func isValid(_ relative: String) -> Bool {
+        let trimmed = relative.trimmingCharacters(in: .whitespaces)
+        return !trimmed.isEmpty && !trimmed.hasPrefix("/") && !trimmed.contains("\\") && !trimmed.contains("\0")
+            && !trimmed.split(separator: "/").contains(where: { $0.hasPrefix(".") })
+    }
+
     static func resolve(_ relative: String, in folder: URL, path: String) throws -> URL {
         let trimmed = relative.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, !trimmed.hasPrefix("/"), !trimmed.contains("\\"), !trimmed.contains("\0"),
-              !trimmed.split(separator: "/").contains(where: { $0 == ".." }) else {
+        guard isValid(relative) else {
             throw NibError.invalid("'\(relative)' must be a relative path inside the plugin folder", path: path)
         }
         let base = folder.resolvingSymlinksInPath()
@@ -126,7 +132,7 @@ enum ManifestValidator {
         }
         if let folder = folder {
             do { _ = try PluginPaths.existing(m.entry, in: folder, path: "$.entry") } catch { out.append(NibError.wrap(error)) }
-        } else if m.entry.isEmpty || m.entry.hasPrefix("/") || m.entry.contains("..") {
+        } else if !PluginPaths.isValid(m.entry) {
             fail("the entry must be a path inside the plugin folder", "$.entry")
         }
         for (i, p) in m.permissions.enumerated() {
@@ -168,6 +174,7 @@ enum ManifestValidator {
         }
         func file(_ relative: String?, _ path: String) {
             guard let r = relative, !r.isEmpty else { return fail("missing file path", path) }
+            guard PluginPaths.isValid(r) else { return fail("file paths must not contain hidden components or leave the plugin folder", path) }
             guard let folder = folder else { return }
             do { _ = try PluginPaths.existing(r, in: folder, path: path) } catch { out.append(NibError.wrap(error)) }
         }

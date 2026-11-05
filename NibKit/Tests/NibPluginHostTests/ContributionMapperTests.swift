@@ -342,6 +342,31 @@ final class ContributionMapperTests: XCTestCase {
         XCTAssertTrue(ManifestValidator.problems(manifest, folder: nil).isEmpty)
     }
 
+    func testManifestRejectsEveryUnhashedFileReference() throws {
+        let kit = PluginTestKit()
+        let value = kit.manifest(Self.pid, contributes: [
+            "panels": [["id": "dev.test.all.panel", "title": "Panel", "entry": ".panels/main.html"]],
+            "templates": [["id": "dev.test.all.pdf", "title": "PDF", "kind": "pdf", "file": ".templates/page.pdf"]],
+            "elements": [["id": "dev.test.all.elements", "title": "Elements", "files": ["elements/.items.json"]]],
+            "tapePatterns": [["id": "dev.test.all.tape", "title": "Tape", "file": ".tape.png"]],
+            "boardTemplates": [["id": "dev.test.all.board", "title": "Board", "file": ".boards/frame.json"]]
+        ]).merging(["entry": ".main.js"])
+        let manifest = try value.decode(PluginManifest.self)
+        let folder = try kit.install(value)
+        let locations: [URL?] = [nil, folder]
+        for location in locations {
+            let paths = Set(ManifestValidator.problems(manifest, folder: location).compactMap { $0.path })
+            for expected in ["$.entry", "$.contributes.panels[0].entry", "$.contributes.templates[0].file",
+                             "$.contributes.elements[0].files[0]", "$.contributes.tapePatterns[0].file",
+                             "$.contributes.boardTemplates[0].file"] {
+                XCTAssertTrue(paths.contains(expected), expected)
+            }
+        }
+        for path in [".main.js", ".x/main.js", "panels/.main.html"] {
+            XCTAssertThrowsError(try PluginPaths.resolve(path, in: folder, path: "$.entry"))
+        }
+    }
+
     func testSchemaConversionKeepsTypesBoundsAndDefaults() throws {
         let schema = SchemaConverter.schema(try JSONValue.parse(#"""
         {"type": "object", "required": ["page"], "properties": {

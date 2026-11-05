@@ -318,7 +318,7 @@ final class NibPluginRuntimeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: folder) }
         let inside = try PluginRuntime.entryURL(PluginManifest.fixture(entry: "dist/main.js"), folder: folder)
         XCTAssertTrue(inside.path.hasSuffix("/dist/main.js"))
-        for entry in ["../main.js", "/etc/main.js", "a/../../main.js", ""] {
+        for entry in ["../main.js", "/etc/main.js", "a/../../main.js", "", ".main.js", ".x/main.js", "dist/.main.js"] {
             XCTAssertThrowsError(try PluginRuntime.entryURL(PluginManifest.fixture(entry: entry), folder: folder), entry)
         }
         let script = folder.appendingPathComponent("main.js")
