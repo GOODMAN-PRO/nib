@@ -38,10 +38,49 @@ enum ImportLocations {
         return false
     }
 
-    /// Open In copies and share-extension files: Nib's to delete once imported or declined.
-    static func isInConsumableInbox(_ url: URL) -> Bool {
-        if isInside(url, openInInbox) { return true }
-        if let inbox = appGroupInbox, isInside(url, inbox) { return true }
+    static var inboxes: [URL] { [openInInbox] + [appGroupInbox].compactMap { $0 } }
+
+    /// Use the public catalog as well as disk records: a provider may have evicted a folder's metadata.
+    @MainActor
+    static func userFolders(_ library: LibraryService?) -> [URL] {
+        guard let library else { return [] }
+        var folders = library.allNodes().filter { $0.kind == .folder }.map {
+            library.rootURL.appendingPathComponent($0.path, isDirectory: true)
+        }
+        if canonical(library.rootURL) == canonical(openInInbox) { folders.append(library.rootURL) }
+        return folders
+    }
+
+    static func isUserOwned(_ url: URL, folders: [URL]) -> Bool {
+        folders.contains { canonical(url) == canonical($0) || isInside(url, $0) }
+    }
+
+    /// Like NibLibrary's catalog scanner, ownership is proved by the record name, not readable JSON.
+    /// Also protect damaged names and evicted iCloud records. A failed listing is never permission to delete.
+    /// NibContracts documents the record format but does not yet expose a shared classifier.
+    static func isHandoffInbox(_ directory: URL, userFolders: [URL] = []) -> Bool {
+        guard !isUserOwned(directory, folders: userFolders),
+              let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return false }
+        return !names.contains { $0.hasPrefix(".nibfolder.") || $0.hasPrefix("..nibfolder.") }
+    }
+
+    /// Open In copies and share-extension files, rechecked immediately before consumption.
+    static func isInConsumableInbox(_ url: URL, inboxes: [URL] = ImportLocations.inboxes,
+                                    userFolders: [URL] = []) -> Bool {
+        guard !isUserOwned(url, folders: userFolders) else { return false }
+        for inbox in inboxes where isInside(url, inbox) {
+            guard isHandoffInbox(inbox, userFolders: userFolders) else { return false }
+            // A recorded folder nested inside staging is still the user's folder.
+            var parent = url.deletingLastPathComponent()
+            while isInside(parent, inbox) {
+                guard isHandoffInbox(parent, userFolders: userFolders) else { return false }
+                parent.deleteLastPathComponent()
+            }
+            if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                return isHandoffInbox(url, userFolders: userFolders)
+            }
+            return true
+        }
         return false
     }
 }
@@ -149,10 +188,12 @@ enum InboxFiles {
     /// Everything in the inboxes, plus loose files in Documents (never plain folders: the library, or its folders,
     /// may live there). Nib documents put into Documents with Finder count too, unless Documents is the library
     /// itself (`packagesFromDocuments` false), where they already are library documents.
-    static func entries(inboxes: [URL], documents: URL, packagesFromDocuments: Bool = false) -> [Entry] {
+    static func entries(inboxes: [URL], documents: URL, packagesFromDocuments: Bool = false,
+                        userFolders: [URL] = []) -> [Entry] {
         var out: [Entry] = []
-        for inbox in inboxes {
+        for inbox in inboxes where ImportLocations.isHandoffInbox(inbox, userFolders: userFolders) {
             for e in ArchiveIO.visibleEntries(of: inbox) {
+                guard ImportLocations.isInConsumableInbox(e.url, inboxes: [inbox], userFolders: userFolders) else { continue }
                 out.append(Entry(url: e.url, isDirectory: e.isDirectory, fromInbox: true, key: key(e.url)))
             }
         }
@@ -234,11 +275,12 @@ enum InboxScanner {
             await runImport([ShareHandoff.link], app: app, navigator: nav)
             return
         }
-        let inboxes = [ImportLocations.openInInbox] + [ImportLocations.appGroupInbox].compactMap { $0 }
+        let inboxes = ImportLocations.inboxes
+        let userFolders = ImportLocations.userFolders(library)
         let documents = ImportLocations.documents
         let packages = ImportLocations.canonical(library.rootURL) != ImportLocations.canonical(documents)
         let found = await Task.detached(priority: .utility) {
-            InboxFiles.entries(inboxes: inboxes, documents: documents, packagesFromDocuments: packages)
+            InboxFiles.entries(inboxes: inboxes, documents: documents, packagesFromDocuments: packages, userFolders: userFolders)
         }.value
         let content = app.content
         let offered = InboxFiles.offered(found, inFlight: ImportEngine.inFlight, declined: declined) { url, isDirectory in

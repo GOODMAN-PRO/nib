@@ -793,6 +793,37 @@ final class FeatImportTests: XCTestCase {
         }
     }
 
+    func testImportPreservesUserInboxPDFButConsumesAHandoffCopy() async throws {
+        let h = harness()
+        let inbox = ImportLocations.openInInbox
+        try FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)
+        let name = UUID().uuidString
+        let source = inbox.appendingPathComponent(name + ".pdf")
+        let record = inbox.appendingPathComponent(".nibfolder.1234abcd " + name + ".json")
+        let bytes = Data("%PDF user original".utf8)
+        try bytes.write(to: source)
+        try Data("damaged folder record".utf8).write(to: record)
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: record)
+            ImportEngine.consumableFiles.remove(source.standardizedFileURL.path)
+        }
+        // PDF dispatch is owned by NibPDF; this fake exercises the real import engine's cleanup boundary.
+        h.app.content.importers.register(ImporterDescriptor(id: "test.pdf", title: "PDF", fileExtensions: ["pdf"],
+            owner: "test") { url, _, _ in
+            XCTAssertEqual(try Data(contentsOf: url), bytes)
+            return [Fixtures.docID]
+        })
+        XCTAssertFalse(InboxFiles.entries(inboxes: [inbox], documents: ImportLocations.documents).contains { $0.url == source })
+        ImportEngine.consumableFiles.insert(source.standardizedFileURL.path) // stale offer must not bypass the new guard
+        _ = try await h.run("import.files", ["urls": urls([source]), "folder": "lib"])
+        XCTAssertEqual(try Data(contentsOf: source), bytes)
+        try FileManager.default.removeItem(at: record)
+        XCTAssertTrue(InboxFiles.entries(inboxes: [inbox], documents: ImportLocations.documents).contains { $0.url == source })
+        _ = try await h.run("import.files", ["urls": urls([source]), "folder": "lib"])
+        XCTAssertFalse(exists(source))
+    }
+
     func testHandoffSurvivesUnavailableDialogAndStagingCleanup() async throws {
         let h = harness()
         let board = UIPasteboard.general

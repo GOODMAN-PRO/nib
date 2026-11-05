@@ -699,7 +699,7 @@ enum ImportEngine {
                                            idQueue: idQueue, library: library, staging: staging, ctx: ctx, dialog: ask,
                                            reveal: true)
         case .cancelled:
-            for s in sources { consumeInboxCopy(s.original) }                      // a declined Open In leaves nothing behind
+            for s in sources { consumeInboxCopy(s.original, library: library) }                      // a declined Open In leaves nothing behind
             return .cancelledResult
         case .notShown:
             throw NibError(.unavailable, "Nib couldn't show the import dialog",
@@ -775,7 +775,7 @@ enum ImportEngine {
                 }
                 for f in files {
                     if report.skipped.isEmpty {
-                        consumeImported(f.source.original, converted: report.converted)
+                        consumeImported(f.source.original, converted: report.converted, library: library)
                     } else {
                         keepSource(f.source.original)
                     }
@@ -801,7 +801,7 @@ enum ImportEngine {
             // original saved from the pasteboard, including when this is a later inbox-scan retry.
             for f in failed where f.entry == nil {
                 if let url = URL(string: f.url), ShareHandoff.isRecoveryOriginal(url) { keepSource(f.url) }
-                else { consumeInboxCopy(f.url) }
+                else { consumeInboxCopy(f.url, library: library) }
             }
         } else if ctx.principal.isUser, !failed.isEmpty {
             ImportUI.reportPartialFailure(failed, ctx: ctx)
@@ -906,8 +906,11 @@ enum ImportEngine {
     }
 
     /// Open In copies (Documents/Inbox) and share-extension files (App Group inbox) belong to Nib once seen.
-    static func consumeInboxCopy(_ original: String) {
-        guard let url = URL(string: original), url.isFileURL, ImportLocations.isInConsumableInbox(url) else { return }
+    static func consumeInboxCopy(_ original: String, library: LibraryService? = nil,
+                                 inboxes: [URL] = ImportLocations.inboxes) {
+        guard let url = URL(string: original), url.isFileURL,
+              ImportLocations.isInConsumableInbox(url, inboxes: inboxes,
+                  userFolders: ImportLocations.userFolders(library)) else { return }
         try? FileManager.default.removeItem(at: url)
         if !FileManager.default.fileExists(atPath: url.path) {
             try? FileManager.default.removeItem(at: ShareHandoff.recoveryMarker(url))
@@ -917,9 +920,13 @@ enum ImportEngine {
     /// After a complete import: inbox copies, plus loose Documents files the inbox scan offered, are removed. A loose
     /// file that went through a lossy conversion (Word, PowerPoint, web pages → PDF) is the person's original: it
     /// stays, and the scan does not offer it again.
-    private static func consumeImported(_ original: String, converted: Bool) {
-        consumeInboxCopy(original)
+    private static func consumeImported(_ original: String, converted: Bool, library: LibraryService) {
+        consumeInboxCopy(original, library: library)
         guard let url = URL(string: original), url.isFileURL else { return }
+        let folders = ImportLocations.userFolders(library)
+        guard !ImportLocations.isUserOwned(url, folders: folders) else { return }
+        if ImportLocations.inboxes.contains(where: { ImportLocations.isInside(url, $0) }),
+           !ImportLocations.isInConsumableInbox(url, userFolders: folders) { return }
         let path = url.standardizedFileURL.path
         guard consumableFiles.remove(path) != nil else { return }
         if converted {
