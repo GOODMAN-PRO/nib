@@ -87,6 +87,21 @@ final class CaptureUITests: XCTestCase {
         return element
     }
 
+    /// Waits until the named control is hittable, fully inside the window and no longer moving,
+    /// so a capture never shoots a presentation that is still in flight.
+    private func settled(_ name: String) throws {
+        let element = try require(name)
+        let deadline = Date().addingTimeInterval(12)
+        var last = CGRect.null
+        while Date() < deadline {
+            let frame = element.frame
+            if frame == last, element.isHittable, ui.app.windows.firstMatch.frame.contains(frame) { return }
+            last = frame
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        }
+        throw NibUI.Failure.message("\(name) did not settle inside the window: \(last)")
+    }
+
     private func tap(_ name: String, scroll: Bool = false) throws {
         let target = try ui.requireControl(name, scroll: scroll, timeout: 5)
         guard target.isEnabled else {
@@ -363,6 +378,7 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.ui.openDocument("Motion flashcards")
             try self.tap("Practice")
+            try self.settled("Flip Card")
             try self.capture(29, "study-session") { $0.openPanels.contains("studysession.practice") }
         }
     }
@@ -435,7 +451,7 @@ final class CaptureUITests: XCTestCase {
     private func capture24RenderError() {
         variants(scenario: .failedRender) {
             try self.openNotebook()
-            _ = try self.require("Try Again")
+            try self.settled("Try Again")
             try self.capture(33, "page-render-error") {
                 $0.screen == "document" && $0.fixtureScenario == "failedRender" && $0.renderFailureCount == 1
             }
