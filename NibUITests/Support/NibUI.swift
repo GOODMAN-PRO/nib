@@ -54,6 +54,15 @@ final class NibUI {
         return !frame.isNull && !frame.isInfinite && !visible.isNull && visible.width > 1 && visible.height > 1
     }
 
+    func nativeEditorHittability(_ element: XCUIElement) -> Bool? {
+        guard let snapshot = try? element.snapshot(), !snapshot.frame.isNull, !snapshot.frame.isInfinite,
+              snapshot.frame.minX.isFinite, snapshot.frame.minY.isFinite else { return nil }
+        guard let reader = NSClassFromString("NibUIReadiness") as? NSObject.Type,
+              let value = reader.perform(NSSelectorFromString("hittabilityOfElement:"), with: element)?
+                .takeUnretainedValue() as? NSNumber else { return nil }
+        return value.boolValue
+    }
+
     /// Exact, bounded matches only. Native editors precede their identically labelled captions.
     /// Offscreen matches remain available to revealFormElement so it can find the actual containing form.
     func findControl(_ name: String, type: XCUIElement.ElementType = .any,

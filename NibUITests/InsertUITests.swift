@@ -148,7 +148,12 @@ final class InsertUITests: XCTestCase {
         if visible("Finish Editing") { try tap("Finish Editing") }
         else if visible("Done typing") { try tap("Done typing") }
         else { try ui.nativeKey(XCUIKeyboardKey.escape.rawValue, [], in: focusedField()) }
-        try wait("Text input must finish") { !self.ui.app.textViews.allElementsBoundByIndex.contains { $0.isHittable } }
+        try wait("Text input must finish") {
+            for editor in self.ui.app.textViews.allElementsBoundByIndex {
+                guard let hittable = self.ui.nativeEditorHittability(editor), !hittable else { return false }
+            }
+            return true
+        }
     }
     private func replace(_ field: XCUIElement, with text: String) throws {
         try ui.replaceNativeText(in: field, with: text)
@@ -235,7 +240,7 @@ final class InsertUITests: XCTestCase {
     private func snapshot(_ kind: String) throws -> JSON { try all(); return try item(kind) }
     private func json(_ value: Any?) -> String {
         guard let value else { return "null" }
-        return (try? String(data: JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .fragmentsAllowed]), encoding: .utf8)) ?? "invalid JSON"
+        return (try? String(data: JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .fragmentsAllowed, .withoutEscapingSlashes]), encoding: .utf8)) ?? "invalid JSON"
     }
     private func paragraphs(_ object: JSON) throws -> [JSON] {
         try XCTUnwrap((object["text"] as? JSON)?["paragraphs"] as? [JSON])
@@ -589,12 +594,14 @@ final class InsertUITests: XCTestCase {
         try shape(); let origin = try item("shape")
         for side in ["Above", "On the Right", "Below", "On the Left"] {
             try menu("Add Connected Shape", side); try counts(7)
-            let added = try item("shape")
             try all(); let copied = try items()
             XCTAssertEqual(copied.filter { $0["kind"] as? String == "connector" }.count, 1)
             let connector = try XCTUnwrap(copied.first(where: { $0["kind"] as? String == "connector" })?["connector"] as? JSON)
             XCTAssertNotNil((connector["from"] as? JSON)?["item"])
             XCTAssertNotNil((connector["to"] as? JSON)?["item"])
+            let addedID = try XCTUnwrap((connector["to"] as? JSON)?["item"] as? String)
+            let added = try XCTUnwrap(copied.first { $0["id"] as? String == addedID }?["shape"] as? JSON)
+            ui.logQA("Quick Diagram added shape", "side=\(side) origin=\(json(origin)) added=\(json(added))")
             let shapes = [added]
             let f = try XCTUnwrap(origin["frame"] as? JSON), x = f["x"] as? Double ?? 0, y = f["y"] as? Double ?? 0
             XCTAssertTrue(shapes.contains { shape in
@@ -1373,7 +1380,10 @@ final class InsertUITests: XCTestCase {
         }
     }
     func testReplayModesAndSeekFromRealTimestampedInk() throws {
-        try recordClip(draw: true); try clipRow().tap(); try tap("Pause")
+        try recordClip(draw: true, minimumSeconds: 30); try clipRow().tap()
+        let pause = ui.app.buttons["Pause"].firstMatch
+        try wait("Replay must expose Pause before the clip ends") { pause.exists && pause.isHittable }
+        pause.tap()
         let slider = try control("Playback position", .slider)
         try ui.dragSlider(slider, to: 0) {
             try self.wait("Replay must seek to the beginning") { ((try? self.playbackTimes().position) ?? .infinity) < 0.5 }

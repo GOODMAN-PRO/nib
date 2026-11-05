@@ -210,3 +210,13 @@ D:app-round-4#10 / keyboard-and-state#9 show repeated typing without focus on th
 ## C15 - Pages thumbnail and persistence readiness
 
 S:singles-rest#2 correction places the caption-inclusive centre on the pen options edge; tapThumb now restricts contact to the upper image centre and passes visible Tools/preset-strip frames as obstructions. S:#1 unbookmark now waits on a successful persisted-page read (a read failure cannot count as false). S:#6 correction: Add to Outline waits for a finite stable alert frame on two reads plus keyboard presence before replacement; no interruption monitor. Expected two thumbnail selection/stack tests, bookmark persistence and outline add flow. CI must show two selected pages without New Colour, persisted unbookmark, and no default Cancel during outline typing; interruption cause remains unknown.
+
+## C16 - Insert singles
+
+S:singles-insert#3: json adds withoutEscapingSlashes, making URL positive and removal assertions meaningful. Audited all contains needles with slash: the remaining matches are filesystem paths or HTTP request strings, not reserialized JSON. S:#6: forge-spec F032 says edge-dot tap creates a connected shape and diagram.create groups the transaction; it specifies no selection change after addConnected. Current DiagramAddConnected puts shape/connector without changing selection. Use the already-taken select-all copy and the connector destination item ID to identify the added shape (avoids both source and preexisting fixture shapes), then keep every side/anchor/undo assertion.
+
+S:#7: Replay records minimumSeconds30 and uses one direct Pause predicate/tap. S:#1 correction: finish's TextView polling treats invalid/infinite frames and undetermined hittability as not ready. A small separate runner-only Objective-C exception boundary returns optional NSNumber for the latter; Swift loads its class by name because the protected bridging header cannot change. project.yml already compiles the entire NibUITests source directory. Escape delivery remains untouched. This does not claim sticky Escape fixed. Expected URL, Quick Diagram sides and Replay timing; sticky waits should fail normally instead of throwing on transient inf geometry. CI must verify the new ObjC helper links/loads and the unchanged final assertions.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| QuickDiagramEachSide | Quick Diagram added shape | Does the destination shape differ geometrically from the source in the requested direction? |
