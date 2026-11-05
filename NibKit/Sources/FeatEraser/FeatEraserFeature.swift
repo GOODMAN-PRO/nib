@@ -66,7 +66,8 @@ public enum FeatEraserFeature: NibFeature {
     }
 
     static func canEdit(_ ctx: MenuContext) -> Bool {
-        pageRef(ctx) != nil && !(ctx.session?.readOnly ?? false)
+        guard let doc = ctx.doc ?? ctx.session?.document else { return false }
+        return pageRef(ctx) != nil && !(ctx.session?.readOnly ?? false) && !ctx.app.isReadOnly(doc)
     }
 }
 

@@ -90,6 +90,31 @@ final class FeatEraserTests: XCTestCase {
         XCTAssertEqual(EraserSettings.filter(h.app.settings), Set(InkTool.allCases))
     }
 
+    func testAllEraseCommandsRefusePersistenceReadOnlyDocumentsWithoutMutating() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        h.app.workspace.persistence = ReadOnlyErasePersistence(base: h.persistence)
+        XCTAssertFalse(h.session.readOnly)
+        let before = try h.snapshotAll(), depth = h.undoDepth(Fixtures.docID)
+        let calls: [(String, JSONValue)] = [
+            ("page.clear", ["page": .string(page1)]),
+            ("page.deleteItems", ["page": .string(page1), "scope": "page", "kinds": ["stroke"]]),
+            ("page.deleteItems", ["doc": "doc:FIXTUREDOC01", "scope": "document", "kinds": ["shape"]]),
+            ("ink.erase", ["page": .string(page1), "path": [[100, 100], [100, 140]], "radius": 3, "mode": "stroke"]),
+            ("ink.scribbleErase", ["page": .string(page1), "points": [[70, 116], [150, 118], [70, 121], [150, 124]]])
+        ]
+        for (command, params) in calls {
+            do {
+                _ = try await h.run(command, params)
+                XCTFail("Expected permissionDenied for \(command)")
+            } catch let error as NibError { XCTAssertEqual(error.code, .permissionDenied) }
+            XCTAssertEqual(try h.snapshotAll(), before)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        }
+        let context = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1)
+        XCTAssertFalse(FeatEraserFeature.canEdit(context))
+        XCTAssertTrue(h.app.ui.menuItems(.documentMore, context).filter { $0.owner == FeatEraserFeature.id }.isEmpty)
+    }
+
     func testTheSharedEraserKeysAreTheOnesOtherFeaturesRead() {
         let h = Harness(features: [FeatEraserFeature.self])
         XCTAssertEqual(EraserSettings.mode(h.app.settings), .standard)
@@ -976,4 +1001,19 @@ private final class SilentCanvasHost: CanvasHost {
     func cancelWetStroke() { base.cancelWetStroke() }
     func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { base.attachLiveView(view, item: item, page: page) }
     func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) { renderRequests += 1 }
+}
+
+@MainActor
+private final class ReadOnlyErasePersistence: DocumentPersistence {
+    let base: InMemoryPersistence
+    init(base: InMemoryPersistence) { self.base = base }
+    func isReadOnly(_ doc: DocumentID) -> Bool { doc == Fixtures.docID }
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] { try base.loadItems(doc, page: page) }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try base.fileURL(doc, relativePath: relativePath) }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { nil }
 }
