@@ -197,3 +197,13 @@ Image/collection/GIF/tape cancel paths use the helper. Collection save and reimp
 | --- | --- | --- |
 | Image Photos/Files, image replacement, collection import/export, GIF Files, tape pattern; shared Photos callers | Remote picker readiness / Remote picker Cancel / Remote picker inventory | Did the remote tree load, was Cancel hittable at its frame, and what controls/files actually existed? |
 | CollectionExportSaveAndReimport | Collection Files location | Which named location was actually tapped in save and import? |
+
+### I7 - audio playback duration and audible-input boundary
+
+Confirmed insert-pickers-audio#3: a five-second clip ended before the 7-10-second Pause lookup. Rename/export/delete now records at least 30 seconds through the existing observed-clock wait, retaining every assertion and the 180-second allowance. CI must resolve Pause while playing and complete the original rename/share/cancel/delete checks.
+
+For #2 correction, the 27 ms run with Skip Silence/Reduce Noise is proven; an empty audible map is still inference. Current Player builds a plan from SilenceMap.audible and the UI exposes neither the map nor an audio-import route. The verifier proposes turning both settings off, but this job explicitly requires sound while Skip Silence is **on** and unchanged assertions. Consequently that workaround is not applied. NibUITests cannot make the simulator microphone receive a tone: runner speaker playback is not a proven microphone-input path, and changing the app recording fixture or CI audio input is outside the allowed paths. No silent-file mutation or injected recording is substituted for the real recording test. An audible app fixture/CI microphone feed and app-side SilenceMap span logging are required to finish this part; the enabled-settings Play/Pause expectation remains, with a pre-play options/raw-state boundary. This is an explicit scope-limited explanation, not a claimed audio fix.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| AudioPlayPauseSeekSkipSettingsAndClose | Audio enabled-settings playback / State step (Audio before Play with Skip Silence and Reduce Noise) | Which settings and exposed state preceded the potentially immediate end? SilenceMap itself is unavailable to the runner. |

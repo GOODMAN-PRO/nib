@@ -1434,12 +1434,14 @@ final class InsertUITests: XCTestCase {
         XCTAssertTrue((try control("Playback Options").value as? String)?.contains("Skipping silence") == true)
         try tap("Playback Options"); try tap("Reduce Noise")
         XCTAssertTrue((try control("Playback Options").value as? String)?.contains("Reducing noise") == true)
+        ui.logQA("Audio enabled-settings playback", "before Play options=" + String(describing: try control("Playback Options").value))
+        ui.logStateStep("Audio before Play with Skip Silence and Reduce Noise")
         try tap("Play"); try tap("Pause")
         try tap("Playback Options"); try tap("Close Player")
         try wait("Close Player unloads playback bar") { !self.query("Playback position").firstMatch.exists }
     }
     func testAudioRenameExportDeleteCancelAndConfirm() throws {
-        try recordClip(); try ui.nativeContextMenu(try clipRow(), path: ["Rename"])
+        try recordClip(minimumSeconds: 30); try ui.nativeContextMenu(try clipRow(), path: ["Rename"])
         try replace(try control("Name", .textField), with: "Motion lecture"); try tap("Rename")
         let row = try control("Motion lecture")
         let duration = row.value as? String
