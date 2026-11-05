@@ -279,7 +279,7 @@ struct SearchResults: View {
                             .id(cursor)
                             .onAppear { loadMore() }
                         }
-                        if let indexing = state.indexingMessage {
+                        if state.showsIndexingFooter, let indexing = state.indexingMessage {
                             Text(indexing)
                                 .font(NibFont.footnote)
                                 .foregroundStyle(NibColor.labelSecondary)

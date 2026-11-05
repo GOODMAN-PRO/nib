@@ -986,6 +986,58 @@ final class FeatSearchUITests: XCTestCase {
         }
     }
 
+    func testEmptyAdviceDoesNotRecommendTheAlreadySelectedFilterAndIndexingAppearsOnce() {
+        let state = SearchState()
+        state.query = "Physics"
+        for filter in SearchFilter.allCases {
+            state.filter = filter
+            XCTAssertEqual(state.emptyPresentation?.message, "Try fewer words or check the spelling.")
+        }
+        state.filter = .all
+        state.progress = IndexProgressPayload(running: true, done: 0, total: 5, pending: 5)
+        XCTAssertEqual(state.emptyPresentation, .indexing)
+        XCTAssertFalse(state.showsIndexingFooter)
+        state.matches = [hit()]
+        XCTAssertTrue(state.showsIndexingFooter)
+        state.progress = nil
+        XCTAssertFalse(state.showsIndexingFooter)
+    }
+
+    func testIndexCompletionKeepsEmptySearchPendingUntilRefreshedTitlesArrive() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [])
+        let runtime = SearchRuntime.from(h.app)
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "query": "Physics"])
+        let state = runtime.state(h.session)
+        XCTAssertEqual(state.emptyPresentation, .noResults("Physics"))
+        installDependencies(h, hits: [hit(kind: "title")])
+        let completed = h.app.events.emit(IndexProgressPayload(running: false, done: 5, total: 5, pending: 0))
+        await runtime.receive(completed)
+        XCTAssertEqual(state.emptyPresentation, .searching)
+        XCTAssertTrue(state.refreshPending)
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        XCTAssertEqual(state.matches.count, 1)
+        XCTAssertFalse(state.loading)
+        XCTAssertFalse(state.refreshPending)
+    }
+
+    func testChangingFilterCancelsQueuedRefreshWithoutLeavingSearchLoading() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [hit()])
+        let runtime = SearchRuntime.from(h.app)
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "query": "Hello"])
+        let state = runtime.state(h.session)
+        let completed = h.app.events.emit(IndexProgressPayload(running: false, done: 1, total: 1, pending: 0))
+        await runtime.receive(completed)
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertTrue(state.refreshPending)
+        XCTAssertFalse(state.canStepMatches)
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "filter": "all"])
+        XCTAssertFalse(state.refreshPending)
+        XCTAssertFalse(state.loading)
+        XCTAssertTrue(state.canStepMatches)
+    }
+
     func testNativePhoneFieldHasIndependentClearAndCancelInBothAppearances() async throws {
         var query = "Physics"
         var closed = false
