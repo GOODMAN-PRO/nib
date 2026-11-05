@@ -1003,6 +1003,12 @@ final class FolderLibrary: LibraryService {
         overlayLoadedDocuments(&entries)
         let before = catalog.byPath
         install(entries)
+        // A remote Trash move has the same editor lifecycle as local trash. Install the new package URLs first
+        // so closing flushes pending edits to the moved package. Missing packages are left open for recovery.
+        let previouslyLive = Set(before.values.filter { $0.isDocument && !$0.inTrash }.map { $0.node.id })
+        for entry in entries where entry.isDocument && entry.inTrash && previouslyLive.contains(entry.node.id) {
+            workspace.close(entry.node.id)
+        }
         var refs: [String] = []
         for e in entries where before[e.node.path] != e { refs.append(e.ref) }
         let now = Set(entries.map { $0.node.path })

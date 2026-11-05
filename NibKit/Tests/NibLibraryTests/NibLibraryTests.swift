@@ -830,6 +830,40 @@ final class NibLibraryTests: XCTestCase {
         XCTAssertNil(lib.h.app.services.packages.url("FOREIGNDOC01"))
     }
 
+    func testRemoteTrashClosesLoadedDocumentAfterInstallingMovedLocation() async throws {
+        let lib = try await makeLibrary()
+        let doc = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Moved remotely"]))
+        _ = try lib.h.app.workspace.content(doc)
+        let package = try XCTUnwrap(lib.library.packageURL(doc))
+        let trash = lib.library.metadataURL.appendingPathComponent("trash", isDirectory: true)
+        try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+        let moved = trash.appendingPathComponent(package.lastPathComponent, isDirectory: true)
+        var closed: [DocumentID] = []
+        var locationAtClose: URL?
+        let subscription = lib.h.app.events.subscribe { event in
+            if event.type == NibEventType.docClosed, let id = event.doc {
+                closed.append(id)
+                locationAtClose = lib.h.app.services.packages.url(id)
+            }
+        }
+        defer { subscription.cancel() }
+        try FileManager.default.moveItem(at: package, to: moved)
+        lib.library.refresh()
+        XCTAssertFalse(lib.h.app.workspace.isLoaded(doc))
+        XCTAssertEqual(closed, [doc])
+        XCTAssertEqual(locationAtClose?.standardizedFileURL, moved.standardizedFileURL)
+        XCTAssertNotNil(lib.library.node(doc)?.trashedAt)
+    }
+
+    func testMissingRemotePackageKeepsLoadedDocumentForRecovery() async throws {
+        let lib = try await makeLibrary()
+        let doc = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Unavailable"]))
+        _ = try lib.h.app.workspace.content(doc)
+        try FileManager.default.removeItem(at: XCTUnwrap(lib.library.packageURL(doc)))
+        lib.library.refresh()
+        XCTAssertTrue(lib.h.app.workspace.isLoaded(doc))
+    }
+
     func testACopiedPackageGetsItsOwnID() async throws {
         let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Original"]))
