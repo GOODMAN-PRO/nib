@@ -428,7 +428,7 @@ final class NibUI {
                 logQA("Form lazy edge unavailable", "Top not confirmed within six bounded moves")
                 return
             }
-            if !lazySearch && direction == nil { direction = targetFrame.map { $0.midY < viewport.midY } }
+            if !lazySearch && direction == nil { direction = targetFrame.map { $0.midY < viewport.midY } ?? false }
             guard lazySearch || direction != nil else { return }
             let down = lazySearch ? homing : (direction == true)
             guard let start = formDragStart(snapshot, viewport: viewport, down: down) else { return }
@@ -1717,7 +1717,7 @@ final class NibUI {
     }
 
     /// Resolve the presented form once for a batch; use typed queries inside it for each editor.
-    private func nativeFormContainer() -> XCUIElement {
+    func nativeFormContainer() -> XCUIElement {
         for surface in [app.alerts.firstMatch, app.sheets.firstMatch, app.popovers.firstMatch] {
             if surface.exists { return surface }
         }

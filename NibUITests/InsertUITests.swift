@@ -252,41 +252,49 @@ final class InsertUITests: XCTestCase {
     private func canvasText(_ value: String) -> XCUIElement {
         ui.canvas.staticTexts.matching(NSPredicate(format: "value == %@", value)).firstMatch
     }
-    private func settledCanvasPoint(_ target: XCUIElement, fallback: CGPoint? = nil) throws -> XCUICoordinate {
-        var previousFrame: CGRect?
+    private func settledCanvasPoint(_ target: XCUIElement) throws -> XCUICoordinate {
+        var previousFrames: [CGRect]?
         var previousOffset: CGPoint?
+        var previousZoom: Double?
+        var previousPage: String?
         var visibleFrame = CGRect.zero
+        var appFrame = CGRect.zero
         do {
             try wait("Canvas item and scroll position must settle after keyboard dismissal") {
                 guard !self.ui.app.keyboards.firstMatch.exists, target.exists,
-                      let state = try? self.ui.state() else { return false }
-                let frame = target.frame.intersection(self.ui.canvas.frame).intersection(self.ui.app.windows.firstMatch.frame)
+                      let state = try? self.ui.state(), let page = state.page else {
+                    previousFrames = nil
+                    return false
+                }
+                // AX item frames already include the page's current scroll/zoom transform.
+                // Compare the full item and viewport geometry, not just their intersection.
+                let frames = [target.frame, self.ui.canvas.frame, self.ui.app.windows.firstMatch.frame, self.ui.app.frame]
+                let frame = frames[0].intersection(frames[1]).intersection(frames[2])
                 let offset = CGPoint(x: state.contentOffset.x, y: state.contentOffset.y)
-                defer { previousFrame = frame; previousOffset = offset }
-                guard !frame.isNull, frame.width > 0, frame.height > 0,
-                      previousFrame == frame, previousOffset == offset else { return false }
+                defer {
+                    previousFrames = frames; previousOffset = offset
+                    previousZoom = state.zoom; previousPage = page
+                }
+                guard frames.allSatisfy({ !$0.isNull && !$0.isInfinite && $0.minX.isFinite && $0.minY.isFinite
+                    && $0.width.isFinite && $0.height.isFinite && $0.width > 0 && $0.height > 0 }),
+                      !frame.isNull, frame.width > 0, frame.height > 0,
+                      previousFrames == frames, previousOffset == offset,
+                      previousZoom == state.zoom, previousPage == page else { return false }
                 visibleFrame = frame
+                appFrame = frames[3]
                 return true
             }
         } catch {
-            // Sticky/link/clipped multiline text need not expose the full string as an AX value.
-            // Keep the former canvas point and the caller's selection/edit/content assertions.
-            ui.logQA("Insert item point fallback", "reason=\(error) " + ui.elementFacts(target))
-            previousOffset = nil
-            previousFrame = nil
-            try wait("Fallback canvas and scroll position must settle after keyboard dismissal") {
-                guard !self.ui.app.keyboards.firstMatch.exists,
-                      let state = try? self.ui.state() else { return false }
-                let frame = self.ui.canvas.frame
-                let offset = CGPoint(x: state.contentOffset.x, y: state.contentOffset.y)
-                defer { previousFrame = frame; previousOffset = offset }
-                return frame.width > 0 && frame.height > 0 && previousFrame == frame && previousOffset == offset
-            }
-            return ui.coordinate(fallback ?? point)
+            // The probe has no item/page-local geometry from which to reconstruct a missing AX frame.
+            // Keyboard avoidance retains its offset, so a stable canvas cannot validate the insertion point.
+            let facts = "reason=\(error) " + ui.elementFacts(target)
+            ui.logQA("Insert item point fallback", "unavailable; refusing stale insertion point; " + facts)
+            ui.recordDiagnostics("Insert item geometry unavailable", facts: facts)
+            throw NibUI.Failure.message("Cannot establish current canvas item geometry; refusing to tap: " + facts)
         }
         ui.logQA("Insert settled item", "frame=\(visibleFrame) offset=\(String(describing: previousOffset))")
         return ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
-            dx: visibleFrame.midX - ui.app.frame.minX, dy: visibleFrame.midY - ui.app.frame.minY))
+            dx: visibleFrame.midX - appFrame.minX, dy: visibleFrame.midY - appFrame.minY))
     }
     private func selectAt(_ p: CGPoint? = nil, target: XCUIElement? = nil) throws {
         try ui.selectTool("lasso")
@@ -295,7 +303,7 @@ final class InsertUITests: XCTestCase {
             ui.coordinate(CGPoint(x: 0.36, y: 0.84)).tap()
             _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 0 }
         }
-        if let target { try settledCanvasPoint(target, fallback: p).tap() }
+        if let target { try settledCanvasPoint(target).tap() }
         else { ui.coordinate(p ?? point).tap() }
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
     }
@@ -1083,7 +1091,12 @@ final class InsertUITests: XCTestCase {
     func testGIPHYKeySaveRemoveAndSearchRetryRetainsQuery() throws {
         try elements(); try tap("GIFs"); try tap("Open Settings")
         if visible("Remove Key") { try tap("Remove Key") }
-        try ui.fillNativeForm([("Paste your GIPHY API key", "nib-ui-invalid-test-key")])
+        let form = ui.nativeFormContainer()
+        try ui.requireControl("Show text", type: .button, in: form).tap()
+        let keyField = form.textFields.matching(NSPredicate(format:
+            "label == %@ OR placeholderValue == %@", "Paste your GIPHY API key", "Paste your GIPHY API key")).firstMatch
+        try wait("GIPHY key must be revealed before exact replacement verification") { keyField.exists }
+        try ui.replaceNativeText(in: keyField, with: "nib-ui-invalid-test-key", container: form)
         try tap("Save Key")
         XCTAssertTrue(query("Remove Key").firstMatch.waitForExistence(timeout: 8))
         try ui.dismissSheets(); try elements(); try tap("GIFs")
