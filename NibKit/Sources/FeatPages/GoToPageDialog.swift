@@ -93,44 +93,46 @@ struct GoToPageDialog: View {
         VStack(spacing: 0) {
             NibSheetHeader(String(localized: "Go to Page"), primaryTitle: String(localized: "Go"),
                            isPrimaryEnabled: outcome.index != nil, onCancel: { context.dismiss() }, onPrimary: { go() })
-            if pages.isEmpty {
-                NibEmptyState(symbol: .pages, title: String(localized: "No pages to go to"),
-                              message: String(localized: "Open a notebook, then choose Go to Page."))
-            } else {
-                VStack(spacing: NibSpacing.l) {
-                    HStack(alignment: .firstTextBaseline, spacing: NibSpacing.s) {
-                        NibField(text: $input, prompt: String(localized: "Page"))
-                            .multilineTextAlignment(.center)
-                            .keyboardType(.numbersAndPunctuation)
-                            .submitLabel(.go)
-                            .autocorrectionDisabled()
-                            .textInputAutocapitalization(.never)
-                            .focused($fieldFocused)
-                            .onSubmit { go() }
-                            .onChange(of: input) { _, text in
-                                // NibField grows vertically, so Return can arrive as a line break instead of a submit.
-                                guard text.contains("\n") else { return }
-                                input = text.replacingOccurrences(of: "\n", with: "")
-                                go()
-                            }
-                            .accessibilityLabel(String(localized: "Page number or title"))
-                            .accessibilityHint(String(localized: "\(pages.count) pages"))
-                        Text(String(localized: "of \(pages.count)"))
-                            .font(NibFont.title3)
+            ScrollView {
+                if pages.isEmpty {
+                    NibEmptyState(symbol: .pages, title: String(localized: "No pages to go to"),
+                                  message: String(localized: "Open a notebook, then choose Go to Page."))
+                } else {
+                    VStack(spacing: NibSpacing.l) {
+                        HStack(alignment: .firstTextBaseline, spacing: NibSpacing.s) {
+                            NibField(text: $input, prompt: String(localized: "Page"))
+                                .multilineTextAlignment(.center)
+                                .keyboardType(.numbersAndPunctuation)
+                                .submitLabel(.go)
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                                .focused($fieldFocused)
+                                .onSubmit { go() }
+                                .onChange(of: input) { _, text in
+                                    // NibField grows vertically, so Return can arrive as a line break instead of a submit.
+                                    guard text.contains("\n") else { return }
+                                    input = text.replacingOccurrences(of: "\n", with: "")
+                                    go()
+                                }
+                                .accessibilityLabel(String(localized: "Page number or title"))
+                                .accessibilityHint(String(localized: "\(pages.count) pages"))
+                            Text(String(localized: "of \(pages.count)"))
+                                .font(NibFont.title3)
+                                .foregroundStyle(NibColor.labelSecondary)
+                                .accessibilityHidden(true)
+                        }
+                        Text(message(outcome))
+                            .font(NibFont.footnote)
                             .foregroundStyle(NibColor.labelSecondary)
-                            .accessibilityHidden(true)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: NibSpacing.s) {
+                            NibButton(String(localized: "First Page"), size: .compact) { jump(to: 0) }
+                            NibButton(String(localized: "Last Page"), size: .compact) { jump(to: pages.count - 1) }
+                        }
                     }
-                    Text(message(outcome))
-                        .font(NibFont.footnote)
-                        .foregroundStyle(NibColor.labelSecondary)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: NibSpacing.s) {
-                        NibButton(String(localized: "First Page"), size: .compact) { jump(to: 0) }
-                        NibButton(String(localized: "Last Page"), size: .compact) { jump(to: pages.count - 1) }
-                    }
+                    .padding(NibSpacing.xl)
                 }
-                .padding(NibSpacing.xl)
             }
             Spacer(minLength: 0)
         }
