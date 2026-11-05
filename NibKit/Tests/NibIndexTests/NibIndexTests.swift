@@ -46,6 +46,51 @@ private final class SlowRecognizer: TextRecognizer {
 
 @MainActor
 final class NibIndexTests: XCTestCase {
+    func testUnreadableDocumentDoesNotRestartSweepAndRetriesChangedPackage() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        let head = try XCTUnwrap(h.persistence.heads.removeValue(forKey: doc))
+        let package = try XCTUnwrap(h.app.services.packages.url(doc))
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: package) }
+        let headFile = package.appendingPathComponent("doc.00000007.json")
+        try Data("broken".utf8).write(to: headFile)
+        _ = await indexer.sweep(foreground: false)
+        XCTAssertFalse(indexer.db?.keys(doc: doc).contains(IndexKeys.docUnit) == true)
+
+        await indexer.refreshTitles()
+        XCTAssertNil(indexer.sweepTask, "an unchanged unreadable package must not schedule another sweep")
+        indexer.startSweep(after: 60)
+        let running = try XCTUnwrap(indexer.sweepTask)
+        await indexer.refreshTitles()
+        XCTAssertEqual(indexer.sweepTask, running, "library changes must not cancel an active sweep")
+        _ = await indexer.runBackgroundTask()
+        await running.value
+        XCTAssertNil(indexer.sweepTask)
+
+        h.persistence.heads[doc] = head
+        try Data("downloaded head".utf8).write(to: headFile)
+        await indexer.refreshTitles()
+        let retry = try XCTUnwrap(indexer.sweepTask, "changed package must become eligible again")
+        await retry.value
+        XCTAssertTrue(indexer.db?.keys(doc: doc).contains(IndexKeys.docUnit) == true)
+        let found = results(try await h.run("search.text", ["query": "Remember"]))
+        XCTAssertFalse(found.isEmpty)
+    }
+
+    func testNewDocumentDuringScheduledSweepDoesNotCancelIt() async throws {
+        let (h, indexer) = harness()
+        _ = await indexer.sweep(foreground: false)
+        indexer.startSweep(after: 60)
+        let running = try XCTUnwrap(indexer.sweepTask)
+        let copy = try h.library.duplicate(Fixtures.docID)
+        await indexer.refreshTitles()
+        XCTAssertEqual(indexer.sweepTask, running)
+        _ = await indexer.runBackgroundTask()
+        await running.value
+        XCTAssertTrue(indexer.db?.keys(doc: copy).contains(IndexKeys.docUnit) == true)
+    }
+
     func testCancelledFinalPageCannotStampAnIndexClearedForRebuild() async throws {
         let (h, indexer) = harness()
         var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])

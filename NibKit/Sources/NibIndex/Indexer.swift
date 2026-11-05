@@ -545,7 +545,9 @@ final class Indexer {
     private var firstDirty: Date?
     private var debounceTask: Task<Void, Never>?
     private var processing = false
-    private var sweepTask: Task<Void, Never>?
+    private(set) var sweepTask: Task<Void, Never>?
+    /// Failed heads are retried only after their library metadata or package files change.
+    private var unreadableDocuments: [DocumentID: String] = [:]
     private var rebuildGeneration: UInt64 = 0
     private var subscriptions: [EventSubscription] = []
     private var settingsToken: NSObjectProtocol?
@@ -1112,23 +1114,29 @@ final class Indexer {
         startSweep(after: 2)
     }
 
-    private func refreshTitles() async {
+    func refreshTitles() async {
         guard let library = app.services.library else { return }
         var needsSweep = false
         for node in library.allNodes() + library.trashedNodes() where node.kind == .document {
             indexTitle(node.id, kind: node.documentKind)
             if node.trashedAt == nil, let db, !db.keys(doc: node.id).contains(IndexKeys.docUnit) {
-                needsSweep = true
+                if let failed = unreadableDocuments[node.id] {
+                    if await unreadableStamp(node.id) != failed { needsSweep = true }
+                } else {
+                    needsSweep = true
+                }
             }
         }
         await prune()
         // Copies and synced packages can arrive without a document transaction.
-        if needsSweep { startSweep(after: 2) }
+        // A running sweep checks again on completion, including documents added during its pass.
+        if needsSweep && sweepTask == nil { startSweep(after: 2) }
     }
 
     /// Drops documents the library no longer knows (deleted permanently, or another library folder).
     private func prune() async {
         guard let library = app.services.library, let db = db else { return }
+        unreadableDocuments = unreadableDocuments.filter { library.node($0.key) != nil }
         for doc in db.documents() where library.node(doc) == nil && !app.workspace.isLoaded(doc) {
             try? await removeDocument(doc)
         }
@@ -1171,7 +1179,14 @@ final class Indexer {
     private func sweepDocument(_ doc: DocumentID, db: SearchDatabase, pausable: Bool,
                                progress: SweepProgress) async -> DocumentPass {
         let generation = rebuildGeneration
-        guard let head = await loadHead(doc) else { return DocumentPass() }
+        let attemptedStamp = await unreadableStamp(doc)
+        if !app.workspace.isLoaded(doc), !committedDocs.contains(doc),
+           unreadableDocuments[doc] == attemptedStamp { return DocumentPass() }
+        guard let head = await loadHead(doc) else {
+            unreadableDocuments[doc] = attemptedStamp
+            return DocumentPass()
+        }
+        unreadableDocuments[doc] = nil
         // Open documents can hold unsaved state; committed ones changed since their last pass.
         let checkPages = app.workspace.isLoaded(doc) || committedDocs.contains(doc)
         let stamp = checkPages ? nil : await documentStamp(doc, head: head)
@@ -1196,13 +1211,26 @@ final class Indexer {
         return pass
     }
 
+    private func unreadableStamp(_ doc: DocumentID) async -> String {
+        let modified = app.services.library?.node(doc)?.modified ?? 0
+        let package = app.services.packages.url(doc)
+        let files = await Task.detached(priority: .utility) {
+            package.flatMap { PackageStamp.make($0) }
+        }.value
+        return "\(modified)|\(package?.path ?? "")|\(files ?? "missing")"
+    }
+
     func startSweep(after delay: TimeInterval) {
         sweepTask?.cancel()
         sweepTask = Task(priority: .utility) { @MainActor [weak self] in
             if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
             guard !Task.isCancelled, let self = self else { return }
             let completed = await self.sweep(foreground: true)
-            if !completed && !Task.isCancelled {
+            guard !Task.isCancelled else { return }
+            self.sweepTask = nil
+            if completed {
+                await self.refreshTitles()
+            } else {
                 self.app.scheduleBackgroundTask(IndexKeys.backgroundTask, earliestIn: 15 * 60)
             }
         }
@@ -1211,6 +1239,7 @@ final class Indexer {
     /// The `app.nib.index` BGProcessingTask: pending changes, then the whole library until done or expired.
     func runBackgroundTask() async -> Bool {
         sweepTask?.cancel()
+        sweepTask = nil
         await flush(Set(dirtyPages.keys).union(dirtyDocs).union(wholeDocs).union(reorderedDocs))
         let completed = await sweep(foreground: false)
         if !completed { app.scheduleBackgroundTask(IndexKeys.backgroundTask, earliestIn: 15 * 60) }
