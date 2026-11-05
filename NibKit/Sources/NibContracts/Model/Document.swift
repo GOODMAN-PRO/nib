@@ -766,6 +766,8 @@ public struct DocumentContent: Codable, Equatable {
     public func pageIndex(_ id: PageID) -> Int? { livePages.firstIndex { $0.id == id } }
 
     /// Order key for inserting a page at `position` relative to `anchor` (a live page).
+    /// A read-only key cannot split equal keys: a tied gap falls after the tie run.
+    /// Writers that need the exact gap must re-key the tied pages in their transaction.
     public func orderKey(_ position: PagePosition, relativeTo anchor: PageID?) -> String {
         let pages = livePages
         switch position {
@@ -777,10 +779,13 @@ public struct DocumentContent: Codable, Equatable {
             guard let anchor = anchor, let i = pages.firstIndex(where: { $0.id == anchor }) else {
                 return FractionalIndex.between(pages.last?.order, nil)
             }
-            if position == .before {
-                return FractionalIndex.between(i > 0 ? pages[i - 1].order : nil, pages[i].order)
+            let at = position == .before ? i : i + 1
+            let low = at > 0 ? pages[at - 1].order : nil
+            var high = at < pages.count ? pages[at].order : nil
+            if let low, let upper = high, low >= upper {
+                high = pages.dropFirst(at).first { $0.order > low }?.order
             }
-            return FractionalIndex.between(pages[i].order, i + 1 < pages.count ? pages[i + 1].order : nil)
+            return FractionalIndex.between(low, high)
         }
     }
 }

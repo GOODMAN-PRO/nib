@@ -134,7 +134,8 @@ public enum SafeMode {
     private static let crashKey = "nib.safemode.pendingLaunches"
     private static let disabledKey = "nib.safemode.disabledFeatures"
 
-    public static var isActive: Bool { UserDefaults.standard.integer(forKey: crashKey) >= 2 }
+    // beginLaunch has already counted the current launch, which has not failed.
+    public static var isActive: Bool { UserDefaults.standard.integer(forKey: crashKey) >= 3 }
 
     public static var disabledFeatures: Set<String> {
         get { Set(UserDefaults.standard.stringArray(forKey: disabledKey) ?? []) }

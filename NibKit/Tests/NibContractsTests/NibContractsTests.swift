@@ -49,6 +49,18 @@ final class NibContractsTests: XCTestCase {
         XCTAssertLessThan(first, "1")
     }
 
+    func testReadOnlyPageOrderKeySkipsToTheNextDistinctBound() {
+        let content = DocumentContent(meta: DocumentMeta(kind: .notebook), pages: [
+            PageRecord(id: "A", order: "V"), PageRecord(id: "B", order: "V"), PageRecord(id: "C", order: "V1")
+        ])
+        let requests: [(PagePosition, PageID)] = [(.after, "A"), (.before, "B")]
+        for request in requests {
+            let key = content.orderKey(request.0, relativeTo: request.1)
+            XCTAssertGreaterThan(key, "V")
+            XCTAssertLessThan(key, "V1", "The old equal-bound midpoint jumped past the next distinct page too")
+        }
+    }
+
     func testRevCodingAndOrder() throws {
         let a = Rev(wallMs: 10, counter: 1, device: 2)
         let b = Rev(wallMs: 10, counter: 2, device: 1)
@@ -115,6 +127,149 @@ final class NibContractsTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(), before)
     }
 
+    func testMalformedStoredKeysAreRejectedForSingleAndBatchWrites() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h)
+        let before = try h.snapshot()
+        for key in ["0", "00", "_", "V0", "A-B", "é"] {
+            for batch in [false, true] {
+                for kind in 0..<5 {
+                    XCTAssertThrowsError(try ctx.mutate { tx -> Void in
+                        switch kind {
+                        case 0:
+                            var item = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+                            item.z = key
+                            if batch { try tx.put([item], doc: Fixtures.docID, page: Fixtures.page1) }
+                            else { try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1) }
+                        case 1:
+                            let page = PageRecord(order: key)
+                            if batch { try tx.put([PageRecord(), page], doc: Fixtures.docID) }
+                            else { try tx.put(page, doc: Fixtures.docID) }
+                        case 2:
+                            let block = TextBlock(kind: .paragraph, order: key)
+                            if batch { try tx.put([TextBlock(kind: .paragraph), block], doc: Fixtures.docID) }
+                            else { try tx.put(block, doc: Fixtures.docID) }
+                        case 3:
+                            let card = StudyCard(front: CardFace(), back: CardFace(), order: key)
+                            if batch { try tx.put([StudyCard(front: CardFace(), back: CardFace()), card], doc: Fixtures.docID) }
+                            else { try tx.put(card, doc: Fixtures.docID) }
+                        default:
+                            let entry = OutlineEntry(title: "Invalid order", page: nil, order: key)
+                            if batch { try tx.put([OutlineEntry(title: "Valid", page: nil), entry], doc: Fixtures.docID) }
+                            else { try tx.put(entry, doc: Fixtures.docID) }
+                        }
+                    }) { error in
+                        XCTAssertEqual((error as? NibError)?.code, .invalidParams)
+                    }
+                    XCTAssertEqual(try h.snapshot(), before, "Failed writes must be atomic")
+                    XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+                }
+            }
+        }
+
+        // Persistence and sync can supply legacy keys: retaining one must not lock the record against edits/deletion.
+        for key in ["0", "00", "_", "V0", "V00000", "W000010", "A-B", "é"] {
+            for batch in [false, true] {
+                let legacy = Harness()
+                var content = try XCTUnwrap(legacy.persistence.heads[Fixtures.docID])
+                var page = try XCTUnwrap(content.pages.first { $0.id == Fixtures.page2 })
+                page.order = key
+                content.pages = content.pages.map { $0.id == page.id ? page : $0 }
+                var block = TextBlock(kind: .paragraph, order: key)
+                var card = StudyCard(front: CardFace(), back: CardFace(), order: key)
+                var entry = OutlineEntry(title: "Legacy", page: nil, order: key)
+                content.blocks.append(block)
+                content.cards.append(card)
+                content.outline.append(entry)
+                legacy.persistence.heads[Fixtures.docID] = content
+                var items = try XCTUnwrap(legacy.persistence.pageItems[Fixtures.docID]?[Fixtures.page1])
+                let index = try XCTUnwrap(items.firstIndex { $0.id == Fixtures.textID })
+                items[index].z = key
+                var item = items[index]
+                legacy.persistence.pageItems[Fixtures.docID, default: [:]][Fixtures.page1] = items
+                let legacyContext = try await probeContext(legacy)
+
+                item.locked = true
+                try legacyContext.mutate { tx in
+                    if batch {
+                        try tx.put([item], doc: Fixtures.docID, page: Fixtures.page1)
+                        try tx.put([page], doc: Fixtures.docID)
+                        try tx.put([block], doc: Fixtures.docID)
+                        try tx.put([card], doc: Fixtures.docID)
+                        try tx.put([entry], doc: Fixtures.docID)
+                    } else {
+                        try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
+                        try tx.put(page, doc: Fixtures.docID)
+                        try tx.put(block, doc: Fixtures.docID)
+                        try tx.put(card, doc: Fixtures.docID)
+                        try tx.put(entry, doc: Fixtures.docID)
+                    }
+                }
+                XCTAssertTrue(try legacy.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: item.id).locked)
+                XCTAssertEqual(try legacy.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: item.id).z, key)
+
+                let unchanged = try legacy.snapshot()
+                for kind in 0..<5 {
+                    XCTAssertThrowsError(try legacyContext.mutate { tx -> Void in
+                        switch kind {
+                        case 0:
+                            var changed = item; changed.z = "bad-key"
+                            if batch { try tx.put([item, changed], doc: Fixtures.docID, page: Fixtures.page1) }
+                            else { try tx.put(changed, doc: Fixtures.docID, page: Fixtures.page1) }
+                        case 1:
+                            var changed = page; changed.order = "bad-key"
+                            if batch { try tx.put([page, changed], doc: Fixtures.docID) }
+                            else { try tx.put(changed, doc: Fixtures.docID) }
+                        case 2:
+                            var changed = block; changed.order = "bad-key"
+                            if batch { try tx.put([block, changed], doc: Fixtures.docID) }
+                            else { try tx.put(changed, doc: Fixtures.docID) }
+                        case 3:
+                            var changed = card; changed.order = "bad-key"
+                            if batch { try tx.put([card, changed], doc: Fixtures.docID) }
+                            else { try tx.put(changed, doc: Fixtures.docID) }
+                        default:
+                            var changed = entry; changed.order = "bad-key"
+                            if batch { try tx.put([entry, changed], doc: Fixtures.docID) }
+                            else { try tx.put(changed, doc: Fixtures.docID) }
+                        }
+                    }) { error in
+                        XCTAssertEqual((error as? NibError)?.code, .invalidParams)
+                    }
+                    XCTAssertEqual(try legacy.snapshot(), unchanged)
+                }
+
+                page.deleted = true
+                block.deleted = true
+                card.deleted = true
+                entry.deleted = true
+                try legacyContext.mutate { tx in
+                    if batch {
+                        try tx.delete(items: [item.id], doc: Fixtures.docID, page: Fixtures.page1)
+                        try tx.put([page], doc: Fixtures.docID)
+                        try tx.put([block], doc: Fixtures.docID)
+                        try tx.put([card], doc: Fixtures.docID)
+                        try tx.put([entry], doc: Fixtures.docID)
+                    } else {
+                        try tx.delete(item: item.id, doc: Fixtures.docID, page: Fixtures.page1)
+                        try tx.put(page, doc: Fixtures.docID)
+                        try tx.put(block, doc: Fixtures.docID)
+                        try tx.put(card, doc: Fixtures.docID)
+                        try tx.put(entry, doc: Fixtures.docID)
+                    }
+                }
+                let storedItems = try legacy.app.workspace.allItems(Fixtures.docID, page: Fixtures.page1)
+                XCTAssertEqual(storedItems.first { $0.id == item.id }?.deleted, true)
+                XCTAssertEqual(storedItems.first { $0.id == item.id }?.z, key)
+                let stored = try legacy.app.workspace.content(Fixtures.docID)
+                XCTAssertEqual(stored.pages.first { $0.id == page.id }?.deleted, true)
+                XCTAssertEqual(stored.blocks.first { $0.id == block.id }?.deleted, true)
+                XCTAssertEqual(stored.cards.first { $0.id == card.id }?.deleted, true)
+                XCTAssertEqual(stored.outline.first { $0.id == entry.id }?.deleted, true)
+            }
+        }
+    }
+
     func testSelectiveRevertSkipsLaterEdits() async throws {
         let h = Harness()
         let ctx = try await probeContext(h)
@@ -133,6 +288,48 @@ final class NibContractsTests: XCTestCase {
         let r = h.app.bus.revert(group: group, doc: Fixtures.docID)
         XCTAssertEqual(r?.skipped, 1)
         XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID).layer, 2)
+    }
+
+    func testHistoryPreviewsDoNotChangeDocumentsOrConsumeHistory() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h)
+        try ctx.mutate("Lock text") { tx in
+            var item = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+            item.locked = true
+            try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
+        }
+        let edited = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        let undo = try await h.app.bus.execute(Invocation(command: CommandIDs.undo,
+            params: ["doc": "doc:FIXTUREDOC01"], dryRun: true))
+        XCTAssertEqual(undo.value["done"], true)
+        XCTAssertEqual(undo.value["label"], "Lock text")
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID), edited)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        XCTAssertFalse(h.app.bus.history.canRedo(Fixtures.docID))
+
+        do {
+            _ = try await h.app.bus.execute(Invocation(command: CommandIDs.revertGroup,
+                params: ["doc": "doc:FIXTUREDOC01", "group": .string(ctx.group)], dryRun: true))
+            XCTFail("Selective revert previews must be refused")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .unsupported)
+        }
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID), edited)
+        XCTAssertEqual(h.app.bus.history.entries(Fixtures.docID).map { $0.group }, [ctx.group])
+        XCTAssertFalse(h.app.bus.history.canRedo(Fixtures.docID))
+
+        _ = try await h.run(CommandIDs.undo, ["doc": "doc:FIXTUREDOC01"])
+        let undone = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        let redo = try await h.app.bus.execute(Invocation(command: CommandIDs.redo,
+            params: ["doc": "doc:FIXTUREDOC01"], dryRun: true))
+        XCTAssertEqual(redo.value["done"], true)
+        XCTAssertEqual(redo.value["label"], "Lock text")
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID), undone)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        XCTAssertTrue(h.app.bus.history.canRedo(Fixtures.docID))
+        _ = try await h.run(CommandIDs.redo, ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertTrue(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID).locked)
+        XCTAssertFalse(h.app.bus.history.canRedo(Fixtures.docID))
     }
 
     func testRemoteMergeIsLastWriterWins() throws {

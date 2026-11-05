@@ -128,6 +128,7 @@ public final class DocTransaction {
                     it.z = FractionalIndex.between(top, nil)
                 }
             }
+            if existing?.z != it.z { try checkOrderKey(it.z, path: "$.z") }
             if top.map({ it.z > $0 }) ?? true { top = it.z }
             stampProvenance(&it, existing: existing, inherited: nil)
             it.rev = workspace.clock.tick()
@@ -164,6 +165,12 @@ public final class DocTransaction {
         return item
     }
 
+    private func checkOrderKey(_ key: String, path: String = "$.order") throws {
+        guard FractionalIndex.isValid(key) else {
+            throw NibError.invalid(String(localized: "Order keys must contain only letters A–Z, a–z and digits, and must not end in 0."), path: path)
+        }
+    }
+
     /// Provenance cannot be forged: non-user principals always stamp themselves on create and never change it;
     /// `inherited` (a stored record's `createdBy`, for moves) wins over both.
     private func stampProvenance(_ it: inout Item, existing: Item?, inherited: String??) {
@@ -183,6 +190,8 @@ public final class DocTransaction {
         if it.z.isEmpty {
             if let z = existing?.z, !z.isEmpty { it.z = z } else { it.z = try topZ(doc, page: page) }
         }
+        // Legacy keys must not prevent edits or tombstones that keep the stored ordering.
+        if existing?.z != it.z { try checkOrderKey(it.z, path: "$.z") }
         stampProvenance(&it, existing: existing, inherited: inherited)
         it.rev = workspace.clock.tick()
         let before = try workspace.writeItem(it, doc: doc, page: page)
@@ -209,7 +218,7 @@ public final class DocTransaction {
             let last = try content(doc).livePages.last?.order
             p.order = FractionalIndex.between(last, nil)
         }
-        return try putRecord(p, doc: doc, at: \.pages) { .page(doc, before: $0, after: $1) }
+        return try putOrderedRecord(p, doc: doc, at: \.pages) { .page(doc, before: $0, after: $1) }
     }
 
     public func putMeta(_ meta: DocumentMeta) throws {
@@ -226,7 +235,7 @@ public final class DocTransaction {
             let last = try content(doc).liveBlocks.last?.order
             b.order = FractionalIndex.between(last, nil)
         }
-        return try putRecord(b, doc: doc, at: \.blocks) { .block(doc, before: $0, after: $1) }
+        return try putOrderedRecord(b, doc: doc, at: \.blocks) { .block(doc, before: $0, after: $1) }
     }
 
     @discardableResult
@@ -236,7 +245,7 @@ public final class DocTransaction {
             let last = try content(doc).liveCards.last?.order
             c.order = FractionalIndex.between(last, nil)
         }
-        return try putRecord(c, doc: doc, at: \.cards) { .card(doc, before: $0, after: $1) }
+        return try putOrderedRecord(c, doc: doc, at: \.cards) { .card(doc, before: $0, after: $1) }
     }
 
     /// contracts-v2: inserts or replaces many blocks in one pass (empty `order` = appended in array order).
@@ -302,12 +311,14 @@ public final class DocTransaction {
             let last = try content(doc).liveOutline.last?.order
             e.order = FractionalIndex.between(last, nil)
         }
-        return try putRecord(e, doc: doc, at: \.outline) { .outline(doc, before: $0, after: $1) }
+        return try putOrderedRecord(e, doc: doc, at: \.outline) { .outline(doc, before: $0, after: $1) }
     }
 
     private func putOrdered<T: OrderedRecord>(_ records: [T], doc: DocumentID, at path: WritableKeyPath<DocumentContent, [T]>,
                                               last: String?, wrap: (T?, T) -> Mutation) throws -> [T] {
         guard !records.isEmpty else { return [] }
+        var byID: [NibID: T] = [:]
+        for r in try content(doc)[keyPath: path] where byID[r.id] == nil { byID[r.id] = r }
         var top = last
         var runKeys: ArraySlice<String> = []
         var prepared: [T] = []
@@ -323,13 +334,24 @@ public final class DocTransaction {
                 }
                 r.order = runKeys.removeFirst()
             }
+            if byID[r.id]?.order != r.order { try checkOrderKey(r.order) }
             if top.map({ r.order > $0 }) ?? true { top = r.order }
             r.rev = workspace.clock.tick()
+            byID[r.id] = r
             prepared.append(r)
         }
         let befores = try workspace.writeRecords(prepared, doc: doc, at: path)
         for (b, a) in zip(befores, prepared) { mutations.append(wrap(b, a)) }
         return prepared
+    }
+
+    private func putOrderedRecord<T: OrderedRecord>(_ record: T, doc: DocumentID,
+                                                    at path: WritableKeyPath<DocumentContent, [T]>,
+                                                    wrap: (T?, T) -> Mutation) throws -> T {
+        if workspace.currentRecord(record.id, doc: doc, at: path)?.order != record.order {
+            try checkOrderKey(record.order)
+        }
+        return try putRecord(record, doc: doc, at: path, wrap: wrap)
     }
 
     private func putRecord<T: LWWRecord>(_ record: T, doc: DocumentID, at path: WritableKeyPath<DocumentContent, [T]>,

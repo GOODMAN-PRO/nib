@@ -4,7 +4,7 @@ import ImageIO
 import NibContracts
 
 // Page-structure commands. Every page change goes through `ctx.mutate`, so page-level undo is the document's undo
-// (D-063). New pages get their place from `DocumentContent.orderKey`; the cover is simply page 1 (D-038).
+// (D-063). OrderKeys plans exact insertion gaps, repairing ties atomically; the cover is simply page 1 (D-038).
 
 enum PageCommands {
     @MainActor
@@ -136,7 +136,10 @@ struct PageAdd: NibCommand {
         // Reading a PDF or image, or the template picker, awaited: place the pages in the document as it is now.
         let current = try ctx.workspace.content(doc)
         try NewPageIDs.checkUnused(ids, in: current)
-        let keys = OrderKeys.keys(position, anchor: anchor, count: specs.count, in: current)
+        let placement = OrderKeys.plan(position, anchor: anchor, count: specs.count, in: current.livePages)
+        let keys = placement.keys
+        let rekeyed = Dictionary(placement.rekeyed.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let placedPages = current.livePages.map { rekeyed[$0.id] ?? $0 }
         var records: [PageRecord] = []
         for (i, spec) in specs.enumerated() {
             var background = spec.background
@@ -145,7 +148,7 @@ struct PageAdd: NibCommand {
                let distribution = current.meta.ext?["create.paperDistribution"],
                distribution["pattern"]?.stringValue == "everyOther",
                let paper = try? distribution["background"]?.decode(Background.self) {
-                let paperIndex = current.livePages.filter { page in
+                let paperIndex = placedPages.filter { page in
                     page.order < keys[i] && !(page.background.template.map { PageTemplates.isCover($0, ctx.content) } ?? false)
                 }.count + i
                 if paperIndex % 2 == 1 {
@@ -159,7 +162,10 @@ struct PageAdd: NibCommand {
             records.append(PageRecord(id: ids[i] ?? NibID.make(), order: keys[i], size: spec.size, background: background))
         }
         // One batch write: a long PDF added page by page does not re-sort the page list once per page.
-        try ctx.mutate { tx in try tx.put(records, doc: doc) }
+        try ctx.mutate { tx in
+            try tx.put(placement.rekeyed, doc: doc)
+            try tx.put(records, doc: doc)
+        }
         let refs = records.map { NodeRef.page(doc, $0.id).description }
         await PageNavigation.reveal(refs.first, doc: doc, ctx)
         return Output(ref: refs[0], refs: refs)
@@ -281,21 +287,35 @@ struct PageDuplicate: NibCommand {
         let ids = try NewPageIDs.parse(id: nil, ids: p.ids, count: targets.count)
         var plan: [(doc: DocumentID, source: PageRecord, copy: PageRecord)] = []
         var contents: [DocumentID: DocumentContent] = [:]
+        var liveByDocument: [DocumentID: [PageRecord]] = [:]
         for (i, t) in targets.enumerated() {
             let content = try contents[t.doc] ?? PageArgs.pagedContent(t.doc, ctx, path: "$.pages[\(i)]")
             contents[t.doc] = content
             try NewPageIDs.checkUnused([ids[i]], in: content, path: "$.ids[\(i)]")
-            let live = content.livePages
+            let live = liveByDocument[t.doc] ?? content.livePages
+            liveByDocument[t.doc] = live
             guard let at = live.firstIndex(where: { $0.id == t.page }) else { throw PageArgs.notLive(t.page, path: "$.pages[\(i)]") }
-            let next = at + 1 < live.count ? live[at + 1].order : nil
-            let copy = PageFactory.copy(of: live[at], id: ids[i] ?? NibID.make(),
-                                        order: FractionalIndex.between(live[at].order, next))
+            // Resolve the order inside the transaction, after any preceding copies/re-keying.
+            let copy = PageFactory.copy(of: live[at], id: ids[i] ?? NibID.make(), order: "")
             plan.append((t.doc, live[at], copy))
         }
         try ctx.mutate { tx in
             for entry in plan {
+                var live = liveByDocument[entry.doc] ?? []
+                let placement = OrderKeys.plan(.after, anchor: entry.source.id, count: 1, in: live)
+                if !placement.rekeyed.isEmpty {
+                    let rekeyed = try tx.put(placement.rekeyed, doc: entry.doc)
+                    let byID = Dictionary(rekeyed.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                    live = live.map { byID[$0.id] ?? $0 }
+                }
+                var copy = entry.copy
+                copy.order = placement.keys[0]
                 let original = try tx.items(entry.doc, page: entry.source.id)
-                try PageWriter.insert([(entry.copy, ItemCloner.clone(original, freshIDs: true))], doc: entry.doc, tx: tx)
+                try PageWriter.insert([(copy, ItemCloner.clone(original, freshIDs: true))], doc: entry.doc, tx: tx)
+                // Preserve the sorted snapshot for the next copy without sorting every page again.
+                let at = live.firstIndex(where: { $0.id == entry.source.id }).map { $0 + 1 } ?? live.count
+                live.insert(copy, at: at)
+                liveByDocument[entry.doc] = live
             }
         }
         return Output(refs: plan.map { NodeRef.page($0.doc, $0.copy.id).description })
@@ -586,9 +606,10 @@ struct PageReorder: NibCommand {
             _ = try PageArgs.livePage(a.page, in: content, path: anchorPath)
         }
         let position: PagePosition = p.before != nil ? .before : (p.after != nil ? .after : .end)
-        let bounds = OrderKeys.bounds(position, anchor: anchor?.page, in: remaining)
-        let keys = FractionalIndex.balanced(count: records.count, after: bounds.lo, before: bounds.hi)
+        let placement = OrderKeys.plan(position, anchor: anchor?.page, count: records.count, in: remaining)
+        let keys = placement.keys
         try ctx.mutate { tx in
+            try tx.put(placement.rekeyed, doc: doc)
             for (i, record) in records.enumerated() {
                 var page = record
                 page.order = keys[i]
@@ -734,7 +755,20 @@ struct PageRestore: NibCommand {
             records.append((t.doc, page))
         }
         try ctx.mutate { tx in
-            for r in records { try tx.put(r.page, doc: r.doc) }
+            for r in records {
+                var page = r.page
+                let content = try tx.content(r.doc)
+                // Only sort when a collision needs neighbouring keys; match livePages' id tie-break.
+                if let collision = content.pages.lazy.filter({ !$0.deleted && $0.order == page.order })
+                    .max(by: { $0.id.raw < $1.id.raw }) {
+                    let live = content.livePages
+                    // Earlier restores in this same transaction also occupy their new keys.
+                    let placement = OrderKeys.plan(.after, anchor: collision.id, count: 1, in: live)
+                    if !placement.rekeyed.isEmpty { try tx.put(placement.rekeyed, doc: r.doc) }
+                    page.order = placement.keys[0]
+                }
+                try tx.put(page, doc: r.doc)
+            }
         }
         return Output(restored: records.count)
     }
@@ -1007,7 +1041,8 @@ enum PagePasting {
         // The document may have changed while the assets were copied: place the pages in it as it is now.
         let content = try ctx.workspace.content(doc)
         try NewPageIDs.checkUnused(chosen, in: content)
-        let keys = OrderKeys.keys(position, anchor: anchor, count: payload.pages.count, in: content)
+        let placement = OrderKeys.plan(position, anchor: anchor, count: payload.pages.count, in: content.livePages)
+        let keys = placement.keys
         let defaultSize = ctx.services.settings.get(NibSettings.defaultPageSize)
         var plan: [(PageRecord, [Item])] = []
         for (i, entry) in payload.pages.enumerated() {
@@ -1015,7 +1050,10 @@ enum PagePasting {
             let items = AssetRefs.rewriting(entry.items.filter { !$0.deleted }, map.names)
             plan.append((PageFactory.fitted(page, to: content.meta.kind, defaultSize: defaultSize), ItemCloner.clone(items, freshIDs: true)))
         }
-        try ctx.mutate { tx in try PageWriter.insert(plan, doc: doc, tx: tx) }
+        try ctx.mutate { tx in
+            try tx.put(placement.rekeyed, doc: doc)
+            try PageWriter.insert(plan, doc: doc, tx: tx)
+        }
         return plan.map { NodeRef.page(doc, $0.0.id).description }
     }
 }
@@ -1092,6 +1130,42 @@ enum NewPageIDs {
 }
 
 enum OrderKeys {
+    /// Exact insertion, including a gap inside a tie run. Apply `rekeyed` in the same transaction as the new pages.
+    static func plan(_ position: PagePosition, anchor: PageID?, count: Int,
+                     in pages: [PageRecord]) -> (keys: [String], rekeyed: [PageRecord]) {
+        guard count > 0 else { return ([], []) }
+        let at: Int
+        switch position {
+        case .start: at = 0
+        case .end: at = pages.count
+        case .before, .after:
+            if let anchor, let i = pages.firstIndex(where: { $0.id == anchor }) {
+                at = position == .before ? i : i + 1
+            } else { at = pages.count }
+        }
+        let lowKey = at > 0 ? pages[at - 1].order : nil
+        let highKey = at < pages.count ? pages[at].order : nil
+        guard let low = lowKey, let high = highKey, low == high else {
+            let keys = count == 1 ? [FractionalIndex.between(lowKey, highKey)]
+                : FractionalIndex.balanced(count: count, after: lowKey, before: highKey)
+            return (keys, [])
+        }
+        var start = at - 1
+        var end = at + 1
+        while start > 0 && pages[start - 1].order == low { start -= 1 }
+        while end < pages.count && pages[end].order == low { end += 1 }
+        let keys = FractionalIndex.balanced(count: end - start + count,
+            after: start > 0 ? pages[start - 1].order : nil,
+            before: end < pages.count ? pages[end].order : nil)
+        let offset = at - start
+        let rekeyed = (start..<end).map { i -> PageRecord in
+            var page = pages[i]
+            page.order = keys[i - start + (i < at ? 0 : count)]
+            return page
+        }
+        return (Array(keys[offset..<(offset + count)]), rekeyed)
+    }
+
     /// The neighbours a page inserted at `position` sits between (`pages` live, in order), as `orderKey` places it.
     static func bounds(_ position: PagePosition, anchor: PageID?, in pages: [PageRecord]) -> (lo: String?, hi: String?) {
         switch position {
@@ -1101,12 +1175,18 @@ enum OrderKeys {
             return (pages.last?.order, nil)
         case .before, .after:
             guard let a = anchor, let i = pages.firstIndex(where: { $0.id == a }) else { return (pages.last?.order, nil) }
-            if position == .before { return (i > 0 ? pages[i - 1].order : nil, pages[i].order) }
-            return (pages[i].order, i + 1 < pages.count ? pages[i + 1].order : nil)
+            let at = position == .before ? i : i + 1
+            let low = at > 0 ? pages[at - 1].order : nil
+            var high = at < pages.count ? pages[at].order : nil
+            if let low, let upper = high, low >= upper {
+                high = pages.dropFirst(at).first { $0.order > low }?.order
+            }
+            return (low, high)
         }
     }
 
-    /// Keys for `count` consecutive new pages: one from `DocumentContent.orderKey`, several spread over the same gap by
+    /// Read-only keys (ties fall after the run). Writers use `plan` to preserve the exact insertion point.
+    /// One key from `DocumentContent.orderKey`, several spread over the same gap by
     /// `FractionalIndex.balanced` (contracts-v2 G23), so a 2000-page PDF import gets keys a few characters long.
     static func keys(_ position: PagePosition, anchor: PageID?, count: Int, in content: DocumentContent) -> [String] {
         guard count > 1 else { return count == 1 ? [content.orderKey(position, relativeTo: anchor)] : [] }
