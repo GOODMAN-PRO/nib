@@ -225,6 +225,41 @@ final class LessonManagerTests: XCTestCase {
         XCTAssertFalse(try h.app.workspace.items(copyID, page: page).contains { $0.id == secret.id })
     }
 
+    func testPresentRefreshPreservesEditsMadeDuringTransfer() async throws {
+        let h = harness()
+        let (doc, page, _, _) = try source(h)
+        let result = try await h.run(CommandIDs.lessonSetState, ["doc": .string(doc.raw), "state": "present"])
+        let privateDoc = NodeRef.documentID(from: try XCTUnwrap(result["ref"]?.stringValue))
+        let note = Item(id: "EDITNOTE01", kind: .text, layer: LessonManager.presentLayer,
+                        text: TextBoxItem(frame: Frame(x: 0, y: 0, w: 100, h: 30), text: RichText(plain: "Before")))
+        var removed = note
+        removed.id = "REMOVENOTE01"
+        try await h.insert([note, removed], page: page, doc: privateDoc)
+        let started = expectation(description: "presentation transfer started")
+        let gate = BlockingPresentAssets(base: try XCTUnwrap(h.app.services.assets), started: started)
+        h.app.services.assets = gate
+        let refresh = Task { try await h.run(CommandIDs.lessonSetState, ["doc": .string(doc.raw), "state": "present"]) }
+        defer { gate.release() }
+        await fulfillment(of: [started], timeout: 2)
+        var updated = note
+        updated.text?.text = RichText(plain: "After")
+        var added = note
+        added.id = "ADDEDNOTE01"
+        try await h.insert([updated, added], page: page, doc: privateDoc)
+        h.app.commands.register(CommandDescriptor(id: "test.deletePrivate", title: "Delete private note", summary: "Test helper", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in try tx.delete(item: removed.id, doc: privateDoc, page: page) }
+            return [:]
+        }
+        try await h.run("test.deletePrivate")
+        gate.release()
+        _ = try await refresh.value
+        h.app.workspace.close(privateDoc)
+        let items = try h.app.workspace.items(privateDoc, page: page)
+        XCTAssertEqual(items.first { $0.id == note.id }?.text?.text.plainText, "After")
+        XCTAssertTrue(items.contains { $0.id == added.id })
+        XCTAssertFalse(items.contains { $0.id == removed.id })
+    }
+
     func testPresentRefreshDoesNotResurrectDeletedSourceItemsOrPages() async throws {
         for legacy in [false, true] {
             let h = harness()
@@ -635,6 +670,23 @@ private final class BlockingLessonAssets: AssetStore {
     }
     func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
     func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
+}
+
+private final class BlockingPresentAssets: AssetStore {
+    let base: AssetStore
+    let started: XCTestExpectation
+    private let gate = DispatchSemaphore(value: 0)
+    init(base: AssetStore, started: XCTestExpectation) { self.base = base; self.started = started }
+    func release() { gate.signal() }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef {
+        started.fulfill()
+        guard gate.wait(timeout: .now() + 3) == .success else { throw NibError.unavailable("presentation gate timed out") }
+        return try base.put(data, ext: ext, doc: doc)
+    }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
     func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
     func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
 }
