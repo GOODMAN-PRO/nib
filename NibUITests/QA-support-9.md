@@ -192,3 +192,9 @@ Next CI must pair the runner result with app dragSessionWillBegin, move proposal
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | Pages reorder / selected-stack drag | Thumbnail drag result / State step (thumbnail drag completed) | Did a native context menu survive the gesture, and what selection/page/responder state followed? |
+
+### C2 - outline menu callers
+
+Confirmed the current outlineMenu uses ordinary press, Move tap and action tap while OutlineTableController supplies native context menus (P:pages-outline-templates#0 and correction). Rename, Delete and every Move submenu action now use H2 as one path. The shared thumbnail pageMenu also uses H2 for the diagnosed Add to Outline and Create Template from Page stalls. Kept assertions, Rename alert handling, submenu depth checks and all allowances.
+
+Should unblock Pages OutlineAddRenameNavigateAndDeleteRetainsPage, OutlineMoveNestOutdentAndThreeLevelLimit and remove the observed waits in OutlineThumbnailAndMoreAddTargetCorrectPage / template creation. Next CI must show all submenu contacts without idle waits, then the unchanged page-link, nesting, deletion and Undo checks. Uses the H2 diagnostic table; no separate log family.

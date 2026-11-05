@@ -717,7 +717,7 @@ final class PagesUITests: XCTestCase {
         try ui.waitForState { $0.page == target }
     }
     private func pageMenu(_ number: Int, _ action: String) throws {
-        try require(thumb(number)).press(forDuration: 0.8); try tap(action)
+        try ui.nativeContextMenu(try require(thumb(number)), path: [action])
     }
     private func beginSelection() throws {
         try tap("Select")
@@ -803,9 +803,7 @@ final class PagesUITests: XCTestCase {
         try wait("Outline entry \(title) must be created") { (try? self.entry(title)) != nil }
     }
     private func outlineMenu(_ title: String, _ action: String, move: Bool = false) throws {
-        try require(label(title)).press(forDuration: 0.8)
-        if move { try tap("Move") }
-        try tap(action)
+        try ui.nativeContextMenu(try require(label(title)), path: move ? ["Move", action] : [action])
     }
     private func openTrash() throws {
         try closeNavigator(); try ui.tapCommand("window.showLibrary"); try tap("Trash", prefix: true)
