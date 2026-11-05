@@ -1056,7 +1056,6 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         return super.canPerformAction(action, withSender: sender)
     }
 
-
     override var keyCommands: [UIKeyCommand]? {
         guard model.isSelecting else { return nil }
         let selectAll = UIKeyCommand(title: String(localized: "Select All Pages"), action: #selector(selectAllPages),
@@ -1069,6 +1068,36 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
                                 input: UIKeyCommand.inputEscape)
         for command in [selectAll, copy, trash, done] { command.wantsPriorityOverSystemBehavior = true }
         return [selectAll, copy, trash, done]
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandled = presses
+        let held = event?.allPresses.filter { $0.phase != .ended && $0.phase != .cancelled }
+            .compactMap { $0.key?.keyCode } ?? []
+        for press in presses {
+            guard let key = press.key else { continue }
+            let shortcut = ThumbnailKeyPress.shortcut(code: key.keyCode, characters: key.charactersIgnoringModifiers,
+                                                       keyFlags: key.modifierFlags,
+                                                       eventFlags: event?.modifierFlags ?? [], heldKeys: held)
+            guard performUnhandledPress(shortcut) else { continue }
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    /// The HID route must stop here before the shell replays a canvas shortcut.
+    /// Use the same actions and menu availability/confirmation rules as UIKeyCommand.
+    @discardableResult
+    func performUnhandledPress(_ shortcut: KeyShortcut) -> Bool {
+        guard model.isSelecting else { return false }
+        switch shortcut {
+        case KeyShortcut("a", .command): selectAllPages()
+        case KeyShortcut("c", .command): copyPages()
+        case KeyShortcut("delete"): trashPages()
+        case KeyShortcut("escape"): endSelecting()
+        default: return false
+        }
+        return true
     }
 
     @objc private func selectAllPages() {
@@ -1115,5 +1144,36 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         #endif
         guard visible else { return }
         model.perform(item, context)
+    }
+}
+
+/// Keep event-level and held modifiers: HID chords need not repeat their flags on the letter.
+@MainActor
+enum ThumbnailKeyPress {
+    static func shortcut(code: UIKeyboardHIDUsage, characters: String,
+                         keyFlags: UIKeyModifierFlags, eventFlags: UIKeyModifierFlags,
+                         heldKeys: [UIKeyboardHIDUsage] = []) -> KeyShortcut {
+        let input: String
+        switch code {
+        case .keyboardEscape: input = "escape"
+        case .keyboardDeleteOrBackspace: input = "delete"
+        default: input = characters.lowercased()
+        }
+        var flags = keyFlags.union(eventFlags)
+        for held in heldKeys {
+            switch held {
+            case .keyboardLeftGUI, .keyboardRightGUI: flags.insert(.command)
+            case .keyboardLeftAlt, .keyboardRightAlt: flags.insert(.alternate)
+            case .keyboardLeftShift, .keyboardRightShift: flags.insert(.shift)
+            case .keyboardLeftControl, .keyboardRightControl: flags.insert(.control)
+            default: break
+            }
+        }
+        var modifiers: KeyModifiers = []
+        if flags.contains(.command) { modifiers.insert(.command) }
+        if flags.contains(.alternate) { modifiers.insert(.option) }
+        if flags.contains(.shift) { modifiers.insert(.shift) }
+        if flags.contains(.control) { modifiers.insert(.control) }
+        return KeyShortcut(input, modifiers)
     }
 }

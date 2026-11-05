@@ -373,6 +373,33 @@ final class FeatKeyboardTests: XCTestCase {
                        ids.map { ["doc": .string(NodeRef.document(NibID($0)).description)] })
     }
 
+    func testLibraryCreationPressFallbackUsesTheLiveInvokingWindowRoute() async throws {
+        let h = await started()
+        h.session.document = nil
+        let root = KeyboardWindowController(session: h.session)
+        let keyboard = LibraryCreationKeyboardResponder(context: ChromeContext(app: h.app, session: h.session, navigator: root))
+        root.view.addSubview(keyboard)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        keyboard.restoreFocus()
+        let recorder = stand(in: h, for: [CommandIDs.panelOpen])
+        let ran = expectation(description: "Creation HID fallback dispatches once")
+        recorder.onCall = { if $0 == CommandIDs.panelOpen { ran.fulfill() } }
+        XCTAssertTrue(keyboard.performUnhandledPress(KeyShortcut("n", [.command, .option])))
+        await fulfillment(of: [ran], timeout: 3)
+        recorder.onCall = nil
+        XCTAssertEqual(recorder.params(CommandIDs.panelOpen).count, 1)
+        XCTAssertTrue(h.app.ui.activeNavigator === root)
+        XCTAssertFalse(keyboard.performUnhandledPress(KeyShortcut("escape")))
+        root.modal = UIViewController()
+        XCTAssertFalse(keyboard.performUnhandledPress(KeyShortcut("n", [.command, .option])))
+        root.modal = nil
+        h.session.document = Fixtures.docID
+        XCTAssertFalse(keyboard.performUnhandledPress(KeyShortcut("n", [.command, .option])))
+    }
+
     func testLibraryCreationNativeResponderRevalidatesAndPreservesTextAndModalFocus() async throws {
         let h = await started()
         h.session.document = nil

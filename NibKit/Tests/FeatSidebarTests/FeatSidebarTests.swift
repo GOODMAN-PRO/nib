@@ -1070,6 +1070,50 @@ final class FeatSidebarTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(doc), before, "a canvas receives an image copy; the source page is retained")
     }
 
+    func testThumbnailPressFallbackSelectsCopiesConfirmsTrashAndEndsSelection() async throws {
+        let h = harness()
+        let log = CallLog()
+        stub(h, [SidebarIDs.pageCopy, SidebarIDs.pageTrash], log)
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        let grid = laidOutGrid(model)
+        XCTAssertFalse(grid.performUnhandledPress(KeyShortcut("a", .command)))
+        model.setSelecting(true)
+        XCTAssertTrue(grid.performUnhandledPress(KeyShortcut("a", .command)))
+        XCTAssertEqual(model.orderedSelection, [p1, p2, p3])
+        model.setSelection([p1, p2])
+        XCTAssertTrue(grid.performUnhandledPress(KeyShortcut("c", .command)))
+        try await waitUntil { log.calls.count == 1 }
+        XCTAssertEqual(log.calls[0].command, SidebarIDs.pageCopy)
+        XCTAssertEqual(log.calls[0].params["pages"], [.string(ref(p1)), .string(ref(p2))])
+        XCTAssertTrue(grid.performUnhandledPress(KeyShortcut("delete")))
+        XCTAssertNotNil(model.pendingTrash, "Multiple pages still require the existing confirmation")
+        XCTAssertEqual(log.calls.count, 1)
+        model.cancelPendingTrash()
+        for shortcut in [KeyShortcut("a"), KeyShortcut("c", [.command, .shift]),
+                         KeyShortcut("delete", .command), KeyShortcut("escape", .shift), KeyShortcut("x", .command)] {
+            XCTAssertFalse(grid.performUnhandledPress(shortcut), "Unrelated presses must reach super")
+        }
+        XCTAssertTrue(grid.performUnhandledPress(KeyShortcut("escape")))
+        XCTAssertFalse(model.isSelecting)
+        XCTAssertTrue(model.selection.isEmpty)
+        XCTAssertFalse(grid.performUnhandledPress(KeyShortcut("c", .command)))
+        XCTAssertFalse(grid.performUnhandledPress(KeyShortcut("delete")))
+    }
+
+    func testThumbnailPressDecodingKeepsEventAndHeldModifiersAndUsesHIDForEscape() {
+        XCTAssertEqual(ThumbnailKeyPress.shortcut(code: .keyboardA, characters: "A", keyFlags: [],
+                                                  eventFlags: .command), KeyShortcut("a", .command))
+        XCTAssertEqual(ThumbnailKeyPress.shortcut(code: .keyboardC, characters: "c", keyFlags: [],
+                                                  eventFlags: [], heldKeys: [.keyboardRightGUI]), KeyShortcut("c", .command))
+        XCTAssertEqual(ThumbnailKeyPress.shortcut(code: .keyboardEscape, characters: "", keyFlags: [],
+                                                  eventFlags: []), KeyShortcut("escape"))
+        XCTAssertEqual(ThumbnailKeyPress.shortcut(code: .keyboardDeleteOrBackspace, characters: "", keyFlags: [],
+                                                  eventFlags: []), KeyShortcut("delete"))
+        XCTAssertEqual(ThumbnailKeyPress.shortcut(code: .keyboardC, characters: "c", keyFlags: .command,
+                                                  eventFlags: .alternate, heldKeys: [.keyboardLeftShift, .keyboardRightControl]),
+                       KeyShortcut("c", [.command, .option, .shift, .control]))
+    }
+
     func testThumbnailGridOwnsKeyboardFocusOnlyWhileSelecting() {
         let h = harness()
         let model = PagesPanelModel(app: h.app, session: h.session)
