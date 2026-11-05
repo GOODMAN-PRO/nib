@@ -499,6 +499,51 @@ final class FeatBackupTests: XCTestCase {
         XCTAssertNil(engine.status().error)
     }
 
+    func testBackgroundingFilesPickerDoesNotRestartSavedOrCancelledManualBackup() async throws {
+        for cancel in [false, true] {
+            let (h, engine, root) = try makeHarness()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let navigator = BackupTestNavigator(session: h.session)
+            h.app.ui.activeNavigator = navigator
+            let picker = BackupTestPicker()
+            picker.cancel = cancel
+            engine.userInterface = picker
+            var archives = 0, resumes = 0
+            engine.archive = { _, _, _, _, _ in
+                archives += 1
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                let url = root.appendingPathComponent("manual.zip")
+                try Data("archive".utf8).write(to: url)
+                return url
+            }
+            engine.resumeManual = { resumes += 1 }
+            picker.onSave = {
+                XCTAssertTrue(engine.status().manual)
+                engine.interruptManualForBackground()
+                await Task.yield()
+                engine.resumeInterruptedManual()
+                XCTAssertFalse(engine.status().manualInterrupted)
+            }
+            h.app.commands.register(CommandDescriptor(id: "test.manual", title: "Manual", summary: "Exercise engine", effect: .session)) { _, ctx in
+                try await engine.manual(ctx)
+            }
+            do {
+                _ = try await h.run("test.manual")
+                XCTAssertFalse(cancel)
+            } catch let error as NibError {
+                XCTAssertTrue(cancel)
+                XCTAssertEqual(error.code, .userDenied)
+            }
+            engine.resumeInterruptedManual()
+            XCTAssertEqual(archives, 1)
+            XCTAssertEqual(picker.saves, 1)
+            XCTAssertEqual(resumes, 0)
+            XCTAssertFalse(engine.status().manualInterrupted)
+            XCTAssertFalse(engine.status().running)
+            XCTAssertEqual(engine.status().state, cancel ? "idle" : "ok")
+        }
+    }
+
     func testWebDAVValidationFailsBeforeSettingsOrQueueChanges() async throws {
         let (h, engine, root) = try makeHarness()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -613,10 +658,12 @@ private final class BackupTestNavigator: SceneNavigator {
 private final class BackupTestPicker: BackupUserInterface {
     var saves = 0
     var cancel = false
+    var onSave: (() async -> Void)?
     func chooseFolder(navigator: SceneNavigator) async throws -> URL { throw NibError.unavailable("Not used") }
     func saveArchive(_ url: URL, navigator: SceneNavigator) async throws {
         saves += 1
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        await onSave?()
         if cancel { throw NibError(.userDenied, "Files selection cancelled") }
     }
 }

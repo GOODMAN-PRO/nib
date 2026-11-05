@@ -85,6 +85,7 @@ final class BackupEngine {
     private(set) var error: String?
     private var progress = 0.0
     private var manualProgress: Progress?
+    private var manualArchiving = false
     private var manualInterrupted = false
     private var skippedLocked = 0
 
@@ -199,7 +200,7 @@ final class BackupEngine {
     }
 
     func interruptManualForBackground() {
-        guard let progress = manualProgress else { return }
+        guard manualArchiving, let progress = manualProgress else { return }
         manualInterrupted = true; progress.cancel(); emit()
     }
 
@@ -499,7 +500,7 @@ final class BackupEngine {
         let lifecycle = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.interruptManualForBackground() }
         }
-        manualProgress = progress; manualInterrupted = false; running = true; state = "syncing"; error = nil; emit()
+        manualProgress = progress; manualArchiving = true; manualInterrupted = false; running = true; state = "syncing"; error = nil; emit()
         let publisher = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 self?.emit()
@@ -507,7 +508,7 @@ final class BackupEngine {
             }
         }
         defer {
-            NotificationCenter.default.removeObserver(lifecycle); publisher.cancel(); manualProgress = nil; running = false; emit()
+            NotificationCenter.default.removeObserver(lifecycle); publisher.cancel(); manualProgress = nil; manualArchiving = false; running = false; emit()
             // Activation may arrive before cancellation finishes unwinding.
             if !NibApp.isHostlessTest, UIApplication.shared.applicationState == .active { resumeInterruptedManual() }
         }
@@ -520,6 +521,8 @@ final class BackupEngine {
                 if isLocked(node.id, node: node, ctx: ctx) { progress.cancel() }
             }
             guard !progress.isCancelled else { throw CancellationError() }
+            // Once the archive is ready, backgrounding the Files picker must not schedule another backup.
+            manualArchiving = false; manualInterrupted = false
             var result: [String: JSONValue] = ["name": .string(url.lastPathComponent),
                 "skippedLocked": .number(Double(skippedLocked)), "restoreCommand": .string(CommandIDs.importPick)]
             if let navigator {
@@ -531,6 +534,7 @@ final class BackupEngine {
                 result["asset"] = .string("tmp:" + ref.name)
             }
             state = skippedLocked == 0 ? "ok" : "warning"
+            manualInterrupted = false
             if skippedLocked > 0 { error = String(localized: "Locked documents were skipped. Unlock them and create another backup to include them.") }
             return .object(result)
         } catch {
@@ -540,7 +544,7 @@ final class BackupEngine {
                 throw NibError(.unavailable, self.error!)
             }
             if let failure = error as? NibError, failure.code == .userDenied {
-                state = "idle"; self.error = nil; emit(); throw failure
+                manualInterrupted = false; state = "idle"; self.error = nil; emit(); throw failure
             }
             report(error); throw NibError.wrap(error)
         }
