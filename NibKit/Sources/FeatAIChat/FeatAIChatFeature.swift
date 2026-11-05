@@ -161,7 +161,7 @@ enum ChatCommands {
                     return try await handler(params, ctx)
                 }
                 catch {
-                    if !ctx.dryRun, !(error is CancellationError), let app = ctx.app {
+                    if ctx.principal.isUser, !ctx.dryRun, !(error is CancellationError), let app = ctx.app {
                         ChatRuntime.get(app).model(for: ctx.activeSession).error = NibError.wrap(error)
                     }
                     throw error

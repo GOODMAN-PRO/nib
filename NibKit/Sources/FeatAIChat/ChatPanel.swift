@@ -200,6 +200,9 @@ struct ChatPanel: View {
                           action: model.retryPrompt != nil && model.canSend ? NibAction(String(localized: "Retry")) {
                     model.perform(ChatCommand.send, ["retry": true])
                 } : nil)
+                NibButton(String(localized: "Dismiss error"), kind: .plain, size: .compact) {
+                    model.perform(ChatCommand.inspect, ["section": "error"])
+                }
             }
             Color.clear.frame(height: NibSpacing.xxs).id("aichat.bottom")
         }

@@ -6,6 +6,25 @@ import NibTesting
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testRecoverableToolErrorsStayWithAIWhileUserErrorsCanBeDismissed() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        model.mode = .edit
+        model.chatID = "RETRYCHAT"
+        model.isStreaming = true
+        let params: JSONValue = ["changes": [["command": "test.missing", "params": [:]]]]
+        do {
+            _ = try await h.run(ChatCommand.propose, params, as: .ai("RETRYCHAT"))
+            XCTFail("Invalid proposal must report a tool error")
+        } catch { XCTAssertNil(model.error) }
+        do {
+            _ = try await h.run(ChatCommand.propose, params)
+            XCTFail("Invalid user proposal must fail")
+        } catch { XCTAssertNotNil(model.error) }
+        _ = try await h.run(ChatCommand.inspect, ["section": "error"])
+        XCTAssertNil(model.error)
+    }
+
     func testAnswerDraftUsesReadableCitationLabelsAndUnresolvedFallback() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let model = ChatRuntime.get(h.app).model(for: h.session)
