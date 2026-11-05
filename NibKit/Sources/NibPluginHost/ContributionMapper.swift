@@ -1965,13 +1965,15 @@ struct PluginPanelUnavailable: View {
 
 /// A plugin's text-document block: draws `CustomBlock.display` at the block's height; a tap runs the block's command
 /// with {ref} (docs/PLUGIN_API.md §5.9).
-final class PluginBlockView: UIView {
+final class PluginBlockView: UIScrollView {
     private let app: NibApp
     private let session: EditorSession
     private let doc: DocumentID
     private let block: TextBlock
     private let command: String
     private let height: CGFloat
+    private let surface = PluginBlockSurface()
+    private var drawingWidth: CGFloat = 0
 
     @MainActor
     init(context: BlockViewContext, command: String, title: String, defaultHeight: Double) {
@@ -1984,7 +1986,23 @@ final class PluginBlockView: UIView {
         super.init(frame: CGRect(x: 0, y: 0, width: 320, height: height))
         isOpaque = false
         backgroundColor = .clear
-        contentMode = .redraw
+        alwaysBounceVertical = false
+        showsVerticalScrollIndicator = false
+        isDirectionalLockEnabled = true
+        contentInsetAdjustmentBehavior = .never
+        surface.isOpaque = false
+        surface.backgroundColor = .clear
+        surface.contentMode = .redraw
+        surface.drawContent = { [weak self] cg in
+            guard let self = self, let display = self.block.custom?.display else { return }
+            display.draw(in: cg, origin: .zero, assets: self.app.services.assets, doc: self.doc)
+        }
+        for op in block.custom?.display.ops ?? [] {
+            let edge = max(op.rect?.maxX ?? 0, op.points?.map(\.x).max() ?? 0)
+            let padded = edge + max(0, op.width ?? 1) / 2
+            if padded.isFinite { drawingWidth = max(drawingWidth, CGFloat(padded)) }
+        }
+        addSubview(surface)
         isAccessibilityElement = true
         accessibilityLabel = title
         accessibilityTraits = .button
@@ -1997,12 +2015,35 @@ final class PluginBlockView: UIView {
 
     override var intrinsicContentSize: CGSize { CGSize(width: UIView.noIntrinsicMetric, height: height) }
 
-    override func draw(_ rect: CGRect) {
-        guard let cg = UIGraphicsGetCurrentContext(), let display = block.custom?.display else { return }
-        display.draw(in: cg, origin: .zero, assets: app.services.assets, doc: doc)
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let size = CGSize(width: max(bounds.width, drawingWidth), height: height)
+        surface.frame = CGRect(origin: .zero, size: size)
+        if contentSize != size { contentSize = size }
+        let offset = min(max(0, contentOffset.x), max(0, size.width - bounds.width))
+        if contentOffset.x != offset { contentOffset.x = offset }
+    }
+
+    override func accessibilityScroll(_ direction: UIAccessibilityScrollDirection) -> Bool {
+        guard direction == .left || direction == .right else { return super.accessibilityScroll(direction) }
+        let delta = direction == .left ? bounds.width : -bounds.width
+        let offset = min(max(0, contentOffset.x + delta), max(0, contentSize.width - bounds.width))
+        guard offset != contentOffset.x else { return false }
+        setContentOffset(CGPoint(x: offset, y: 0), animated: false)
+        UIAccessibility.post(notification: .pageScrolled, argument: nil)
+        return true
     }
 
     @objc private func tapped() {
         app.perform(command, ["ref": .string(NodeRef.block(doc, block.id).description)], session: session)
+    }
+}
+
+private final class PluginBlockSurface: UIView {
+    var drawContent: ((CGContext) -> Void)?
+
+    override func draw(_ rect: CGRect) {
+        guard let context = UIGraphicsGetCurrentContext() else { return }
+        drawContent?(context)
     }
 }
