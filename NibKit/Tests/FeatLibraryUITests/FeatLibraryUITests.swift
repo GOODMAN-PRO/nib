@@ -1288,6 +1288,17 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(shortMenu.viewportHeight, 132)
     }
 
+    func testNewMenuCanUseRoomBelowItsAnchorInsteadOfTheGenericPopoverCap() {
+        let full = LibraryMenuViewport(available: 800, count: 11, rowHeight: 44, header: 66, maximumHeight: 800)
+        XCTAssertFalse(full.scrolls)
+        XCTAssertEqual(full.viewportHeight, 484)
+        XCTAssertEqual(full.height, 550)
+        let short = LibraryMenuViewport(available: 310, count: 11, rowHeight: 44, header: 66, maximumHeight: 310)
+        XCTAssertTrue(short.scrolls)
+        XCTAssertLessThanOrEqual(short.height, 310)
+        XCTAssertEqual(short.viewportHeight.truncatingRemainder(dividingBy: 44), 0)
+    }
+
     func testFolderStyleResolvesSymbolEmojiAndDefaultForBothLayouts() throws {
         var row = LibraryRow(ref: "folder:STYLECHECK01", kind: "folder", title: "Semester Notes", color: "#0066E0", icon: "graduationcap.fill")
         XCTAssertEqual(row.folderGlyph, .symbol(try XCTUnwrap(NibSymbol(systemName: "graduationcap.fill"))))
