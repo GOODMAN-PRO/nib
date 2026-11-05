@@ -126,6 +126,9 @@ final class InterruptedCollabTransport: CollabTransport {
     var busyRemaining = 0
     var failAt: Set<Int> = []
     var failedCount = 0
+    var minimumSendInterval: TimeInterval = 0
+    var shouldThrottle: (() -> Bool)?
+    private var lastSend = Date.distantPast
     init(_ base: InMemoryCollabTransport) { self.base = base }
     var id: String { base.id }
     var displayName: String { base.displayName }
@@ -151,6 +154,9 @@ final class InterruptedCollabTransport: CollabTransport {
     }
     func join(code: String, displayName: String) async throws { try await base.join(code: code, displayName: displayName) }
     func send(_ data: Data, to peers: [CollabPeer]?) throws {
+        if shouldThrottle?() == true, Date().timeIntervalSince(lastSend) < minimumSendInterval {
+            throw NibError(.timeout, "Relay queue is full", hint: "relay-busy")
+        }
         if alwaysBusy || busyAt.remove(accepted) != nil || busyRemaining > 0 {
             if busyRemaining > 0 { busyRemaining -= 1 }
             busyCount += 1
@@ -163,6 +169,7 @@ final class InterruptedCollabTransport: CollabTransport {
         // Production transports address peers by id, independently of the current display name.
         let targets = peers.map { requested in base.peers.filter { peer in requested.contains { $0.id == peer.id } } }
         try base.send(data, to: targets)
+        lastSend = Date()
         if peers == nil { broadcastSends += 1 }
         accepted += 1
     }
