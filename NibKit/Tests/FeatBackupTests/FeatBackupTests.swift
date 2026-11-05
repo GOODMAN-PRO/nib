@@ -146,9 +146,12 @@ final class FeatBackupTests: XCTestCase {
         XCTAssertEqual(first["state"], "warning")
         XCTAssertTrue(try XCTUnwrap(first["error"]?.stringValue).contains("Page 1"))
         XCTAssertTrue(engine.queue.entries.isEmpty)
-        XCTAssertNil(engine.queue.lastSuccess, "an incomplete archive is not a clean success")
+        XCTAssertEqual(engine.queue.lastSuccess, time, "delivered backups record completion while retaining the omission warning")
         XCTAssertNil(receivedReports[0])
 
+        // Drain earlier writes, then keep the subscribed old engine off the reloaded queue file.
+        try await engine.persist().value
+        engine.store = BackupQueueStore(url: root.appendingPathComponent("retired/queue.json"))
         let reloaded = BackupEngine(app: h.app)
         reloaded.store = BackupQueueStore(url: root.appendingPathComponent("queue.json"))
         reloaded.now = { Date(timeIntervalSince1970: time) }
@@ -164,6 +167,7 @@ final class FeatBackupTests: XCTestCase {
         _ = try await BackupExecution.$automatic.withValue(true) { try await h.run(CommandIDs.backupNow) }
         XCTAssertEqual(receivedReports.count, 2)
         XCTAssertEqual(receivedReports[1], omissions, "the persisted report must reach the toast owner on automatic runs")
+        XCTAssertEqual(reloaded.queue.lastSuccess, time)
 
         partial = false; failDelivery = true
         changedItem.z = "zzz"
@@ -174,6 +178,7 @@ final class FeatBackupTests: XCTestCase {
             XCTFail("delivery failure must surface")
         } catch { }
         XCTAssertFalse(reloaded.queue.exportReports.isEmpty, "a failed delivery cannot clear the previous partial-backup status")
+        XCTAssertEqual(reloaded.queue.lastSuccess, time - 100, "failed delivery must not advance completion time")
         XCTAssertTrue(try XCTUnwrap(reloaded.status().error).contains("Page 1"))
         failDelivery = false
         time += 100
@@ -184,6 +189,62 @@ final class FeatBackupTests: XCTestCase {
         XCTAssertNotNil(reloaded.queue.lastSuccess)
         let disk = try await reloaded.store.load()
         XCTAssertTrue(disk.exportReports.isEmpty)
+        try await engine.persist().value
+    }
+
+    func testObsoleteOmissionReportsArePrunedByRunsAndLibraryChanges() async throws {
+        for change in ["trash", "delete", "exclude", "format"] {
+            for notifyLibrary in [false, true] {
+                let (h, engine, root) = try makeHarness()
+                defer { try? FileManager.default.removeItem(at: root) }
+                var time = 100.0
+                engine.now = { Date(timeIntervalSince1970: time) }
+                h.app.commands.register(CommandDescriptor(id: CommandIDs.exportRun, title: "Export", summary: "Partial export", effect: .read)) { params, ctx in
+                    let ref = try ctx.services.assets!.putTemporary(Data("backup".utf8), ext: "zip")
+                    var result: [String: JSONValue] = ["files": [["asset": .string("tmp:" + ref.name)]]]
+                    if params["docs"]?.arrayValue?.first?.stringValue == "doc:" + Fixtures.docID.raw && params["format"] == "nibnote" {
+                        result["warning"] = "Page 1: missing image"
+                        result["omissions"] = [["asset": "missing.png"]]
+                    }
+                    return .object(result)
+                }
+                h.app.commands.register(CommandDescriptor(id: CommandIDs.webdavPut, title: "PUT", summary: "Delivery", effect: .session)) { _, _ in [:] }
+                await engine.start()
+                _ = try await h.run(CommandIDs.backupConfigure, ["destination": ["kind": "webdav"], "format": "nib", "frequent": true])
+                _ = try await h.run(CommandIDs.backupNow)
+                XCTAssertNotNil(engine.queue.omissionWarning)
+                XCTAssertEqual(engine.status().state, "warning")
+                XCTAssertEqual(engine.queue.lastSuccess, time)
+
+                var config = BackupSettings.read(h.app.settings)
+                switch change {
+                case "trash": try h.library.trash(Fixtures.docID)
+                case "delete": try h.library.deletePermanently(Fixtures.docID)
+                case "exclude":
+                    config.exclusions = [try XCTUnwrap(h.library.node(Fixtures.docID)).title]
+                    BackupSettings.write(config, to: h.app.settings)
+                default:
+                    config.format = "pdf"
+                    BackupSettings.write(config, to: h.app.settings)
+                }
+                time += 100
+                if notifyLibrary {
+                    await engine.libraryChanged()
+                    XCTAssertNil(engine.queue.omissionWarning, change)
+                }
+                // No pending documents: cleanup must also settle the early automatic-return path.
+                _ = try await BackupExecution.$automatic.withValue(true) { try await h.run(CommandIDs.backupNow) }
+                XCTAssertNil(engine.queue.omissionWarning, change)
+                XCTAssertEqual(engine.status().state, "ok", change)
+                XCTAssertNil(engine.status().error, change)
+                XCTAssertEqual(engine.queue.lastSuccess, time - 100, "cleanup preserves the last delivered backup time")
+                let disk = try await engine.store.load()
+                XCTAssertTrue(disk.exportReports.isEmpty, change)
+                _ = try await h.run(CommandIDs.backupNow)
+                XCTAssertEqual(engine.status().state, "ok", change)
+                XCTAssertEqual(engine.queue.lastSuccess, time, change)
+            }
+        }
     }
 
     func testClearDuringExportDoesNotSendOrConsumeNewQueue() async throws {

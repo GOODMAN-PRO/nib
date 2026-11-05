@@ -203,7 +203,9 @@ final class BackgroundCache {
         if let r = raster, r.url == url {
             decoded = (r.image, r.size)
         } else {
-            guard let d = ExportImages.decode(url: url, maxPixel: 4096) else {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let d = ExportImages.decode(source, maxPixel: 4096),
+                  CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete else {
                 throw ExportAssets.unavailable(record.background.asset?.name ?? url.lastPathComponent)
             }
             raster = (url, d.image, d.size)

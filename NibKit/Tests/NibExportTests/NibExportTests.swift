@@ -398,9 +398,8 @@ final class NibExportTests: XCTestCase {
         let h = Harness()
         let complete = try h.assets.data(Fixtures.pngAsset, doc: Fixtures.docID)
         let truncated = Data(complete.prefix(41))
-        let source = try XCTUnwrap(CGImageSourceCreateWithData(truncated as CFData, nil))
-        XCTAssertGreaterThan(CGImageSourceGetCount(source), 0, "the container still identifies an image")
-        XCTAssertNotNil(CGImageSourceCopyPropertiesAtIndex(source, 0, nil), "the header is readable")
+        // ImageIO versions differ in how much metadata this prefix exposes; either
+        // a rejected container or an incomplete decoded frame must fail drawing.
         h.assets.install(truncated, as: Fixtures.pngAsset, doc: Fixtures.docID)
         let url = try XCTUnwrap(h.assets.url(Fixtures.pngAsset, doc: Fixtures.docID))
         var page = try XCTUnwrap(h.persistence.loadHead(Fixtures.docID).page(Fixtures.pdfPage))

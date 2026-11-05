@@ -116,6 +116,21 @@ final class BackupQueueTests: XCTestCase {
         XCTAssertEqual(legacy.lastSuccess, 100)
     }
 
+    func testReportsKeepOnlyEligibleDocumentsAndConfiguredFormats() {
+        var queue = BackupQueue()
+        let document = NibID("DOC/with-slash")
+        let report = BackupQueue.ExportReport(document: "Notes", warning: "Missing image", omissions: [])
+        for key in [document.raw + "/nibnote", document.raw + "/pdf", "REMOVED/pdf", "malformed"] {
+            queue.exportReports[key] = report
+        }
+        queue.pruneReports(keeping: [document], formats: ["nibnote", "pdf"])
+        XCTAssertEqual(Set(queue.exportReports.keys), [document.raw + "/nibnote", document.raw + "/pdf"])
+        queue.pruneReports(keeping: [document], formats: ["pdf"])
+        XCTAssertEqual(Set(queue.exportReports.keys), [document.raw + "/pdf"])
+        queue.pruneReports(keeping: [], formats: ["pdf"])
+        XCTAssertNil(queue.omissionWarning)
+    }
+
     func testMirroredPathsAndTraversalValidation() throws {
         let folder = LibraryNode(id: Fixtures.folderID, kind: .folder, title: "School", path: "School")
         let doc = LibraryNode(id: Fixtures.docID, kind: .document, title: "Physics/Notes", path: "School/Notes.nibnote", parent: folder.id)

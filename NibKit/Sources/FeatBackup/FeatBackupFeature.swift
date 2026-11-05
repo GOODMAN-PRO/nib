@@ -218,6 +218,7 @@ final class BackupEngine {
         let allowed = eligible(nodes)
         queue.retain(allowed)
         let config = BackupSettings.read(app.settings)
+        pruneExportReports(keeping: allowed, formats: config.exportFormats)
         guard config.destination.kind != "none" else { persist(); emit(); return }
         let runGeneration = generation
         var changed = BackupQueue.changedDocuments(before: before, after: nodes)
@@ -274,6 +275,16 @@ final class BackupEngine {
         guard let app else { return [] }
         let config = BackupSettings.read(app.settings)
         return Set(nodes.filter { $0.kind == .document && $0.trashedAt == nil && !BackupQueue.excluded($0.title, substrings: config.exclusions) }.map(\.id))
+    }
+
+    private func pruneExportReports(keeping documents: Set<DocumentID>, formats: [String]) {
+        let hadReports = !queue.exportReports.isEmpty
+        queue.pruneReports(keeping: documents, formats: formats)
+        // A removed/excluded document can leave no work to trigger another automatic pass.
+        if hadReports && queue.exportReports.isEmpty && !running && error == nil && state == "warning" {
+            state = queue.entries.isEmpty ? "ok" : "idle"
+            if queue.entries.isEmpty { progress = 1 }
+        }
     }
 
     func configurationChanged() async throws {
@@ -371,8 +382,10 @@ final class BackupEngine {
         let library = try ctx.services.require(ctx.services.library, "Library")
         let nodes = library.allNodes()
         if ctx.dryRun { return status() }
-        queue.retain(eligible(nodes))
-        if !automatic { for id in eligible(nodes).sorted() { queue.enqueue(id, at: now().timeIntervalSince1970) } }
+        let allowed = eligible(nodes)
+        queue.retain(allowed)
+        pruneExportReports(keeping: allowed, formats: config.exportFormats)
+        if !automatic { for id in allowed.sorted() { queue.enqueue(id, at: now().timeIntervalSince1970) } }
         if automatic && !queue.isDue(at: now().timeIntervalSince1970, frequent: config.frequent) { try await persist().value; return status() }
         let bookmark = app.settings.get(BackupSettings.bookmark)
         if config.destination.kind == "folder", bookmark == nil { throw NibError.unavailable("Choose a folder with backup.chooseFolder") }
@@ -393,8 +406,7 @@ final class BackupEngine {
                 ctx.workspace.persistence.flush(entry.document)
                 let oldStamp = try await store.loadStamp(entry.document)
                 let stamp = try await contentStamp(entry.document, persistence: ctx.workspace.persistence, previous: oldStamp)
-                let formats = config.format == "both" ? ["nibnote", "pdf"] : [config.format == "nib" ? "nibnote" : "pdf"]
-                for format in formats {
+                for format in config.exportFormats {
                     try Task.checkCancellation()
                     let reportKey = entry.document.raw + "/" + format
                     var params: [String: JSONValue] = ["docs": .array([.string("doc:" + entry.document.raw)]), "format": .string(format)]
@@ -449,7 +461,7 @@ final class BackupEngine {
         if let failure { report(failure) }
         else if self.error == nil {
             if skippedLocked > 0 { state = "warning"; self.error = String(localized: "Locked documents were skipped. Unlock them to include them in the next backup.") }
-            else if queue.omissionWarning != nil { state = "warning"; progress = 1 }
+            else if queue.omissionWarning != nil { state = "warning"; queue.lastSuccess = now().timeIntervalSince1970; progress = 1 }
             else { state = "ok"; queue.lastSuccess = now().timeIntervalSince1970; progress = 1 }
         }
         try await persist().value

@@ -691,8 +691,12 @@ final class WebDAVMirrorTests: XCTestCase {
 
             // The next pass downloads the newer version instead of deleting A's edits.
             let next = try await sync(server, b, stateB, "0000000b")
-            XCTAssertEqual(next.downloaded, 1)
+            XCTAssertEqual(next.downloaded, withoutETags ? 2 : 1,
+                           "without listing ETags, the moved copy also needs one verification download")
             XCTAssertEqual(DAVTest.read(b, old), "A2, newer")
+            XCTAssertEqual(DAVTest.read(b, "K.nibnote/doc.0000000a.json"), "A1")
+            let stable = try await sync(server, b, stateB, "0000000b")
+            XCTAssertEqual(stable.downloaded + stable.uploaded + stable.conflicts + stable.pending, 0)
         }
     }
 

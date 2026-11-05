@@ -66,6 +66,14 @@ struct BackupQueue: Codable, Equatable {
         entries.removeAll { !documents.contains($0.document) }
         rebuildIndices()
     }
+    mutating func pruneReports(keeping documents: Set<DocumentID>, formats: [String]) {
+        let allowed = Set(documents.map(\.raw))
+        exportReports = exportReports.filter { key, _ in
+            guard let separator = key.lastIndex(of: "/") else { return false }
+            return allowed.contains(String(key[..<separator])) &&
+                formats.contains(String(key[key.index(after: separator)...]))
+        }
+    }
     mutating func clear() { entries.removeAll(); indices.removeAll() }
 
     static func interval(frequent: Bool) -> TimeInterval { frequent ? 90 : 12 * 60 * 60 }
@@ -157,6 +165,10 @@ struct BackupConfiguration: Codable, Equatable {
     var folder: String
     var exclusions: [String]
     var frequent: Bool
+
+    var exportFormats: [String] {
+        format == "both" ? ["nibnote", "pdf"] : [format == "nib" ? "nibnote" : "pdf"]
+    }
 }
 
 enum BackupSettings {
