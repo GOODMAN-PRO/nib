@@ -1034,29 +1034,53 @@ final class FeatSearchUITests: XCTestCase {
         state.matches = [hit()]
         state.isPresented = true
         state.instant = true
+        // Liquid Off changes these shared design switches when its container appears.
+        let reduced = NibMotion.forcesReduced
+        let haptics = NibHaptics.isEnabled
+        defer { NibMotion.forcesReduced = reduced; NibHaptics.isEnabled = haptics }
         for width in [CGFloat(390), CGFloat(600)] {
-            let view = NibDropletContainer {
+            let floating = NibFloatingHost()
+            floating.present("searchui.library") {
                 LibrarySearchFloatingContent(app: h.app, session: h.session, state: state)
                     .environment(\.horizontalSizeClass, .compact)
-            }.nibLiquidMode(.off).ignoresSafeArea()
+            }
+            // The fallback water layer includes blur padding in its ideal size. Without a fixed
+            // window proposal its measured width feeds the search width and then its own next frame.
+            // Host the production floating layer in an explicitly bounded viewport, as the shell does.
+            let view = NibDropletContainer { NibFloatingLayer(host: floating) }
+                .nibLiquidMode(.off)
+                .frame(width: width, height: 834)
+                .ignoresSafeArea()
             let host = UIHostingController(rootView: view)
+            host.safeAreaRegions = []
             let window = UIWindow(frame: CGRect(x: 0, y: 0, width: width, height: 834))
             window.rootViewController = host
             window.isHidden = false
             defer { window.isHidden = true; window.rootViewController = nil }
             host.view.frame = window.bounds
-            for _ in 0..<10 {
-                host.view.setNeedsLayout()
-                host.view.layoutIfNeeded()
-                try await Task.sleep(for: .milliseconds(20))
-            }
             func scrolls(_ view: UIView) -> [UIScrollView] {
                 ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap(scrolls)
             }
-            let results = try XCTUnwrap(scrolls(host.view).max { $0.bounds.height < $1.bounds.height })
-            let frame = results.convert(results.bounds, to: window)
-            XCTAssertEqual(frame.minX, NibSpacing.l, accuracy: 1)
-            XCTAssertEqual(frame.maxX, width - NibSpacing.l, accuracy: 1)
+            let deadline = Date().addingTimeInterval(2)
+            var frame: CGRect?
+            var stableSamples = 0
+            // Let UIKit perform layout on its normal turns, not a synchronous layoutIfNeeded loop.
+            while Date() < deadline && stableSamples < 3 {
+                try await Task.sleep(for: .milliseconds(20))
+                let results = scrolls(host.view).max { $0.bounds.height < $1.bounds.height }
+                let next = results.map { $0.convert($0.bounds, to: window) }
+                let fits = next.map {
+                    $0.height > NibMetrics.barHeight && abs($0.minX - NibSpacing.l) <= 1
+                        && abs($0.maxX - (width - NibSpacing.l)) <= 1
+                } ?? false
+                stableSamples = fits && next == frame ? stableSamples + 1 : 0
+                frame = next
+            }
+            let diagnostic = "width=\(width), window=\(window.bounds), results=\(String(describing: frame)), stableSamples=\(stableSamples)"
+            XCTAssertGreaterThanOrEqual(stableSamples, 3, "Search layout must settle within two seconds; " + diagnostic)
+            let measured = try XCTUnwrap(frame, diagnostic)
+            XCTAssertEqual(measured.minX, NibSpacing.l, accuracy: 1, diagnostic)
+            XCTAssertEqual(measured.maxX, width - NibSpacing.l, accuracy: 1, diagnostic)
         }
     }
 
