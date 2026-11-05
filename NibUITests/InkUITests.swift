@@ -253,7 +253,7 @@ final class InkUITests: XCTestCase {
             // Dismiss the observed popover from outside its content, never by tapping a similarly named app control.
             let content = picker.scrollViews.firstMatch
             let point = ui.coordinate(CGPoint(x: 0.95, y: 0.85))
-            guard content.exists && !content.frame.contains(point.screenPoint) else {
+            guard content.exists && !content.frame.contains(ui.interfacePoint(CGPoint(x: 0.95, y: 0.85))) else {
                 throw NibUI.Failure.message("No outside dismissal point for native colour picker")
             }
             point.tap()

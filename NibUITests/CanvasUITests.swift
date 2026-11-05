@@ -235,7 +235,7 @@ final class CanvasUITests: XCTestCase {
         try open(); try ui.selectTool("lasso")
         let before = try ui.state()
         let paper = try page().frame
-        let focal = ui.coordinate(CGPoint(x: 0.5, y: 0.5)).screenPoint
+        let focal = ui.interfacePoint(CGPoint(x: 0.5, y: 0.5))
         let anchor = CGPoint(x: (focal.x - paper.minX) / before.zoom, y: (focal.y - paper.minY) / before.zoom)
         try ui.pinchZoom(scale: 1.5, at: CGPoint(x: 0.5, y: 0.5))
         let zoomed = try ui.waitForState { $0.zoom > before.zoom + 0.1 }

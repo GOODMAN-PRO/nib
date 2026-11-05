@@ -94,3 +94,9 @@ S:singles-rest#7 confirms actionGroupCell View More and no Save to Files in the 
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Both Selection PNG export tests | PNG share View More | Which action types and rows appear after expansion? Existing export-failed diagnostics retain screenshot. |
+
+## H6 - interface versus device coordinates
+
+S:singles-rest#9 proves the landscape mapping (1032-y,x), including the wrong (381.8,660.5) container drop. Added interfacePoint from canvas.frame. Audited every screenPoint: Selection frame comparisons and drag destination, Canvas pinch focal oracle, Ink picker outside check, Insert dropped-element assertion and geometry/comment diagnostics now use interface space. recordGeometry describes that space. Two-point stroke distance uses interface endpoints (distance is rotation-invariant); multi-tap validates interface contacts and converts only for NibTouchPaths. Remaining screenPoint uses feed NibTouchPaths exclusively (Ink path, Insert image path, shared multi-tap/path). screen()/drag callers otherwise already consume frame-derived interface geometry.
+
+Previously passing by accident: Selection testRectangleSelectsAnIntersectingStroke compared maxX against the rotated y-derived x; testBlankPageContextMenuAnchorsAndInsertSpaceActsAtPoint's half-canvas tolerance admitted the wrong anchor. The lasso unrelated-stroke exclusion also used a wrong point (inside an otherwise failing test). Word-selection and ElementDrag location checks were not reached and are not claimed previous passes. Expected lasso, moving-container attachment and Canvas pinch tests now check the intended geometry; existing assertions/tolerances remain. CI must show the (660.5,650.2) drop, attachment persistence, and focal projection within the unchanged 45pt tolerance.

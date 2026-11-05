@@ -1475,10 +1475,16 @@ final class NibUI {
         canvas.coordinate(withNormalizedOffset: CGVector(dx: point.x, dy: point.y))
     }
 
-    /// Captures screen-point geometry at the action boundary so CI can distinguish gesture delivery from AX projection.
+    /// Accessibility frames and app-coordinate offsets use interface space, unlike screenPoint in landscape.
+    func interfacePoint(_ normalized: CGPoint) -> CGPoint {
+        let frame = canvas.frame
+        return CGPoint(x: frame.minX + normalized.x * frame.width, y: frame.minY + normalized.y * frame.height)
+    }
+
+    /// Captures interface geometry at the action boundary for comparison with accessibility frames.
     func recordGeometry(_ name: String, touches: [CGPoint], selection: CGRect? = nil) {
         XCTContext.runActivity(named: name) { activity in
-            let attachment = XCTAttachment(string: "All frames and touches are screen points.\n"
+            let attachment = XCTAttachment(string: "All frames and touches are interface points.\n"
                 + "app=\(app.frame) window=\(app.windows.firstMatch.frame) canvas=\(canvas.frame)\n"
                 + "touches=\(touches) selection=\(String(describing: selection))\n\(probe.value ?? "missing")")
             attachment.name = name; attachment.lifetime = .keepAlways; activity.add(attachment)
@@ -1542,7 +1548,8 @@ final class NibUI {
         guard path.count >= 2 else { throw Failure.message("A stroke needs at least two points") }
         if path.count == 2 {
             let start = coordinate(path[0]), end = coordinate(path[1])
-            let distance = hypot(end.screenPoint.x - start.screenPoint.x, end.screenPoint.y - start.screenPoint.y)
+            let a = interfacePoint(path[0]), b = interfacePoint(path[1])
+            let distance = hypot(b.x - a.x, b.y - a.y)
             start.press(forDuration: 0.01, thenDragTo: end, withVelocity: XCUIGestureVelocity(rawValue: distance / duration), thenHoldForDuration: 0)
         } else {
             try synthesize([path], duration: duration)
@@ -1559,8 +1566,8 @@ final class NibUI {
             [CGPoint(x: centre.x + direction * radius, y: centre.y),
              CGPoint(x: centre.x + direction * radius * scale, y: centre.y)]
         }
-        recordGeometry("Pinch focal point and contact paths", touches: [coordinate(centre).screenPoint]
-            + paths.flatMap { $0.map { coordinate($0).screenPoint } })
+        recordGeometry("Pinch focal point and contact paths", touches: [interfacePoint(centre)]
+            + paths.flatMap { $0.map { interfacePoint($0) } })
         try synthesize(paths, duration: duration)
     }
     func doubleTap(at point: CGPoint = CGPoint(x: 0.5, y: 0.5)) { coordinate(point).doubleTap() }
@@ -1569,17 +1576,18 @@ final class NibUI {
     func canvasMultiTap(touches: Int, taps: Int = 2) throws {
         guard (2...3).contains(touches), (1...2).contains(taps) else { throw Failure.message("Unsupported multi-tap") }
         let before = app.windows.firstMatch.frame
-        let centre = coordinate(CGPoint(x: 0.18, y: 0.65)).screenPoint
-        let points = (0..<touches).map { index in
-            CGPoint(x: centre.x + CGFloat(index - 1) * 20, y: centre.y)
+        let frame = canvas.frame
+        let normalized = (0..<touches).map { index in
+            CGPoint(x: 0.18 + CGFloat(index - 1) * 20 / frame.width, y: 0.65)
         }
+        let points = normalized.map { interfacePoint($0) }
         guard points.allSatisfy({ before.insetBy(dx: 60, dy: 60).contains($0) }) else {
             throw Failure.message("Multi-tap must stay clear of system window edges")
         }
         recordGeometry("Stationary multi-tap", touches: points)
         let done = XCTestExpectation(description: "Stationary multi-tap completed")
         var failure: Error?
-        NibTouchPaths.tap(at: points.map { NSValue(cgPoint: $0) }, count: UInt(taps)) { error in
+        NibTouchPaths.tap(at: normalized.map { NSValue(cgPoint: coordinate($0).screenPoint) }, count: UInt(taps)) { error in
             failure = error; done.fulfill()
         }
         guard XCTWaiter.wait(for: [done], timeout: 10) == .completed else { throw Failure.message("Multi-tap timed out") }

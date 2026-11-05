@@ -218,9 +218,9 @@ final class SelectionUITests: XCTestCase {
         try loop(count: 1)
         try countsEqual(before)
         let b = try bounds()
-        ui.recordGeometry("Lasso content versus selection accessibility frame", touches: stroke.map { ui.coordinate($0).screenPoint }, selection: b)
-        XCTAssertTrue(b.contains(ui.coordinate(stroke[2]).screenPoint), "Lasso must select the enclosed stroke")
-        XCTAssertFalse(b.contains(ui.coordinate(CGPoint(x: 0.5, y: 0.85)).screenPoint), "Unrelated stroke must remain outside selection")
+        ui.recordGeometry("Lasso content versus selection accessibility frame", touches: stroke.map { ui.interfacePoint($0) }, selection: b)
+        XCTAssertTrue(b.contains(ui.interfacePoint(stroke[2])), "Lasso must select the enclosed stroke")
+        XCTAssertFalse(b.contains(ui.interfacePoint(CGPoint(x: 0.5, y: 0.85))), "Unrelated stroke must remain outside selection")
     }
 
     func testRectangleSelectsAnIntersectingStroke() throws {
@@ -228,7 +228,7 @@ final class SelectionUITests: XCTestCase {
         try lassoSettings(); try tap("Rectangle"); outside()
         try ui.drawStroke([CGPoint(x: 0.40, y: 0.60), CGPoint(x: 0.48, y: 0.73)])
         _ = try ui.waitForState(timeout: 10) { $0.selectionCount == 1 }
-        XCTAssertGreaterThan(try bounds().maxX, ui.coordinate(CGPoint(x: 0.57, y: 0.7)).screenPoint.x,
+        XCTAssertGreaterThan(try bounds().maxX, ui.interfacePoint(CGPoint(x: 0.57, y: 0.7)).x,
                              "Intersection selects the entire stroke, not only the portion inside the rectangle")
     }
 
@@ -338,7 +338,7 @@ final class SelectionUITests: XCTestCase {
         let anchor = CGPoint(x: 0.62, y: 0.52)
         try pageMenu(at: anchor)
         let item = try control("Insert Space")
-        XCTAssertLessThan(abs(item.frame.midX - ui.coordinate(anchor).screenPoint.x), ui.canvas.frame.width / 2)
+        XCTAssertLessThan(abs(item.frame.midX - ui.interfacePoint(anchor).x), ui.canvas.frame.width / 2)
         item.tap()
         try loop(CGRect(x: 0.36, y: 0.52, width: 0.29, height: 0.40), count: 1)
         XCTAssertGreaterThan(try bounds().minY, before.minY + 10, "Insert Space must move ink below its page-menu anchor")
@@ -504,7 +504,7 @@ final class SelectionUITests: XCTestCase {
         try draw([CGPoint(x: 0.42, y: 0.79), CGPoint(x: 0.47, y: 0.86), CGPoint(x: 0.53, y: 0.80)])
         try lassoSettings(); try toggle("Shapes", to: false); outside()
         try loop(CGRect(x: 0.40, y: 0.77, width: 0.16, height: 0.11), count: 1)
-        drag(centre(try bounds()), ui.coordinate(CGPoint(x: 0.48, y: 0.63)).screenPoint)
+        drag(centre(try bounds()), ui.interfacePoint(CGPoint(x: 0.48, y: 0.63)))
         let attached = try copiedItems()
         XCTAssertEqual(attached.first { $0["kind"] as? String == "stroke" }?["attachedTo"] as? String, parentID,
                        "Real drop must attach the stroke before testing linked movement")
@@ -825,7 +825,7 @@ final class SelectionUITests: XCTestCase {
         // Smart Ink owns selectedWord separately from the canvas item selection probe.
         let word = try handwritingGeometry("Selected word")
         XCTAssertEqual(ui.app.otherElements.matching(NSPredicate(format: "label == 'Selected word'")).count, 1)
-        XCTAssertLessThan(word.frame.maxX, ui.coordinate(CGPoint(x: 0.52, y: 0.595)).screenPoint.x)
+        XCTAssertLessThan(word.frame.maxX, ui.interfacePoint(CGPoint(x: 0.52, y: 0.595)).x)
         let before = try ui.state()
         try tap("Delete Word")
         _ = try ui.waitForState(timeout: 8) { $0.strokeCountOnPage == before.strokeCountOnPage - 1 }

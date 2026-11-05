@@ -322,7 +322,7 @@ final class InsertUITests: XCTestCase {
     private func visibleCanvasText(_ value: String) throws -> XCUIElement {
         let text = ui.canvas.staticTexts.matching(NSPredicate(format: "value == %@", value)).firstMatch
         try wait("Committed text must be visible at its current canvas position") { text.exists && text.isHittable }
-        ui.recordGeometry("Committed text position", touches: [text.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).screenPoint], selection: text.frame)
+        ui.recordGeometry("Committed text position", touches: [CGPoint(x: text.frame.midX, y: text.frame.midY)], selection: text.frame)
         return text
     }
     func testTextInsertCommitEditAndUndo() throws {
@@ -834,8 +834,8 @@ final class InsertUITests: XCTestCase {
         try elements()
         let star = try control("Star")
         let drop = ui.coordinate(end)
-        let dropPoint = drop.screenPoint
-        ui.recordGeometry("Element drag start", touches: [star.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).screenPoint, dropPoint])
+        let dropPoint = ui.interfacePoint(end)
+        ui.recordGeometry("Element drag start", touches: [CGPoint(x: star.frame.midX, y: star.frame.midY), dropPoint])
         star.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8, thenDragTo: drop)
         try counts(5)
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount > 0 }
@@ -1136,9 +1136,9 @@ final class InsertUITests: XCTestCase {
     func testCommentAddOpenBadgeReplyAndCopyText() throws {
         try comment(); try tap("cmd.panel.close")
         try wait("Comment panel must finish closing before badge hit-testing") { !self.ui.app.buttons["cmd.panel.close"].exists }
-        ui.recordDiagnostics("Comment badge before reopen", facts: "tap screen point=\(ui.coordinate(point).screenPoint)", includeHierarchy: false)
+        ui.recordDiagnostics("Comment badge before reopen", facts: "tap interface point=\(ui.interfacePoint(point))", includeHierarchy: false)
         ui.coordinate(point).tap()
-        ui.recordDiagnostics("Comment badge after reopen", facts: "tap screen point=\(ui.coordinate(point).screenPoint)", includeHierarchy: false)
+        ui.recordDiagnostics("Comment badge after reopen", facts: "tap interface point=\(ui.interfacePoint(point))", includeHierarchy: false)
         XCTAssertTrue(try message("Check the units").exists)
         let reply = try control("Reply"); try ui.focusField(reply); reply.typeText("Use metres per second"); try tap("Send")
         let posted = try message("Use metres per second")
