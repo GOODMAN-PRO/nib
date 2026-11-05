@@ -842,8 +842,11 @@ final class FeatCollabTests: XCTestCase {
             CollabPair.hasItem(pair.guest, "HOSTIMAGE001", page: Fixtures.page2)
                 && (try? pair.guest.assets.data(scanRef, doc: Fixtures.docID)) == scan
         }
-        XCTAssertTrue(CollabPair.hasItem(cy, "HOSTIMAGE001", page: Fixtures.page2))
-        XCTAssertEqual(try? cy.assets.data(scanRef, doc: Fixtures.docID), scan)
+        // The second guest is served after the first: wait for it as the first half of this test does.
+        try await waitUntil {
+            CollabPair.hasItem(cy, "HOSTIMAGE001", page: Fixtures.page2)
+                && (try? cy.assets.data(scanRef, doc: Fixtures.docID)) == scan
+        }
     }
 
     func testReceivedFilesMustMatchTheirNames() throws {
