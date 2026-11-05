@@ -504,18 +504,18 @@ struct NibSheetChrome: ViewModifier {
                 chrome(content)
             }
             .presentationSizing(.form.fitted(horizontal: true, vertical: true))
-            .scrollIndicators(.visible)
-            .scrollIndicatorsFlash(onAppear: true)
+            .scrollIndicators(.visible, axes: .vertical)
         } else {
             chrome(content)
-                .scrollIndicators(.visible)
-                .scrollIndicatorsFlash(onAppear: true)
+                .scrollIndicators(.visible, axes: .vertical)
         }
     }
 
     @ViewBuilder private func chrome(_ content: Content) -> some View {
         // Sheets may contain bottom-pinned actions. Keep scroll cues on their scroll
         // hosts; a root mask fades those actions and shared margins double local padding.
+        // Only the vertical indicator policy belongs here. A root flash reaches every
+        // nested strip, so individual scroll owners opt into flashing when needed.
         if #available(iOS 26.0, *) {
             content
         } else {

@@ -8,6 +8,36 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testSheetCuePreservesHorizontalStripIndicatorPolicy() async throws {
+        let content = ScrollView(.vertical) {
+            VStack {
+                ScrollView(.horizontal) {
+                    HStack { ForEach(0..<20) { Text("Swatch \($0)").frame(width: 80, height: 44) } }
+                }
+                Color.clear.frame(height: 900)
+            }
+        }
+        .modifier(NibSheetChrome())
+        // A caller's horizontal policy must survive the sheet's vertical cue.
+        .scrollIndicators(.hidden)
+        let host = UIHostingController(rootView: content)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 400))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func scrolls(in view: UIView) -> [UIScrollView] {
+            ((view as? UIScrollView).map { [$0] } ?? [])
+                + view.subviews.flatMap { scrolls(in: $0) }
+        }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        let views = scrolls(in: host.view)
+        let vertical = try XCTUnwrap(views.first { $0.contentSize.height > $0.bounds.height + 1 })
+        let horizontal = try XCTUnwrap(views.first { $0.contentSize.width > $0.bounds.width + 1 })
+        XCTAssertTrue(vertical.showsVerticalScrollIndicator)
+        XCTAssertFalse(horizontal.showsHorizontalScrollIndicator,
+                       "Sheet chrome must not make thumbnail and swatch strips show indicators")
+    }
+
     func testNativePopoverActionRemainsHittableAndTracksDisabledStateAcrossRefresh() async throws {
         var count = 0
         func content(_ enabled: Bool) -> AnyView {
