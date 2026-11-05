@@ -337,13 +337,12 @@ struct EraserSizePresets: View {
     }
 }
 
-/// Erase Filter chips (T-019). Four chips fit one row at the default size; at large type they wrap to two rows of
-/// two, so no chip ever wraps its label.
+/// Erase Filter chips (T-019). Labels stay on one line; overflow has a persistent trailing scroll cue.
 struct EraserFilterChips: View {
     @ObservedObject var model: EraserOptions
 
     var body: some View {
-        ScrollView(.horizontal) {
+        NibScrollView(.horizontal) {
             HStack(spacing: NibSpacing.s) { chips(InkTool.allCases) }
         }
         .scrollBounceBehavior(.basedOnSize)

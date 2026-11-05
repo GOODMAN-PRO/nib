@@ -870,6 +870,8 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 
 ### 13.7 Sheets and lists
 
+`NibScrollView` keeps native scroll indicators and reserves a 16 pt cue lane when content exceeds its viewport. The chevron points towards more content (back towards the start at the end), below a vertical list or after a horizontal strip. The cue never masks a label or control, does not intercept touches, and stays reserved while scrolling to prevent layout jumps. `NibPopoverPanel` uses it for all tool lists; forms with pinned actions use it for their options only.
+
 | Component | Anatomy | Notes |
 |---|---|---|
 | **`.nibSheet`** | System sheet on `backgroundSecondary` (radius 28) below iOS 26, the system material on 26 | No glass inside; one Tinted primary |

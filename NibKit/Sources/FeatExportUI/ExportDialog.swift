@@ -244,21 +244,17 @@ struct ExportDialog: View {
                 GeometryReader { geometry in
                     if !typeSize.isAccessibilitySize && geometry.size.height >= 4 * NibMetrics.hitTarget {
                         VStack(alignment: .leading, spacing: NibSpacing.l) {
-                            ScrollView {
+                            NibScrollView {
                                 VStack(alignment: .leading, spacing: NibSpacing.l) { options; secondaryActions }
                                     .padding(.bottom, NibSpacing.l)
                             }
                             .scrollBounceBehavior(.basedOnSize)
-                            .scrollIndicators(.visible)
-                            .nibFadeBottomEdge()
                             primaryActions
                         }
                     } else {
                         // Short windows and large text keep all actions reachable in one scroller.
-                        ScrollView { form.padding(.bottom, NibSpacing.l) }
+                        NibScrollView { form.padding(.bottom, NibSpacing.l) }
                             .scrollBounceBehavior(.basedOnSize)
-                            .scrollIndicators(.visible)
-                            .nibFadeBottomEdge()
                     }
                 }
             } else {
