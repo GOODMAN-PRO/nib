@@ -1936,7 +1936,9 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertLessThanOrEqual(paper.maxY, viewport.maxY - NibSpacing.l + 1,
                     "The first paper tile and label must clear the bottom fade on opening")
                 XCTAssertGreaterThan(paper.minY, preview.maxY)
-                XCTAssertTrue(viewport.contains(cue))
+                XCTAssertTrue(sheetFrame.contains(cue))
+                XCTAssertGreaterThanOrEqual(cue.minY, viewport.maxY)
+                XCTAssertFalse(cue.intersects(try XCTUnwrap(frames["documentType"])))
                 let verticals = scrollViews(host.view).filter { $0.contentSize.height > $0.bounds.height + 1 }
                 XCTAssertEqual(verticals.count, 1, "The production sheet has one vertical form scroll")
                 let vertical = try XCTUnwrap(verticals.first)
@@ -1960,6 +1962,66 @@ final class FeatCreateTests: XCTestCase {
                 vertical.setContentOffset(CGPoint(x: vertical.contentOffset.x, y: resting + 100), animated: false)
                 try await settle()
                 XCTAssertEqual(preview.minY - (try XCTUnwrap(frames["preview"])).minY, 100, accuracy: 1)
+            }
+        }
+    }
+
+    func testProductionScrollCueNeverOverlapsDocumentTypeOrChangesViewport() async throws {
+        for typeSize in [DynamicTypeSize.large, .accessibility5] {
+            for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+                let h = harness()
+                var frames: [String: CGRect] = [:]
+                let sheet = NewNotebookSheet(app: h.app, folder: nil, kind: .notebook,
+                    session: h.session, navigator: nil, idiom: .pad, onDone: {})
+                    .environment(\.notebookLayoutDiagnostics, true)
+                    .onPreferenceChange(NotebookLayoutFrames.self) { frames = $0 }
+                    .environment(\.dynamicTypeSize, typeSize)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .ignoresSafeArea()
+                let host = UIHostingController(rootView: sheet)
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                func settle() async throws {
+                    for _ in 0..<10 {
+                        host.view.setNeedsLayout()
+                        host.view.layoutIfNeeded()
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
+                }
+                func scrollViews(_ view: UIView) -> [UIScrollView] {
+                    ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap(scrollViews)
+                }
+                try await settle()
+                let viewport = try XCTUnwrap(frames["viewport"])
+                let cue = try XCTUnwrap(frames["cue"])
+                let type = try XCTUnwrap(frames["documentType"])
+                XCTAssertTrue(viewport.contains(type), "The document-type control must be fully visible on opening")
+                XCTAssertFalse(cue.intersects(type), "The cue must not cover any part of the document-type control")
+                XCTAssertGreaterThanOrEqual(cue.minY, viewport.maxY)
+                let scroll = try XCTUnwrap(scrollViews(host.view).first { $0.contentSize.height > $0.bounds.height + 1 })
+                XCTAssertEqual(scroll.contentOffset.y, 0, accuracy: 1)
+                let inset = scroll.adjustedContentInset
+                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: 100), animated: false)
+                try await settle()
+                XCTAssertEqual(type.minY - (try XCTUnwrap(frames["documentType"])).minY, 100, accuracy: 1)
+                XCTAssertFalse(cue.intersects(try XCTUnwrap(frames["documentType"])))
+                // Reach the end and return: hiding/showing the cue must not alter layout or insets.
+                let end = scroll.contentSize.height - scroll.bounds.height + inset.bottom
+                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: end), animated: false)
+                try await settle()
+                XCTAssertEqual(scroll.contentOffset.y, end, accuracy: 1)
+                XCTAssertEqual(frames["viewport"], viewport)
+                XCTAssertEqual(frames["cue"], cue)
+                XCTAssertEqual(scroll.adjustedContentInset, inset)
+                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: 0), animated: false)
+                try await settle()
+                XCTAssertEqual(frames["viewport"], viewport)
+                XCTAssertEqual(frames["cue"], cue)
+                XCTAssertEqual((try XCTUnwrap(frames["documentType"])).minY, type.minY, accuracy: 1)
+                XCTAssertEqual(scroll.contentOffset.y, 0, accuracy: 1)
             }
         }
     }
@@ -2104,6 +2166,7 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertGreaterThan(categoryFrame.minY, formFrame.maxY,
                                      "Tall cover controls must remain before Paper, without a separate viewport")
                 let region = try XCTUnwrap(regions.first)
+                let viewport = region.convert(region.bounds, to: window)
                 let initialFormY = formFrame.minY
                 let initialCategoryY = categoryFrame.minY
                 let offset = initialCategoryY - NibSpacing.m
@@ -2122,7 +2185,7 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertEqual(categoryFrame.minY, NibSpacing.m, accuracy: 1)
                 XCTAssertGreaterThanOrEqual(tileFrame.minY, categoryFrame.maxY)
                 XCTAssertGreaterThanOrEqual(tileFrame.height, NibMetrics.paperTileSize.height)
-                XCTAssertLessThan(tileFrame.maxY, size.height - NibSpacing.l,
+                XCTAssertLessThan(tileFrame.maxY, viewport.maxY - NibSpacing.l,
                                   "The entire first tile and its name must be above the continuation fade")
                 XCTAssertGreaterThanOrEqual(categoryFrame.minX, NibSpacing.l)
                 XCTAssertLessThanOrEqual(categoryFrame.maxX, size.width - NibSpacing.l)
@@ -2134,7 +2197,7 @@ final class FeatCreateTests: XCTestCase {
                 let background = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 1, y: size.height - 1)))
                 func contrast(at distance: CGFloat) throws -> Int {
                     let pixel = try XCTUnwrap(NibSnapshot.pixel(image,
-                        at: CGPoint(x: size.width / 2, y: size.height - distance)))
+                        at: CGPoint(x: size.width / 2, y: viewport.maxY - distance)))
                     return abs(Int(pixel.r) - Int(background.r))
                         + abs(Int(pixel.g) - Int(background.g)) + abs(Int(pixel.b) - Int(background.b))
                 }

@@ -494,6 +494,44 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         XCTAssertEqual(persistence.headReads - before, 102, "Commit/open callbacks use the same kind gate")
     }
 
+    func testPageIndexReusesHeadsAcrossSameTurnTabSwaps() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let persistence = CountingHeadPersistence(h.persistence)
+        h.app.workspace.persistence = persistence
+        let index = PageIndex(app: h.app)
+        var consumer = index.attach()
+        await index.sync()
+        let reads = persistence.headReads
+        for _ in 0..<3 {
+            // Queue an old-tab callback, then disappear before the replacement appears.
+            h.app.events.emit(NibEventType.docOpened, doc: Fixtures.docID)
+            index.detach(consumer)
+            consumer = index.attach()
+            await index.sync()
+            for _ in 0..<10 { await Task.yield() }
+            XCTAssertEqual(persistence.headReads, reads, "A tab swap must reuse unchanged heads and reject old callbacks")
+        }
+        index.detach(consumer)
+    }
+
+    func testPageIndexInvalidatesCommitsDuringTabSwapWithoutPublishingWhileHidden() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        h.app.commands.register(BookmarkStandIn.self)
+        let index = PageIndex(app: h.app)
+        let first = index.attach()
+        await index.sync()
+        try await h.run("test.bookmark", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        XCTAssertFalse(index.bookmarked.isEmpty)
+        index.detach(first)
+        // Undo is synchronous: this commit lands in the gap before the next main-actor turn.
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertFalse(index.bookmarked.isEmpty, "No head reads or publication while detached")
+        let second = index.attach()
+        await index.sync()
+        XCTAssertTrue(index.bookmarked.isEmpty, "The replacement tab must refresh the head changed during the gap")
+        index.detach(second)
+    }
+
     func testPageIndexStopsAfterLastConsumerAndRejectsQueuedEvents() async throws {
         let h = Harness(features: [FeatLibraryOrganizeFeature.self])
         h.app.commands.register(BookmarkStandIn.self)

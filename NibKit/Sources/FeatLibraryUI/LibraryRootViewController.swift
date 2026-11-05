@@ -73,12 +73,16 @@ final class LibraryViewModel: ObservableObject {
     @Published var rows: [LibraryRow] = []
     @Published var visibleRows: [LibraryRow] = []
     @Published var allFolders: [LibraryRow] = []
+    @Published var foldersExpanded = false
     func isSidebarPlaceSelected(_ place: LibrarySidebarPlace) -> Bool {
         guard let collection = place.collection else { return tab?.id == place.id }
         guard tab == nil, self.collection == collection else { return false }
-        // A folder with its own sidebar row owns the selection. Nested/unlisted
-        // folders still belong to Documents, so navigation never loses its place.
-        return collection != .documents || !allFolders.contains { $0.nodeID == folder }
+        // Only a visible folder row owns selection; collapsed/unlisted folders
+        // still belong to Documents, so navigation never loses its place.
+        return collection != .documents || !foldersExpanded || !allFolders.contains { $0.nodeID == folder }
+    }
+    func isSidebarFolderSelected(_ row: LibraryRow) -> Bool {
+        foldersExpanded && tab == nil && collection == .documents && folder == row.nodeID
     }
     @Published var selection = LibrarySelection()
     @Published var tab: LibraryPanel?
@@ -875,11 +879,12 @@ struct LibraryRootView: View {
                         .accessibilityIdentifier("cmd.library.setView")
                         .libraryDropTarget(place.id == PanelIDs.trash ? "trash" : "card:tab:" + place.id)
                     }
-                    DisclosureGroup(String(localized: "Folders")) {
+                    DisclosureGroup(String(localized: "Folders"), isExpanded: $model.foldersExpanded) {
                         ForEach(model.allFolders) { row in
                             Button { model.setView(["folder": .string(row.ref), "sidebar": false]) } label: {
-                                NibSidebarRow(row.name, symbol: .folderFill, count: model.sidebarCounts[row.ref], isSelected: model.tab == nil && model.collection == .documents && model.folder == row.nodeID,
+                                NibSidebarRow(row.name, symbol: .folderFill, count: model.sidebarCounts[row.ref], isSelected: model.isSidebarFolderSelected(row),
                                               glyphTint: row.color.flatMap { RGBA(hex: $0) }.map { Color(uiColor: $0.uiColor) })
+                                    .libraryLayoutFrame("sidebar.folder." + row.ref, space: .global)
                             }
                             .accessibilityIdentifier("cmd.library.setView")
                             .libraryDropTarget("sidebarFolder:" + row.ref)

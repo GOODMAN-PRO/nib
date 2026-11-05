@@ -278,7 +278,9 @@ final class PageIndex: ObservableObject {
     private let bag = SubscriptionBag()
     private var consumers: Set<UUID> = []
     private var attachment = UUID()
+    private var commitAttachment = UUID()
     private var syncTask: Task<Void, Never>?
+    private var teardownTask: Task<Void, Never>?
     /// Heads read between yields to the main run loop while the library is read.
     private static let chunk = 1
 
@@ -290,11 +292,22 @@ final class PageIndex: ObservableObject {
     @discardableResult
     func attach(_ consumer: UUID = UUID()) -> UUID {
         guard consumers.insert(consumer).inserted, consumers.count == 1, let app else { return consumer }
+        teardownTask?.cancel()
+        teardownTask = nil
+        bag.items.forEach { $0.cancel() }
+        bag.items.removeAll()
         attachment = UUID()
         let generation = attachment
+        commitAttachment = UUID()
+        let commitGeneration = commitAttachment
         bag.items.append(app.bus.observeCommits { [weak self] changes in
-            guard let self, self.attachment == generation, !self.consumers.isEmpty else { return }
-            for doc in changes.documents where changes.headChanged(doc) { self.read(doc) }
+            // Commit observers run synchronously on main. During a tab swap,
+            // invalidate changed heads without reading or publishing while hidden.
+            guard let self, self.commitAttachment == commitGeneration else { return }
+            for doc in changes.documents where changes.headChanged(doc) {
+                if self.consumers.isEmpty { self.readAt[doc] = nil }
+                else { self.read(doc) }
+            }
         })
         bag.items.append(app.events.subscribe { [weak self] event in
             let type = event.type
@@ -318,9 +331,17 @@ final class PageIndex: ObservableObject {
         attachment = UUID() // Reject event callbacks already queued on the main actor.
         syncTask?.cancel()
         syncTask = nil
-        bag.items.forEach { $0.cancel() }
-        bag.items.removeAll()
-        readAt.removeAll() // Commits while detached must be read on the next appearance.
+        teardownTask = Task { [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled, let self, self.consumers.isEmpty else { return }
+            self.commitAttachment = UUID()
+            self.bag.items.forEach { $0.cancel() }
+            self.bag.items.removeAll()
+            // A same-turn replacement consumer keeps its cache. After a full
+            // departure, commits will no longer be observed and must be refreshed.
+            self.readAt.removeAll()
+            self.teardownTask = nil
+        }
     }
 
     var bookmarked: [PageEntry] { documents.values.flatMap { $0.bookmarked } }

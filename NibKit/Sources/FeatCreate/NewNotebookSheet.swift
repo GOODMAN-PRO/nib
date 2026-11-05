@@ -949,6 +949,26 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
     @State private var hasMoreBelow = false
 
     var body: some View {
+        VStack(spacing: 0) {
+            scrollingForm
+            // Reserve the cue's measured height even at the end, so scrolling
+            // never changes the viewport or moves controls beneath an overlay.
+            Label(String(localized: "Scroll for more options"), systemImage: NibSymbol.chevronDown.name)
+                .font(NibFont.footnote)
+                .foregroundStyle(NibColor.labelSecondary)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, contentInset)
+                .padding(.vertical, NibSpacing.s)
+                .fixedSize(horizontal: false, vertical: true)
+                .opacity(hasMoreBelow ? 1 : 0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(!hasMoreBelow)
+                .accessibilityIdentifier("create.scrollCue")
+                .notebookLayoutFrame("cue")
+        }
+    }
+
+    private var scrollingForm: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.xl) {
                 form
@@ -969,19 +989,6 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
         .onPreferenceChange(NotebookFormContinuation.self) { hasMoreBelow = $0 }
         .scrollIndicators(.visible)
         .scrollIndicatorsFlash(onAppear: true)
-        .overlay(alignment: .top) {
-            if hasMoreBelow {
-                Label(String(localized: "Scroll for more options"), systemImage: NibSymbol.chevronDown.name)
-                    .font(NibFont.footnote)
-                    .foregroundStyle(NibColor.labelSecondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, NibSpacing.s)
-                    .background(NibColor.backgroundSecondary)
-                    .allowsHitTesting(false)
-                    .accessibilityIdentifier("create.scrollCue")
-                    .notebookLayoutFrame("cue")
-            }
-        }
         .contentMargins(.horizontal, contentInset, for: .scrollContent)
         .scrollDismissesKeyboard(.interactively)
         .nibFadeBottomEdge()
@@ -1207,6 +1214,7 @@ struct NewNotebookSheet: View {
         // Names the group; each segment keeps its own title (a label on a plain container would replace them all).
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Document type"))
+        .notebookLayoutFrame("documentType")
     }
 
     @ViewBuilder
@@ -1429,6 +1437,7 @@ struct NewNotebookSheet: View {
                 .font(NibFont.footnote)
                 .foregroundStyle(NibColor.labelSecondary)
                 .fixedSize(horizontal: false, vertical: true)
+                .accessibilityHidden(true)
             millimetreField(label, field: field, value: value)
         }
     }

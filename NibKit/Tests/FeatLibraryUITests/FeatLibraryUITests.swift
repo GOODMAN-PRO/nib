@@ -180,7 +180,11 @@ final class FeatLibraryUITests: XCTestCase {
         let documents = try XCTUnwrap(model.sidebarPlaces.first { $0.collection == .documents })
         XCTAssertTrue(model.isSidebarPlaceSelected(documents))
         model.folder = folder.nodeID
+        XCTAssertTrue(model.isSidebarPlaceSelected(documents))
+        XCTAssertFalse(model.isSidebarFolderSelected(folder))
+        model.foldersExpanded = true
         XCTAssertFalse(model.isSidebarPlaceSelected(documents))
+        XCTAssertTrue(model.isSidebarFolderSelected(folder))
         model.folder = "NESTED"
         XCTAssertTrue(model.isSidebarPlaceSelected(documents))
     }
@@ -1157,34 +1161,47 @@ final class FeatLibraryUITests: XCTestCase {
                 XCTAssertGreaterThanOrEqual(back.height, NibMetrics.hitTarget)
                 let documents = try XCTUnwrap(model.sidebarPlaces.first { $0.collection == .documents })
                 let hasFolderRow = model.allFolders.contains { $0.nodeID == model.folder }
-                XCTAssertEqual(model.isSidebarPlaceSelected(documents), !hasFolderRow)
+                XCTAssertEqual(model.isSidebarPlaceSelected(documents), !model.foldersExpanded || !hasFolderRow)
             }
         }
     }
 
-    func testProductionSidebarShowsDocumentsSelectionOnlyForAnUnlistedFolder() async throws {
+    func testProductionSidebarTransfersVisibleSelectionWhenFoldersExpand() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         await model.appear()
         model.liquidMode = .off
+        let folderRow = try XCTUnwrap(model.allFolders.first { $0.nodeID == Fixtures.folderID })
         for variant in [NibSnapshot.Variant.light, .dark] {
-            for listed in [false, true] {
-                model.folder = listed ? Fixtures.folderID : "UNLISTED"
+            for expanded in [false, true] {
+                model.folder = Fixtures.folderID
+                model.foldersExpanded = expanded
                 var frames: [String: CGRect] = [:]
                 let image = try await hostlessLayoutImage(LibraryRootView(model: model, idiom: .pad)
                     .environment(\.libraryLayoutDiagnostics, true)
                     .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 },
                     size: CGSize(width: 1194, height: 834), variant: variant)
-                let row = try XCTUnwrap(frames["sidebar.place.documents"])
-                var accentPixels = 0
-                // NibSidebarRow's leading glyph is accent only when the actual row is selected.
-                for x in Int(ceil(row.minX))..<Int(floor(row.minX + 50)) {
-                    for y in Int(ceil(row.minY))..<Int(floor(row.maxY)) {
-                        guard let pixel = NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))) else { continue }
-                        if Int(pixel.b) - Int(pixel.r) > 50 && Int(pixel.b) - Int(pixel.g) > 30 { accentPixels += 1 }
+                // Count actually drawn selected glyphs, not rows hidden by the disclosure.
+                func accentPixels(in row: CGRect) -> Int {
+                    var count = 0
+                    for x in Int(ceil(row.minX))..<Int(floor(row.minX + 50)) {
+                        for y in Int(ceil(row.minY))..<Int(floor(row.maxY)) {
+                            guard let pixel = NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))) else { continue }
+                            if Int(pixel.b) - Int(pixel.r) > 50 && Int(pixel.b) - Int(pixel.g) > 30 { count += 1 }
+                        }
                     }
+                    return count
                 }
-                if listed { XCTAssertEqual(accentPixels, 0, "The listed folder owns the selection") }
-                else { XCTAssertGreaterThan(accentPixels, 5, "Documents must stay visibly selected inside an unlisted folder") }
+                let documents = try XCTUnwrap(frames["sidebar.place.documents"])
+                let documentsSelected = accentPixels(in: documents) > 5
+                var folderSelected = false
+                if expanded {
+                    let folder = try XCTUnwrap(frames["sidebar.folder." + folderRow.ref])
+                    folderSelected = accentPixels(in: folder) > 5
+                }
+                XCTAssertEqual(documentsSelected, !expanded)
+                XCTAssertEqual(folderSelected, expanded)
+                XCTAssertEqual([documentsSelected, folderSelected].filter { $0 }.count, 1,
+                    "A catalogued folder must have exactly one visible selection in either disclosure state")
             }
         }
     }
