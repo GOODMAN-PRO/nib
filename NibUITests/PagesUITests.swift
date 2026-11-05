@@ -323,6 +323,7 @@ final class PagesUITests: XCTestCase {
         try pages()
         // iPadOS windowing control places this scene beside the other Nib scene.
         let multitasking = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'multitasking' OR label == 'Window Controls'")).firstMatch
+        ui.diagnoseWindowControls()
         try require(multitasking, "Window controls must allow arranging two Nib windows for page drag").tap()
         try tap("Split View", prefix: true)
         let other = XCUIApplication(bundleIdentifier: "com.apple.springboard").icons["Nib"].firstMatch

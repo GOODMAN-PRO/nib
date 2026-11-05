@@ -268,3 +268,11 @@ D:app-round-4#11/#14/#15 corrections leave ownership unknown. Toast Undo now rec
 | Library DragDocumentIntoFolderAndToastUndo | Toast Undo button and label / immediately after tap | Which Button centre was tapped versus the label frame, and what remained immediately afterward? |
 | Capture four ThreeDocumentTabs variants | Capture tabs toggle / tabs before wait | Did the setting change, and which tab values exist? |
 | Chrome ruler rotation and shared NibUI paths | Touch path orientation | Which device orientation and first/last screen points were actually supplied? |
+
+## X5 - window-control inventories
+
+S:singles-rest#3 verifier rejects an environment classification without AX evidence. The two protected cross-window/cross-app tests add only a pre-lookup diagnostic: Nib and SpringBoard window/multitasking/Split View matches with type/id/label/frame/value, full trees through logQA and screenshot. Original selectors, waits, gestures and assertions are unchanged. CI must establish absence versus a differently exposed control before assigning capability/owner.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Pages DragPagesBetweenWindows / Selection ExternalDragToSafari | Window control inventory / hierarchy Nib / hierarchy SpringBoard / before lookup | Which process exposes which window controls, or do both trees lack them? |

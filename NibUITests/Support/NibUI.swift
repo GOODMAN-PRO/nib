@@ -1736,6 +1736,20 @@ final class NibUI {
         }
     }
 
+    func diagnoseWindowControls() {
+        let predicate = NSPredicate(format: "label CONTAINS[c] 'multitasking' OR label CONTAINS[c] 'Window Controls' OR identifier CONTAINS[c] 'window-controls' OR label CONTAINS[c] 'Split View'")
+        for (name, source) in [("Nib", app), ("SpringBoard", XCUIApplication(bundleIdentifier: "com.apple.springboard"))] {
+            let matches = source.descendants(matching: .any).matching(predicate).allElementsBoundByIndex
+            logQA("Window control inventory", "source=\(name) matches=\(matches.count)")
+            for element in matches {
+                guard let snapshot = try? element.snapshot() else { continue }
+                logQA("Window control inventory", "source=\(name) type=\(snapshot.elementType.rawValue) id=\(snapshot.identifier) label=\(snapshot.label) frame=\(snapshot.frame) value=\(String(describing: snapshot.value))")
+            }
+            logQA("Window control hierarchy " + name, source.debugDescription)
+        }
+        recordDiagnostics("Window controls before lookup", includeHierarchy: false)
+    }
+
     func cancelConfirmation(action: String) throws {
         let surface = app.sheets.allElementsBoundByIndex.first {
             hasVisibleFrame($0) && $0.buttons[action].exists

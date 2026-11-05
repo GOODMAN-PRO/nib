@@ -1104,6 +1104,7 @@ final class SelectionUITests: XCTestCase {
         let appControls = ui.app.buttons.matching(windowPredicate).firstMatch
         let systemControls = springboard.buttons.matching(windowPredicate).firstMatch
         let windowMenu = appControls.exists ? appControls : systemControls
+        ui.diagnoseWindowControls()
         XCTAssertTrue(windowMenu.waitForExistence(timeout: 5), "Cross-app drag requires real system multitasking controls")
         windowMenu.tap()
         let split = ui.app.buttons["Split View"].exists ? ui.app.buttons["Split View"] : springboard.buttons["Split View"]
