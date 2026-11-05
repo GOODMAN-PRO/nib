@@ -119,6 +119,27 @@ final class NibIndexTests: XCTestCase {
         XCTAssertFalse(found.isEmpty)
     }
 
+    func testRebuildRetriesUnreadableDocumentWithoutAPackageStampChange() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        let head = try XCTUnwrap(h.persistence.heads.removeValue(forKey: doc))
+        let package = try XCTUnwrap(h.app.services.packages.url(doc))
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: package) }
+        try Data("unchanged package".utf8).write(to: package.appendingPathComponent("doc.00000007.json"))
+        _ = await indexer.sweep(foreground: false)
+        XCTAssertFalse(indexer.db?.keys(doc: doc).contains(IndexKeys.docUnit) == true)
+
+        // Model a transient read failure resolving without a disk revision or library modification.
+        h.persistence.heads[doc] = head
+        _ = await indexer.sweep(foreground: false)
+        XCTAssertFalse(indexer.db?.keys(doc: doc).contains(IndexKeys.docUnit) == true)
+        _ = try await h.run("index.rebuild")
+        _ = await indexer.runBackgroundTask()
+        XCTAssertTrue(indexer.db?.keys(doc: doc).contains(IndexKeys.docUnit) == true)
+        XCTAssertFalse(results(try await h.run("search.text", ["query": "Remember"])).isEmpty)
+    }
+
     func testNewDocumentDuringScheduledSweepDoesNotCancelIt() async throws {
         let (h, indexer) = harness()
         _ = await indexer.sweep(foreground: false)

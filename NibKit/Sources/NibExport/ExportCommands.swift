@@ -19,6 +19,8 @@ struct ExportRun: NibCommand {
         var inline: Bool?
         /// File name without extension for a single file (or the zip).
         var name: String?
+        /// An unattended caller's persisted report. Only an identical warning toast is suppressed.
+        var reportedOmissions: [ExportOmission]? = nil
     }
 
     struct File: Codable, Equatable {
@@ -50,6 +52,7 @@ struct ExportRun: NibCommand {
             "options": ExportOptions.schema,
             "inline": .bool("also return each file as base64 (20 MB total at most)"),
             "name": .str("file name without extension (single file or the zip)"),
+            "reportedOmissions": .arr(.anything(), "previously reported omissions; suppress only an identical warning toast"),
         ], required: ["docs", "format"]),
         examples: [
             try! JSONValue.parse(#"{"docs": ["doc:FIXTUREDOC01"], "format": "pdf"}"#),
@@ -95,7 +98,9 @@ struct ExportRun: NibCommand {
             output.omissions = omissions
             let warning = ExportOmission.message(omissions)
             output.warning = warning
-            (ctx.activeSession?.floatingHost ?? ctx.navigator?.floatingHost)?.postToast(warning)
+            if p.reportedOmissions != omissions {
+                (ctx.activeSession?.floatingHost ?? ctx.navigator?.floatingHost)?.postToast(warning)
+            }
         }
         return output
     }

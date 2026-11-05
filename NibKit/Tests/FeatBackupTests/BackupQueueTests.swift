@@ -103,6 +103,34 @@ final class BackupQueueTests: XCTestCase {
         do { _ = try await first.load(); XCTFail("Corruption must be reported") } catch { }
     }
 
+    func testOmissionReportsPersistAndOldQueuesStillDecode() throws {
+        var queue = BackupQueue()
+        queue.exportReports["DOC/nibnote"] = BackupQueue.ExportReport(document: "Notes",
+            warning: "Page 1: missing image", omissions: [["asset": "missing.png", "pages": ["Page 1"]]])
+        let restored = try JSONDecoder().decode(BackupQueue.self, from: JSONEncoder().encode(queue))
+        XCTAssertEqual(restored, queue)
+        XCTAssertTrue(try XCTUnwrap(restored.omissionWarning).contains("Page 1: missing image"))
+        let legacy = try JSONDecoder().decode(BackupQueue.self, from: Data(#"{"entries":[],"lastSuccess":100}"#.utf8))
+        XCTAssertTrue(legacy.exportReports.isEmpty)
+        XCTAssertNil(legacy.omissionWarning)
+        XCTAssertEqual(legacy.lastSuccess, 100)
+    }
+
+    func testReportsKeepOnlyEligibleDocumentsAndConfiguredFormats() {
+        var queue = BackupQueue()
+        let document = NibID("DOC/with-slash")
+        let report = BackupQueue.ExportReport(document: "Notes", warning: "Missing image", omissions: [])
+        for key in [document.raw + "/nibnote", document.raw + "/pdf", "REMOVED/pdf", "malformed"] {
+            queue.exportReports[key] = report
+        }
+        queue.pruneReports(keeping: [document], formats: ["nibnote", "pdf"])
+        XCTAssertEqual(Set(queue.exportReports.keys), [document.raw + "/nibnote", document.raw + "/pdf"])
+        queue.pruneReports(keeping: [document], formats: ["pdf"])
+        XCTAssertEqual(Set(queue.exportReports.keys), [document.raw + "/pdf"])
+        queue.pruneReports(keeping: [], formats: ["pdf"])
+        XCTAssertNil(queue.omissionWarning)
+    }
+
     func testMirroredPathsAndTraversalValidation() throws {
         let folder = LibraryNode(id: Fixtures.folderID, kind: .folder, title: "School", path: "School")
         let doc = LibraryNode(id: Fixtures.docID, kind: .document, title: "Physics/Notes", path: "School/Notes.nibnote", parent: folder.id)

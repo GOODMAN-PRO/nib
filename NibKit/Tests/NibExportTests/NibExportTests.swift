@@ -1,9 +1,23 @@
 import XCTest
 import UIKit
 import PDFKit
+import ImageIO
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import NibExport
+
+@MainActor
+private final class OmissionToastHost: FloatingHosting {
+    var messages: [String] = []
+    func present(_ id: String, content: AnyView) {}
+    func dismiss(_ id: String) {}
+    func isPresenting(_ id: String) -> Bool { false }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool { false }
+    func removeAnchor(_ id: String) {}
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { nil }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) { messages.append(message) }
+}
 
 @MainActor
 final class NibExportTests: XCTestCase {
@@ -231,6 +245,33 @@ final class NibExportTests: XCTestCase {
 
     // MARK: Packages
 
+    func testOmissionMessageUsesDisplayLabelsAndCountNeutralWording() {
+        let omission = ExportOmission(document: "Notebook", asset: "missing.png",
+            pages: ["Notes (draft) (PRIVATEPAGEID)"], pageLabels: ["Notes (draft)"])
+        for count in [1, 2] {
+            let message = ExportOmission.message(Array(repeating: omission, count: count))
+            XCTAssertTrue(message.contains("Notes (draft)"))
+            XCTAssertFalse(message.contains("PRIVATEPAGEID"))
+            XCTAssertTrue(message.contains("Unreadable assets omitted: \(count)."))
+            let records = ExportOmission.message(Array(repeating:
+                ExportOmission(document: "Notebook", asset: "missing.png", pages: []), count: count))
+            XCTAssertTrue(records.contains("Unreadable assets omitted: \(count)."))
+            XCTAssertTrue(records.contains("document records"))
+        }
+    }
+
+    func testLegacyOmissionMessageFallsBackToPagesWithoutIDs() throws {
+        let json = #"{"document":"Notebook","asset":"missing.png","pages":["Notes (draft) (PRIVATEPAGEID)","Page 2"]}"#
+        let omission = try JSONDecoder().decode(ExportOmission.self, from: Data(json.utf8))
+        XCTAssertNil(omission.pageLabels)
+        let message = ExportOmission.message([omission])
+        XCTAssertTrue(message.contains("Notes (draft)"))
+        XCTAssertTrue(message.contains("Page 2"))
+        XCTAssertFalse(message.contains("PRIVATEPAGEID"))
+        XCTAssertFalse(message.contains("document records"))
+        XCTAssertEqual(omission.pages, ["Notes (draft) (PRIVATEPAGEID)", "Page 2"])
+    }
+
     /// The package holds the store's files: the head, one compressed page file per page with items on the exported
     /// layers (comments included), the assets, and the audio transcript.
     func testNibnotePackageHasTheStoreFormatWithAudioCommentsAndVisibleLayersOnly() async throws {
@@ -336,7 +377,8 @@ final class NibExportTests: XCTestCase {
 
     func testUnreadableImageBackgroundFailsInsteadOfExportingBlankPaper() async throws {
         let h = Harness(features: [NibExportFeature.self])
-        h.assets.install(Data("broken image".utf8), as: Fixtures.pngAsset, doc: Fixtures.docID)
+        // Preserve the PNG signature and IHDR, but truncate the encoded pixel data.
+        let truncated = Data(try h.assets.data(Fixtures.pngAsset, doc: Fixtures.docID).prefix(41))
         h.app.commands.register(CommandDescriptor(id: "test.imageBackground", title: "Background", summary: "Test image background.",
             effect: .edit, exposure: .ui)) { _, ctx in
             try ctx.mutate { tx in
@@ -347,11 +389,42 @@ final class NibExportTests: XCTestCase {
             return .null
         }
         try await h.run("test.imageBackground")
-        do {
-            _ = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"],
-                "pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "format": "png"])
-            XCTFail("Undecodable image background must fail")
-        } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+        for data in [Data("broken image".utf8), truncated] {
+            h.assets.install(data, as: Fixtures.pngAsset, doc: Fixtures.docID)
+            for format in ["pdf", "png"] {
+                let root = FileManager.default.temporaryDirectory.appendingPathComponent("nib-export")
+                let before = Set((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [])
+                do {
+                    _ = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"],
+                        "pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "format": .string(format)])
+                    XCTFail("Undecodable image background must fail")
+                } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+                XCTAssertEqual(Set((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []), before)
+                _ = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"],
+                    "pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "format": .string(format), "options": ["background": false]])
+            }
+        }
+    }
+
+    func testBackgroundDrawingReportsTruncatedPixelsAfterReadingTheHeader() throws {
+        let h = Harness()
+        let complete = try h.assets.data(Fixtures.pngAsset, doc: Fixtures.docID)
+        let truncated = Data(complete.prefix(41))
+        // ImageIO versions differ in how much metadata this prefix exposes; either
+        // a rejected container or an incomplete decoded frame must fail drawing.
+        h.assets.install(truncated, as: Fixtures.pngAsset, doc: Fixtures.docID)
+        let url = try XCTUnwrap(h.assets.url(Fixtures.pngAsset, doc: Fixtures.docID))
+        var page = try XCTUnwrap(h.persistence.loadHead(Fixtures.docID).page(Fixtures.pdfPage))
+        page.background = .ofImage(Fixtures.pngAsset)
+        let cg = try XCTUnwrap(CGContext(data: nil, width: 16, height: 16, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let cache = BackgroundCache()
+        XCTAssertThrowsError(try cache.drawImage(url, record: page, cg: cg)) { error in
+            XCTAssertEqual((error as? NibError)?.code, .unavailable)
+        }
+        h.assets.install(complete, as: Fixtures.pngAsset, doc: Fixtures.docID)
+        _ = h.assets.url(Fixtures.pngAsset, doc: Fixtures.docID) // The harness materializes new bytes on URL access.
+        XCTAssertNoThrow(try cache.drawImage(url, record: page, cg: cg), "a failed decode must not poison the cache")
     }
 
     func testPackageWithoutAnAssetServiceReportsOmissionsAndKeepsTheDocument() async throws {
@@ -383,13 +456,39 @@ final class NibExportTests: XCTestCase {
             XCTAssertEqual(omissions.count, 1)
             XCTAssertEqual(omissions[0]["asset"]?.stringValue, Fixtures.pngAsset.name)
             XCTAssertTrue(omissions[0]["pages"]?.arrayValue?.contains { $0.stringValue?.contains(Fixtures.page1.raw) == true } == true)
-            XCTAssertNotNil(result["warning"]?.stringValue)
+            let warning = try XCTUnwrap(result["warning"]?.stringValue)
+            XCTAssertFalse(warning.contains(Fixtures.page1.raw))
+            XCTAssertTrue(warning.contains("Unreadable assets omitted: 1."))
             let file = try XCTUnwrap(result["files"]?.arrayValue?.first)
             let data = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(file["base64"]?.stringValue)))
             XCTAssertNotNil(data.range(of: Data("Export Report.txt".utf8)))
             XCTAssertNotNil(data.range(of: Data("assets/fixture-page.pdf".utf8)))
             XCTAssertNil(data.range(of: Data("assets/fixture-image.png".utf8)))
         }
+    }
+
+    func testExportRunSuppressesOnlyPreviouslyReportedOmissionToasts() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        let host = OmissionToastHost()
+        h.session.floatingHost = host
+        h.app.services.assets = InMemoryAssetStore(root: h.persistence.root)
+        let params: JSONValue = ["docs": ["doc:FIXTUREDOC01"], "format": "nibnote"]
+        let first = try await h.run(CommandIDs.exportRun, params)
+        XCTAssertEqual(host.messages.count, 1)
+        let previous = try XCTUnwrap(first["omissions"])
+        let repeatParams: JSONValue = ["docs": ["doc:FIXTUREDOC01"], "format": "nibnote", "reportedOmissions": previous]
+        let repeated = try await h.run(CommandIDs.exportRun, repeatParams)
+        XCTAssertEqual(repeated["omissions"], previous)
+        XCTAssertNotNil(repeated["warning"], "suppression must not hide the persistent report")
+        XCTAssertEqual(host.messages.count, 1)
+        // A changed omission set must alert again; normal user exports always alert.
+        let assets = try XCTUnwrap(h.app.services.assets as? InMemoryAssetStore)
+        assets.install(try h.assets.data(Fixtures.pdfAsset, doc: Fixtures.docID), as: Fixtures.pdfAsset, doc: Fixtures.docID)
+        _ = try await h.run(CommandIDs.exportRun, repeatParams)
+        XCTAssertEqual(host.messages.count, 2)
+        _ = try await h.run(CommandIDs.exportRun, params)
+        XCTAssertEqual(host.messages.count, 3)
+        XCTAssertTrue(host.messages.allSatisfy { !$0.contains(Fixtures.page1.raw) })
     }
 
     func testPackageSilentlySkipsAssetsReferencedOnlyByTrashedPages() async throws {

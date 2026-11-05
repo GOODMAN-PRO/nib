@@ -280,8 +280,7 @@ struct DeletionPlan: Equatable {
 enum DeletionPlanner {
     /// Subfolders of the container's Library with web, cookie and restoration data.
     static let librarySubfolders = ["WebKit", "Cookies", "HTTPStorages", "Saved Application State"]
-    /// The Open In inbox (Documents/Inbox): app data wherever the library is, since the library's catalogue skips the
-    /// root `Inbox` of a library in Documents, and a library elsewhere does not contain it.
+    /// The Open In inbox is app data only when it has no library folder record.
     static let inboxFolder = "Inbox"
     /// Where Temporary Diagnostic Mode puts its zipped library copies (Documents/diagnostics). With the library in
     /// Documents this is also an ordinary library folder, so it is never removed whole.
@@ -291,7 +290,8 @@ enum DeletionPlanner {
         let clear = [l.caches, l.applicationSupport, l.temporary]
             + librarySubfolders.map { l.library.appendingPathComponent($0, isDirectory: true) }
             + l.appGroups
-        let remove = [l.documents.appendingPathComponent(inboxFolder, isDirectory: true)]
+        let inbox = l.documents.appendingPathComponent(inboxFolder, isDirectory: true)
+        let remove = isHandoffInbox(inbox) ? [inbox] : []
         let diagnostics = [l.documents.appendingPathComponent(diagnosticsFolder, isDirectory: true)]
         var keep: [URL] = []
         if let root = libraryRoot { keep.append(root) }
@@ -308,6 +308,15 @@ enum DeletionPlanner {
         }
         return DeletionPlan(includeLibrary: includeLibrary, clear: clear, remove: remove, diagnosticFolders: diagnostics,
                             libraryRoots: roots, keep: keep)
+    }
+
+    private static func isHandoffInbox(_ url: URL) -> Bool {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: url.path) else { return false }
+        return !names.contains { name in
+            guard NibOwnership.isFolderMarker(name) else { return false }
+            let body = name.dropFirst(".nibfolder.".count).dropLast(".json".count)
+            return body.count >= 8 && body.prefix(8).allSatisfy { ("0"..."9").contains($0) || ("a"..."f").contains($0) }
+        }
     }
 }
 

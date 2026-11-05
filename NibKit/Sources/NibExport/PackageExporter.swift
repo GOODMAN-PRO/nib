@@ -9,14 +9,22 @@ struct ExportOmission: Codable, Equatable {
     var document: String
     var asset: String
     var pages: [String]
+    /// Display labels only. `pages` retains identities for the archive report and API consumers.
+    var pageLabels: [String]? = nil
 
     static func message(_ omissions: [Self]) -> String {
-        let pages = Set(omissions.flatMap { $0.pages }).sorted().joined(separator: ", ")
+        let labels = omissions.flatMap { omission in
+            omission.pageLabels ?? omission.pages.map { page in
+                guard page.hasSuffix(")"), let suffix = page.range(of: " (", options: .backwards) else { return page }
+                return String(page[..<suffix.lowerBound])
+            }
+        }
+        let pages = Set(labels).sorted().joined(separator: ", ")
         let count = omissions.count
         if pages.isEmpty {
-            return String(localized: "Export completed without \(count) unreadable assets in document records. See Export Report.txt in the archive.")
+            return String(localized: "Export otherwise complete. Unreadable assets omitted: \(count). Location: document records. See Export Report.txt in the archive.")
         }
-        return String(localized: "Export completed without \(count) unreadable assets on pages \(pages). See Export Report.txt in the archive.")
+        return String(localized: "Export otherwise complete. Unreadable assets omitted: \(count). Pages: \(pages). See Export Report.txt in the archive.")
     }
 
     static func sidecar(_ url: URL) -> URL { url.appendingPathExtension("nib-export-report.json") }
@@ -305,10 +313,12 @@ enum PackageWriter {
         encoder.userInfo[.nibCompactPoints] = true
         var refs = PackageAssets.refs(in: job.head)
         var pagesByAsset: [String: Set<String>] = [:]
+        var labelsByAsset: [String: Set<String>] = [:]
         for (index, page) in job.head.livePages.enumerated() {
             if let asset = page.background.asset {
                 let label = page.title ?? String(localized: "Page \(index + 1)")
                 pagesByAsset[asset.name, default: []].insert(label + " (" + page.id.raw + ")")
+                labelsByAsset[asset.name, default: []].insert(label)
             }
         }
         var omissions: [ExportOmission] = []
@@ -317,11 +327,14 @@ enum PackageWriter {
                 let items = try pull(i)
                 guard !items.isEmpty else { return }
                 let record = job.head.livePages.first { $0.id == page }
-                let label = (record?.title ?? String(localized: "Page \(i + 1)")) + " (" + page.raw + ")"
+                let label = record?.title ?? String(localized: "Page \(i + 1)")
                 for item in items {
                     let names = PackageAssets.refs(in: item)
                     refs.formUnion(names)
-                    for name in names { pagesByAsset[name, default: []].insert(label) }
+                    for name in names {
+                        pagesByAsset[name, default: []].insert(label + " (" + page.raw + ")")
+                        labelsByAsset[name, default: []].insert(label)
+                    }
                 }
                 let json = try encoder.encode(items)
                 let data = try (json as NSData).compressed(using: .lzfse) as Data
@@ -340,7 +353,8 @@ enum PackageWriter {
                 do { data = try ExportAssets.data(AssetRef(name), doc: job.doc, assets: job.assets) }
                 catch {
                     omissions.append(ExportOmission(document: job.title, asset: name,
-                                                    pages: (pagesByAsset[name] ?? []).sorted()))
+                                                    pages: (pagesByAsset[name] ?? []).sorted(),
+                                                    pageLabels: (labelsByAsset[name] ?? []).sorted()))
                     continue
                 }
                 try data.write(to: dir.appendingPathComponent(name), options: .atomic)

@@ -238,12 +238,13 @@ enum LibraryCopier {
 
     /// The top-level items that make up the library at `root`: folders, packages, loose files and `.nib-library`
     /// (not Finder/Files litter, not iOS's Inbox of the app's Documents folder).
-    static func topLevelItems(of root: URL) -> [URL] {
-        let skipInbox = LibraryFolder.isAppDocuments(root)
+    static func topLevelItems(of root: URL, appDocuments: URL? = LibraryFolder.appDocuments) -> [URL] {
+        let skipInbox = appDocuments.map { LibraryFolder.samePlace(root, $0) } ?? false
         let names = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
         return names.filter { name in
             if name == ".DS_Store" || name == ".Trash" { return false }
-            if skipInbox && name == SyncFiles.inboxName { return false }
+            if skipInbox && name == SyncFiles.inboxName,
+               SyncFiles.isHandoffInbox(root.appendingPathComponent(name)) { return false }
             return true
         }.sorted().map { root.appendingPathComponent($0) }
     }

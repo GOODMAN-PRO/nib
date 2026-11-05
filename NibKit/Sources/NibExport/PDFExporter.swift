@@ -231,7 +231,7 @@ final class ExportPlan {
             }
         } else if !checkedImageBackgrounds.contains(url) {
             // Snapshotting runs on the main actor. Read the container metadata only; the worker's
-            // BackgroundCache decodes pixels once and reuses them while drawing repeated backgrounds.
+            // BackgroundCache decodes pixels on the worker and throws if the body cannot be decoded.
             guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
                   CGImageSourceGetStatus(source) == .statusComplete,
                   CGImageSourceGetCount(source) > 0,
@@ -388,12 +388,15 @@ struct PaperInfo {
 /// under a light trait collection, so paper and ink never invert. `cg`: 1 unit = 1 page point, y down.
 enum ExportCompositor {
     static func draw(_ snap: PageSnapshot, region: Rect, env: RenderEnvironment, target: RenderTarget,
-                     omit: Set<ElementID>, backgrounds: BackgroundCache, cg: CGContext) {
+                     omit: Set<ElementID>, backgrounds: BackgroundCache, cg: CGContext) throws {
+        var failure: Error?
         UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
             cg.saveGState()
             defer { cg.restoreGState() }
             cg.clip(to: region.cg)
-            let paper = drawBackground(snap, region: region, env: env, target: target, backgrounds: backgrounds, cg: cg)
+            let paper: PaperInfo
+            do { paper = try drawBackground(snap, region: region, env: env, target: target, backgrounds: backgrounds, cg: cg) }
+            catch { failure = error; return }
             let items = snap.items.filter { !omit.contains($0.id) && snap.intersects($0, region) }
             for band in ExportBands.make(items) {
                 drawBand(band, snap: snap, region: region, paper: paper, env: env, target: target, cg: cg)
@@ -402,12 +405,13 @@ enum ExportCompositor {
                 InvisibleText.draw(snap.text.filter { $0.bbox.intersects(region) }, cg: cg)
             }
         }
+        if let failure { throw failure }
     }
 
     // MARK: Background
 
     static func drawBackground(_ snap: PageSnapshot, region: Rect, env: RenderEnvironment, target: RenderTarget,
-                               backgrounds: BackgroundCache, cg: CGContext) -> PaperInfo {
+                               backgrounds: BackgroundCache, cg: CGContext) throws -> PaperInfo {
         let record = snap.record
         let area = record.size.map { Rect(x: 0, y: 0, width: $0.width, height: $0.height) } ?? region
         let draw = env.options.background
@@ -437,7 +441,7 @@ enum ExportCompositor {
         case .image:
             guard draw else { return PaperInfo(colour: nil) }
             fill(area, .white, cg)
-            if let url = snap.backgroundURL { backgrounds.drawImage(url, record: record, cg: cg) }
+            if let url = snap.backgroundURL { try backgrounds.drawImage(url, record: record, cg: cg) }
             return PaperInfo(colour: nil)
         }
     }
@@ -883,11 +887,11 @@ enum PDFWriter {
                         let visible = snap.items.filter { snap.intersects($0, sheet.region) }
                         let annotated = job.editable ? EditableSplit.annotated(visible, bounds: snap.paintBounds) : []
                         cg.saveGState()
+                        defer { cg.restoreGState() }
                         cg.scaleBy(x: sheet.pdfScale, y: sheet.pdfScale)
                         cg.translateBy(x: CGFloat(-sheet.region.x), y: CGFloat(-sheet.region.y))
-                        ExportCompositor.draw(snap, region: sheet.region, env: job.environment, target: .vector,
+                        try ExportCompositor.draw(snap, region: sheet.region, env: job.environment, target: .vector,
                                               omit: Set(annotated.map { $0.id }), backgrounds: backgrounds, cg: cg)
-                        cg.restoreGState()
                         specs[i] = PDFAnnotations.collect(snap, sheet: sheet, annotated: annotated, job: job,
                                                           backgrounds: backgrounds)
                     } catch {
