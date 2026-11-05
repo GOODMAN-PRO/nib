@@ -354,6 +354,9 @@ final class DropletField {
             e.hasRest = true
             e.dyn.size.snap(to: CGPoint(x: rect.width, y: rect.height))
             e.dyn.corner.snap(to: cornerTarget(e.style, rect.size))
+            // A droplet that was never presented has no visual position to keep: a leftover offset (a drag
+            // released while no tick ran) must not displace it from its new rest.
+            if !e.isDragging { e.dyn.offset.snap(to: .zero) }
             entries[id] = e
             if let pending = pendingBuds.removeValue(forKey: id) {
                 setBud(id, source: pending.source, presented: pending.presented, instant: true, dismiss: dismissers[id] ?? {})
@@ -700,6 +703,14 @@ final class DropletField {
         e.dyn.lift.target = 1
         e.dyn.offset.target = .zero
         e.dyn.anchor.target = .zero
+        if physicsOff || !isActive {
+            // No spring carries a released droplet home when motion is off or the scene is inactive. The palette
+            // then kept its drag offset after landing on another dock and drew its tools outside the window
+            // (UI run 42002945246: "[Nib QA dock]" bodyOffset=(644, -364) after edge=top, with Reduce Motion).
+            e.dyn.offset.snap(to: .zero)
+            e.dyn.anchor.snap(to: .zero)
+            e.dyn.lift.snap(to: 1)
+        }
         entries[id] = e
         wake()
         return released

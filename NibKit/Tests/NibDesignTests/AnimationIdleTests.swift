@@ -90,4 +90,26 @@ final class AnimationIdleTests: XCTestCase {
             XCTAssertFalse(busy)
         }
     }
+
+    /// UI run 42002945246: with Reduce Motion the palette was dragged from the leading dock to the top dock and its
+    /// body kept the drag offset (644, -364) after landing, so its tools were drawn outside the window.
+    func testReducedMotionReleaseOntoAnotherDockLeavesNoBodyOffset() {
+        let field = DropletField()
+        defer { field.setActive(false) }
+        field.reduceMotion = true
+        let leading = CGRect(x: 16, y: 313.5, width: 56, height: 469)
+        let top = CGRect(x: 453.5, y: 100, width: 469, height: 56)
+        field.setRest("palette", leading, style: .palette)
+        field.beginDrag("palette", at: CGPoint(x: leading.midX, y: leading.midY))
+        field.drag("palette", to: CGPoint(x: leading.midX + 644, y: leading.midY - 364))
+        XCTAssertNotEqual(field.node("palette").presentation.bodyOffset, .zero, "The held droplet follows the finger")
+        field.endDrag("palette", velocity: .zero)
+        XCTAssertEqual(field.node("palette").presentation.bodyOffset, .zero,
+                       "Without motion a released droplet is home at once")
+        field.setRest("palette", top, style: .palette)
+        let landed = field.node("palette").presentation
+        XCTAssertEqual(landed.bodyOffset, .zero, "The body must rest on its new dock")
+        XCTAssertEqual(landed.bodySize.width, top.width, accuracy: 0.01)
+        XCTAssertEqual(landed.bodySize.height, top.height, accuracy: 0.01)
+    }
 }
