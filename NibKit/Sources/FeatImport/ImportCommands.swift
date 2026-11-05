@@ -760,8 +760,12 @@ enum ImportEngine {
                                   folders: folderRefs.isEmpty ? nil : folderRefs, failed: failed.isEmpty ? nil : failed)
         if let session = session {
             session.finish(imported: importedFiles, failures: failed, stopped: session.isCancelled)
-            // A failed import is not consent to discard its source. Keep it, without repeatedly prompting.
-            for f in failed where f.entry == nil { keepSource(f.url) }
+            // The failure is now visible. Dispose of Nib's Open In/share copies, but retain the only
+            // original saved from the pasteboard, including when this is a later inbox-scan retry.
+            for f in failed where f.entry == nil {
+                if let url = URL(string: f.url), ShareHandoff.isRecoveryOriginal(url) { keepSource(f.url) }
+                else { consumeInboxCopy(f.url) }
+            }
         } else if ctx.principal.isUser, !failed.isEmpty {
             ImportUI.reportPartialFailure(failed, ctx: ctx)
         }
@@ -868,6 +872,9 @@ enum ImportEngine {
     static func consumeInboxCopy(_ original: String) {
         guard let url = URL(string: original), url.isFileURL, ImportLocations.isInConsumableInbox(url) else { return }
         try? FileManager.default.removeItem(at: url)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.removeItem(at: ShareHandoff.recoveryMarker(url))
+        }
     }
 
     /// After a complete import: inbox copies, plus loose Documents files the inbox scan offered, are removed. A loose

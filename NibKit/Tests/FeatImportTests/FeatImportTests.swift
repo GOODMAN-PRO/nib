@@ -779,7 +779,7 @@ final class FeatImportTests: XCTestCase {
         let name = UUID().uuidString + ".pdf"
         board.items = [[ShareHandoff.nameType: name, ShareHandoff.dataType: bytes]]
         let saved = ImportLocations.openInInbox.appendingPathComponent(name)
-        defer { try? FileManager.default.removeItem(at: saved) }
+        defer { ImportEngine.consumeInboxCopy(saved.absoluteString) }
         h.app.commands.register(CommandDescriptor(id: "test.handoff", title: "Import", summary: "Exercise failed presentation.",
             effect: .read, exposure: .ui)) { _, ctx in
             let staging = try ImportStaging()
@@ -808,7 +808,7 @@ final class FeatImportTests: XCTestCase {
         let bytes = Data("not a decodable image".utf8)
         board.items = [[ShareHandoff.nameType: name, ShareHandoff.dataType: bytes]]
         let saved = ImportLocations.openInInbox.appendingPathComponent(name)
-        defer { try? FileManager.default.removeItem(at: saved) }
+        defer { ImportEngine.consumeInboxCopy(saved.absoluteString) }
         do {
             try await h.run("import.files", ["urls": [.string(ShareHandoff.link)], "folder": "lib"])
             XCTFail("Invalid image must fail")
@@ -817,7 +817,7 @@ final class FeatImportTests: XCTestCase {
         }
     }
 
-    func testFailedInboxFileSurvivesTheDialogsFailureReport() async throws {
+    func testFailedInboxCopyIsRemovedAfterTheDialogsFailureReport() async throws {
         let h = harness()
         let inbox = ImportLocations.openInInbox
         try FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)
@@ -833,10 +833,42 @@ final class FeatImportTests: XCTestCase {
                 session: h.session, sources: sources, preset: nil)
             let result = try await ImportEngine.perform(sources, destination: .libraryRoot, ids: nil, ctx: ctx, dialog: dialog)
             XCTAssertEqual(result.failed?.count, 1)
-            XCTAssertEqual(try Data(contentsOf: source), bytes)
+            XCTAssertEqual(dialog.model.failures.count, 1)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
             return .null
         }
         try await h.run("test.failedDialogImport")
+    }
+
+    func testFailedDialogHandoffRetainsOriginalAcrossInboxRetries() async throws {
+        let h = harness()
+        let board = UIPasteboard.general
+        let previous = board.items
+        defer { board.items = previous }
+        let name = UUID().uuidString + ".png"
+        let bytes = Data("not an image".utf8)
+        board.items = [[ShareHandoff.nameType: name, ShareHandoff.dataType: bytes]]
+        let saved = ImportLocations.openInInbox.appendingPathComponent(name)
+        defer { ImportEngine.consumeInboxCopy(saved.absoluteString) }
+        h.app.commands.register(CommandDescriptor(id: "test.failedHandoffDialog", title: "Import", summary: "Retain a handoff original.",
+            effect: .read, exposure: .ui)) { _, ctx in
+            for original in [ShareHandoff.link, saved.absoluteString] {
+                let sources = [ImportSource(original: original)]
+                let navigator = StubNavigator()
+                let dialog = ImportDialogSession(navigator: navigator, library: h.library, workspace: ctx.workspace,
+                    session: h.session, sources: sources, preset: nil)
+                let result = try await ImportEngine.perform(sources, destination: .libraryRoot, ids: nil, ctx: ctx, dialog: dialog)
+                XCTAssertEqual(result.failed?.count, 1)
+                XCTAssertEqual(dialog.model.failures.count, 1)
+                XCTAssertEqual(try Data(contentsOf: saved), bytes)
+                XCTAssertTrue(ShareHandoff.isRecoveryOriginal(saved))
+            }
+            return .null
+        }
+        try await h.run("test.failedHandoffDialog")
+        ImportEngine.consumeInboxCopy(saved.absoluteString)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: saved.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ShareHandoff.recoveryMarker(saved).path))
     }
 
     func testPickerPresentationFailureIsNotUserCancellation() async {
