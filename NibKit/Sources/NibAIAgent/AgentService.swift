@@ -207,10 +207,31 @@ final class AgentService: AIService {
             return .failure(NibError(.notFound, "conversation '\(chatID)' was deleted", path: "$.chat",
                                      hint: "start a new conversation"))
         }
-        if pendingSaves[ObjectIdentifier(chatStore)]?[chatID] != nil {
-            // Older chat UIs may still offer generation Retry. Never regenerate a completed turn
-            // while its save is pending; the UI must route recovery to ai.chat.save instead.
-            return .failure(Self.saveFailure(chatID))
+        let storeKey = ObjectIdentifier(chatStore)
+        if let pending = pendingSaves[storeKey]?[chatID] {
+            // Also recover through older clients' generation Retry, including after another
+            // write has already flushed this store's pinned queue.
+            if await chatStore.flushAsync() != nil { return .failure(Self.saveFailure(chatID)) }
+            guard self.chatStore === chatStore else {
+                return .failure(NibError(.conflict, String(localized: "The library changed while saving the conversation.")))
+            }
+            do { try chatStore.checkAccess(chatID, principal: basePrincipal, gateway: app.gateway) }
+            catch { return .failure(NibError.wrap(error)) }
+            guard !chatStore.isDeleted(chatID) else { return .failure(ChatStore.unknownChat(chatID)) }
+            pendingSaves[storeKey]?[chatID] = nil
+            let shown = chatStore.visibleMessages(chatID)
+            // A retry can contain just the last prompt, or history ending in that prompt
+            // (or the completed answer). Match the suffix, including image identities.
+            func matchesSuffix(_ records: [ChatRecord]) -> Bool {
+                guard incoming.count <= records.count else { return false }
+                return zip(records.suffix(incoming.count), incoming).allSatisfy { s, m in
+                    (s.role ?? "user") == m.role && (s.text ?? "") == m.text
+                        && (s.images ?? []) == (m.images ?? []).map(\.name)
+                }
+            }
+            if matchesSuffix(shown) || (shown.last?.role == "assistant" && matchesSuffix(Array(shown.dropLast()))) {
+                return .success(pending)
+            }
         }
         guard running[chatID] == nil else {
             return .failure(NibError(.conflict, "this conversation is already answering",
@@ -289,7 +310,7 @@ final class AgentService: AIService {
         let persistenceError = persisted ? await chatStore.flushAsync() : nil
         let response = AIResponse(text: text, changes: outcome.changes, group: group, usage: outcome.usage,
                                   chatID: persisted ? chatID : nil)
-        if persistenceError != nil {
+        if persistenceError != nil && outcome.error == nil {
             pendingSaves[ObjectIdentifier(chatStore), default: [:]][chatID] = response
         }
         // Preserve provider errors and successful cancellation receipts. Save failures carry a
@@ -306,7 +327,9 @@ final class AgentService: AIService {
         if let e = reportedError { payload["error"] = e.json["error"] ?? .null }
         if let e = persistenceError {
             payload["persistenceError"] = e.json["error"] ?? .null
-            payload["recovery"] = ["command": "ai.chat.save", "params": ["chat": .string(chatID)]]
+            if outcome.error == nil {
+                payload["recovery"] = ["command": "ai.chat.save", "params": ["chat": .string(chatID)]]
+            }
         }
         app?.events.emit(NibEventType.aiTurnFinished, principal: principal, doc: doc, changes: outcome.changes,
                          payload: .object(payload))

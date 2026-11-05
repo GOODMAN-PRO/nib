@@ -252,18 +252,21 @@ struct AIChatList: NibCommand {
         if let store = store { loaded = await store.summariesAsync(doc: doc, all: p.all ?? false) }
         else { loaded = ai.chats(doc: doc) }
         try checkLibrary()
-        let summaries = loaded.filter { visible($0.doc) }
-        let rows = summaries.map { s -> Row in
-            let count = store?.messageCount(s.id) ?? ai.messages(chatID: s.id).count
-            return Row(id: s.id, title: s.title, doc: s.doc.map { NodeRef.document($0).description }, updated: s.updated,
-                       messages: count)
+        // Construct rows only at the return boundary: selected-chat loading can suspend
+        // while any other listed document becomes locked.
+        func rows() -> [Row] {
+            loaded.filter { visible($0.doc) }.map { s -> Row in
+                let count = store?.messageCount(s.id) ?? ai.messages(chatID: s.id).count
+                return Row(id: s.id, title: s.title, doc: s.doc.map { NodeRef.document($0).description }, updated: s.updated,
+                           messages: count)
+            }
         }
-        guard let chat = p.chat else { return Output(chats: rows) }
+        guard let chat = p.chat else { return Output(chats: rows()) }
         guard let store = store else {
             let list = ai.messages(chatID: chat).enumerated().map {
                 Message(id: String($0.offset), role: $0.element.role, text: $0.element.text)
             }
-            return Output(chats: rows, messages: list)
+            return Output(chats: rows(), messages: list)
         }
         let loadedState = await store.stateAsync(chat)
         try checkLibrary()
@@ -275,7 +278,7 @@ struct AIChatList: NibCommand {
             Message(id: $0.id.raw, role: $0.role ?? "user", text: $0.text ?? "", at: $0.at, rating: $0.rating,
                     group: $0.group, changes: $0.changes, cancelled: $0.cancelled)
         }
-        return Output(chats: rows, messages: list)
+        return Output(chats: rows(), messages: list)
     }
 }
 

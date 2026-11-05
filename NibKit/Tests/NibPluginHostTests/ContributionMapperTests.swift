@@ -315,6 +315,108 @@ final class ContributionMapperTests: XCTestCase {
         XCTAssertThrowsError(try PluginPaths.resolve("/etc/hosts", in: empty, path: "$"))
     }
 
+    func testCompactBoundedNumberFitsOptionsBarAtLargeTypeAndNarrowWidth() async throws {
+        let field = SchemaField.field(key: "thickness", schema: [
+            "type": "number", "title": "Stroke thickness", "minimum": 0, "maximum": 1, "default": 0.57
+        ])
+        for type in [DynamicTypeSize.xxxLarge, .accessibility1] {
+            // Measure the uncompressed control too: a clipped 44-point host alone could
+            // hide the old vertical label/slider stack and falsely pass this regression.
+            let control = UIHostingController(rootView:
+                SchemaFieldControl(field: field, value: .number(0.57), compact: true, commit: { _, _ in })
+                    .environment(\.dynamicTypeSize, type).fixedSize())
+            let ideal = control.sizeThatFits(in: CGSize(width: 288, height: 1000))
+            XCTAssertGreaterThan(ideal.height, 0)
+            XCTAssertLessThanOrEqual(ideal.height, 44, "The entire control must fit without vertical clipping")
+
+            let host = UIHostingController(rootView:
+                SchemaFormView(fields: [field], values: ["thickness": .number(0.57)], style: .bar, commit: { _, _ in })
+                    .environment(\.dynamicTypeSize, type))
+            host.safeAreaRegions = []
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 288, height: 44))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            func scrollView(in view: UIView) -> UIScrollView? {
+                if let scroll = view as? UIScrollView { return scroll }
+                for child in view.subviews {
+                    if let found = scrollView(in: child) { return found }
+                }
+                return nil
+            }
+            // SwiftUI can defer its first layout; keep the wait bounded.
+            for _ in 0..<100 {
+                host.view.layoutIfNeeded()
+                if let scroll = scrollView(in: host.view), scroll.contentSize.width > 288 { break }
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            let scroll = try XCTUnwrap(scrollView(in: host.view))
+            XCTAssertLessThanOrEqual(scroll.contentSize.height, 44)
+            XCTAssertEqual(scroll.bounds.width, 288, accuracy: 1)
+            XCTAssertGreaterThan(scroll.contentSize.width, scroll.bounds.width)
+            XCTAssertTrue(scroll.isScrollEnabled)
+            let end = scroll.contentSize.width - scroll.bounds.width
+            scroll.setContentOffset(CGPoint(x: end, y: 0), animated: false)
+            XCTAssertEqual(scroll.contentOffset.x, end, accuracy: 1, "The trailing value must remain reachable")
+        }
+    }
+
+    func testPluginBlockResizeKeepsRightHandMarkerReachableByScrolling() throws {
+        let h = Harness(features: [])
+        var block = TextBlock(kind: .custom)
+        block.custom = CustomBlock(owner: Self.pid, type: "marker", height: 120,
+            display: DisplayList(ops: [DisplayOp(op: .rect, rect: Rect(x: 500, y: 20, width: 20, height: 20),
+                                               fill: RGBA(255, 0, 0))]))
+        let context = BlockViewContext(app: h.app, session: h.session, doc: Fixtures.docID, block: block,
+                                       heightChanged: { _ in })
+        let view = PluginBlockView(context: context, command: "test.edit", title: "Marker", defaultHeight: 120)
+        view.frame = CGRect(x: 0, y: 0, width: 640, height: 120)
+        view.layoutIfNeeded()
+        XCTAssertTrue(try containsRedMarker(view))
+        view.frame.size.width = 288
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertGreaterThanOrEqual(view.contentSize.width, 520)
+        XCTAssertEqual(view.contentSize.height, 120)
+        XCTAssertFalse(try containsRedMarker(view), "The marker starts outside the narrow viewport")
+        XCTAssertTrue(view.accessibilityScroll(.left), "Scrolling must expose the preserved drawing width")
+        view.layoutIfNeeded()
+        XCTAssertGreaterThan(view.contentOffset.x, 0)
+        XCTAssertTrue(try containsRedMarker(view), "The actual drawing, not just contentSize, must survive resizing")
+        view.frame.size.width = 640
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertEqual(view.contentOffset.x, 0, accuracy: 0.5)
+        XCTAssertTrue(try containsRedMarker(view))
+    }
+
+    private func containsRedMarker(_ view: UIView) throws -> Bool {
+        func display(_ child: UIView) {
+            child.setNeedsDisplay()
+            child.layer.displayIfNeeded()
+            child.subviews.forEach(display)
+        }
+        display(view)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { context in
+            view.layer.render(in: context.cgContext)
+        }
+        let cgImage = try XCTUnwrap(image.cgImage)
+        let width = cgImage.width, height = cgImage.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        try pixels.withUnsafeMutableBytes { bytes in
+            let bitmap = try XCTUnwrap(CGContext(data: bytes.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue))
+            bitmap.draw(cgImage, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+        }
+        return stride(from: 0, to: pixels.count, by: 4).contains {
+            pixels[$0] > 200 && pixels[$0 + 1] < 30 && pixels[$0 + 2] < 30 && pixels[$0 + 3] > 200
+        }
+    }
+
     func testSliderDisplayHidesFloatingPointNoiseWithoutRoundingDrafts() {
         let us = Locale(identifier: "en_US")
         let de = Locale(identifier: "de_DE")

@@ -192,6 +192,29 @@ final class FeatAISettingsTests: XCTestCase {
         XCTAssertTrue(checked)
         XCTAssertEqual(Keychain.getString(service: AIProviderConfig.keychainService, account: c.keychainAccount), "staged-secret-086")
     }
+    func testRepeatedEditorSaveUsesStoredOptionalFieldsAsBaseline() async throws {
+        let (h, store) = setupStore()
+        var baseline = try config()
+        baseline.transcriptionModel = "speech-model"
+        baseline.imageModel = "image-model"
+        baseline.contextTokens = 8192
+        try store.save(baseline, apiKey: nil)
+        var draft = ProviderDraft(config: baseline)
+        draft.transcriptionModel = ""
+        draft.imageModel = ""
+        let runtime = try XCTUnwrap(h.app.services.get(ProviderSettingsRuntime.serviceKey, as: ProviderSettingsRuntime.self))
+        let saved = try await runtime.saveFromSettings(draft.config(), key: nil, app: h.app, expected: baseline)
+        XCTAssertEqual(saved.config, store.configs.first)
+        XCTAssertEqual(saved.config.transcriptionModel, "speech-model")
+        XCTAssertEqual(saved.config.imageModel, "image-model")
+        draft = ProviderDraft(config: saved.config)
+        draft.name = "Renamed again"
+        let second = try await runtime.saveFromSettings(draft.config(), key: nil, app: h.app, expected: saved.config)
+        XCTAssertEqual(second.config.name, "Renamed again")
+        XCTAssertEqual(second.config.contextTokens, 8192)
+        XCTAssertEqual(second.config, store.configs.first)
+    }
+
     func testNameOnlyDraftRejectsExternallyChangedModelAtCommandCommit() async throws {
         for changeInHook in [false, true] {
             let (h, store) = setupStore()

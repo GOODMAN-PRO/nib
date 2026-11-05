@@ -70,7 +70,8 @@ final class ProviderSettingsRuntime {
     private var pending: [String: Pending] = [:]
     private var baselines: [String: AIProviderConfig] = [:]
 
-    func saveFromSettings(_ config: AIProviderConfig, key: String?, app: NibApp, expected: AIProviderConfig? = nil) async throws {
+    @discardableResult
+    func saveFromSettings(_ config: AIProviderConfig, key: String?, app: NibApp, expected: AIProviderConfig? = nil) async throws -> ProviderRow {
         let config = try ProviderValidation.validate(config)
         try ProviderValidation.rejectKeyInMetadata(config, key: key ?? Keychain.getString(
             service: AIProviderConfig.keychainService, account: config.keychainAccount))
@@ -81,6 +82,14 @@ final class ProviderSettingsRuntime {
         _ = try await app.bus.execute(Invocation(command: CommandIDs.aiProviderSave,
                                                 params: try JSONValue.from(ProviderSave.Params(config)),
                                                 principal: .user, session: app.services.sessions.active, group: group))
+        // Return the canonical row: omitted optional parameters can preserve stored fields.
+        // Editors must use this baseline rather than the draft submitted to the command.
+        let result = try await app.bus.execute(CommandIDs.aiProviderList, ["id": .string(config.id.uuidString)])
+        let listed = try result.decode(ProviderList.Output.self)
+        guard let row = listed.providers.first(where: { $0.id == config.id }) else {
+            throw NibError(.notFound, String(localized: "AI provider not found."))
+        }
+        return row
     }
 
     func checkBaseline(for ctx: CommandContext, existing: AIProviderConfig?) throws {
