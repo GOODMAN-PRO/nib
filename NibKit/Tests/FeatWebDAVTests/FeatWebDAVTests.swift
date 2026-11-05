@@ -40,6 +40,8 @@ final class FakeDAVServer {
     private(set) var requests: [String] = []
     /// When true, PUT responses carry no ETag header (like nginx).
     var omitPutETag = false
+    var putETagForm: ((String) -> String)?
+    var putETagHeader = "ETag"
     /// When true, files are listed without an ETag (version = date and size).
     var omitFileETags = false
     var collectionETags = CollectionETags.propagating
@@ -235,7 +237,7 @@ final class FakeDAVServer {
             let etag = "\"v\(counter)\""
             files[path] = File(data: body ?? Data(), etag: etag, modified: Date())
             changed(path)
-            return (existed ? 204 : 201, omitPutETag ? [:] : ["ETag": etag], Data())
+            return (existed ? 204 : 201, omitPutETag ? [:] : [putETagHeader: putETagForm?(etag) ?? etag], Data())
         case "DELETE":
             if files[path] != nil || collections.contains(path) {
                 removeLocked(path)

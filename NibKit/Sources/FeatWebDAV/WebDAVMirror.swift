@@ -975,10 +975,14 @@ final class WebDAVMirrorRun {
             if failure.isFatal { throw failure }
             observed = nil
         }
-        let uploaded = etag.map { "e:" + WebDAVPaths.normalizeETag($0) }
-        // A later PROPFIND may already describe another device's write. Never pair that version with our bytes.
+        let uploaded = etag.flatMap { raw -> String? in
+            let value = WebDAVPaths.normalizeETag(raw)
+            return value.isEmpty ? nil : "e:" + value
+        }
+        // DAVResource.version and uploaded both normalize the raw validator exactly once. Compare only
+        // ETags: a date/size fallback is not evidence that another device wrote after our PUT.
         let version: String?
-        if let observed = observed, let uploaded = uploaded, observed != uploaded {
+        if let observed = observed, let uploaded = uploaded, observed.hasPrefix("e:"), observed != uploaded {
             version = nil
         } else {
             version = observed ?? uploaded

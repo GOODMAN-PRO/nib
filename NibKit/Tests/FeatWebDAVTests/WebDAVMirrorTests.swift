@@ -440,6 +440,35 @@ final class WebDAVMirrorTests: XCTestCase {
         XCTAssertEqual(DAVTest.read(root, "a.json"), "theirs")
     }
 
+    func testPutValidatorFormsAndDateSizeListingsStayStable() async throws {
+        for form in 0..<7 {
+            let server = FakeDAVServer.install()
+            server.putETagForm = { tag in
+                switch form {
+                case 0: return "W/" + tag
+                case 1: return String(tag.dropFirst().dropLast())
+                case 5: return ""
+                case 6: return "\"\""
+                default: return tag
+                }
+            }
+            server.putETagHeader = form == 2 ? "OC-ETag" : "ETag"
+            server.omitFileETags = form == 3
+            server.omitPutETag = form == 4
+            let root = DAVTest.tempDir("validators"), state = DAVTest.tempDir("state")
+            try DAVTest.write(root, "a.json", "ours")
+            _ = try await sync(server, root, state, dev)
+            let saved = MirrorStateStore(directory: state, key: dev).load()
+            XCTAssertFalse(try XCTUnwrap(saved.entries["a.json"]).remote.isEmpty)
+            let stable = try await sync(server, root, state, dev)
+            XCTAssertEqual(stable.downloaded + stable.uploaded + stable.conflicts, 0)
+            try DAVTest.write(root, "a.json", "edited locally after upload")
+            let edited = try await sync(server, root, state, dev)
+            XCTAssertEqual(edited.uploaded, 1)
+            XCTAssertEqual(edited.conflicts + edited.downloaded, 0)
+        }
+    }
+
     func testServerWithoutPutETagsStaysStable() async throws {
         let server = FakeDAVServer.install()
         server.omitPutETag = true
