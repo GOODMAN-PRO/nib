@@ -181,6 +181,39 @@ final class FeatSmartInkTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(), before)
     }
 
+    func testReflowRejectsMovedLockedOrDeletedSourcesDuringRecognition() async throws {
+        for change in ["move", "lock", "delete"] {
+            let h = Harness(features: [FeatSmartInkFeature.self])
+            let s = Synth.paragraph()
+            let refs = try await install(s, in: h)
+            // The first word would stay put: it must still be checked as an input to the plan.
+            let id = s.ids[0]
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
+                                                      summary: "Change source ink during recognition.", effect: .edit)) { _, ctx in
+                try ctx.mutate { tx in
+                    let original = try tx.item(Fixtures.docID, page: Fixtures.page2, id: id)
+                    if change == "delete" {
+                        try tx.delete(item: id, doc: Fixtures.docID, page: Fixtures.page2)
+                    } else {
+                        var edited = original.transformed(by: change == "move" ? .translation(100, 40) : .identity)
+                        if change == "lock" { edited.locked = true }
+                        try tx.put(edited, doc: Fixtures.docID, page: Fixtures.page2)
+                    }
+                }
+                return [:]
+            }
+            let code = await errorCode {
+                try await h.run(CommandIDs.handwritingReflow, ["refs": self.json(refs), "width": 77])
+            }
+            XCTAssertEqual(code, .conflict, change)
+            XCTAssertEqual(h.undoDepth(doc), 1, "only the intervening edit commits")
+            let now = try strokePoints(h)
+            for glyph in s.glyphs where glyph.id != id {
+                XCTAssertEqual(now[glyph.id], glyph.points, "no part of a stale plan may commit")
+            }
+        }
+    }
+
     func testStraightenLevelsASlantedLineAndUndoes() async throws {
         let h = Harness(features: [FeatSmartInkFeature.self])
         var s = Synth()
