@@ -100,7 +100,14 @@ enum ReplayReader {
             var params: JSONValue = ["ref": .string(NodeRef.page(doc, page).description), "depth": 2,
                                      "fields": ["kind", "stroke", "bbox", "deleted"]]
             if let cursor { params = params.merging(["cursor": .string(cursor)]) }
-            let result = try await query(CommandIDs.queryGet, params)
+            let result: JSONValue
+            do {
+                result = try await query(CommandIDs.queryGet, params)
+            } catch let error as NibError where error.code == .notFound {
+                // Purged and moved pages have no readable record. Discard even earlier batches if the page
+                // disappeared during pagination; other errors still propagate so the controller can retry.
+                return []
+            }
             try requireExpanded(result)
             if result["trashed"]?.boolValue == true || result["deleted"]?.boolValue == true { return [] }
             for row in result["items"]?.arrayValue ?? [] {
