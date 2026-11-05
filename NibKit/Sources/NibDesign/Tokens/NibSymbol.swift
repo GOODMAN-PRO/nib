@@ -212,6 +212,12 @@ public struct NibSymbol: Hashable, Sendable {
     public static let history = NibSymbol("clock.arrow.circlepath")
 
     // Settings and places
+    /// The Accessibility settings page, using the iOS 17-compatible standing figure.
+    public static let accessibility = NibSymbol("figure.stand")
+    /// Recording preferences, distinct from Record and the transcript's captions bubble.
+    public static let recordingSettings = NibSymbol("waveform.circle")
+    /// Start Quick Lesson, distinct from exporting or sharing a document.
+    public static let lesson = NibSymbol("play.rectangle")
     public static let profile = NibSymbol("person.crop.circle")
     public static let language = NibSymbol("globe")
     public static let notifications = NibSymbol("bell.badge")
@@ -246,6 +252,7 @@ public struct NibSymbol: Hashable, Sendable {
         bold, italic, underline, strikethrough, textSuperscript, textSubscript, inlineCode, fontSize, alignLeft,
         alignCentre, alignRight, justify, listBulleted, listNumbered, checklist, indent, outdent, lineSpacing,
         recordDot, skipBack10, skipForward10, transcript, speak, timer, stopwatch, lap, history,
+        accessibility, recordingSettings, lesson,
         profile, language, notifications, reminder, info, advanced, templates, minimap, fitToContent, calendar, cloud,
         backup, diagnostics, dictionary,
     ]

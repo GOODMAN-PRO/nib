@@ -174,6 +174,19 @@ public enum NibBudPlacement: Sendable {
         return result
     }
 
+    /// Resolve obstruction and available space before measuring content. Never feed the resulting
+    /// viewport back into this decision: a short viewport can otherwise undo its own avoidance.
+    func layout(beside source: CGRect, width: CGFloat, gap: CGFloat, in bounds: CGRect,
+                avoiding obstacles: [CGRect]) -> (anchor: CGRect, available: CGSize) {
+        let ideal = CGSize(width: max(0, NibGeometry.finite(width)), height: NibMetrics.popoverMaxHeight)
+        let anchor = unobstructedAnchor(source, size: ideal, gap: gap, in: bounds, avoiding: obstacles)
+        let available = availableSize(beside: anchor, gap: gap, in: bounds)
+        // Only centre() chooses the final side, using measured content. A short popover
+        // should keep its requested side even when the ideal 520 pt viewport would not fit.
+        return (anchor, CGSize(width: min(ideal.width, available.width),
+                               height: min(ideal.height, available.height)))
+    }
+
     /// Constrain the scrolling viewport before measuring it, choosing the larger side if necessary.
     func availableSize(beside anchor: CGRect, gap: CGFloat, in bounds: CGRect) -> CGSize {
         let anchor = NibGeometry.rect(anchor), gap = max(0, NibGeometry.finite(gap))
@@ -251,11 +264,12 @@ public struct NibBudPopover<Content: View>: View {
                                 height: max(0, frame.height - safe.top - safe.bottom))
             let palettes = field?.worldAnchors.filter { $0.key.hasPrefix(NibPalettePresentation.anchorPrefix) }
                 .sorted { $0.key < $1.key }.map(\.value) ?? []
-            let anchor = placement.unobstructedAnchor(sourceAnchor, size: size, gap: gap, in: bounds, avoiding: palettes)
-            let available = placement.availableSize(beside: anchor, gap: gap, in: bounds)
-            let centre = placement.centre(size: size, beside: anchor, gap: gap, in: bounds)
-            NibPopoverPanel(title: title, subtitle: subtitle, width: min(width, available.width),
-                            maxHeight: available.height) { content }
+            let layout = placement.layout(beside: sourceAnchor, width: width, gap: gap, in: bounds, avoiding: palettes)
+            let fitted = CGSize(width: min(size.width, layout.available.width),
+                                height: min(size.height, layout.available.height))
+            let centre = placement.centre(size: fitted, beside: layout.anchor, gap: gap, in: bounds)
+            NibPopoverPanel(title: title, subtitle: subtitle, width: layout.available.width,
+                            maxHeight: layout.available.height) { content }
                 .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
                 .droplet(id, style: .popover)
                 .budsFrom(source, isPresented: $isPresented)
@@ -486,18 +500,18 @@ struct NibSheetChrome: ViewModifier {
                 chrome(content)
             }
             .presentationSizing(.form.fitted(horizontal: true, vertical: true))
-            .scrollIndicators(.visible)
-            .scrollIndicatorsFlash(onAppear: true)
+            .scrollIndicators(.visible, axes: .vertical)
         } else {
             chrome(content)
-                .scrollIndicators(.visible)
-                .scrollIndicatorsFlash(onAppear: true)
+                .scrollIndicators(.visible, axes: .vertical)
         }
     }
 
     @ViewBuilder private func chrome(_ content: Content) -> some View {
         // Sheets may contain bottom-pinned actions. Keep scroll cues on their scroll
         // hosts; a root mask fades those actions and shared margins double local padding.
+        // Only the vertical indicator policy belongs here. A root flash reaches every
+        // nested strip, so individual scroll owners opt into flashing when needed.
         if #available(iOS 26.0, *) {
             content
         } else {

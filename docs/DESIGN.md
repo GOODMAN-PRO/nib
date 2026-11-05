@@ -114,7 +114,9 @@ UI neutrals are Apple's semantic colours. In code they are `NibColor` / `NibUICo
 | `fill4` | `#747480` 8 % | `#767680` 18 % | Proposal block, composer, search field |
 | `background` | `#FFFFFF` | `#000000` | Library content |
 | `backgroundSecondary` | `#F2F2F7` | `#1C1C1E` | Sidebar, folder tiles, sheets, Reduce Transparency Deep |
-| `backgroundTertiary` | `#FFFFFF` | `#2C2C2E` | Segment knob, grouped cells |
+| `backgroundTertiary` | `#FFFFFF` | `#2C2C2E` | Grouped cells |
+| `selectedSegment` | System `tertiarySystemBackground` (same as `backgroundTertiary`) | System `systemGray2`, opaque | Selected segmented-control knob; distinct from the `fill3` track in dark chrome |
+| `selectedCell` | System `tertiarySystemFill` (same as `fill3`) | System `systemGray2`, opaque | Selected option tiles and width presets; preserves the light selection fill and separates dark selections from Deep |
 | `desk` | `#E7E7EC` | `#121214` | Behind pages (never pure white or black: the page edge must read) |
 | `chromeOpaque` | `#F4F4F6` | `#2C2C2E` | Reduce Transparency droplet fill |
 | `scrim` | `#000000` 18 % | `#000000` 45 % | Behind sheets |
@@ -435,6 +437,7 @@ Each is a `NibSymbol` token (named first); features never spell an SF Symbol. Ev
 | Tools | `drawShape` `pencil.and.outline`, `layers` `square.3.layers.3d`, `editHandwriting` `scribble`, `recognisedText` `text.viewfinder`, `convertToText` `character.textbox`, `straighten` `level`, `insertSpace` `arrow.up.and.down`, `math` `x.squareroot`, `graph` `chart.xyaxis.line`, `table` `tablecells`, `dragHandle` `line.3.horizontal` |
 | Editing | `cut` `scissors`, `copy` `doc.on.doc`, `paste` `doc.on.clipboard`, `duplicate` `plus.square.on.square`, `link` `link`, `arrange` `square.stack.3d.up`, `screenshot` `camera.viewfinder`, `crop` `crop`, `flipHorizontal` / `flipVertical` `arrow.left.and.right.righttriangle.left.righttriangle.right` / `arrow.up.and.down.righttriangle.up.righttriangle.down`, `replace` `arrow.2.squarepath` |
 | Text formatting | `bold`, `italic`, `underline`, `strikethrough`, `textSuperscript` `textformat.superscript`, `textSubscript` `textformat.subscript`, `inlineCode` `chevron.left.forwardslash.chevron.right`, `fontSize` `textformat.size`, `alignLeft` / `alignCentre` / `alignRight` / `justify` `text.alignleft` / `text.aligncenter` / `text.alignright` / `text.justify`, `listBulleted` `list.bullet`, `listNumbered` `list.number`, `checklist`, `indent` `increase.indent`, `outdent` `decrease.indent`, `lineSpacing` `arrow.up.and.down.text.horizontal` |
+| Settings and lessons | `accessibility` `figure.stand` (Accessibility settings, iOS 17-compatible fallback), `recordingSettings` `waveform.circle` (Recording Settings, distinct from Record), `lesson` `play.rectangle` (Start Quick Lesson, shares Present's presentation glyph); semantic tokens, distinct from Speak, Transcript and Share |
 | Audio and time | `recordDot` `record.circle`, `skipBack10` / `skipForward10` `gobackward.10` / `goforward.10`, `transcript` `captions.bubble`, `speak` `speaker.wave.2`, `timer`, `stopwatch`, `lap` `flag`, `history` `clock.arrow.circlepath` |
 | Documents and sharing | `unlock` `lock.open`, `touchID` `touchid`, `print` `printer`, `saveToFiles` `square.and.arrow.down.on.square`, `newWindow` `macwindow.badge.plus`, `externalLink` `arrow.up.forward.app`, `qrCode` `qrcode`, `templates` `rectangle.3.group`, `minimap` `map`, `fitToContent` `arrow.up.left.and.arrow.down.right` |
 | Settings and places | `profile` `person.crop.circle`, `language` `globe`, `notifications` `bell.badge`, `reminder` `bell`, `info` `info.circle` (About, info notices), `advanced` `wrench.and.screwdriver`, `calendar`, `cloud` `icloud`, `backup` `externaldrive`, `diagnostics` `stethoscope`, `dictionary` `character.book.closed` |
@@ -565,6 +568,8 @@ Real water holds on longer than it takes to join. A **neck** is a capsule of thi
 8. **From the keyboard** (a shortcut, ⌘K) the popover or panel appears in place with no bud (`instant`).
 
 The same mechanics apply to the lasso object menu (buds from the selection's top edge), in-document search (from the magnifier), the export popover (from Share), the New menu (from "+ New"), the recording HUD (from the mic) and the page-number peek. A feature places such a popover with `NibBudPopover(placement:)` (`.below`, `.above`, `.leading`, `.trailing`): it is positioned from the source's frame, `popoverGap` away (16 on iPhone) and clamped inside the container inset by 16 pt. The palette's own popovers use the same rule, so there is one placement code path.
+
+`NibBudPopover` reserves palette clearance using its requested width and ideal 520 pt height, capped to the available viewport, before measuring content. This deliberately conservative mode can move a compact popover farther from its source when only the ideal frame would touch a nearby palette. Measured height never feeds back into that reservation, preventing a shrinking viewport from undoing its own clearance. Final positioning prefers the requested side and flips only when the measured content cannot fit there and the opposite side has more room.
 
 While a bud is open it is modal for VoiceOver (focus moves into it when its content is revealed, and the canvas behind it is not reachable), a hardware Escape closes it, and the dismiss area covers the whole window including the status-bar and home-indicator strips.
 
@@ -813,7 +818,7 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 | **`NibSlider`** | 4 pt `fill1` track, `label` fill, 28 pt white bead thumb | 44 pt tall | Thumb stretches up to **0.10** with speed (`thumb` spring, about its grab side) and settles in one small undershoot; detent haptics |
 | **`NibStrokeWidthSlider`** | Three preset dots (5, 8, 12 pt) + value in mm + bead slider | Presets 44 × 40 | Selected preset on `fill3`. `init(width:range:presets:title:unit:)` titles it and measures in `.millimetres` ("0.50 mm") or `.points` ("12 pt", the eraser's Size) |
 | **`NibWidthPresetButton`** | One preset: a `label` dot (`NibMetrics.widthPresetDot(index)`: 5, 8, 12 pt) in a 44 × 40 cell | 44 pt hit | Selected on `fill3` (radius 12). The slider's presets, the Pencil palette's widths, options bars: a thickness looks the same everywhere. A hover outline of a width is a `NibStroke.hairline` circle |
-| **`NibSegmentedControl`** | `fill3` track (radius 9, 2 pt inset), `backgroundTertiary` knob (radius 7, E1) | 32 pt visual; each segment's hit area is 44 pt tall | Knob glides on `tap`; selected label semibold |
+| **`NibSegmentedControl`** | `fill3` track (radius 9, 2 pt inset), `selectedSegment` knob (radius 7, E1) | 32 pt visual; each segment's hit area is 44 pt tall | Knob glides on `tap`; selected label semibold. `sizing: .intrinsic` (default) preserves full labels and stacks when needed. Opt-in `sizing: .fitting` shares the available width equally (including RTL); labels use one line with tail truncation at the existing footnote size, never scale down. The full label remains available to accessibility. Fitting needs 44 pt per segment plus the 4 pt track inset; narrower rows and accessibility Dynamic Type sizes stack with full labels. Use for the 240 pt page switcher and equal-width paragraph controls |
 
 ### 13.4 Controls and text
 
@@ -870,6 +875,8 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 | **`.nibSheet`** | System sheet on `backgroundSecondary` (radius 28) below iOS 26, the system material on 26 | No glass inside; one Tinted primary |
 | **`NibSheetHeader`** | Cancel (accent, ⎋) · title (title3, up to 2 lines, never under the buttons) · primary (Tinted compact, ⏎) | ≥ 60 pt |
 | **`NibRow`** | Optional 29 pt icon squircle (radius 7), title, subtitle, accessory | In `List(.insetGrouped)`; ≥ 44 pt |
+
+`.nibSheet` makes vertical scroll indicators visible while preserving each horizontal strip's indicator policy. The shared chrome intentionally omits the on-appear flash: a root flash also reaches nested horizontal strips. A feature that needs this cue must opt in on its own vertical `ScrollView`; existing feature-owned flashes remain unchanged.
 
 System components used as they are: `Menu`/`UIMenu`, context menus with previews, `UIActivityViewController`, `UIColorPickerViewController`, `UIDocumentPickerViewController`, alerts and confirmation dialogs, `ProgressView`, the keyboard and its shortcuts bar.
 

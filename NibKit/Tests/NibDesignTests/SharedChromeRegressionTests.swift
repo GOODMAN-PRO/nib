@@ -8,6 +8,80 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testBudPopoverUsesMeasuredHeightBeforeFlippingSide() async throws {
+        let bounds = CGRect(x: 0, y: 0, width: 700, height: 700)
+        let source = CGRect(x: 328, y: 400, width: 44, height: 44)
+        for contentHeight in [CGFloat(100), 400] {
+            let field = DropletField()
+            field.bounds = bounds
+            field.reduceMotion = true
+            field.mode = .off
+            field.setWorldAnchor("source", source)
+            let content = NibBudPopover(id: "menu", source: "source", isPresented: .constant(true),
+                                        title: "Options", placement: .below) {
+                Color.clear.frame(height: contentHeight)
+            }
+            .environment(field)
+            .environment(\.horizontalSizeClass, .regular)
+            .environment(\.dynamicTypeSize, .large)
+            .coordinateSpace(NibLiquid.space)
+            .ignoresSafeArea()
+            .transaction { $0.disablesAnimations = true; $0.animation = nil }
+            let host = UIHostingController(rootView: content)
+            let window = UIWindow(frame: bounds)
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil; field.setActive(false) }
+            host.view.frame = bounds
+            func scroll(in view: UIView) -> UIScrollView? {
+                if let result = view as? UIScrollView { return result }
+                return view.subviews.lazy.compactMap { scroll(in: $0) }.first
+            }
+            for _ in 0..<10 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            let viewport = try XCTUnwrap(scroll(in: host.view))
+            let frame = viewport.convert(viewport.bounds, to: host.view)
+            let roomBelow = bounds.maxY - NibMetrics.chromeInset - source.maxY - NibMetrics.popoverGap
+            if contentHeight == 100 {
+                XCTAssertLessThan(frame.height, roomBelow)
+                XCTAssertEqual(frame.minY, source.maxY + NibMetrics.popoverGap, accuracy: 1,
+                               "The ideal 520 pt height must not move short content above its source")
+            } else {
+                XCTAssertGreaterThan(frame.height, roomBelow)
+                XCTAssertEqual(frame.maxY, source.minY - NibMetrics.popoverGap, accuracy: 1)
+            }
+        }
+    }
+
+    func testSheetCuePreservesHorizontalStripIndicatorPolicy() async throws {
+        let content = ScrollView(.vertical) {
+            VStack {
+                ScrollView(.horizontal) {
+                    HStack { ForEach(0..<20) { Text("Swatch \($0)").frame(width: 80, height: 44) } }
+                }
+                Color.clear.frame(height: 900)
+            }
+        }
+        .modifier(NibSheetChrome())
+        // A caller's horizontal policy must survive the sheet's vertical cue.
+        .scrollIndicators(.hidden)
+        let host = UIHostingController(rootView: content)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 400))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func scrolls(in view: UIView) -> [UIScrollView] {
+            ((view as? UIScrollView).map { [$0] } ?? [])
+                + view.subviews.flatMap { scrolls(in: $0) }
+        }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        let views = scrolls(in: host.view)
+        let vertical = try XCTUnwrap(views.first { $0.contentSize.height > $0.bounds.height + 1 })
+        let horizontal = try XCTUnwrap(views.first { $0.contentSize.width > $0.bounds.width + 1 })
+        XCTAssertTrue(vertical.showsVerticalScrollIndicator)
+        XCTAssertFalse(horizontal.showsHorizontalScrollIndicator,
+                       "Sheet chrome must not make thumbnail and swatch strips show indicators")
+    }
+
     func testNativePopoverActionRemainsHittableAndTracksDisabledStateAcrossRefresh() async throws {
         var count = 0
         func content(_ enabled: Bool) -> AnyView {

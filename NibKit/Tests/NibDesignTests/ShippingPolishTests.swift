@@ -157,6 +157,32 @@ final class ShippingPolishTests: XCTestCase {
         XCTAssertGreaterThan(accessible.height, narrow.height)
     }
 
+    func testFittingSegmentsShareNarrowRowsAndPreserveAccessibleFallback() {
+        let tabs = ["Pages", "Outline", "Bookmarks"]
+        let control = NibSegmentedControl(selection: .constant("Pages"), options: tabs, sizing: .fitting) { $0 }
+        for direction in [LayoutDirection.leftToRight, .rightToLeft] {
+            let size = NibSnapshot.fittingSize(control.environment(\.layoutDirection, direction), width: 240)
+            XCTAssertEqual(size.width, 240, accuracy: 1)
+            XCTAssertEqual(size.height, NibMetrics.hitTarget, accuracy: 1,
+                           "The 240 pt page switcher must remain a single row")
+        }
+        let tooNarrow = NibSnapshot.fittingSize(control, width: 100)
+        XCTAssertLessThanOrEqual(tooNarrow.width, 100)
+        XCTAssertGreaterThanOrEqual(tooNarrow.height, 3 * NibMetrics.hitTarget)
+        let accessible = NibSnapshot.fittingSize(control, width: 240, variant: .largeText)
+        XCTAssertLessThanOrEqual(accessible.width, 240)
+        XCTAssertGreaterThanOrEqual(accessible.height, 3 * NibMetrics.hitTarget)
+
+        for labels in [["Left", "Centre", "Right", "Justify"], ["Auto", "1.15", "1.5", "2"],
+                       ["Always ask", "Ask for destructive changes", "Allow all changes"]] {
+            let fitting = NibSegmentedControl(selection: .constant(labels[0]), options: labels, sizing: .fitting) { $0 }
+            let size = NibSnapshot.fittingSize(fitting, width: 280)
+            XCTAssertEqual(size.width, 280, accuracy: 1, "Paragraph rows must align at the right edge")
+            XCTAssertEqual(size.height, NibMetrics.hitTarget, accuracy: 1,
+                           "Long labels truncate at the existing type size instead of forcing a stack")
+        }
+    }
+
     func testPanelHeaderPreservesLongProviderAndKeyInformation() {
         let header = NibPanelHeader(title: "Assistant",
             subtitle: "OpenAI-compatible provider · Local language model · API key is not configured",
