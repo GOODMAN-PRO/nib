@@ -1153,6 +1153,21 @@ final class ContractsV2Tests: XCTestCase {
         XCTAssertFalse(w.isReadOnly(doc))
     }
 
+    func testHeadReadStampTracksDirectEditsWritesAndRemoval() throws {
+        let h = Harness()
+        let persistence = h.persistence
+        let initial = try XCTUnwrap(persistence.headReadStamp(doc))
+        XCTAssertEqual(persistence.headReadStamp(doc), initial)
+        persistence.heads[doc]?.pages.reverse()
+        let edited = try XCTUnwrap(persistence.headReadStamp(doc))
+        XCTAssertNotEqual(edited, initial, "Direct fixture edits must invalidate read caches too")
+        let head = try persistence.loadHead(doc)
+        persistence.didChange(doc, head: head, pages: [:])
+        XCTAssertNotEqual(persistence.headReadStamp(doc), edited)
+        persistence.heads[doc] = nil
+        XCTAssertNil(persistence.headReadStamp(doc), "A removed head cannot validate an older cached snapshot")
+    }
+
     func testWindowShowLibraryUsesTheNavigator() async throws {
         let h = Harness()
         do {

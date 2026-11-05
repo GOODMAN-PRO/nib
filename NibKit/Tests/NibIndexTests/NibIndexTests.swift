@@ -311,8 +311,68 @@ final class NibIndexTests: XCTestCase {
         let indexed = await indexer.indexDocument(doc)
         XCTAssertEqual(indexed, 0)
         XCTAssertEqual(counting.itemLoads, 96)
-        XCTAssertLessThanOrEqual(counting.headLoads, 4, "one initial head plus one after each 32-page yield")
+        XCTAssertLessThanOrEqual(counting.headLoads, 2, "stamp validation must reuse the head after every yield")
         XCTAssertFalse(h.app.workspace.isLoaded(doc))
+    }
+
+    func testCompletedDeletionDuringUnchangedPageYieldCannotRestoreRowsOrPositions() async throws {
+        // First yield: the old pass must not re-extract the now-deleted later page. Final yield: it must not
+        // overwrite the remaining pages' positions using its old head. Also exercise providers without stamps.
+        for knowsStamps in [true, false] {
+            for yieldIndex in [0, 2] {
+                let (h, indexer) = harness()
+                let doc = Fixtures.docID
+                var head = try XCTUnwrap(h.persistence.heads[doc])
+                head.pages = (0..<3).map { i in
+                    PageRecord(id: NibID("YIELDPAGE00\(i)"), order: String(i), size: .a4)
+                }
+                let pages = head.pages
+                h.persistence.heads[doc] = head
+                for (page, text) in zip(pages, ["Yieldanchor", "Yieldvanishing", "Yieldtail"]) {
+                    h.persistence.pageItems[doc, default: [:]][page.id] = [
+                        Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 10, w: 100, h: 30), text: RichText(plain: text)))
+                    ]
+                }
+                await indexer.indexDocument(doc)
+                let counting = CountingIndexPersistence(base: h.persistence)
+                counting.knowsHeadStamps = knowsStamps
+                h.app.workspace.persistence = counting
+                let entered = expectation(description: "Unchanged page reached cooperative yield")
+                let resume = expectation(description: "Deletion indexing completed during yield")
+                let finished = expectation(description: "Older pass finished")
+                var suspended = false
+                indexer.yieldAfterPage = { _, page in
+                    guard page == pages[yieldIndex].id, !suspended else { await Task.yield(); return }
+                    suspended = true
+                    XCTAssertEqual(indexer.extractionsInFlight, 0, "This is not the extraction-wait refresh path")
+                    entered.fulfill()
+                    await self.fulfillment(of: [resume], timeout: 2)
+                }
+                let sweep = Task { @MainActor in
+                    let units = await indexer.indexDocument(doc)
+                    XCTAssertEqual(units, 0, "Every live page was already indexed before the yield")
+                    finished.fulfill()
+                }
+                defer { sweep.cancel(); indexer.yieldAfterPage = { _, _ in await Task.yield() } }
+                await fulfillment(of: [entered], timeout: 2)
+                head.pages[1].deleted = true
+                head.pages[1].rev = Rev(wallMs: 10, counter: 0, device: 8)
+                head.pages[0].order = "z"
+                head.pages[0].rev = Rev(wallMs: 11, counter: 0, device: 8)
+                h.persistence.heads[doc] = head
+                await indexer.indexPage(doc, pages[1].id, head: head)
+                XCTAssertNil(indexer.db?.version(doc: doc, key: pages[1].id.raw))
+                XCTAssertEqual(indexer.extractionsInFlight, 0, "Deletion is complete before the older pass resumes")
+                resume.fulfill()
+                await fulfillment(of: [finished], timeout: 2)
+                XCTAssertNil(indexer.db?.version(doc: doc, key: pages[1].id.raw))
+                let vanished = results(try await h.run("search.text", ["query": "Yieldvanishing"]))
+                XCTAssertTrue(vanished.isEmpty)
+                let anchor = results(try await h.run("search.text", ["query": "Yieldanchor"]))
+                XCTAssertEqual(anchor.first?["pageIndex"]?.intValue, 1)
+                XCTAssertFalse(h.app.workspace.isLoaded(doc))
+            }
+        }
     }
 
     private var strokeRef: String { NodeRef.item(Fixtures.docID, Fixtures.page1, Fixtures.strokeID).description }
@@ -1200,9 +1260,11 @@ private final class GatedIndexRecognizer: TextRecognizer {
 @MainActor
 private final class CountingIndexPersistence: DocumentPersistence {
     let base: InMemoryPersistence
+    var knowsHeadStamps = true
     private(set) var headLoads = 0
     private(set) var itemLoads = 0
     init(base: InMemoryPersistence) { self.base = base }
+    func headReadStamp(_ doc: DocumentID) -> String? { knowsHeadStamps ? base.headReadStamp(doc) : nil }
     func loadHead(_ doc: DocumentID) throws -> DocumentContent {
         headLoads += 1
         return try base.loadHead(doc)

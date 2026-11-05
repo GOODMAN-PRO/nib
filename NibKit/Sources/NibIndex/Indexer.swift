@@ -41,8 +41,35 @@ enum StableHash {
 struct DocReader {
     let workspace: Workspace
 
+    /// Pass-local: no heads survive a sweep or pin closed documents in the workspace.
+    struct HeadCache {
+        var doc: DocumentID?
+        var head: DocumentContent?
+        var stamp: String?
+        var persistence: ObjectIdentifier?
+    }
+
     func head(_ doc: DocumentID) throws -> DocumentContent {
         try workspace.peekContent(doc)
+    }
+
+    func head(_ doc: DocumentID, cache: inout HeadCache) throws -> DocumentContent {
+        if workspace.isLoaded(doc) {
+            cache = HeadCache()
+            return try head(doc)
+        }
+        let persistence = workspace.persistence
+        let identity = ObjectIdentifier(persistence)
+        let stamp = persistence.headReadStamp(doc)
+        if let stamp, cache.doc == doc, cache.stamp == stamp, cache.persistence == identity,
+           let head = cache.head { return head }
+        cache = HeadCache()
+        let fresh = try head(doc)
+        // A background writer can replace files during the read. Never certify that snapshot with a later stamp.
+        if let stamp, persistence.headReadStamp(doc) == stamp {
+            cache = HeadCache(doc: doc, head: fresh, stamp: stamp, persistence: identity)
+        }
+        return fresh
     }
 
     /// All items of a page, tombstones included.
@@ -532,6 +559,8 @@ final class Indexer {
     let app: NibApp
     /// Quiet period after the last commit before dirty pages are indexed.
     var debounce: TimeInterval = 5
+    /// Injectable cooperative suspension for deterministic tests of changes between unchanged pages.
+    var yieldAfterPage: @MainActor (DocumentID, PageID) async -> Void = { _, _ in await Task.yield() }
     private var database: SearchDatabase?
     private var databaseFailed = false
     private var dirtyPages: [DocumentID: Set<PageID>] = [:]
@@ -836,13 +865,23 @@ final class Indexer {
                                progress: SweepProgress?) async -> DocumentPass {
         var pass = DocumentPass()
         guard let db = db else { return pass }
+        var headCache = DocReader.HeadCache()
         var currentHead = head
+        @MainActor func refreshHead() -> Bool {
+            guard let fresh = try? reader.head(doc, cache: &headCache) else {
+                pass.completed = false
+                return false
+            }
+            currentHead = fresh
+            return true
+        }
+        guard refreshHead() else { return pass }
         indexTitle(doc, kind: currentHead.meta.kind)
         if await indexDocUnit(doc, currentHead: &currentHead, force: force) {
             pass.units += 1
             progress?.unitIndexed()
-            if let fresh = try? reader.head(doc) { currentHead = fresh }
         }
+        guard refreshHead() else { return pass }
         let live = currentHead.livePages
         let liveKeys = Set(live.map { $0.id.raw })
         // Pages that are gone, including ones whose extraction is still running (it finishes before the removal).
@@ -850,8 +889,8 @@ final class Indexer {
         for key in stale.sorted() {
             await removeUnit(doc, key: key)
         }
-        if !stale.isEmpty, let fresh = try? reader.head(doc) { currentHead = fresh }
-        for (offset, page) in live.enumerated() {
+        if !stale.isEmpty, !refreshHead() { return pass }
+        for page in live {
             if shouldStop(pausable: pausable) {
                 pass.completed = false
                 break
@@ -859,14 +898,12 @@ final class Indexer {
             if await indexPage(doc, page.id, currentHead: &currentHead, force: force) {
                 pass.units += 1
                 progress?.unitIndexed()
-                if let fresh = try? reader.head(doc) { currentHead = fresh }
             }
-            // Even unchanged pages synchronously read and hash items. Yield each time to keep the main actor
-            // responsive; batch only head reads (indexPage also refreshes after waiting for another unit).
-            await Task.yield()
-            if (offset + 1) % 32 == 0 {
-                if let fresh = try? reader.head(doc) { currentHead = fresh }
-            }
+            // A deletion can finish indexing during ANY yield, even when this page needed no extraction.
+            // Revalidate after the final yield too, before writing page positions. Reliable persistence stamps
+            // make unchanged reads cheap; a provider without a stamp must be read again rather than trusted.
+            await yieldAfterPage(doc, page.id)
+            guard refreshHead() else { return pass }
         }
         updatePageIndexes(doc, head: currentHead)
         return pass

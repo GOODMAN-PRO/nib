@@ -8,6 +8,10 @@ import Foundation
 public protocol DocumentPersistence: AnyObject {
     /// Loads and merges the document head from every device file. Throws `not_found`.
     func loadHead(_ doc: DocumentID) throws -> DocumentContent
+    /// Cheap validation token for `loadHead`, or nil when no reliable token is available. Must change when
+    /// ANY input to the merged head changes (disk, WAL, queued/pending writes, or effective revision ordering).
+    /// Callers validate before and after reading, and must scope cached heads to this persistence instance.
+    func headReadStamp(_ doc: DocumentID) -> String?
     /// Loads and merges all items of a page, tombstones included.
     func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item]
     /// Called on the main actor after every commit/merge. `head` is nil when unchanged; `pages` holds the
@@ -32,6 +36,7 @@ public protocol DocumentPersistence: AnyObject {
 
 @MainActor
 public extension DocumentPersistence {
+    func headReadStamp(_ doc: DocumentID) -> String? { nil }
     func isReadOnly(_ doc: DocumentID) -> Bool { false }
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? { nil }
     func contentFingerprint(_ doc: DocumentID, page: PageID) -> String? { nil }
@@ -39,7 +44,10 @@ public extension DocumentPersistence {
 
 @MainActor
 public final class InMemoryPersistence: DocumentPersistence {
-    public var heads: [DocumentID: DocumentContent] = [:]
+    public var heads: [DocumentID: DocumentContent] = [:] {
+        didSet { headGeneration &+= 1 }
+    }
+    private var headGeneration: UInt64 = 0
     public var pageItems: [DocumentID: [PageID: [Item]]] = [:]
     public let root: URL
 
@@ -51,6 +59,10 @@ public final class InMemoryPersistence: DocumentPersistence {
     public func loadHead(_ doc: DocumentID) throws -> DocumentContent {
         guard let h = heads[doc] else { throw NibError.notFound("document \(doc)") }
         return h
+    }
+
+    public func headReadStamp(_ doc: DocumentID) -> String? {
+        heads[doc] == nil ? nil : String(headGeneration)
     }
 
     public func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
