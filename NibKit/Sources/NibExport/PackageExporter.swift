@@ -21,7 +21,7 @@ struct ExportOmission: Codable, Equatable {
 
     static func sidecar(_ url: URL) -> URL { url.appendingPathExtension("nib-export-report.json") }
     static func read(_ urls: [URL]) -> [Self] {
-        urls.flatMap { url in
+        urls.flatMap { url -> [ExportOmission] in
             guard let data = try? Data(contentsOf: sidecar(url)),
                   let report = try? JSONDecoder().decode([Self].self, from: data) else { return [] }
             return report
