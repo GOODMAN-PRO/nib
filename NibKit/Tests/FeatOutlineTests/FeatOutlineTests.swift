@@ -720,6 +720,27 @@ final class FeatOutlineTests: XCTestCase {
         try await waitUntil { model.sections.map { $0.kind } == [.custom] }
     }
 
+    func testOutlineAndBookmarkAspectsUseDisplayedPageSizeAfterRotation() async throws {
+        for rotation in [0, 90, 180, 270] {
+            let h = harness()
+            var content = try XCTUnwrap(h.persistence.heads[doc])
+            let index = try XCTUnwrap(content.pages.firstIndex { $0.id == Fixtures.page1 })
+            content.pages[index].size = PageSize(842, 595)
+            content.pages[index].rotation = rotation
+            content.pages[index].bookmarked = true
+            h.persistence.heads[doc] = content
+            let expected = CGFloat(842.0 / 595.0)
+            XCTAssertEqual(PageGeometry.aspect(content.pages[index]), expected)
+            let row = try XCTUnwrap(BookmarkRow.rows(content, current: Fixtures.page1).first)
+            XCTAssertEqual(row.aspect, expected)
+            let model = OutlinePanelModel(app: h.app, session: h.session)
+            try await waitUntil { !model.sections.isEmpty }
+            XCTAssertEqual(model.aspect(Fixtures.page1), expected)
+        }
+        XCTAssertEqual(PageGeometry.aspect(nil), CGFloat(595.28 / 841.89))
+        XCTAssertEqual(PageGeometry.aspect(PageRecord(order: "V", size: PageSize(0, 0))), CGFloat(595.28 / 841.89))
+    }
+
     func testBookmarkControlHitTargetCoversPreviewTitleAndWhitespace() throws {
         let control = BookmarkRowControl()
         var activations = 0
