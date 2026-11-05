@@ -91,6 +91,54 @@ final class NibStoreTests: XCTestCase {
         XCTAssertEqual(Set(saved.map(\.id)), Set((items[Fixtures.page1] ?? []).map(\.id) + [added.id]))
     }
 
+    func testPageEnumerationFailureIsNotCachedAndRecoveredInkSurvivesEditing() throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+        let dir = pageFile(pkg, Fixtures.page1).deletingLastPathComponent()
+        let backup = pkg.appendingPathComponent("saved-page", isDirectory: true)
+        try FileManager.default.moveItem(at: dir, to: backup)
+        // A plain file deterministically fails directory enumeration without relying on simulator permissions.
+        try Data("directory unavailable".utf8).write(to: dir)
+        let workspace = Workspace(clock: HLCClock(device: 10), persistence: store, events: EventBus())
+        XCTAssertThrowsError(try workspace.allItems(doc, page: Fixtures.page1))
+        XCTAssertFalse(workspace.isPageCached(doc, page: Fixtures.page1))
+        XCTAssertNil(store.contentRevision(doc, page: Fixtures.page1))
+        store.flush(doc)
+        try FileManager.default.removeItem(at: dir)
+        try FileManager.default.moveItem(at: backup, to: dir)
+        var recovered = try workspace.allItems(doc, page: Fixtures.page1)
+        let added = walStroke("AFTERLISTRECOVERY")
+        recovered.append(added)
+        store.didChange(doc, head: nil, pages: [Fixtures.page1: recovered])
+        try store.checkpoint(doc)
+        let saved = try lib.store("0000000a").loadItems(doc, page: Fixtures.page1)
+        XCTAssertEqual(Set(saved.map(\.id)), Set((items[Fixtures.page1] ?? []).map(\.id) + [added.id]))
+    }
+
+    func testUnwrittenPageIsEmptyButMissingPackageIsNot() throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        let doc = Fixtures.docID
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page1), [])
+        try FileManager.default.createDirectory(at: pkg.appendingPathComponent("pages"), withIntermediateDirectories: true)
+        XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page1), [])
+        let placeholder = pkg.appendingPathComponent("pages/." + Fixtures.page1.raw + ".icloud")
+        try Data().write(to: placeholder)
+        XCTAssertThrowsError(try store.loadItems(doc, page: Fixtures.page1),
+                             "an evicted page directory is not an unwritten page")
+        try FileManager.default.removeItem(at: placeholder)
+        try FileManager.default.removeItem(at: pkg)
+        XCTAssertThrowsError(try store.loadItems(doc, page: Fixtures.page1))
+    }
+
     func testIndexSweepDoesNotRetainClosedPackageSnapshots() throws {
         let lib = TestLibrary()
         defer { try? FileManager.default.removeItem(at: lib.root) }
@@ -335,10 +383,14 @@ final class NibStoreTests: XCTestCase {
         store.write(doc, synchronously: false)
         store.waitForIO()
         XCTAssertTrue(store.wal.read(doc).isEmpty)
+        XCTAssertThrowsError(try store.loadItems(doc, page: Fixtures.page2))
+        XCTAssertNil(store.contentRevision(doc, page: Fixtures.page2))
+        try FileManager.default.removeItem(at: blocked)
+        // The directory is readable again, but neither the package write nor WAL append has succeeded.
+        // The complete retained snapshot is still the only copy of this stroke.
         XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [stroke])
         XCTAssertEqual(store.contentRevision(doc, page: Fixtures.page2), stroke.rev)
 
-        try FileManager.default.removeItem(at: blocked)
         try FileManager.default.removeItem(at: store.wal.directory)
         store.flush(doc)
         XCTAssertEqual(try lib.store("0000000a").loadItems(doc, page: Fixtures.page2), [stroke])
@@ -444,6 +496,52 @@ final class NibStoreTests: XCTestCase {
         XCTAssertEqual(try lib.store("0000000a").loadItems(doc, page: Fixtures.page2), [stroke])
     }
 
+    func testCheckpointRecoversWALBeforeCopyingAnUnopenedPackage() throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let writer = lib.store("0000000a")
+        writer.didChange(doc, head: content, pages: items)
+        writer.flush(doc)
+        var head = content
+        head.meta.favorite = true
+        head.meta.rev = HLCClock(device: 10).tick()
+        let added = walStroke("UNOPENEDWALINK")
+        // A terminated process leaves only a delta in the WAL and stale package files.
+        try writer.wal.append(WriteAheadLog.Entry(head: head, pages: [Fixtures.page1.raw: [added]]), doc: doc)
+        let relaunched = lib.store("0000000a")
+        XCTAssertTrue(relaunched.retainedReadDocuments.isEmpty)
+        let own = pageFile(pkg, Fixtures.page1)
+        let original = try Data(contentsOf: own)
+        try Data("temporary read failure".utf8).write(to: own)
+        XCTAssertThrowsError(try relaunched.checkpoint(doc))
+        XCTAssertFalse(relaunched.wal.read(doc).isEmpty)
+        try original.write(to: own)
+        // Recovery can now read every page, but acknowledging the checkpoint still requires a durable head.
+        let headURL = pkg.appendingPathComponent("doc.0000000a.json")
+        let originalHead = try Data(contentsOf: headURL)
+        try FileManager.default.removeItem(at: headURL)
+        try FileManager.default.createDirectory(at: headURL, withIntermediateDirectories: false)
+        try Data("blocks head replacement".utf8).write(to: headURL.appendingPathComponent("blocked"))
+        XCTAssertThrowsError(try relaunched.checkpoint(doc))
+        XCTAssertFalse(relaunched.wal.read(doc).isEmpty, "failed recovery writes must retain the WAL")
+        try FileManager.default.removeItem(at: headURL)
+        try originalHead.write(to: headURL)
+        try relaunched.checkpoint(doc)
+        XCTAssertTrue(relaunched.wal.read(doc).isEmpty)
+        XCTAssertTrue(relaunched.retainedReadDocuments.isEmpty, "checkpoint does not open or consume remote state")
+        // The library's duplicate path checkpoints then copies package bytes. Keep that boundary here: this
+        // module's test target intentionally does not depend on NibLibrary.
+        let duplicate = lib.root.appendingPathComponent("Duplicate.nibnote", isDirectory: true)
+        try FileManager.default.copyItem(at: pkg, to: duplicate)
+        let copiedHead = try PackageCodec.decodeHead(Data(contentsOf: duplicate.appendingPathComponent("doc.0000000a.json")))
+        let copiedItems = try PackageCodec.decodeItems(Data(contentsOf: pageFile(duplicate, Fixtures.page1)))
+        XCTAssertTrue(copiedHead.meta.favorite)
+        XCTAssertEqual(Set(copiedItems.map(\.id)), Set((items[Fixtures.page1] ?? []).map(\.id) + [added.id]))
+    }
+
     func testLogIsNotTruncatedWhileFailedChangesAreNotOnDisk() throws {
         let lib = TestLibrary()
         let (content, items) = Fixtures.sampleContent()
@@ -465,11 +563,15 @@ final class NibStoreTests: XCTestCase {
         XCTAssertEqual(store.wal.read(doc).count, 2, "nothing is truncated while the failed page is not on disk")
 
         let relaunched = lib.store("0000000a")
+        XCTAssertThrowsError(try relaunched.loadHead(doc), "WAL deltas cannot replace an unreadable page snapshot")
+        XCTAssertThrowsError(try relaunched.loadItems(doc, page: Fixtures.page2))
+        XCTAssertEqual(relaunched.wal.read(doc).count, 2)
+        XCTAssertTrue(relaunched.retainedReadDocuments.isEmpty)
+        try FileManager.default.removeItem(at: blocked)
         XCTAssertTrue(try relaunched.loadHead(doc).meta.favorite)
         XCTAssertEqual(try relaunched.loadItems(doc, page: Fixtures.page2).map(\.id), ["FAILEDWRITE2"])
 
         // Once the page can be written, the replayed changes reach the disk and the log is truncated.
-        try FileManager.default.removeItem(at: blocked)
         relaunched.flush(doc)
         XCTAssertTrue(relaunched.wal.read(doc).isEmpty)
         XCTAssertEqual(try PackageCodec.decodeItems(Data(contentsOf: pageFile(pkg, Fixtures.page2))).map(\.id),

@@ -693,7 +693,7 @@ final class FolderWatcher {
     private var pendingFull = false
     private var running: Task<SyncReport, Never>?
     private var polls = 0
-    private var downloadsPending = false
+    private(set) var downloadsPending = false
     private var rootRecoveryInFlight = false
     /// Checks run so far (tests and diagnostics).
     private(set) var checks = 0
@@ -1023,10 +1023,13 @@ final class FolderWatcher {
                     let error = NibError.wrap(error)
                     report.errors.append(SyncIssue(doc: nil, code: error.code.rawValue, message: error.message))
                     setStatus(nil, state: "error", reason: "refreshFailed", message: error.message)
+                    downloadsPending = waiting
+                    lastReport = report
                     return report
                 }
                 guard rootGeneration == generation, library.rootURL.standardizedFileURL == root else { return report }
                 report.refreshed = true
+                if statuses[""]?.reason == "refreshFailed" { setStatus(nil, state: "idle") }
                 // Packages may have moved: point their presenters at the new places.
                 for (doc, presenter) in packagePresenters {
                     if let url = app.services.packages.url(doc), presenter.presentedItemURL?.standardizedFileURL != url.standardizedFileURL {
@@ -1055,6 +1058,7 @@ final class FolderWatcher {
                 try await refreshCatalog(library, app: app)
                 guard rootGeneration == generation, library.rootURL.standardizedFileURL == root else { return report }
                 report.refreshed = true
+                if statuses[""]?.reason == "refreshFailed" { setStatus(nil, state: "idle") }
             } catch {
                 guard rootGeneration == generation, library.rootURL.standardizedFileURL == root else { return report }
                 let error = NibError.wrap(error)

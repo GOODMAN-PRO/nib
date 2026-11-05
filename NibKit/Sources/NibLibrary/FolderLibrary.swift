@@ -875,7 +875,8 @@ final class FolderLibrary: LibraryService {
         while true {
             try Task.checkCancellation()
             let gen = generation
-            let job = scanner(previous: catalog.byPath)
+            var job = scanner(previous: catalog.byPath)
+            job.reuse = FileManager.default.fileExists(atPath: cacheURL.path)
             let (result, names, offMain) = try await Task.detached(priority: .utility) {
                 _ = try FileManager.default.contentsOfDirectory(at: job.root, includingPropertiesForKeys: nil)
                 return (job.scanAll(), prefs.reload(), !Thread.isMainThread)

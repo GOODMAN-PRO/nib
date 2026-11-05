@@ -571,10 +571,24 @@ struct PackageFiles {
     }
 
     /// Item files of one page (none when the page has never been written).
-    func pageSources(_ pkg: URL, page: PageID) -> [Source] {
+    func pageSources(_ pkg: URL, page: PageID) throws -> [Source] {
         let dir = pkg.appendingPathComponent(PackageCodec.pageDirectory(page), isDirectory: true)
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        let names = try pageDirectoryContents(dir, package: pkg)
         return sources(names, in: dir, role: PackageCodec.pageRole)
+    }
+
+    /// Missing page folders are normal. Confirm absence by listing the parent: an inaccessible folder (or
+    /// package) must never look like a new empty page, even if its provider reports it as missing.
+    private func pageDirectoryContents(_ dir: URL, package: URL) throws -> [String] {
+        do {
+            return try FileManager.default.contentsOfDirectory(atPath: dir.path)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            guard dir.standardizedFileURL != package.standardizedFileURL else { throw error }
+            let parent = try pageDirectoryContents(dir.deletingLastPathComponent(), package: package)
+            guard !parent.contains(dir.lastPathComponent),
+                  !parent.contains("." + dir.lastPathComponent + ".icloud") else { throw error }
+            return []
+        }
     }
 
     private func sources(_ names: [String], in dir: URL, role: (String) -> PackageCodec.Role?) -> [Source] {

@@ -678,7 +678,7 @@ enum DocumentMerger {
                 if let t = face.text { for a in AssetRemap.attachments(t) { assets.insert(a) } }
             }
         }
-        let knownClips = Set(dst.audio.map { $0.id })
+        let knownClips = Set(dst.liveAudio.map { $0.id })
         let clips = src.liveAudio.filter { !knownClips.contains($0.id) }
 
         // Copy asset and audio bytes off the main actor (a dry run copies nothing).
@@ -778,7 +778,8 @@ enum DocumentMerger {
                     let after = try tx.content(target)
                     let pages = Set(beforeMerge.pages.map(\.id))
                     let outline = Set(beforeMerge.outline.map(\.id))
-                    let audio = Set(beforeMerge.audio.map(\.id))
+                    let audio = Dictionary(uniqueKeysWithValues: beforeMerge.audio.map { ($0.id, $0) })
+                    let copiedAudio = Set(clips.map(\.id))
                     let blocks = Set(beforeMerge.blocks.map(\.id))
                     let cards = Set(beforeMerge.cards.map(\.id))
                     for var record in after.pages where !pages.contains(record.id) {
@@ -789,8 +790,12 @@ enum DocumentMerger {
                         record.deleted = true
                         try tx.put(record, doc: target)
                     }
-                    for var record in after.audio where !audio.contains(record.id) {
-                        record.deleted = true
+                    for var record in after.audio where copiedAudio.contains(record.id) {
+                        if let previous = audio[record.id] {
+                            record = previous
+                        } else {
+                            record.deleted = true
+                        }
                         try tx.put(record, doc: target)
                     }
                     for var record in after.blocks where !blocks.contains(record.id) {

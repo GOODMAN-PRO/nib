@@ -198,6 +198,10 @@ final class PackagePersistence: DocumentPersistence {
     // MARK: Loading
 
     func loadHead(_ doc: DocumentID) throws -> DocumentContent {
+        try readHead(doc, remembering: true)
+    }
+
+    private func readHead(_ doc: DocumentID, remembering: Bool) throws -> DocumentContent {
         let pkg = try files.package(doc)
         let now = PackageCodec.ms(Date())
         // Snapshot BEFORE reading the log/files: a completed write may truncate the log and retire its snapshot
@@ -226,9 +230,6 @@ final class PackagePersistence: DocumentPersistence {
             log.error("\(doc.raw, privacy: .public) has format \(format) > \(NibFormat.version): read-only")
             emit(doc, StoreStatus.newerFormat)
         }
-        known[doc] = Known(head: head)
-        seen[doc] = read.stamps
-
         // Replay: pages logged but not written before the app died, merged over what the device files hold.
         var recovered: [PageID: [Item]] = [:]
         for entry in logged {
@@ -251,7 +252,11 @@ final class PackagePersistence: DocumentPersistence {
             pending[doc] = p
             scheduleWrite(doc)
         }
-        retainReadCache(doc)
+        if remembering {
+            known[doc] = Known(head: head)
+            seen[doc] = read.stamps
+            retainReadCache(doc)
+        }
         return head
     }
 
@@ -281,7 +286,7 @@ final class PackagePersistence: DocumentPersistence {
                             now: UInt64) throws -> (items: [Item], read: PackageFiles.ReadResult<[Item]>) {
         let queued = readable.snapshot(doc)
         let logged = wal.read(doc)
-        let read = files.read(files.pageSources(pkg, page: page), in: PackageCodec.pageDirectory(page),
+        let read = files.read(try files.pageSources(pkg, page: page), in: PackageCodec.pageDirectory(page),
                               decode: PackageCodec.decodeItems) { PackageCodec.hasFutureRev($0, now: now) }
         report(doc, read)
         guard read.ownFailures.isEmpty else {
@@ -341,6 +346,11 @@ final class PackagePersistence: DocumentPersistence {
 
     /// Operations that copy package bytes must know that every pending edit reached those bytes.
     func checkpoint(_ doc: DocumentID) throws {
+        if gate.contains(doc) { throw ReadOnlyGate.refusal(doc) }
+        // Finish queued log appends before inspecting recovery obligations. A newly launched store may have
+        // no in-memory writes at all; replay its WAL into full snapshots before copying package bytes.
+        waitForIO()
+        if !wal.read(doc).isEmpty { _ = try readHead(doc, remembering: false) }
         if gate.contains(doc) { throw ReadOnlyGate.refusal(doc) }
         if let error = write(doc, synchronously: true) { throw error }
     }
@@ -470,7 +480,7 @@ final class PackagePersistence: DocumentPersistence {
         if let kept = queued?.pages[page] { unwritten.append(kept) }
         if let items = pending[doc]?.pages[page] { unwritten.append(items) }
 
-        let sources = files.pageSources(pkg, page: page)
+        guard let sources = try? files.pageSources(pkg, page: page) else { return nil }
         let stamps = Dictionary(sources.map { ($0.name, $0.stamp) }, uniquingKeysWith: { first, _ in first })
         if unwritten.isEmpty, let cached = fileRevisions[doc]?[page], cached.stamps == stamps { return cached.rev }
         let now = PackageCodec.ms(Date())
@@ -531,7 +541,7 @@ final class PackagePersistence: DocumentPersistence {
         var pageCopies: [PageID: [URL]] = [:]
         for (page, revs) in k.itemRevs {
             let dir = PackageCodec.pageDirectory(page)
-            let read = files.read(changed(files.pageSources(pkg, page: page), in: dir), in: dir,
+            let read = files.read(changed(try files.pageSources(pkg, page: page), in: dir), in: dir,
                                   decode: PackageCodec.decodeItems) { PackageCodec.hasFutureRev($0, now: now) }
             report(doc, read)
             stamps.merge(read.stamps) { _, new in new }
@@ -542,9 +552,6 @@ final class PackagePersistence: DocumentPersistence {
             }
             if !read.copies.isEmpty { pageCopies[page] = read.copies }
         }
-        seen[doc] = stamps
-        known[doc] = k
-
         // Merged conflict copies go into this device's files, then they are deleted.
         if !gate.contains(doc), !headCopies.isEmpty || !pageCopies.isEmpty {
             var p = pending[doc] ?? PendingWrite()
@@ -559,6 +566,10 @@ final class PackagePersistence: DocumentPersistence {
             pending[doc] = p
             scheduleWrite(doc)
         }
+        // Publish consumption only once every throwing read above has succeeded. Otherwise the next poll must
+        // return the entire patch again, including head changes read before a failed conflict-copy merge.
+        seen[doc] = stamps
+        known[doc] = k
         return patch.isEmpty ? nil : patch
     }
 

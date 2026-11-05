@@ -667,21 +667,61 @@ final class NibLibraryTests: XCTestCase {
         let lib = try await makeLibrary()
         let source = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Source", "cover": false]))
         let target = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Target", "cover": false]))
+        lib.h.app.workspace.close(source)
+        var sourceHead = try XCTUnwrap(lib.head(source))
+        var clip = AudioClip(id: "RETRYAUDIO01", name: "Recording", file: "audio/RETRYAUDIO01.caf",
+                             start: 0, duration: 12, page: sourceHead.livePages.first?.id)
+        clip.transcriptFile = "transcripts/RETRYAUDIO01"
+        clip.language = "en"
+        clip.summary = "Keep this summary"
+        sourceHead.audio.append(clip)
+        lib.persistence.didChange(source, head: sourceHead, pages: [:])
+        let audioBytes = Data("recording bytes retained across retries".utf8)
+        let transcriptBytes = Data("{\"text\":\"Keep these words\"}".utf8)
+        let transcriptPath = "transcripts/RETRYAUDIO01.00000007.json"
+        try audioBytes.write(to: lib.persistence.fileURL(source, relativePath: clip.file))
+        try transcriptBytes.write(to: lib.persistence.fileURL(source, relativePath: transcriptPath))
         let before = try lib.h.app.workspace.content(target)
-        let sourcePages = try lib.h.app.workspace.content(source).livePages.count
+        let sourcePages = sourceHead.livePages.count
         let trash = lib.library.metadataURL.appendingPathComponent("trash", isDirectory: true)
         if FileManager.default.fileExists(atPath: trash.path) { try FileManager.default.removeItem(at: trash) }
         try Data("blocked trash".utf8).write(to: trash)
         let params: JSONValue = ["source": .string("doc:\(source.raw)"), "into": .string("doc:\(target.raw)")]
-        do {
-            try await lib.run("doc.merge", params)
-            XCTFail("The failed trash move must be reported")
-        } catch {}
-        XCTAssertEqual(try lib.h.app.workspace.content(target).livePages, before.livePages)
-        XCTAssertNil(lib.library.node(source)?.trashedAt)
+        var priorTombstone: AudioClip?
+        for _ in 0..<2 {
+            do {
+                try await lib.run("doc.merge", params)
+                XCTFail("The failed trash move must be reported")
+            } catch {}
+            let failed = try lib.h.app.workspace.content(target)
+            XCTAssertEqual(failed.livePages, before.livePages)
+            XCTAssertEqual(failed.liveAudio, before.liveAudio)
+            var tombstone = try XCTUnwrap(failed.audio.first { $0.id == clip.id })
+            XCTAssertTrue(tombstone.deleted)
+            if let previous = priorTombstone {
+                // Restoring the old payload needs a fresh revision to beat the attempted resurrection.
+                XCTAssertGreaterThan(tombstone.rev, previous.rev)
+                tombstone.rev = previous.rev
+                XCTAssertEqual(tombstone, previous)
+            }
+            priorTombstone = failed.audio.first { $0.id == clip.id }
+            XCTAssertNil(lib.library.node(source)?.trashedAt)
+            XCTAssertEqual(try Data(contentsOf: lib.persistence.fileURL(source, relativePath: clip.file)), audioBytes)
+            XCTAssertEqual(try Data(contentsOf: lib.persistence.fileURL(source, relativePath: transcriptPath)), transcriptBytes)
+        }
         try FileManager.default.removeItem(at: trash)
         try await lib.run("doc.merge", params)
-        XCTAssertEqual(try lib.h.app.workspace.content(target).livePages.count, before.livePages.count + sourcePages)
+        let merged = try lib.h.app.workspace.content(target)
+        XCTAssertEqual(merged.livePages.count, before.livePages.count + sourcePages)
+        let copied = try XCTUnwrap(merged.liveAudio.first)
+        XCTAssertEqual(merged.liveAudio.count, 1)
+        XCTAssertEqual(copied.id, clip.id)
+        XCTAssertEqual(copied.language, clip.language)
+        XCTAssertEqual(copied.summary, clip.summary)
+        XCTAssertEqual(copied.transcriptFile, clip.transcriptFile)
+        XCTAssertEqual(copied.page, merged.livePages.last?.id)
+        XCTAssertEqual(try Data(contentsOf: lib.persistence.fileURL(target, relativePath: copied.file)), audioBytes)
+        XCTAssertEqual(try Data(contentsOf: lib.persistence.fileURL(target, relativePath: transcriptPath)), transcriptBytes)
         XCTAssertNotNil(lib.library.node(source)?.trashedAt)
         XCTAssertEqual(lib.h.undoDepth(target), 0)
     }
@@ -1235,6 +1275,14 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testRefreshRebuildsADeletedCatalog() async throws {
+        try await checkDeletedCatalogRefresh(background: false)
+    }
+
+    func testAwaitedRefreshRebuildsADeletedCatalog() async throws {
+        try await checkDeletedCatalogRefresh(background: true)
+    }
+
+    private func checkDeletedCatalogRefresh(background: Bool) async throws {
         let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Rebuilt"]))
         lib.library.saveCacheNow()
@@ -1250,7 +1298,11 @@ final class NibLibraryTests: XCTestCase {
         theirs.meta.rev = Rev(wallMs: theirs.meta.rev.wallMs + 1, counter: 0, device: 11)
         try PackageIO.encoder().encode(theirs).write(to: pkg.appendingPathComponent("doc.0000000b.json"))
         if let stamp = stamp { try FileManager.default.setAttributes([.modificationDate: stamp], ofItemAtPath: pkg.path) }
-        lib.library.refresh()
+        if background {
+            try await lib.library.refreshCatalog()
+        } else {
+            lib.library.refresh()
+        }
         XCTAssertEqual(lib.library.node(d)?.favorite, true)
         XCTAssertEqual(lib.library.node(d)?.id, d)
         lib.library.saveCacheNow()
