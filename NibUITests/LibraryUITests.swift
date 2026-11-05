@@ -14,6 +14,7 @@ final class LibraryUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
         try ui.launchFixture()
         try visible(item(physics), "Seeded library must be ready")
     }
@@ -73,7 +74,13 @@ final class LibraryUITests: XCTestCase {
         try ui.timedAction("Library tap \(label)") { try self.performTap(label, file: file, line: line) }
     }
     private func performTap(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        let diagnose = ["Move to Trash", "Save to Files"].contains(label)
+        var firstPoll = true
         func candidate() -> XCUIElement? {
+            if diagnose && firstPoll {
+                firstPoll = false
+                ui.recordDiagnostics("Library action first poll", facts: "action=\(label)", includeHierarchy: false)
+            }
             let query = app.buttons.matching(matching(label))
             for index in 0..<min(query.count, 8) {
                 let element = query.element(boundBy: index)
@@ -84,7 +91,19 @@ final class LibraryUITests: XCTestCase {
         if candidate() == nil {
             ui.revealFormElement { self.app.buttons.matching(self.matching(label)).firstMatch }
         }
-        try eventually("Action is not enabled and hittable: \(label)", file: file, line: line) { candidate() != nil }
+        do {
+            try eventually("Action is not enabled and hittable: \(label)", file: file, line: line) { candidate() != nil }
+        } catch {
+            if diagnose {
+                let matches = app.buttons.matching(matching(label)).allElementsBoundByIndex
+                ui.logQA("Library action timeout", "action=\(label) matches=\(matches.count) popovers=\(app.popovers.count) menus=\(app.menus.count) sheets=\(app.sheets.count)")
+                for (index, element) in matches.enumerated() {
+                    ui.logQA("Library action timeout", "match=\(index) " + ui.elementFacts(element, includeOverlaps: true))
+                }
+                ui.recordDiagnostics("Library action timeout screenshot", facts: "action=\(label)", includeHierarchy: false)
+            }
+            throw error
+        }
         guard let target = candidate() else { throw NibUI.Failure.message("Cannot activate \(label)") }
         target.tap()
     }
@@ -583,7 +602,7 @@ final class LibraryUITests: XCTestCase {
     func testFolderStyleColourIconAndFavouritePersist() throws {
         try context(folder, folder: true); try tap("Customise Folder")
         try replace(app.textFields["Hex colour"], with: "#FF8800")
-        try tap("Emoji")
+        try ui.prepareCoveredControl("Emoji"); try tap("Emoji")
         try replace(app.textFields["Emoji"], with: "📚")
         let favourite = app.switches["Show in Favourites"]
         revealFormElement(favourite)
@@ -719,7 +738,16 @@ final class LibraryUITests: XCTestCase {
             previous = frame
             return stable
         }
-        undo.tap()
+        let buttonSnapshot = try undo.snapshot()
+        func labels(_ node: XCUIElementSnapshot) -> [CGRect] {
+            let own = node.elementType == .staticText && node.label == "Undo" ? [node.frame] : []
+            return own + node.children.flatMap { labels($0) }
+        }
+        let buttonFrame = buttonSnapshot.frame
+        ui.logQA("Toast Undo button and label", "button=\(buttonFrame) labels=\(labels(buttonSnapshot))")
+        app.coordinate(withNormalizedOffset: .zero).withOffset(
+            CGVector(dx: buttonFrame.midX - app.frame.minX, dy: buttonFrame.midY - app.frame.minY)).tap()
+        ui.recordDiagnostics("Toast Undo immediately after tap", includeHierarchy: false)
         try eventually("Toast Undo command must restore the document to its original root parent") { self.item(self.physics).exists }
         try openFolder(folder)
         XCTAssertFalse(item(physics).exists, "Undo must remove document from drop destination")

@@ -5,6 +5,7 @@ final class SmokeUITests: XCTestCase {
     func testNotebookInkUndoZoomAndLibrary() throws {
         continueAfterFailure = false
         let ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
         defer {
             let screenshot = XCTAttachment(screenshot: ui.app.screenshot())
             screenshot.lifetime = .keepAlways

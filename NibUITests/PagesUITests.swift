@@ -19,6 +19,7 @@ final class PagesUITests: XCTestCase {
         // The shared runner permits 300 seconds; cold fixture startup is part of each test.
         executionTimeAllowance = 300
         ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
         try ui.launchFixture()
         let fm = FileManager.default
         let containers = URL(fileURLWithPath: NSHomeDirectory()).deletingLastPathComponent()
@@ -179,7 +180,7 @@ final class PagesUITests: XCTestCase {
         try more("Image")
         let photo = try ui.photoAsset(diagnostics: true)
         try require(photo, "Add Page > Image must present selectable Photos assets")
-        photo.tap()
+        try ui.tapPhotoAsset(photo)
         let add = button("Add")
         if add.exists && add.isHittable { add.tap() }
         try count(5)
@@ -283,17 +284,27 @@ final class PagesUITests: XCTestCase {
     }
 
     func testBatchDuplicateAndTrashCancellationScope() throws {
+        diagnoseBatchActions = true
+        defer { diagnoseBatchActions = false; ui.recordDiagnostics("Batch pages completion", includeHierarchy: false) }
         let before = try ids()
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope initial")
         try pages(window: true); try beginSelection(); try tapThumb(1); try tapThumb(2)
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope selected two")
         try selectionAction("Duplicate"); try count(6)
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope duplicated")
         XCTAssertEqual(Set(try ids()).intersection(before).count, 4)
         try tap("Done"); try closeNavigator(); try ui.tapCommand("edit.undo"); try count(4)
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope undo duplicate")
         try pages(window: true); try beginSelection(); try tapThumb(1); try tapThumb(2)
-        try selectionAction("Move to Trash"); try tap("Cancel")
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope selected two")
+        try selectionAction("Move to Trash"); try ui.cancelConfirmation(action: "Move to Trash")
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope cancelled trash")
         XCTAssertEqual(try ids(), before)
         try selectionAction("Move to Trash"); try confirm("Move to Trash"); try count(2)
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope confirmed trash")
         XCTAssertEqual(try ids(), Array(before.suffix(2)))
         try closeNavigator(); try ui.tapCommand("edit.undo"); try count(4)
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope undo trash")
         XCTAssertEqual(try ids(), before)
     }
 
@@ -322,6 +333,7 @@ final class PagesUITests: XCTestCase {
         try pages()
         // iPadOS windowing control places this scene beside the other Nib scene.
         let multitasking = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'multitasking' OR label == 'Window Controls'")).firstMatch
+        ui.diagnoseWindowControls()
         try require(multitasking, "Window controls must allow arranging two Nib windows for page drag").tap()
         try tap("Split View", prefix: true)
         let other = XCUIApplication(bundleIdentifier: "com.apple.springboard").icons["Nib"].firstMatch
@@ -402,7 +414,10 @@ final class PagesUITests: XCTestCase {
         try ui.waitForState { $0.page == first }
         try ui.tapCommand("page.setBookmarked")
         try require(label("No bookmarks"))
-        XCTAssertFalse(try live()[0]["bookmarked"] as? Bool ?? false)
+        try wait("Unbookmark must persist on the current page") {
+            guard let pages = try? self.live(), let first = pages.first else { return false }
+            return first["bookmarked"] as? Bool != true
+        }
     }
 
     func testOutlineAddRenameNavigateAndDeleteRetainsPage() throws {
@@ -497,7 +512,9 @@ final class PagesUITests: XCTestCase {
         try tap("Done")
         try ui.tapCommand("window.showLibrary")
         try tap("App Menu"); try tap("Manage Templates", prefix: true)
-        try ui.waitForState { $0.openPanels.contains("templateui.manage") }
+        try wait("Library must present Notebook Templates with Import Template") {
+            self.label("Notebook Templates").exists && self.button("Import Template").exists
+        }
         try require(button("Import Template"))
         try tap("Covers"); try require(button("No cover"))
     }
@@ -512,7 +529,7 @@ final class PagesUITests: XCTestCase {
         let id = try XCTUnwrap(groups().first { $0["title"] as? String == "Research papers" }?["id"] as? String)
         try replace(ui.app.textFields["Group title"], "Lab papers"); try tap("Rename Group")
         try wait("Rename must preserve group identity") { (try? self.groups().contains { $0["title"] as? String == "Lab papers" && $0["id"] as? String == id }) == true }
-        try tap("Delete Group"); try tap("Cancel")
+        try tap("Delete Group"); try ui.cancelConfirmation(action: "Delete Group")
         XCTAssertTrue(try groups().contains { $0["id"] as? String == id })
         try tap("Delete Group")
         try confirm("Delete Group")
@@ -566,9 +583,15 @@ final class PagesUITests: XCTestCase {
         ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", text)).firstMatch
     }
     private func button(_ text: String, prefix: Bool = false) -> XCUIElement {
-        let query = ui.app.buttons.matching(NSPredicate(format: prefix ? "label BEGINSWITH %@" : "label == %@", text))
-        let matches = query.allElementsBoundByIndex
-        return matches.first { $0.isHittable } ?? matches.first { $0.frame.width > 0 && $0.frame.height > 0 } ?? query.firstMatch
+        let predicate = NSPredicate(format: prefix ? "label BEGINSWITH %@" : "label == %@", text)
+        let queries = [XCUIElement.ElementType.button, .switch, .cell].map {
+            ui.app.descendants(matching: $0).matching(predicate)
+        }
+        let matches = queries.flatMap { $0.allElementsBoundByIndex }.filter { $0.exists }
+        return matches.first { ui.hasVisibleFrame($0) && $0.isHittable }
+            ?? matches.first { ui.hasVisibleFrame($0) }
+            ?? matches.first { $0.frame.width > 0 && $0.frame.height > 0 }
+            ?? matches.first ?? queries[0].firstMatch
     }
     @discardableResult private func require(_ element: XCUIElement, _ message: String = "Required page control missing") throws -> XCUIElement {
         guard element.exists || element.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("\(message): \(element)\n\(ui.app.debugDescription)") }
@@ -593,8 +616,12 @@ final class PagesUITests: XCTestCase {
             if candidate.isHittable && candidate.isEnabled { target = candidate }
         }
         guard let target else { throw NibUI.Failure.message("Button cannot be used: \(text)") }
+        if diagnoseBatchActions {
+            ui.recordDiagnostics("Batch page action resolved", facts: "requested=\(text) " + ui.elementFacts(target, includeOverlaps: true), includeHierarchy: false)
+        }
         target.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
+    private var diagnoseBatchActions = false
     private func more(_ text: String) throws {
         try require(ui.app.buttons["menu.more"]).tap()
         let host = ui.app.scrollViews.matching(NSPredicate(format: "label == 'More'")).firstMatch
@@ -654,8 +681,20 @@ final class PagesUITests: XCTestCase {
             grid.swipeUp()
         }
         try require(element)
-        guard let viewport = NibUITestScrollGeometry.viewport(scroll: grid.frame, window: ui.app.frame, obstructions: []),
-              let point = NibUITestScrollGeometry.tapPoint(control: element.frame, viewport: viewport) else {
+        let palette = ui.app.otherElements.matching(NSPredicate(format: "label == 'Tools'"))
+            .allElementsBoundByIndex.filter { ui.hasVisibleFrame($0) }.map(\.frame)
+        let options = ui.app.scrollViews.matching(NSPredicate(format: "label ENDSWITH ' presets'"))
+            .allElementsBoundByIndex.filter { ui.hasVisibleFrame($0) }.map(\.frame)
+        let frame = element.frame
+        // The button includes its caption. Restrict contact to the upper image, around its horizontal centre.
+        let imageTarget = CGRect(x: frame.midX - 24, y: frame.minY + frame.height * 0.12,
+                                 width: 48, height: frame.height * 0.30)
+        let corridor = CGRect(x: imageTarget.minX, y: frame.minY, width: imageTarget.width, height: frame.height)
+        // The viewport helper clips only below the scroll origin; upper chrome must not collapse it.
+        let obstructions = (palette + options).filter { $0.minY > corridor.minY }
+        guard let viewport = NibUITestScrollGeometry.viewport(scroll: corridor.intersection(grid.frame),
+                  window: ui.app.frame, obstructions: obstructions),
+              let point = NibUITestScrollGeometry.tapPoint(control: imageTarget, viewport: viewport) else {
             throw NibUI.Failure.message("Thumbnail \(number) has no visible tap target")
         }
         ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: point.x - ui.app.frame.minX, dy: point.y - ui.app.frame.minY)).tap()
@@ -674,8 +713,16 @@ final class PagesUITests: XCTestCase {
     }
     private func selectionAction(_ title: String) throws {
         if !button(title).isHittable { try tap("More Actions") }
+        if title.hasPrefix("Rotate "), !button(title).isHittable {
+            try tap("Rotate")
+            if !loggedRotateMenu {
+                loggedRotateMenu = true
+                ui.recordDiagnostics("Pages Rotate submenu")
+            }
+        }
         try tap(title)
     }
+    private var loggedRotateMenu = false
     private func value(_ element: XCUIElement) -> String { element.value as? String ?? "" }
     private func count(_ count: Int) throws {
         try ui.waitForState { $0.pageCount == count }
@@ -730,7 +777,17 @@ final class PagesUITests: XCTestCase {
     }
     private func addOutline(_ title: String) throws {
         if !(try ui.state().openPanels.contains("outline.tab")) { try tab("Outline", id: "outline.tab") }
-        try tap("Add entry"); try replace(ui.app.alerts.textFields.firstMatch, title); try tap("Add")
+        try tap("Add entry")
+        let alert = ui.app.alerts["Add to Outline"].firstMatch
+        var previous: CGRect?
+        try wait("Outline alert must settle with its keyboard before typing") {
+            guard alert.exists, self.ui.app.keyboards.firstMatch.exists else { previous = nil; return false }
+            let frame = alert.frame
+            guard !frame.isNull, !frame.isInfinite, frame.width > 0, frame.height > 0 else { previous = nil; return false }
+            defer { previous = frame }
+            return previous == frame
+        }
+        try replace(alert.textFields.firstMatch, title); try tap("Add")
         try wait("Outline entry \(title) must be created") { (try? self.entry(title)) != nil }
     }
     private func outlineMenu(_ title: String, _ action: String, move: Bool = false) throws {

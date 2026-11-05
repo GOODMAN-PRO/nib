@@ -14,6 +14,7 @@ final class InkUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
         try ui.launchFixture()
         try ui.openDocument("Physics — Motion")
         _ = try ui.waitForState { $0.pageCount == 4 && $0.strokeCountOnPage == 1 }
@@ -199,14 +200,32 @@ final class InkUITests: XCTestCase {
         }
     }
 
-    private var swatches: [XCUIElement] {
+    @MainActor
+    private struct Swatch {
+        let label: String
+        let element: XCUIElement
+        var isSelected: Bool { element.isSelected }
+        func tap() { element.tap() }
+        func press(forDuration duration: TimeInterval) { element.press(forDuration: duration) }
+    }
+
+    private var swatches: [Swatch] {
         let tool = (try? ui.state().tool) ?? "pen"
         let names = ["pen": "Pen", "pencil": "Pencil", "highlighter": "Highlighter", "tape": "Tape", "shape": "Shapes", "drawShape": "Draw Shape"]
         // The main palette mirrors quick inks using the same command ID. Count/edit only the slots in
         // the active tool's options bar; the mirrored buttons are not additional stored presets.
         let group = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", (names[tool] ?? tool) + " presets")).firstMatch
-        return group.buttons.matching(identifier: "cmd.preset.select").allElementsBoundByIndex
-            .filter { !$0.label.hasPrefix("Thickness ") }
+        guard let snapshot = try? group.snapshot() else { return [] }
+        func buttons(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
+            let own = node.elementType == .button && node.identifier == "cmd.preset.select" ? [node] : []
+            return own + node.children.flatMap { buttons($0) }
+        }
+        let query = group.buttons.matching(identifier: "cmd.preset.select")
+        // Ordinals refer only to this typed, identifier-scoped button query, never snapshot child paths.
+        return buttons(snapshot).enumerated().compactMap { index, node in
+            guard !node.label.hasPrefix("Thickness ") else { return nil }
+            return Swatch(label: node.label, element: query.element(boundBy: index))
+        }
     }
 
     private func widthButton(_ slot: Int) throws -> XCUIElement {
@@ -229,7 +248,8 @@ final class InkUITests: XCTestCase {
     }
 
     private func swatchMenu(_ action: String, index: Int = 0) throws {
-        let button = try XCTUnwrap(swatches.indices.contains(index) ? swatches[index] : nil, "Missing colour slot \(index)")
+        let slots = swatches
+        let button = try XCTUnwrap(slots.indices.contains(index) ? slots[index] : nil, "Missing colour slot \(index)")
         button.press(forDuration: 0.7)
         try tap(action, scroll: true)
     }
@@ -246,18 +266,19 @@ final class InkUITests: XCTestCase {
     private func closeColourPicker() throws {
         let picker = colourPicker
         guard picker.exists else { throw NibUI.Failure.message("Native colour picker is not presented") }
-        // This simulator exposes lowercase close; SwiftUI's colour popover can hide that button entirely.
-        let close = picker.buttons.matching(NSPredicate(format: "label ==[c] 'close' OR label ==[c] 'done'")).firstMatch
-        if ui.hasVisibleFrame(close) && close.isHittable { close.tap() }
-        else {
-            // Dismiss the observed popover from outside its content, never by tapping a similarly named app control.
-            let content = picker.scrollViews.firstMatch
-            let point = ui.coordinate(CGPoint(x: 0.95, y: 0.85))
-            guard content.exists && !content.frame.contains(point.screenPoint) else {
-                throw NibUI.Failure.message("No outside dismissal point for native colour picker")
+        let done = picker.buttons.matching(NSPredicate(format: "label ==[c] 'done'")).firstMatch
+        if let candidate = try? done.snapshot(), let root = try? picker.snapshot() {
+            func parent(_ node: XCUIElementSnapshot) -> String? {
+                if node.children.contains(where: { $0.elementType == .button && $0.label == candidate.label && $0.frame == candidate.frame }) {
+                    return "type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) frame=\(node.frame)"
+                }
+                return node.children.compactMap { parent($0) }.first
             }
-            point.tap()
-        }
+            ui.logQA("Colour picker Done candidate", "frame=\(candidate.frame) parent=\(parent(root) ?? "unobserved")")
+        } else { ui.logQA("Colour picker Done candidate", "Done or parent snapshot absent") }
+        let close = picker.buttons.matching(NSPredicate(format: "label ==[c] 'close'")).firstMatch
+        try wait("Native colour picker must expose its close control") { self.ui.hasVisibleFrame(close) && close.isHittable }
+        close.tap()
         try wait("Native colour picker must dismiss") { !picker.exists }
     }
 
@@ -655,6 +676,7 @@ final class InkUITests: XCTestCase {
 
     func testHighlighterCustomColourPersistsAndDrawsTranslucentInk() throws {
         try settings("highlighter"); try tap("Custom…")
+        ui.recordDiagnostics("Colour Spectrum before lookup", facts: ui.elementFacts(ui.app.buttons["Spectrum"].firstMatch, includeOverlaps: true))
         try tap("Spectrum")
         // The system colour field is a real two-dimensional control, selected by its accessibility label.
         let spectrum = try colourSpectrum()
@@ -1380,14 +1402,23 @@ final class InkUITests: XCTestCase {
         try tap("Stylus"); try tap("Apple Pencil", scroll: true)
     }
 
+    private func revealPencilPreference(_ name: String) {
+        let detail = ui.app.collectionViews.containing(NSPredicate(
+            format: "elementType == %@ AND label == %@", NSNumber(value: XCUIElement.ElementType.button.rawValue),
+            "Switch between current tool and eraser")).firstMatch
+        ui.revealFormElement(in: detail) { self.ui.app.switches[name].firstMatch }
+    }
+
     func testPencilHoverSettingPersistsWithoutCreatingMarks() throws {
         let before = try ui.state()
         try pencilSettings()
+        revealPencilPreference("Show hover preview")
         try toggle("Show hover preview", to: false)
         try toggle("Show hover preview", to: true)
         try closePreferences()
         try assertNoNewInk(before)
         try pencilSettings()
+        revealPencilPreference("Show hover preview")
         XCTAssertEqual(try control("Show hover preview", type: .switch, scroll: true).value as? String, "1")
     }
 
@@ -1409,11 +1440,13 @@ final class InkUITests: XCTestCase {
     func testPencilHapticsPreferencePersistsWithoutMarks() throws {
         let before = try ui.state()
         try pencilSettings()
+        revealPencilPreference("Pencil haptics")
         try toggle("Pencil haptics", to: false)
         try toggle("Pencil haptics", to: true)
         try closePreferences()
         try assertNoNewInk(before)
         try pencilSettings()
+        revealPencilPreference("Pencil haptics")
         XCTAssertEqual(try control("Pencil haptics", type: .switch, scroll: true).value as? String, "1")
     }
 

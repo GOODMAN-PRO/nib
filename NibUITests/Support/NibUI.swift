@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import ObjectiveC
 
 struct QAState: Decodable {
     struct Offset: Decodable { let x: Double; let y: Double }
@@ -13,6 +14,7 @@ struct QAState: Decodable {
     let page: String?
     let pageCount: Int
     let tool: String
+    let toolSettingsOpen: String?
     let zoom: Double
     let contentOffset: Offset
     let itemCountOnPage: Int
@@ -52,6 +54,15 @@ final class NibUI {
         return !frame.isNull && !frame.isInfinite && !visible.isNull && visible.width > 1 && visible.height > 1
     }
 
+    func nativeEditorHittability(_ element: XCUIElement) -> Bool? {
+        guard let snapshot = try? element.snapshot(), !snapshot.frame.isNull, !snapshot.frame.isInfinite,
+              snapshot.frame.minX.isFinite, snapshot.frame.minY.isFinite else { return nil }
+        guard let reader = NSClassFromString("NibUIReadiness") as? NSObject.Type,
+              let value = reader.perform(NSSelectorFromString("hittabilityOfElement:"), with: element)?
+                .takeUnretainedValue() as? NSNumber else { return nil }
+        return value.boolValue
+    }
+
     /// Exact, bounded matches only. Native editors precede their identically labelled captions.
     /// Offscreen matches remain available to revealFormElement so it can find the actual containing form.
     func findControl(_ name: String, type: XCUIElement.ElementType = .any,
@@ -63,17 +74,17 @@ final class NibUI {
             name, name, name, name)
         let command = ["cmd.", "tool.", "menu.", "sheet."].contains { name.hasPrefix($0) }
         let kind: XCUIElement.ElementType = type == .any && command ? .button : type
-        // One exact query replaces eleven missing-type queries per root. Query only the supplied
-        // scope (or app); hittability rejects retained modal copies, without repeated root discovery.
         let matches = (scope ?? app).descendants(matching: kind).matching(predicate)
         let first = matches.firstMatch
+        // A missing control should cost one query, not every typed query on each poll.
         guard first.exists else { return nil }
         if kind != .any {
             if !actionable, matches.count == 1 { return first }
             if hasVisibleFrame(first), !first.isEnabled || first.isHittable { return first }
         }
         var candidates: [(XCUIElement, XCUIElementSnapshot)] = []
-        for index in 0..<min(matches.count, 16) {
+        let indexed = min(matches.count, 16)
+        for index in 0..<indexed {
             let element = matches.element(boundBy: index)
             guard element.exists, let snapshot = try? element.snapshot() else { continue }
             candidates.append((element, snapshot))
@@ -87,6 +98,16 @@ final class NibUI {
             let visible = snapshot.frame.intersection(viewport)
             guard !visible.isNull, visible.width > 1, visible.height > 1 else { continue }
             if !snapshot.isEnabled || (element.exists && element.isHittable) { return element }
+        }
+        // Remote picker trees can lose an indexed Any match between count and exists (the Files picker's
+        // Cancel button). Only then resolve concrete first matches, so ordinary lookups cost what they did.
+        if actionable, kind == .any, candidates.count < indexed {
+            for candidateType in priority {
+                let candidate = (scope ?? app).descendants(matching: candidateType).matching(predicate).firstMatch
+                if candidate.exists, hasVisibleFrame(candidate), !candidate.isEnabled || candidate.isHittable {
+                    return candidate
+                }
+            }
         }
         return actionable ? nil : candidates.first?.0
     }
@@ -409,6 +430,35 @@ final class NibUI {
         }
     }
 
+    func logStateStep(_ step: String) {
+        let value = (try? probe.snapshot())?.value
+        logQA("State step", "\(step) probe=\(String(describing: value))")
+    }
+
+    private static var idleSelectorClasses: Set<String> = []
+
+    /// Discovery only: do not invoke, replace or swizzle any private XCTest waiting selector.
+    func logIdleSelectors(for testClass: String) {
+        guard Self.idleSelectorClasses.insert(testClass).inserted else { return }
+        for name in ["XCUIApplicationProcess", "XCUIApplicationImpl"] {
+            guard let cls = NSClassFromString(name) else {
+                logQA("XCTest idle selectors", "testClass=\(testClass) class=\(name) unavailable")
+                continue
+            }
+            var count: UInt32 = 0
+            guard let methods = class_copyMethodList(cls, &count) else {
+                logQA("XCTest idle selectors", "testClass=\(testClass) class=\(name) no instance methods")
+                continue
+            }
+            defer { free(methods) }
+            let names = (0..<Int(count)).map { NSStringFromSelector(method_getName(methods[$0])) }.filter {
+                let lower = $0.lowercased()
+                return lower.contains("uiescen") || lower.contains("idle") || lower.contains("nimation")
+            }.sorted()
+            logQA("XCTest idle selectors", "testClass=\(testClass) class=\(name) selectors=\(names)")
+        }
+    }
+
     /// Complete Files' New Folder action using the editor supplied by the OS.
     /// iOS 26 uses an inline text view and Done; older pickers use an alert and Create.
     func nameNewFilesFolder(_ title: String) throws {
@@ -552,6 +602,7 @@ final class NibUI {
             app.terminate()
             app.launch()
             _ = try waitForState(timeout: 30) { $0.screen == "library" }
+            prepareLaunchKeyRoute()
             if waitForPlacement(3) || expandWindow() { return }
         }
         throw Failure.message("Full-screen recovery failed: display \(screen), window \(app.windows.firstMatch.frame)\n\(system.debugDescription)\n\(app.debugDescription)")
@@ -681,6 +732,7 @@ final class NibUI {
         try establishFullScreen(allowFixtureRelaunch: true)
         _ = try waitForState { $0.screen == "library" }
         try handleAuthorizationAlerts()
+        prepareLaunchKeyRoute()
     }
 
     /// Activates this scene, waits for non-text focus without editing/navigating, and verifies the chord's action.
@@ -707,6 +759,7 @@ final class NibUI {
             let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) route=runner hardware event responder=\(recipient) window=\(window.frame)\n\(probe.value ?? "missing")")
             request.lifetime = .keepAlways; activity.add(request)
             // Deliver at device level after verifying UIKit focus; non-text responders have no AX recipient.
+            let logBeforeDelivery = focused.keyLog ?? []
             try hardwareKey(key, modifiers)
             // The app's own account of the key (window press, responder, command run) goes into the test log
             // for passing and failing chords alike.
@@ -716,10 +769,51 @@ final class NibUI {
             }
             do { try postcondition() }
             catch {
+                // Retry only a proven modifier loss on a fresh printable press outside text editing.
+                // In particular, missing events and control keys are not retry evidence.
+                if let current = try? state(), current.keyResponderIsText != true,
+                   let observed = missingChordModifiers(key, modifiers, before: logBeforeDelivery,
+                                                        after: current.keyLog ?? []) {
+                    logQA("Chord modifier loss retry", "key=\(key) requested=\(modifiers.rawValue) observed=\(observed)")
+                    try sendHardwareKey(key, modifiers)
+                    do { try postcondition(); return }
+                    catch {
+                        recordDiagnostics("Chord retry postcondition failed", facts: "key=\(key) modifiers=\(modifiers.rawValue)")
+                        throw error
+                    }
+                }
                 recordDiagnostics("Chord postcondition failed", facts: "key=\(key) modifiers=\(modifiers.rawValue)")
                 throw error
             }
         }
+    }
+
+    private func missingChordModifiers(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags,
+                                       before: [String], after: [String]) -> String? {
+        guard key.unicodeScalars.count == 1, let scalar = key.unicodeScalars.first,
+              scalar.value >= 32, scalar.value < 127 else { return nil }
+        var expected = 0
+        if modifiers.contains(.shift) { expected |= 1 << 17 }
+        if modifiers.contains(.control) { expected |= 1 << 18 }
+        if modifiers.contains(.alternate) { expected |= 1 << 19 }
+        if modifiers.contains(.command) { expected |= 1 << 20 }
+        let supported: XCUIElement.KeyModifierFlags = [.shift, .control, .alternate, .command]
+        guard expected != 0, modifiers.subtracting(supported).isEmpty else { return nil }
+        // keyLog is bounded: match the retained tail, never mistake an older bare press for this chord.
+        var overlap = min(before.count, after.count)
+        while overlap > 0 && Array(before.suffix(overlap)) != Array(after.prefix(overlap)) { overlap -= 1 }
+        guard before.isEmpty || overlap > 0 else { return nil }
+        let prefix = "window press '\(key)' code "
+        guard let press = after.dropFirst(overlap).last(where: { $0.hasPrefix(prefix) }),
+              let flagsText = press.components(separatedBy: " flags ").last?.split(separator: " ").first,
+              let flags = Int(flagsText), flags & expected != expected else { return nil }
+        return press
+    }
+
+    /// Best effort at process launch, before a native editor can receive its first modified key.
+    func prepareLaunchKeyRoute() {
+        do { try openHardwareKeyRoute() }
+        catch { logQA("Hardware key route unobserved", "launch: \(error)") }
     }
 
     /// Global responders deliberately have no AX keyboard focus. The fixture probe observes UIKit's responder.
@@ -935,10 +1029,14 @@ final class NibUI {
         inspect("before lookup")
         defer { inspect("after lookup") }
         func candidate() -> XCUIElement? {
-            for query in [assets, legacy] {
-                let first = query.firstMatch
-                if hasVisibleFrame(first), first.isHittable { return first }
+            let grid = app.otherElements["photos_sectioned_layout"].firstMatch
+            let first = assets.firstMatch
+            if grid.exists, hasVisibleFrame(first) {
+                let frame = first.frame
+                if grid.frame.contains(CGPoint(x: frame.midX, y: frame.midY)) { return first }
             }
+            let old = legacy.firstMatch
+            if hasVisibleFrame(old), old.isHittable { return old }
             return nil
         }
         if let asset = candidate() { return asset }
@@ -949,6 +1047,31 @@ final class NibUI {
         return asset
     }
 
+    func tapPhotoAsset(_ asset: XCUIElement) throws {
+        guard hasVisibleFrame(asset) else { throw Failure.message("Photos asset lost its visible frame") }
+        let frame = asset.frame, origin = app.frame.origin
+        let grid = app.otherElements["photos_sectioned_layout"].firstMatch
+        let picker = app.otherElements.matching(NSPredicate(format: "label == 'Photos'")).firstMatch
+        let selectionScope = picker.exists ? picker : app
+        app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: frame.midX - origin.x, dy: frame.midY - origin.y)).tap()
+        var outcome = "unobserved"
+        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            if !grid.exists && !asset.exists { outcome = "picker closed"; return true }
+            for name in ["Add", "Done"] {
+                let button = selectionScope.buttons[name].firstMatch
+                if button.exists && button.isEnabled { outcome = name + " enabled"; return true }
+            }
+            return false
+        }, object: nil)
+        let result = XCTWaiter.wait(for: [selected], timeout: 8)
+        logQA("Photos asset coordinate selection", "frame=\(frame) outcome=\(outcome) wait=\(result.rawValue)")
+        guard result == .completed else {
+            recordDiagnostics("Photos asset selection unobserved")
+            throw Failure.message("Coordinate tap did not select the Photos asset")
+        }
+    }
+
     /// Exports the current share sheet to a uniquely named Files directory and waits for the real PNG bytes on disk.
     /// The runner only reads the export; it never reads a background UIPasteboard or generates an expected image.
     func saveSharedPNG() throws -> Data {
@@ -956,9 +1079,36 @@ final class NibUI {
         defer {
             if !finished { recordDiagnostics("Save to Files PNG export failed") }
         }
-        let action = app.buttons["Save to Files"].firstMatch
-        revealFormElement(action)
-        guard action.waitForExistence(timeout: 10), action.isHittable else {
+        func shareAction(_ name: String, actionable: Bool = true) -> XCUIElement? {
+            for type in [XCUIElement.ElementType.button, .cell, .staticText] {
+                if let found = findControl(name, type: type, actionable: actionable) { return found }
+            }
+            return nil
+        }
+        if shareAction("Save to Files", actionable: false) == nil {
+            var more: XCUIElement?
+            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                more = shareAction("View More")
+                return more != nil || shareAction("Save to Files") != nil
+            }, object: nil)
+            guard XCTWaiter.wait(for: [ready], timeout: 10) == .completed else {
+                throw Failure.message("PNG share sheet must offer Save to Files or View More")
+            }
+            if shareAction("Save to Files") == nil, let more {
+                more.tap()
+                logQA("PNG share View More", app.debugDescription)
+            }
+        }
+        if shareAction("Save to Files") == nil {
+            revealFormElement {
+                shareAction("Save to Files", actionable: false) ?? self.app.cells["Save to Files"].firstMatch
+            }
+        }
+        var action: XCUIElement?
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            action = shareAction("Save to Files"); return action != nil
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 10) == .completed, let action else {
             throw Failure.message("PNG share sheet must offer Save to Files")
         }
         action.tap()
@@ -1050,7 +1200,8 @@ final class NibUI {
 
     /// Prefer the native dismissal control; floating number pads can expose an unusable AX frame.
     /// Escape is a fallback only. Synthesis completion is not proof that the keyboard disappeared.
-    func dismissNativeKeyboard(in application: XCUIApplication? = nil, diagnoseWidth: Bool = false) throws {
+    func dismissNativeKeyboard(in application: XCUIApplication? = nil, diagnoseWidth: Bool = false,
+                               inertHeader: XCUIElement? = nil) throws {
         let source = application ?? app
         guard source.keyboards.firstMatch.exists else { return }
         let viewport = source.windows.firstMatch.frame
@@ -1058,7 +1209,9 @@ final class NibUI {
             format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).allElementsBoundByIndex.prefix(8).first {
                 hasVisibleFrame($0, in: viewport)
             }
-        let route = hide == nil ? "hardware Escape (no hittable dismissal control)" : "native Hide/Dismiss keyboard button"
+        let route = inertHeader != nil ? "inert sheet header" :
+            (hide == nil ? "hardware Escape (no hittable dismissal control)" : "native Hide/Dismiss keyboard button")
+        let keyboardBefore = source.keyboards.firstMatch.frame
         func inspect(_ stage: String) {
             guard diagnoseWidth else { return }
             for button in source.keyboards.buttons.allElementsBoundByIndex {
@@ -1070,11 +1223,27 @@ final class NibUI {
                 includeHierarchy: false)
         }
         inspect("before Hide")
-        defer { inspect("completion") }
+        defer {
+            inspect("completion")
+            if diagnoseWidth {
+                let after = source.keyboards.firstMatch.exists ? String(describing: source.keyboards.firstMatch.frame) : "absent"
+                logQA("Width keyboard frame", "route=\(route) before=\(keyboardBefore) after=\(after)")
+            }
+        }
         try XCTContext.runActivity(named: "Dismiss native keyboard") { activity in
             let attachment = XCTAttachment(string: "route=\(route)")
             attachment.lifetime = .keepAlways; activity.add(attachment)
-            if let hide {
+            if let inertHeader {
+                guard hasVisibleFrame(inertHeader), inertHeader.elementType == .staticText else {
+                    throw Failure.message("Numeric keyboard dismissal requires the inert sheet heading")
+                }
+                let frame = inertHeader.frame
+                guard !frame.intersects(keyboardBefore) else {
+                    throw Failure.message("Numeric keyboard covers the sheet heading")
+                }
+                source.coordinate(withNormalizedOffset: .zero).withOffset(
+                    CGVector(dx: frame.midX - source.frame.minX, dy: frame.midY - source.frame.minY)).tap()
+            } else if let hide {
                 // Floating keypad keys can report an invalid activation point: isHittable and tap() then record
                 // "Failed to determine hittability". Tap the visible frame's centre by coordinate instead.
                 let centre = CGPoint(x: hide.frame.midX, y: hide.frame.midY)
@@ -1086,6 +1255,59 @@ final class NibUI {
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
         guard !source.keyboards.firstMatch.exists || XCTWaiter.wait(for: [gone], timeout: 5) == .completed else {
             throw Failure.message("Keyboard did not dismiss after \(route)")
+        }
+    }
+
+    /// Explicit opt-in for four known covered controls, not a global tap policy.
+    func prepareCoveredControl(_ name: String) throws {
+        let target = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", name)).firstMatch
+        let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
+        let alert = app.alerts.firstMatch
+        let region = app.otherElements["PopoverDismissRegion"].firstMatch
+        let numberPad = name == "Move Ruler" && alert.exists && region.exists && app.popovers.firstMatch.exists
+        let frame = target.exists ? target.frame : nil
+        let covered = frame.map { rect in keyboards.contains { $0.intersects(rect) } } ?? false
+        // Ivory is lazy: its Format container, rather than the absent swatch, proves the obstruction.
+        let format = app.scrollViews["Format"].firstMatch
+        let lazyCovered = name == "Ivory" && format.exists && keyboards.contains { $0.intersects(format.frame) }
+        guard numberPad || covered || lazyCovered else { return }
+        let editors = app.descendants(matching: .any).matching(NSPredicate(format: "hasKeyboardFocus == true"))
+            .allElementsBoundByIndex.prefix(4).compactMap { element -> (XCUIElement, String)? in
+                guard let snapshot = try? element.snapshot(),
+                      [XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField].contains(snapshot.elementType),
+                      let value = snapshot.value as? String else { return nil }
+                // Rebind without the focus predicate: that predicate stops matching after dismissal.
+                let candidates = app.descendants(matching: snapshot.elementType).matching(
+                    NSPredicate(format: "identifier == %@ AND label == %@", snapshot.identifier, snapshot.label))
+                guard let stable = candidates.allElementsBoundByIndex.first(where: { $0.frame == snapshot.frame }) else {
+                    return nil
+                }
+                return (stable, value)
+            }
+        logQA("Covered control preparation", "name=\(name) target=\(String(describing: frame)) keyboards=\(keyboards) numberPad=\(numberPad)")
+        if numberPad {
+            let window = app.windows.firstMatch.frame
+            let alertFrame = alert.frame
+            let popovers = app.popovers.allElementsBoundByIndex.map(\.frame)
+            let points = [CGPoint(x: window.minX + 24, y: window.maxY - 24),
+                          CGPoint(x: window.maxX - 24, y: window.maxY - 24)]
+            guard let point = points.first(where: { point in
+                region.frame.contains(point) && !alertFrame.contains(point)
+                    && !popovers.contains(where: { $0.contains(point) })
+            }) else {
+                throw Failure.message("No number-pad dismissal point outside the alert")
+            }
+            app.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+            let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in !app.popovers.firstMatch.exists }, object: nil)
+            guard XCTWaiter.wait(for: [gone], timeout: 5) == .completed else {
+                throw Failure.message("Number-pad popover did not dismiss")
+            }
+        } else { try dismissNativeKeyboard() }
+        for (editor, value) in editors {
+            guard editor.exists, editor.value as? String == value else {
+                throw Failure.message("Keyboard dismissal changed the typed value before \(name)")
+            }
         }
     }
 
@@ -1130,6 +1352,12 @@ final class NibUI {
     func nativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command, in field: XCUIElement) throws {
         try timedAction("Native key \(key), modifiers \(modifiers.rawValue)") {
             try focusField(field)
+            if key.lowercased() == "a", modifiers.contains(.command) {
+                guard isKeyboardFocused(field, allowingAttributeFallback: true)
+                        || (try? readState())?.keyResponderIsText == true else {
+                    throw Failure.message("Native Select All rejected: text does not have the keyboard")
+                }
+            }
             XCTContext.runActivity(named: "Native field key route") { activity in
                 let attachment = XCTAttachment(string: "route=XCUIElement.typeKey field=\(field.label) key=\(key) modifiers=\(modifiers.rawValue) probe=\(probe.value ?? "missing")")
                 attachment.lifetime = .keepAlways; activity.add(attachment)
@@ -1140,9 +1368,11 @@ final class NibUI {
 
     /// Clear is an observable prerequisite, so a failed Select All can never append replacement text.
     func clearNativeText(in field: XCUIElement) throws {
-        try nativeKey("a", in: field)
+        // focusField taps an unfocused editor and verifies focus before nativeKey can send Select All.
+        try focusField(field)
         guard let value = field.value as? String else { throw Failure.message("Native editor has no readable value") }
         if value.isEmpty || value == field.placeholderValue { return }
+        try nativeKey("a", in: field)
         // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
         field.typeText(XCUIKeyboardKey.delete.rawValue)
         let remainingValue = field.value as? String
@@ -1244,8 +1474,8 @@ final class NibUI {
     }
 
     private func readState() throws -> QAState? {
-        guard probe.exists,
-              let state = try NibUITestSnapshot.decode(probe.value, as: QAState.self) else { return nil }
+        guard let snapshot = try? probe.snapshot(),
+              let state = try NibUITestSnapshot.decode(snapshot.value, as: QAState.self) else { return nil }
         if let failure = state.fixtureError { throw Failure.message("Fixture failed: \(failure)") }
         return state
     }
@@ -1299,8 +1529,8 @@ final class NibUI {
         _ = try waitForState { $0.screen == "document" && $0.document != nil }
     }
 
-    func tapCommand(_ id: String) throws {
-        try tapControl("cmd." + id, overflow: ["menu.more", "tool.more"])
+    func tapCommand(_ id: String, diagnostics: Bool = false) throws {
+        try tapControl("cmd." + id, overflow: ["menu.more", "tool.more"], diagnostics: diagnostics)
     }
 
     /// Uses the real Copy control and reads its actual pasteboard output in the writing app. A background runner's
@@ -1334,18 +1564,23 @@ final class NibUI {
         _ = try waitForState { $0.tool == id }
     }
 
-    private func tapControl(_ id: String, overflow: [String]) throws {
+    private func tapControl(_ id: String, overflow: [String], diagnostics: Bool = false) throws {
+        func activate(_ control: XCUIElement) {
+            if diagnostics { recordDiagnostics("Command tap resolved", facts: elementFacts(control, includeOverlaps: true)) }
+            control.tap()
+            if diagnostics { recordDiagnostics("Command tap returned", facts: "command=\(id)", includeHierarchy: false) }
+        }
         func candidate(_ identifier: String) -> XCUIElement? {
             guard let control = findControl(identifier, type: .button), control.isEnabled else { return nil }
             return control
         }
         // XCTest taps the hittable activation point; do not scan every retained scroll host
         // for a control already available on screen (Add Page previously cost 40-50s per tap).
-        if let control = candidate(id) { control.tap(); return }
+        if let control = candidate(id) { activate(control); return }
         let target = app.buttons.matching(identifier: id).firstMatch
         if target.exists {
             revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
-            if let control = candidate(id) { control.tap(); return }
+            if let control = candidate(id) { activate(control); return }
         }
         for identifier in overflow {
             guard let menu = candidate(identifier) else { continue }
@@ -1357,7 +1592,7 @@ final class NibUI {
                 _ = XCTWaiter.wait(for: [ready], timeout: 3)
             }
             revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
-            if let control = candidate(id) { control.tap(); return }
+            if let control = candidate(id) { activate(control); return }
             if menu.exists && menu.isHittable { menu.tap() }
         }
         throw Failure.message("No enabled control \(id)\n\(app.debugDescription)")
@@ -1367,10 +1602,16 @@ final class NibUI {
         canvas.coordinate(withNormalizedOffset: CGVector(dx: point.x, dy: point.y))
     }
 
-    /// Captures screen-point geometry at the action boundary so CI can distinguish gesture delivery from AX projection.
+    /// Accessibility frames and app-coordinate offsets use interface space, unlike screenPoint in landscape.
+    func interfacePoint(_ normalized: CGPoint) -> CGPoint {
+        let frame = canvas.frame
+        return CGPoint(x: frame.minX + normalized.x * frame.width, y: frame.minY + normalized.y * frame.height)
+    }
+
+    /// Captures interface geometry at the action boundary for comparison with accessibility frames.
     func recordGeometry(_ name: String, touches: [CGPoint], selection: CGRect? = nil) {
         XCTContext.runActivity(named: name) { activity in
-            let attachment = XCTAttachment(string: "All frames and touches are screen points.\n"
+            let attachment = XCTAttachment(string: "All frames and touches are interface points.\n"
                 + "app=\(app.frame) window=\(app.windows.firstMatch.frame) canvas=\(canvas.frame)\n"
                 + "touches=\(touches) selection=\(String(describing: selection))\n\(probe.value ?? "missing")")
             attachment.name = name; attachment.lifetime = .keepAlways; activity.add(attachment)
@@ -1434,7 +1675,8 @@ final class NibUI {
         guard path.count >= 2 else { throw Failure.message("A stroke needs at least two points") }
         if path.count == 2 {
             let start = coordinate(path[0]), end = coordinate(path[1])
-            let distance = hypot(end.screenPoint.x - start.screenPoint.x, end.screenPoint.y - start.screenPoint.y)
+            let a = interfacePoint(path[0]), b = interfacePoint(path[1])
+            let distance = hypot(b.x - a.x, b.y - a.y)
             start.press(forDuration: 0.01, thenDragTo: end, withVelocity: XCUIGestureVelocity(rawValue: distance / duration), thenHoldForDuration: 0)
         } else {
             try synthesize([path], duration: duration)
@@ -1451,8 +1693,8 @@ final class NibUI {
             [CGPoint(x: centre.x + direction * radius, y: centre.y),
              CGPoint(x: centre.x + direction * radius * scale, y: centre.y)]
         }
-        recordGeometry("Pinch focal point and contact paths", touches: [coordinate(centre).screenPoint]
-            + paths.flatMap { $0.map { coordinate($0).screenPoint } })
+        recordGeometry("Pinch focal point and contact paths", touches: [interfacePoint(centre)]
+            + paths.flatMap { $0.map { interfacePoint($0) } })
         try synthesize(paths, duration: duration)
     }
     func doubleTap(at point: CGPoint = CGPoint(x: 0.5, y: 0.5)) { coordinate(point).doubleTap() }
@@ -1465,10 +1707,12 @@ final class NibUI {
         let points = (0..<touches).map { index in
             CGPoint(x: centre.x + CGFloat(index - 1) * 20, y: centre.y)
         }
-        guard points.allSatisfy({ before.insetBy(dx: 60, dy: 60).contains($0) }) else {
+        let interfaceCentre = interfacePoint(CGPoint(x: 0.18, y: 0.65))
+        // Contacts are at most 20pt from the centre in any device orientation.
+        guard before.insetBy(dx: 80, dy: 80).contains(interfaceCentre) else {
             throw Failure.message("Multi-tap must stay clear of system window edges")
         }
-        recordGeometry("Stationary multi-tap", touches: points)
+        recordGeometry("Stationary multi-tap centre (contacts within 20pt)", touches: [interfaceCentre])
         let done = XCTestExpectation(description: "Stationary multi-tap completed")
         var failure: Error?
         NibTouchPaths.tap(at: points.map { NSValue(cgPoint: $0) }, count: UInt(taps)) { error in
@@ -1493,18 +1737,79 @@ final class NibUI {
         let points = paths.map { $0.map { NSValue(cgPoint: coordinate($0).screenPoint) } }
         let done = XCTestExpectation(description: "Touch path completed")
         var failure: Error?
+        logTouchPaths(points)
         NibTouchPaths.perform(points, duration: duration) { error in failure = error; done.fulfill() }
         guard XCTWaiter.wait(for: [done], timeout: duration + 15) == .completed else { throw Failure.message("Gesture synthesis timed out") }
         if let failure { throw failure }
     }
 
+    func logTouchPaths(_ paths: [[NSValue]]) {
+        for (index, path) in paths.enumerated() {
+            logQA("Touch path orientation", "orientation=\(XCUIDevice.shared.orientation.rawValue) path=\(index) first=\(String(describing: path.first?.cgPointValue)) last=\(String(describing: path.last?.cgPointValue))")
+        }
+    }
+
+    func diagnoseWindowControls() {
+        let predicate = NSPredicate(format: "label CONTAINS[c] 'multitasking' OR label CONTAINS[c] 'Window Controls' OR identifier CONTAINS[c] 'window-controls' OR label CONTAINS[c] 'Split View'")
+        for (name, source) in [("Nib", app), ("SpringBoard", XCUIApplication(bundleIdentifier: "com.apple.springboard"))] {
+            let matches = source.descendants(matching: .any).matching(predicate).allElementsBoundByIndex
+            logQA("Window control inventory", "source=\(name) matches=\(matches.count)")
+            for element in matches {
+                guard let snapshot = try? element.snapshot() else { continue }
+                logQA("Window control inventory", "source=\(name) type=\(snapshot.elementType.rawValue) id=\(snapshot.identifier) label=\(snapshot.label) frame=\(snapshot.frame) value=\(String(describing: snapshot.value))")
+            }
+            logQA("Window control hierarchy " + name, source.debugDescription)
+        }
+        recordDiagnostics("Window controls before lookup", includeHierarchy: false)
+    }
+
+    func cancelConfirmation(action: String) throws {
+        let surface = app.sheets.allElementsBoundByIndex.first {
+            hasVisibleFrame($0) && $0.buttons[action].exists
+        } ?? app.popovers.allElementsBoundByIndex.first {
+            hasVisibleFrame($0) && $0.buttons[action].exists
+        }
+        guard let surface else { throw Failure.message("Missing confirmation for \(action)") }
+        let heading = surface.label
+        guard !heading.isEmpty else { throw Failure.message("Confirmation must expose its heading") }
+        if let cancel = findControl("Cancel", type: .button, in: surface), cancel.isEnabled && cancel.isHittable {
+            cancel.tap()
+        } else {
+            let region = app.otherElements["PopoverDismissRegion"].firstMatch
+            let window = app.windows.firstMatch.frame
+            let surfaces = app.popovers.allElementsBoundByIndex.map(\.frame) + [surface.frame]
+            let points = [CGPoint(x: window.minX + 24, y: window.maxY - 24),
+                          CGPoint(x: window.maxX - 24, y: window.minY + 24)]
+            guard region.exists, let point = points.first(where: { point in
+                region.frame.contains(point) && !surfaces.contains { $0.contains(point) }
+            }) else { throw Failure.message("Confirmation has no safe outside dismissal point") }
+            app.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+        }
+        let title = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", heading)).firstMatch
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !title.exists }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
+            throw Failure.message("Cancelled confirmation heading remains: \(heading)")
+        }
+    }
+
     func dismissSheets() throws {
+        // Modal form sheets are plain containers in the accessibility tree (only confirmation dialogs are
+        // typed Sheet, run 41961796255), so the close control is looked up app-wide as before. A panel's own
+        // close button counts only until something else was dismissed: after Audio's share sheet closes,
+        // the loop must not go on to close the Audio panel behind it (D:controls-forms#9).
+        var dismissedSurface = false
         for _ in 0..<8 {
             var close: XCUIElement?
             for id in ["sheet.dismiss", "cmd.panel.close", "Cancel", "Done", "Close", "Close export options"] {
+                if dismissedSurface, id == "cmd.panel.close" { continue }
                 if let found = findControl(id, type: .button), found.isEnabled { close = found; break }
             }
-            if let close { close.tap(); continue }
+            if let close {
+                if close.identifier != "cmd.panel.close" { dismissedSurface = true }
+                close.tap()
+                continue
+            }
             if let sheet = app.sheets.allElementsBoundByIndex.first(where: { hasVisibleFrame($0) && $0.isHittable }) {
                 sheet.swipeDown(); continue
             }

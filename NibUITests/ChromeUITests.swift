@@ -18,6 +18,7 @@ final class ChromeUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
         try ui.launchFixture()
     }
 
@@ -81,7 +82,24 @@ final class ChromeUITests: XCTestCase {
         }
     }
     private func escape() throws { try key(XCUIKeyboardKey.escape.rawValue) }
-    private func outside() { ui.coordinate(CGPoint(x: 0.83, y: 0.82)).tap() }
+    private func outside() {
+        guard let snapshot = try? ui.app.snapshot() else { XCTFail("Outside tap needs live geometry"); return }
+        let canvas = ui.canvas.frame
+        func obstructions(_ node: XCUIElementSnapshot) -> [CGRect] {
+            let settings = node.elementType == .scrollView && node.identifier != "nib.canvas"
+                && node.frame.height > 80 && node.frame.width < canvas.width * 0.85
+            let own = settings || node.elementType == .popover ? [node.frame] : []
+            return own + node.children.flatMap { obstructions($0) }
+        }
+        let frames = obstructions(snapshot)
+        let candidates = [CGPoint(x: 0.83, y: 0.82), CGPoint(x: 0.5, y: 0.85), CGPoint(x: 0.5, y: 0.35),
+                          CGPoint(x: 0.2, y: 0.85), CGPoint(x: 0.8, y: 0.35)]
+        guard let point = candidates.first(where: { normalized in
+            let point = ui.interfacePoint(normalized)
+            return canvas.contains(point) && !frames.contains { $0.contains(point) }
+        }) else { XCTFail("No canvas point outside presented popovers/settings"); return }
+        ui.coordinate(point).tap()
+    }
     private func open(_ title: String? = nil) throws {
         try ui.openDocument(title ?? notebook)
         XCTAssertTrue(ui.canvas.waitForExistence(timeout: 15))
@@ -317,6 +335,18 @@ final class ChromeUITests: XCTestCase {
     }
 
     // chrome.options; chrome.moreTools; chrome.scrubTools
+    private func assertToolSettings(_ expected: String?, obsolete label: String) throws {
+        try wait("Tool settings must match the current presentation") {
+            guard let snapshot = try? self.ui.probe.snapshot(), let value = snapshot.value as? String,
+                  let data = value.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let state = try? JSONDecoder().decode(QAState.self, from: data) else { return false }
+            if object.keys.contains("toolSettingsOpen") { return state.toolSettingsOpen == expected }
+            return !self.ui.app.scrollViews.matching(NSPredicate(format: "label == %@", label))
+                .allElementsBoundByIndex.contains { self.ui.hasVisibleFrame($0) && $0.isHittable }
+        }
+    }
+
     func testToolSettingsSwitchReplacesPopoverAndInkToolsActuallyDraw() throws {
         try open()
         for (tool, option) in [("pen", "Fountain Pen"), ("highlighter", "Straight line"), ("eraser", "Whole stroke")] {
@@ -328,9 +358,9 @@ final class ChromeUITests: XCTestCase {
         try settings("pen")
         try tap("tool.highlighter")
         _ = try ui.waitForState { $0.tool == "highlighter" }
-        XCTAssertFalse(query("Fountain Pen").firstMatch.exists, "Switching tools must dismiss the old settings popover")
+        try assertToolSettings(nil, obsolete: "Fountain Pen")
         try tap("menu.toolSettings"); _ = try require("Straight line")
-        XCTAssertFalse(query("Fountain Pen").firstMatch.exists)
+        try assertToolSettings("highlighter", obsolete: "Fountain Pen")
     }
 
     func testSelectedToolTapOpensSettingsAndChangesPenType() throws {
@@ -591,6 +621,11 @@ final class ChromeUITests: XCTestCase {
         }
         try ui.selectTool("highlighter"); _ = try reachable("menu.toolSettings")
         try settings("highlighter")
+        outside()
+        try wait("Highlighter settings must close before using the quick strip") {
+            !self.ui.app.scrollViews.matching(NSPredicate(format: "label == %@", "Highlighter"))
+                .allElementsBoundByIndex.contains { self.ui.hasVisibleFrame($0) && $0.isHittable }
+        }
         try ui.diagnoseAction("Thickness 2 after settings", facts: { self.ui.elementFacts(self.query("Thickness 2").firstMatch, includeOverlaps: true) }) {
             try tap("Thickness 2")
         }
@@ -966,6 +1001,7 @@ final class ChromeUITests: XCTestCase {
         }
         let done = XCTestExpectation(description: "Two fingers rotate ruler")
         var failure: Error?
+        ui.logTouchPaths(paths)
         NibTouchPaths.perform(paths, duration: 0.8) { error in failure = error; done.fulfill() }
         XCTAssertEqual(XCTWaiter.wait(for: [done], timeout: 16), .completed)
         ui.recordDiagnostics("Ruler rotation after", facts: ui.elementFacts(ruler), includeHierarchy: false)
@@ -983,7 +1019,7 @@ final class ChromeUITests: XCTestCase {
         try rulerMenu("Options"); try tap("Hide Digits")
         XCTAssertNotEqual(ui.canvas.screenshot().pngRepresentation, withDigits, "Hide Digits must change the rendered ruler")
         try rulerMenu("Set Position…")
-        try replace("Horizontal position", "4"); try replace("Vertical position", "5"); try tap("Move Ruler")
+        try replace("Horizontal position", "4"); try replace("Vertical position", "5"); try ui.prepareCoveredControl("Move Ruler"); try tap("Move Ruler")
         try rulerMenu("Set Position…")
         XCTAssertEqual(try require("Horizontal position").value as? String, "4")
         XCTAssertEqual(try require("Vertical position").value as? String, "5")

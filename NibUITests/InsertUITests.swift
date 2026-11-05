@@ -22,6 +22,7 @@ final class InsertUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
         // A timed-out denial test cannot run teardown. Reset TCC before every fresh fixture.
         ui.app.resetAuthorizationStatus(for: .microphone)
         addUIInterruptionMonitor(withDescription: "System media permission") { alert in
@@ -147,7 +148,12 @@ final class InsertUITests: XCTestCase {
         if visible("Finish Editing") { try tap("Finish Editing") }
         else if visible("Done typing") { try tap("Done typing") }
         else { try ui.nativeKey(XCUIKeyboardKey.escape.rawValue, [], in: focusedField()) }
-        try wait("Text input must finish") { !self.ui.app.textViews.allElementsBoundByIndex.contains { $0.isHittable } }
+        try wait("Text input must finish") {
+            for editor in self.ui.app.textViews.allElementsBoundByIndex {
+                guard let hittable = self.ui.nativeEditorHittability(editor), !hittable else { return false }
+            }
+            return true
+        }
     }
     private func replace(_ field: XCUIElement, with text: String) throws {
         try ui.replaceNativeText(in: field, with: text)
@@ -234,7 +240,7 @@ final class InsertUITests: XCTestCase {
     private func snapshot(_ kind: String) throws -> JSON { try all(); return try item(kind) }
     private func json(_ value: Any?) -> String {
         guard let value else { return "null" }
-        return (try? String(data: JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .fragmentsAllowed]), encoding: .utf8)) ?? "invalid JSON"
+        return (try? String(data: JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .fragmentsAllowed, .withoutEscapingSlashes]), encoding: .utf8)) ?? "invalid JSON"
     }
     private func paragraphs(_ object: JSON) throws -> [JSON] {
         try XCTUnwrap((object["text"] as? JSON)?["paragraphs"] as? [JSON])
@@ -321,8 +327,15 @@ final class InsertUITests: XCTestCase {
     /// Waits for the committed text's live visible position after keyboard scrolling, editing or undo.
     private func visibleCanvasText(_ value: String) throws -> XCUIElement {
         let text = ui.canvas.staticTexts.matching(NSPredicate(format: "value == %@", value)).firstMatch
+        var ready = false
+        defer {
+            if !ready {
+                ui.recordDiagnostics("Committed Text wait failed", facts: ui.elementFacts(text, includeOverlaps: true))
+            }
+        }
         try wait("Committed text must be visible at its current canvas position") { text.exists && text.isHittable }
-        ui.recordGeometry("Committed text position", touches: [text.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).screenPoint], selection: text.frame)
+        ready = true
+        ui.recordGeometry("Committed text position", touches: [CGPoint(x: text.frame.midX, y: text.frame.midY)], selection: text.frame)
         return text
     }
     func testTextInsertCommitEditAndUndo() throws {
@@ -401,7 +414,7 @@ final class InsertUITests: XCTestCase {
     }
     func testTextBoxStyleAndAutosizePersist() throws {
         try beginText("Styled box"); try tap("More Formatting")
-        try tap("Ivory", scroll: true)
+        try ui.prepareCoveredControl("Ivory"); try tap("Ivory", scroll: true)
         try tap("Thick", scroll: true); try tap("Rounded", scroll: true); try tap("Loose", scroll: true)
         try toggle("Shadow", to: true); try toggle("Fit Height to Text", to: false)
         outside(); try finish()
@@ -425,7 +438,7 @@ final class InsertUITests: XCTestCase {
     }
     func testNamedStyleAndDefaultAffectNewText() throws {
         try beginText("First"); try key("a"); try tap("Larger Text"); try tap("More Formatting")
-        try tap("Save Style…", scroll: true); try replace(try control("Name", .textField), with: "Lab Caption"); try tap("Save")
+        try ui.prepareCoveredControl("Save Style…"); try tap("Save Style…", scroll: true); try replace(try control("Name", .textField), with: "Lab Caption"); try tap("Save")
         try tap("Lab Caption", scroll: true); try tap("Set as Default for New Text", scroll: true); outside(); try finish()
         let first = try snapshot("text")
         outside(); try ui.selectTool("text"); ui.coordinate(CGPoint(x: 0.58, y: 0.82)).tap()
@@ -511,6 +524,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertGreaterThan((frame["y"] as? Double) ?? 0, 0)
         XCTAssertLessThan((frame["w"] as? Double) ?? 595, 595)
         outside()
+        _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 0 }
         try ui.chord("t", [.command, .alternate]) { _ = try self.control("Page text", .textView) }
         let reopened = try control("Page text", .textView)
         XCTAssertTrue((reopened.value as? String)?.contains("Full page report") == true)
@@ -587,12 +601,14 @@ final class InsertUITests: XCTestCase {
         try shape(); let origin = try item("shape")
         for side in ["Above", "On the Right", "Below", "On the Left"] {
             try menu("Add Connected Shape", side); try counts(7)
-            let added = try item("shape")
             try all(); let copied = try items()
             XCTAssertEqual(copied.filter { $0["kind"] as? String == "connector" }.count, 1)
             let connector = try XCTUnwrap(copied.first(where: { $0["kind"] as? String == "connector" })?["connector"] as? JSON)
             XCTAssertNotNil((connector["from"] as? JSON)?["item"])
             XCTAssertNotNil((connector["to"] as? JSON)?["item"])
+            let addedID = try XCTUnwrap((connector["to"] as? JSON)?["item"] as? String)
+            let added = try XCTUnwrap(copied.first { $0["id"] as? String == addedID }?["shape"] as? JSON)
+            ui.logQA("Quick Diagram added shape", "side=\(side) origin=\(json(origin)) added=\(json(added))")
             let shapes = [added]
             let f = try XCTUnwrap(origin["frame"] as? JSON), x = f["x"] as? Double ?? 0, y = f["y"] as? Double ?? 0
             XCTAssertTrue(shapes.contains { shape in
@@ -645,6 +661,7 @@ final class InsertUITests: XCTestCase {
             try menu("Connector Style", route)
             XCTAssertEqual(try item("connector")["route"] as? String, route.lowercased())
         }
+        ui.recordDiagnostics("Connector end before lookup", facts: ui.elementFacts(query("Connector end", .other).firstMatch, includeOverlaps: true))
         let handle = try control("Connector end", .other)
         let previous = try item("connector")
         handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.1, thenDragTo: ui.coordinate(CGPoint(x: 0.68, y: 0.85)))
@@ -670,7 +687,12 @@ final class InsertUITests: XCTestCase {
         provider = try InsertProviderFixture(page: "page:\(try XCTUnwrap(state.document))/\(try XCTUnwrap(state.page))")
         try wait("External fixture endpoint must start") { self.provider?.port != nil }
         try ui.chord(",", .command) { _ = try self.control("Editing") }; try tap("AI", scroll: true); try tap("Add provider", scroll: true)
-        try tap("Preset", scroll: true); try tap("Custom OpenAI-compatible", scroll: true)
+        let preset = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Preset,")).firstMatch
+        ui.revealFormElement(preset)
+        try wait("Provider preset button must be available") { preset.exists && preset.isHittable }
+        preset.tap()
+        try tap("Custom OpenAI-compatible", scroll: true)
+        ui.recordDiagnostics("Provider custom preset selected", facts: ui.elementFacts(preset), includeHierarchy: false)
         for (label, value) in [("Name", "Insert fixture"),
                                ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider?.port))/v1"),
                                ("Chat model", "insert-fixture"), ("Transcription model", "insert-transcript")] {
@@ -771,8 +793,8 @@ final class InsertUITests: XCTestCase {
         try counts(5); try selectAt()
         let before = try item("image")
         try menu("Replace Image")
-        let photo = try ui.photoAsset()
-        XCTAssertTrue(photo.waitForExistence(timeout: 10)); photo.tap()
+        let photo = try ui.photoAsset(diagnostics: true)
+        XCTAssertTrue(photo.waitForExistence(timeout: 10)); try ui.tapPhotoAsset(photo)
         if visible("Add") { try tap("Add") }
         // F034 replaces an existing item, so its unchanged count is not a completion
         // signal. Let the native picker finish before querying the canvas hierarchy.
@@ -788,7 +810,7 @@ final class InsertUITests: XCTestCase {
         try image(); try menu("Save to Photos")
         try allowSystemPermissionIfPresented()
         outside(); try ui.selectTool("image"); ui.coordinate(CGPoint(x: 0.63, y: 0.8)).tap(); try tap("Photos")
-        let photo = try ui.photoAsset()
+        let photo = try ui.photoAsset(diagnostics: true)
         XCTAssertTrue(photo.waitForExistence(timeout: 10), "Saved image must be available in Photos, or a useful permission error must be shown")
         try tap("Cancel"); try counts(5)
     }
@@ -832,14 +854,20 @@ final class InsertUITests: XCTestCase {
     }
     func testElementDragInsertsAtDropPoint() throws {
         try elements()
+        ui.logStateStep("testElementDragInsertsAtDropPoint elements open")
         let star = try control("Star")
+        ui.logStateStep("testElementDragInsertsAtDropPoint Star resolved")
         let drop = ui.coordinate(end)
-        let dropPoint = drop.screenPoint
-        ui.recordGeometry("Element drag start", touches: [star.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).screenPoint, dropPoint])
+        let dropPoint = ui.interfacePoint(end)
+        ui.recordGeometry("Element drag start", touches: [CGPoint(x: star.frame.midX, y: star.frame.midY), dropPoint])
         star.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8, thenDragTo: drop)
+        ui.logStateStep("testElementDragInsertsAtDropPoint drag returned")
+        ui.recordDiagnostics("Element drag returned", includeHierarchy: false)
         try counts(5)
+        ui.logStateStep("testElementDragInsertsAtDropPoint item count converged")
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount > 0 }
         let selection = try selectedBounds()
+        ui.logStateStep("testElementDragInsertsAtDropPoint selection ready")
         ui.recordGeometry("Element drag selection projection", touches: [dropPoint], selection: selection)
         XCTAssertTrue(selection.insetBy(dx: -20, dy: -20).contains(dropPoint))
     }
@@ -857,7 +885,7 @@ final class InsertUITests: XCTestCase {
         let after = ui.app.buttons.allElementsBoundByIndex.map(\.label).filter { collectionLabels.contains($0) }
         XCTAssertLessThan(try XCTUnwrap(after.firstIndex(of: "Renamed Lab")), try XCTUnwrap(before.firstIndex(of: "Renamed Lab")))
         try tap("Collection Options"); try tap("Delete Collection")
-        try tap("Cancel")
+        try ui.cancelConfirmation(action: "Delete Collection")
         try wait("Collection confirmation must dismiss") { !self.ui.app.buttons["Delete Collection"].exists }
         XCTAssertTrue(query("Renamed Lab").firstMatch.exists)
         try tap("Collection Options"); try tap("Delete Collection"); try tap("Delete Collection")
@@ -873,7 +901,7 @@ final class InsertUITests: XCTestCase {
         try collectionPrompt("Lab Node", fieldName: "Element name", action: "Rename")
         try tap("Lab Node"); try counts(6)
         try elements(); try tap("My Objects", scroll: true)
-        try ui.timedAction("Element Lab Node context menu") { try self.control("Lab Node").press(forDuration: 0.8) }; try tap("Delete"); try tap("Cancel")
+        try ui.timedAction("Element Lab Node context menu") { try self.control("Lab Node").press(forDuration: 0.8) }; try tap("Delete"); try ui.cancelConfirmation(action: "Delete Element")
         XCTAssertTrue(query("Lab Node").firstMatch.exists)
         try ui.timedAction("Element Lab Node context menu") { try self.control("Lab Node").press(forDuration: 0.8) }; try tap("Delete"); try tap("Delete Element")
         try wait("Only confirmed element is removed") { !self.query("Lab Node").firstMatch.exists }
@@ -917,8 +945,15 @@ final class InsertUITests: XCTestCase {
         try replace(try control("https://", .textField), with: "not a URL")
         ui.recordDiagnostics("Invalid GIF before submit", facts: "Expected route: ElementsPopover.submit(.gifLink) -> report(imageInsert, invalid web address) -> nibCommandFailed -> ShellViewController.toastIfActive", includeHierarchy: false)
         try tap("Add GIF")
+        if let root = try? ui.app.snapshot() {
+            func texts(_ node: XCUIElementSnapshot) -> [String] {
+                let own = node.elementType == .staticText ? ["\(node.label) frame=\(node.frame)"] : []
+                return own + node.children.flatMap { texts($0) }
+            }
+            ui.recordDiagnostics("Invalid GIF immediately after Add", facts: texts(root).joined(separator: "\n"))
+        } else { ui.recordDiagnostics("Invalid GIF immediately after Add", facts: "snapshot unavailable") }
         let errors = ui.app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'URL' OR label CONTAINS[c] 'address' OR label CONTAINS[c] 'invalid'"))
-        // Observe the transient error before collecting the more expensive screen/tree attachments.
+        // Keep the original error oracle; the immediate diagnostic above investigates its missing presentation.
         let errorAppeared = errors.firstMatch.waitForExistence(timeout: 10)
         ui.recordDiagnostics("Invalid GIF submit result", facts: "error appeared=\(errorAppeared); inspect active prompt and visible toast accessibility representation; no error was synthesized by the test", includeHierarchy: false)
         XCTAssertTrue(errorAppeared, "Invalid GIF link must give an actionable error")
@@ -1004,15 +1039,19 @@ final class InsertUITests: XCTestCase {
             }
         }
         try ui.selectTool("pen"); try ui.drawStroke([point, end]); try counts(5, strokes: 2)
+        ui.logStateStep("Tape visibility pen inserted")
         try drawTape(); try counts(6, strokes: 3)
+        ui.logStateStep("Tape visibility tape inserted")
         ui.recordDiagnostics("Tape committed before visibility toggles", facts: "pen + tape insertion completed", includeHierarchy: false)
         let masked = try canvasPixels()
         ui.coordinate(CGPoint(x: 0.53, y: 0.70)).tap()
+        ui.logStateStep("Tape visibility visibility tap")
         try wait("Reveal tape must visibly expose underlying pen ink") {
             guard let current = try? self.canvasPixels() else { return false }
             return self.changedPixels(masked, current) > 40
         }
         ui.coordinate(CGPoint(x: 0.53, y: 0.70)).tap()
+        ui.logStateStep("Tape visibility visibility tap")
         try wait("Hide tape restores the opaque strip") {
             guard let current = try? self.canvasPixels() else { return false }
             return self.changedPixels(masked, current) < 20
@@ -1023,11 +1062,15 @@ final class InsertUITests: XCTestCase {
         ui.recordDiagnostics("Tape immediately after undo", includeHierarchy: false)
         try counts(5, strokes: 2)
         try ui.tapCommand("edit.redo"); try counts(6, strokes: 3)
+        ui.logStateStep("Tape visibility redo")
         try tap("tool.tape"); try tap("Remove All Tape", scroll: true); try tap("Cancel")
+        ui.logStateStep("Tape visibility cancel remove")
         try counts(6, strokes: 3)
         try tap("Remove All Tape", scroll: true); try tap("Remove All Tape")
+        ui.logStateStep("Tape visibility confirm remove")
         outside(); try counts(5, strokes: 2)
         try ui.tapCommand("edit.undo"); try counts(6, strokes: 3)
+        ui.logStateStep("Tape visibility undo remove")
         completed = true
     }
     func testTapePatternWidthStraightnessOrientationAndClearHistory() throws {
@@ -1072,8 +1115,8 @@ final class InsertUITests: XCTestCase {
     func testTapeImportedPhotoPatternCanBeDrawnAndDeleted() throws {
         try image(); try menu("Save to Photos"); try allowSystemPermissionIfPresented(); outside()
         try ui.selectTool("tape"); try tap("tool.tape"); try tap("Add a pattern from an image", scroll: true); try tap("Photos")
-        let photo = try ui.photoAsset()
-        XCTAssertTrue(photo.waitForExistence(timeout: 10)); photo.tap()
+        let photo = try ui.photoAsset(diagnostics: true)
+        XCTAssertTrue(photo.waitForExistence(timeout: 10)); try ui.tapPhotoAsset(photo)
         try tap("Image 1", scroll: true); outside(); try drawTape()
         XCTAssertNotNil((try snapshot("stroke")["style"] as? JSON)?["tapePattern"])
         try ui.selectTool("tape"); try tap("tool.tape")
@@ -1136,9 +1179,9 @@ final class InsertUITests: XCTestCase {
     func testCommentAddOpenBadgeReplyAndCopyText() throws {
         try comment(); try tap("cmd.panel.close")
         try wait("Comment panel must finish closing before badge hit-testing") { !self.ui.app.buttons["cmd.panel.close"].exists }
-        ui.recordDiagnostics("Comment badge before reopen", facts: "tap screen point=\(ui.coordinate(point).screenPoint)", includeHierarchy: false)
+        ui.recordDiagnostics("Comment badge before reopen", facts: "tap interface point=\(ui.interfacePoint(point))", includeHierarchy: false)
         ui.coordinate(point).tap()
-        ui.recordDiagnostics("Comment badge after reopen", facts: "tap screen point=\(ui.coordinate(point).screenPoint)", includeHierarchy: false)
+        ui.recordDiagnostics("Comment badge after reopen", facts: "tap interface point=\(ui.interfacePoint(point))", includeHierarchy: false)
         XCTAssertTrue(try message("Check the units").exists)
         let reply = try control("Reply"); try ui.focusField(reply); reply.typeText("Use metres per second"); try tap("Send")
         let posted = try message("Use metres per second")
@@ -1182,7 +1225,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertTrue(try message("Check the units").exists)
         try message("Check the units").press(forDuration: 0.8); try tap("Edit Message")
         try replace(try commentEditor("Check the units"), with: "Confirmed edit"); try tap("Save")
-        try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try tap("Cancel")
+        try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try ui.cancelConfirmation(action: "Delete Thread")
         XCTAssertTrue(try message("Confirmed edit").exists)
         try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try tap("Delete Thread")
         try counts(4); try ui.tapCommand("edit.undo"); try counts(5)
@@ -1196,10 +1239,13 @@ final class InsertUITests: XCTestCase {
         try toggle("Show Resolved", to: true)
         try message("Check the units").tap(); try tap("Reopen Thread")
         try message("Check the units").press(forDuration: 0.8)
-        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) {
-            try self.wait("Message context menu must dismiss before panel controls") { !self.ui.app.buttons["Edit Message"].exists }
-        }
-        try tap("cmd.panel.close"); try goToSecondPage(); try panel("Comments")
+        outside()
+        try wait("Thread context menu must dismiss before panel controls") { !self.ui.app.buttons["Show on Page"].exists }
+        let threadClose = ui.app.buttons.matching(NSPredicate(
+            format: "identifier == %@ AND label == %@", "cmd.panel.close", "Close Comment")).firstMatch
+        try wait("Thread panel close must be available") { threadClose.exists && threadClose.isHittable }
+        threadClose.tap()
+        try goToSecondPage(); try panel("Comments")
         try message("Check the units").press(forDuration: 0.8); try tap("Show on Page")
         _ = try ui.waitForState(timeout: 8) { $0.page == original.page }
         XCTAssertTrue(try message("Check the units").exists)
@@ -1335,7 +1381,7 @@ final class InsertUITests: XCTestCase {
             try self.wait("Seek reaches one quarter") { guard let t = try? self.playbackTimes() else { return false }; return abs(t.position - t.duration * 0.25) < 1.5 }
         }
         for speed in ["0.5×", "2×", "1×"] {
-            try tap("Playback Options"); try tap("Speed", scroll: true); try tap(speed, scroll: true)
+            try tap("Playback Options"); try tap(speed, scroll: true)
             XCTAssertTrue((try control("Playback Options").value as? String)?.contains(speed) == true)
         }
         try tap("Playback Options"); try tap("Skip Silence")
@@ -1354,7 +1400,7 @@ final class InsertUITests: XCTestCase {
         row.press(forDuration: 0.8); try tap("Share Audio File")
         XCTAssertTrue(query("Save to Files").firstMatch.waitForExistence(timeout: 10), "Share must expose a real audio file")
         try ui.dismissSheets(); try control("Motion lecture").tap(); try tap("Pause")
-        try control("Motion lecture").press(forDuration: 0.8); try tap("Delete Recording"); try tap("Cancel")
+        try control("Motion lecture").press(forDuration: 0.8); try tap("Delete Recording"); try ui.cancelConfirmation(action: "Delete Recording")
         XCTAssertTrue(query("Playback position").firstMatch.exists)
         XCTAssertEqual(try control("Motion lecture").value as? String, duration)
         try control("Motion lecture").press(forDuration: 0.8); try tap("Delete Recording"); try tap("Delete Recording")
@@ -1363,7 +1409,10 @@ final class InsertUITests: XCTestCase {
         }
     }
     func testReplayModesAndSeekFromRealTimestampedInk() throws {
-        try recordClip(draw: true); try clipRow().tap(); try tap("Pause")
+        try recordClip(draw: true, minimumSeconds: 30); try clipRow().tap()
+        let pause = ui.app.buttons["Pause"].firstMatch
+        try wait("Replay must expose Pause before the clip ends") { pause.exists && pause.isHittable }
+        pause.tap()
         let slider = try control("Playback position", .slider)
         try ui.dragSlider(slider, to: 0) {
             try self.wait("Replay must seek to the beginning") { ((try? self.playbackTimes().position) ?? .infinity) < 0.5 }

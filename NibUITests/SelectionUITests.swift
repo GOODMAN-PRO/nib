@@ -17,6 +17,7 @@ final class SelectionUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
         try ui.launchFixture()
         try ui.openDocument("Physics — Motion")
         _ = try ui.waitForState { $0.itemCountOnPage == 4 && $0.strokeCountOnPage == 1 }
@@ -118,14 +119,24 @@ final class SelectionUITests: XCTestCase {
         ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: point.x - ui.app.frame.minX, dy: point.y - ui.app.frame.minY))
     }
     private func drag(_ start: CGPoint, _ end: CGPoint, modifiers: XCUIElement.KeyModifierFlags = []) {
-        XCUIElement.perform(withKeyModifiers: modifiers) {
+        let body = {
             self.screen(start).press(forDuration: 0.08, thenDragTo: self.screen(end), withVelocity: .slow, thenHoldForDuration: 0)
         }
+        if modifiers.isEmpty { body() }
+        else { XCUIElement.perform(withKeyModifiers: modifiers, block: body) }
     }
     private func centre(_ r: CGRect) -> CGPoint { CGPoint(x: r.midX, y: r.midY) }
     private func clear() throws {
         try ui.selectTool("lasso")
-        ui.coordinate(CGPoint(x: 0.68, y: 0.82)).tap()
+        let selectionCount = try ui.state().selectionCount
+        let selected: CGRect
+        if selectionCount > 0 { selected = try bounds() } else { selected = .null }
+        let candidates = [CGPoint(x: 0.68, y: 0.82), CGPoint(x: 0.9, y: 0.9),
+                          CGPoint(x: 0.35, y: 0.9), CGPoint(x: 0.9, y: 0.3)]
+        guard let point = candidates.first(where: { !selected.insetBy(dx: -12, dy: -12).contains(ui.interfacePoint($0)) }) else {
+            throw NibUI.Failure.message("No canvas point outside the current selection")
+        }
+        ui.coordinate(point).tap()
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 0 }
     }
     private func selectAll(_ count: Int) throws {
@@ -218,9 +229,9 @@ final class SelectionUITests: XCTestCase {
         try loop(count: 1)
         try countsEqual(before)
         let b = try bounds()
-        ui.recordGeometry("Lasso content versus selection accessibility frame", touches: stroke.map { ui.coordinate($0).screenPoint }, selection: b)
-        XCTAssertTrue(b.contains(ui.coordinate(stroke[2]).screenPoint), "Lasso must select the enclosed stroke")
-        XCTAssertFalse(b.contains(ui.coordinate(CGPoint(x: 0.5, y: 0.85)).screenPoint), "Unrelated stroke must remain outside selection")
+        ui.recordGeometry("Lasso content versus selection accessibility frame", touches: stroke.map { ui.interfacePoint($0) }, selection: b)
+        XCTAssertTrue(b.contains(ui.interfacePoint(stroke[2])), "Lasso must select the enclosed stroke")
+        XCTAssertFalse(b.contains(ui.interfacePoint(CGPoint(x: 0.5, y: 0.85))), "Unrelated stroke must remain outside selection")
     }
 
     func testRectangleSelectsAnIntersectingStroke() throws {
@@ -228,7 +239,7 @@ final class SelectionUITests: XCTestCase {
         try lassoSettings(); try tap("Rectangle"); outside()
         try ui.drawStroke([CGPoint(x: 0.40, y: 0.60), CGPoint(x: 0.48, y: 0.73)])
         _ = try ui.waitForState(timeout: 10) { $0.selectionCount == 1 }
-        XCTAssertGreaterThan(try bounds().maxX, ui.coordinate(CGPoint(x: 0.57, y: 0.7)).screenPoint.x,
+        XCTAssertGreaterThan(try bounds().maxX, ui.interfacePoint(CGPoint(x: 0.57, y: 0.7)).x,
                              "Intersection selects the entire stroke, not only the portion inside the rectangle")
     }
 
@@ -338,7 +349,7 @@ final class SelectionUITests: XCTestCase {
         let anchor = CGPoint(x: 0.62, y: 0.52)
         try pageMenu(at: anchor)
         let item = try control("Insert Space")
-        XCTAssertLessThan(abs(item.frame.midX - ui.coordinate(anchor).screenPoint.x), ui.canvas.frame.width / 2)
+        XCTAssertLessThan(abs(item.frame.midX - ui.interfacePoint(anchor).x), ui.canvas.frame.width / 2)
         item.tap()
         try loop(CGRect(x: 0.36, y: 0.52, width: 0.29, height: 0.40), count: 1)
         XCTAssertGreaterThan(try bounds().minY, before.minY + 10, "Insert Space must move ink below its page-menu anchor")
@@ -504,7 +515,7 @@ final class SelectionUITests: XCTestCase {
         try draw([CGPoint(x: 0.42, y: 0.79), CGPoint(x: 0.47, y: 0.86), CGPoint(x: 0.53, y: 0.80)])
         try lassoSettings(); try toggle("Shapes", to: false); outside()
         try loop(CGRect(x: 0.40, y: 0.77, width: 0.16, height: 0.11), count: 1)
-        drag(centre(try bounds()), ui.coordinate(CGPoint(x: 0.48, y: 0.63)).screenPoint)
+        drag(centre(try bounds()), ui.interfacePoint(CGPoint(x: 0.48, y: 0.63)))
         let attached = try copiedItems()
         XCTAssertEqual(attached.first { $0["kind"] as? String == "stroke" }?["attachedTo"] as? String, parentID,
                        "Real drop must attach the stroke before testing linked movement")
@@ -597,13 +608,18 @@ final class SelectionUITests: XCTestCase {
     }
     func testCutMenuRemovesAndPasteRestoresContent() throws {
         try selectedInk(); let before = try ui.state()
-        try ui.tapCommand("clipboard.cut")
+        ui.logStateStep("testCutMenuRemovesAndPasteRestoresContent selected")
+        try ui.tapCommand("clipboard.cut", diagnostics: true)
+        ui.logStateStep("testCutMenuRemovesAndPasteRestoresContent cut sent")
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage - 1 && $0.selectionCount == 0 }
         try pageMenu(); try tap("Paste")
+        ui.logStateStep("testCutMenuRemovesAndPasteRestoresContent paste sent")
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage && $0.itemCountOnPage == before.itemCountOnPage }
         try ui.tapCommand("edit.undo")
+        ui.logStateStep("testCutMenuRemovesAndPasteRestoresContent undo sent")
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage - 1 }
         try undoCounts(before)
+        ui.logStateStep("testCutMenuRemovesAndPasteRestoresContent restored")
     }
     func testCommandXCutIsUndoableAndPasteable() throws {
         try selectedInk(); let before = try ui.state(); try key("x") { try self.ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage - 1 } }
@@ -825,7 +841,7 @@ final class SelectionUITests: XCTestCase {
         // Smart Ink owns selectedWord separately from the canvas item selection probe.
         let word = try handwritingGeometry("Selected word")
         XCTAssertEqual(ui.app.otherElements.matching(NSPredicate(format: "label == 'Selected word'")).count, 1)
-        XCTAssertLessThan(word.frame.maxX, ui.coordinate(CGPoint(x: 0.52, y: 0.595)).screenPoint.x)
+        XCTAssertLessThan(word.frame.maxX, ui.interfacePoint(CGPoint(x: 0.52, y: 0.595)).x)
         let before = try ui.state()
         try tap("Delete Word")
         _ = try ui.waitForState(timeout: 8) { $0.strokeCountOnPage == before.strokeCountOnPage - 1 }
@@ -1093,6 +1109,7 @@ final class SelectionUITests: XCTestCase {
         let appControls = ui.app.buttons.matching(windowPredicate).firstMatch
         let systemControls = springboard.buttons.matching(windowPredicate).firstMatch
         let windowMenu = appControls.exists ? appControls : systemControls
+        ui.diagnoseWindowControls()
         XCTAssertTrue(windowMenu.waitForExistence(timeout: 5), "Cross-app drag requires real system multitasking controls")
         windowMenu.tap()
         let split = ui.app.buttons["Split View"].exists ? ui.app.buttons["Split View"] : springboard.buttons["Split View"]
@@ -1126,7 +1143,12 @@ final class SelectionUITests: XCTestCase {
         defer { provider.stop() }
         try wait("The local Assistant provider fixture must start") { provider.port != nil }
         try settings(); try tap("AI", scroll: true); try tap("Add provider", scroll: true)
-        try tap("Preset", scroll: true); try tap("Custom OpenAI-compatible", scroll: true)
+        let preset = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Preset,")).firstMatch
+        ui.revealFormElement(preset)
+        try wait("Provider preset button must be available") { preset.exists && preset.isHittable }
+        preset.tap()
+        try tap("Custom OpenAI-compatible", scroll: true)
+        ui.recordDiagnostics("Provider custom preset selected", facts: ui.elementFacts(preset), includeHierarchy: false)
         for (label, value) in [("Name", "Selection fixture"),
                                ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider.port))/v1"),
                                ("Chat model", "selection-fixture")] {

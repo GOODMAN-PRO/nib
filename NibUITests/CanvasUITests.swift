@@ -17,6 +17,7 @@ final class CanvasUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
         let scenario: NibUI.FixtureScenario
         if name.contains("testFailedPage") { scenario = .failedRender }
         else if name.contains("testLargeDocumentMemoryRecovery") { scenario = .largeDocument }
@@ -132,8 +133,19 @@ final class CanvasUITests: XCTestCase {
         if shortcut { try key("g", [.command, .option]) { try self.ui.waitForState { $0.openPanels.contains("pages.goToPage") } } }
         else { try more("Go to Page…") }
         let field = try require("Page number or title")
-        field.tap()
-        field.typeText(String(number))
+        let autofocus = ui.isKeyboardFocused(field, allowingAttributeFallback: true)
+        if !autofocus { field.tap() }
+        ui.logQA("Go to Page focus", "page=\(number) autofocus=\(autofocus) afterTap=\(ui.isKeyboardFocused(field, allowingAttributeFallback: true))")
+        func focused() -> Bool { ui.isKeyboardFocused(field, allowingAttributeFallback: true) }
+        if !focused() {
+            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in focused() }, object: nil)
+            if XCTWaiter.wait(for: [ready], timeout: 3) != .completed {
+                field.tap()
+                ui.logQA("Go to Page focus retap", "page=\(number) focused=\(focused())")
+            }
+        }
+        // Preserve app autofocus; do not tap it away or type the requested value twice.
+        if field.value as? String != String(number) { field.typeText(String(number)) }
         try tap("Go")
         _ = try ui.waitForState { !$0.openPanels.contains("pages.goToPage") }
         eventually("Go must activate page \(number)") {
@@ -220,6 +232,18 @@ final class CanvasUITests: XCTestCase {
                       width: box.width / zoom, height: box.height / zoom)
     }
 
+    /// No nested waits: a missing page, box or probe means this outer poll is not ready.
+    private func boxRectNow() -> CGRect? {
+        let pages = ui.app.otherElements.matching(NSPredicate(format: "label == %@", "Page 1 of 4"))
+        guard let paper = pages.allElementsBoundByIndex.first(where: { $0.exists && $0.frame.height > 100 })?.frame,
+              let box = try? element("Zoom box").snapshot() else { return nil }
+        var zoom: Double?
+        _ = ui.matchesState { zoom = $0.zoom; return true }
+        guard let zoom, zoom > 0 else { return nil }
+        return CGRect(x: (box.frame.minX - paper.minX) / zoom, y: (box.frame.minY - paper.minY) / zoom,
+                      width: box.frame.width / zoom, height: box.frame.height / zoom)
+    }
+
     // canvas.scroll; F006/F101
     func testFingerScrollInPencilOnlyModeDoesNotDraw() throws {
         try pencilOnly()
@@ -235,7 +259,7 @@ final class CanvasUITests: XCTestCase {
         try open(); try ui.selectTool("lasso")
         let before = try ui.state()
         let paper = try page().frame
-        let focal = ui.coordinate(CGPoint(x: 0.5, y: 0.5)).screenPoint
+        let focal = ui.interfacePoint(CGPoint(x: 0.5, y: 0.5))
         let anchor = CGPoint(x: (focal.x - paper.minX) / before.zoom, y: (focal.y - paper.minY) / before.zoom)
         try ui.pinchZoom(scale: 1.5, at: CGPoint(x: 0.5, y: 0.5))
         let zoomed = try ui.waitForState { $0.zoom > before.zoom + 0.1 }
@@ -501,15 +525,21 @@ final class CanvasUITests: XCTestCase {
     func testRotateAllPagesChangesEveryPageAndUndoesTogether() throws {
         executionTimeAllowance = 300
         try open()
+        ui.logStateStep("testRotateAllPagesChangesEveryPageAndUndoesTogether opened")
         try more("Rotate All Pages")
+        ui.logStateStep("testRotateAllPagesChangesEveryPageAndUndoesTogether rotated")
+        ui.recordDiagnostics("Rotate All Pages returned", includeHierarchy: false)
         for number in 1...4 {
             try go(number)
+            ui.logStateStep("testRotateAllPagesChangesEveryPageAndUndoesTogether navigated page \(number)")
             let paper = try page(number).frame
             XCTAssertGreaterThan(paper.width, paper.height, "Rotate All Pages must rotate page \(number)")
         }
         try ui.tapCommand("edit.undo")
+        ui.logStateStep("testRotateAllPagesChangesEveryPageAndUndoesTogether undone")
         for number in 1...4 {
             try go(number)
+            ui.logStateStep("testRotateAllPagesChangesEveryPageAndUndoesTogether navigated page \(number)")
             let paper = try page(number).frame
             XCTAssertLessThan(paper.width, paper.height)
         }
@@ -768,7 +798,7 @@ final class CanvasUITests: XCTestCase {
         XCTAssertGreaterThan(next.minY, before.minY)
         XCTAssertEqual(next.minX, before.minX, accuracy: 2)
         try key(XCUIKeyboardKey.return.rawValue, .option) {
-            self.eventually("Option-Return advances writing line") { ((try? self.boxRect().minY) ?? next.minY) > next.minY }
+            self.eventually("Option-Return advances writing line") { (self.boxRectNow()?.minY ?? next.minY) > next.minY }
         }
         let keyboardNext = try boxRect()
         XCTAssertEqual(keyboardNext.minY - next.minY, next.minY - before.minY, accuracy: 2)
