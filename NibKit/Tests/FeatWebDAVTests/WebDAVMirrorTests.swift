@@ -617,6 +617,26 @@ final class WebDAVMirrorTests: XCTestCase {
         XCTAssertEqual(server.text("/dav/Nib/" + copy), "edited on A")
     }
 
+    func testRejectedSubfolderListingLeavesItsFilesAloneAndSyncsOthers() async throws {
+        for status in [403, 423, 500] {
+            let server = FakeDAVServer.install()
+            let root = DAVTest.tempDir("unreadable"), state = DAVTest.tempDir("state")
+            try DAVTest.write(root, "Locked.nibnote/doc.json", "keep")
+            try DAVTest.write(root, "other.json", "before")
+            _ = try await sync(server, root, state, dev)
+            try DAVTest.write(root, "other.json", "after, longer")
+            server.intercept = { method, path in
+                method == "PROPFIND" && path == "/dav/Nib/Locked.nibnote" ? (status, [:], Data()) : nil
+            }
+            let result = try await sync(server, root, state, dev)
+            XCTAssertEqual(result.pending, 1)
+            XCTAssertEqual(result.uploaded, 1)
+            XCTAssertEqual(result.deletedLocal + result.deletedRemote, 0)
+            XCTAssertEqual(DAVTest.read(root, "Locked.nibnote/doc.json"), "keep")
+            XCTAssertEqual(server.text("/dav/Nib/other.json"), "after, longer")
+        }
+    }
+
     func testUnreadableOrVanishingServerPathsNeverDeleteLocalFiles() async throws {
         let server = FakeDAVServer.install()
         let a = DAVTest.tempDir("A")

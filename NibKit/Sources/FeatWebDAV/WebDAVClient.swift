@@ -1008,7 +1008,13 @@ final class WebDAVClient {
                 if complete, !snapshot.etag.isEmpty { tree.snapshot[WebDAVPaths.key(parentPath)] = snapshot }
             }
             level = try await WebDAVClient.concurrentMap(next, limit: listingConcurrency) { rel -> ([String], [DAVResource]?) in
-                (rel, try await self.propfind(try WebDAVPaths.collectionURL(base, components: rel), depth: 1))
+                do {
+                    return (rel, try await self.propfind(try WebDAVPaths.collectionURL(base, components: rel), depth: 1))
+                } catch let error as WebDAVError {
+                    guard !error.isFatal else { throw error }
+                    // An unreadable subtree is unknown, never absent. Other folders can still sync.
+                    return (rel, nil)
+                }
             }
         }
         return tree
