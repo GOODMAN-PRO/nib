@@ -1620,6 +1620,34 @@ final class FeatCanvasTests: XCTestCase {
         await waitUntil("tiles at the new level") { renderer.requests.contains { $0.region != nil && $0.scale == newScale } }
     }
 
+    func testPlaceholderBoundsAreReusedAndOnlyChangedItemsRecomputed() {
+        let index = PlaceholderBoundsIndex()
+        var items = (0..<100).map { _ in Item(kind: .stroke) }
+        var loads = 0, boundsCalls = 0
+        func paint(_ item: Item) -> Rect {
+            boundsCalls += 1
+            return Rect(x: Double(item.layer), y: 0, width: 10, height: 10)
+        }
+        for _ in 0..<32 {
+            let entries = index.entries(page: Fixtures.page1, load: { loads += 1; return items }, paint: paint)
+            XCTAssertEqual(entries.count, 100)
+        }
+        XCTAssertEqual(loads, 1)
+        XCTAssertEqual(boundsCalls, 100)
+        items[0].layer = 2
+        index.update(items[0], page: Fixtures.page1, paint: paint)
+        XCTAssertEqual(boundsCalls, 101)
+        let updated = index.entries(page: Fixtures.page1, load: { XCTFail("must reuse the page"); return [] }, paint: paint)
+        XCTAssertEqual(updated.first { $0.id == items[0].id }?.rect.x, 2)
+        items[0].deleted = true
+        index.update(items[0], page: Fixtures.page1, paint: paint)
+        XCTAssertEqual(index.entries(page: Fixtures.page1, load: { [] }, paint: paint).count, 99)
+        XCTAssertEqual(boundsCalls, 101)
+        index.reset()
+        XCTAssertEqual(index.entries(page: Fixtures.page1, load: { items }, paint: paint).count, 99)
+        XCTAssertEqual(boundsCalls, 200)
+    }
+
     func testLargeHiddenSelectionTraversesPageOnce() {
         let items = (0..<10_000).map { _ in Item(kind: .shape) }
         let ids = Set(items.map(\.id))

@@ -24,6 +24,7 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
     private static let log = Logger(subsystem: "app.nib", category: "canvas")
 
     private(set) var hiddenItems: [PageID: Set<ElementID>] = [:]
+    let placeholderBounds = PlaceholderBoundsIndex()
     private var liveViews: [ElementID: (view: UIView, page: PageID)] = [:]
     private(set) var activeTool: CanvasTool?
     private var activeToolID: String?
@@ -344,7 +345,9 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
                 DisplayList(ops: [DisplayOp(op: .dots, rect: grid, fill: RGBA.black.withAlpha(0.18),
                                            spacing: spacing, radius: 1.6 / scale)]).draw(in: cg)
             }
-            let items = (try? app.workspace.items(documentID, page: page)) ?? []
+            let entries = placeholderBounds.entries(page: page,
+                load: { (try? app.workspace.items(documentID, page: page)) ?? [] },
+                paint: { app.content.paintBounds(for: $0) })
             let hidden = hiddenItems[page] ?? []
             // Board paper can be dark independently of the UI theme.
             let brightness = 0.2126 * Double(paper.r) + 0.7152 * Double(paper.g) + 0.0722 * Double(paper.b)
@@ -352,17 +355,24 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
             cg.setFillColor(ink.withAlpha(0.12).cgColor)
             cg.setStrokeColor(ink.withAlpha(0.45).cgColor)
             cg.setLineWidth(CGFloat(1 / scale))
-            for item in items where visibleLayers.contains(item.layer) && !hidden.contains(item.id) {
+            for entry in entries where entry.rect.intersects(region) {
+                guard visibleLayers.contains(entry.layer), !hidden.contains(entry.id) else { continue }
                 // Replay must not reveal items that have not appeared yet.
-                if let replay = session.replay, replay.mode == .reveal, let stroke = item.stroke,
-                   stroke.t0 > replay.time { continue }
-                let rect = app.content.paintBounds(for: item)
-                guard rect.intersects(region) else { continue }
+                if let replay = session.replay, replay.mode == .reveal, let time = entry.strokeTime,
+                   time > replay.time { continue }
+                let rect = entry.rect
                 cg.fill(rect.cg)
                 cg.stroke(rect.cg)
             }
         }
         return image.cgImage
+    }
+
+    func updatePlaceholderBounds(_ changes: Changeset) {
+        for mutation in changes.mutations {
+            guard case let .item(doc, page, _, after) = mutation, doc == documentID else { continue }
+            placeholderBounds.update(after, page: page) { app.content.paintBounds(for: $0) }
+        }
     }
 
     func renderTile(page: PageID, region: Rect?, scale: Double) async throws -> CGImage {
@@ -703,4 +713,31 @@ struct CanvasRecoverInk: NibCommand {
         }
         return Output(recovered: entries.count)
     }
+}
+
+/// Lightweight painted metadata reused by every placeholder tile on a page.
+final class PlaceholderBoundsIndex {
+    struct Entry {
+        let id: ElementID
+        let layer: Int
+        let strokeTime: Double?
+        let rect: Rect
+        init(_ item: Item, paint: (Item) -> Rect) {
+            id = item.id; layer = item.layer; strokeTime = item.stroke?.t0; rect = paint(item)
+        }
+    }
+    private var pages: [PageID: [ElementID: Entry]] = [:]
+    func entries(page: PageID, load: () -> [Item], paint: (Item) -> Rect) -> Dictionary<ElementID, Entry>.Values {
+        if pages[page] == nil {
+            var entries: [ElementID: Entry] = [:]
+            for item in load() where !item.deleted { entries[item.id] = Entry(item, paint: paint) }
+            pages[page] = entries
+        }
+        return (pages[page] ?? [:]).values
+    }
+    func update(_ item: Item, page: PageID, paint: (Item) -> Rect) {
+        guard pages[page] != nil else { return }
+        pages[page]?[item.id] = item.deleted ? nil : Entry(item, paint: paint)
+    }
+    func reset() { pages.removeAll() }
 }

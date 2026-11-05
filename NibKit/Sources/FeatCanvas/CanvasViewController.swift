@@ -782,6 +782,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         loadModel()
         selectNeighbourIfNeeded(oldPages: oldPages)
         boardContentStale = true
+        host.placeholderBounds.reset()
         boardBoundsPage = nil
         paperCache.removeAll()
         failedPages.removeAll()
@@ -927,6 +928,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     private func committed(_ cs: Changeset) {
         guard !isClosed, cs.documents.contains(documentID) else { return }
+        host.updatePlaceholderBounds(cs)
         updateBoardBounds(cs)
         if cs.headChanged(documentID) {
             let oldPages = livePages
