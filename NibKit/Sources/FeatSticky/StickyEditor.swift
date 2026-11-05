@@ -509,6 +509,7 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
         let zoom = CGFloat(max(host.zoomScale, 0.01))
         let view = StickyNoteView(note: note)
         view.textView.attributedText = StickyText.attributed(note.text, zoom: zoom)
+        view.textView.selectedRange = NSRange(location: view.textView.attributedText.length, length: 0)
         if note.text.isEmpty { view.textView.typingAttributes = StickyText.typingAttributes(zoom: zoom) }
         view.textView.delegate = self
         view.textView.onDone = { [weak self] in self?.endEditing(save: true) }
@@ -519,8 +520,6 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
         if let e = editing, let draft = Self.drafts.removeValue(forKey: e.recoveryKey) {
             view.textView.attributedText = StickyText.scaled(draft.view.textView.attributedText, by: zoom / draft.zoom)
             view.textView.selectedRange = draft.view.textView.selectedRange
-            e.saved = draft.saved
-            e.persisted = draft.persisted
         }
         position(view, zoom: zoom, page: page, host: host)
         host.setHidden([id], page: page)                       // the overlay stands in for the note meanwhile
@@ -537,7 +536,6 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
             .sink { _ in finish() }.store(in: &observers)
 
         view.textView.becomeFirstResponder()
-        view.textView.selectedRange = NSRange(location: view.textView.attributedText.length, length: 0)
         publishRange(view.textView)
         reveal(note, page: page, host: host)
         UIAccessibility.post(notification: .layoutChanged, argument: view.textView)

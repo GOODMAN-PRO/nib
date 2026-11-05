@@ -23,11 +23,11 @@ public enum FeatTextBoxFeature: NibFeature {
             TextLayout.layoutInfo(item)
         })
 
-        // Dismiss an active editor before other canvas taps; otherwise only text-box targets are handled.
+        // Preserve tape, comment and link precedence; also dismiss an editor on unclaimed outside taps.
         for gesture in [CanvasGesture.tap, CanvasGesture.doubleTap] {
             app.content.tapHandlers.register(TapHandlerDescriptor(
                 id: CommandIDs.textTapAt + "." + gesture.rawValue, owner: id, gesture: gesture, command: CommandIDs.textTapAt,
-                order: 50))
+                order: 340))
         }
 
         let settings = app.settings

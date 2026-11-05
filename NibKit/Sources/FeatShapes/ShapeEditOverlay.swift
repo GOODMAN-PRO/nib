@@ -635,8 +635,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         if let draft = Self.drafts.removeValue(forKey: session.recoveryKey) {
             let rich = ShapeTextStyle.richText(draft.textView.attributedText ?? NSAttributedString(), shape: shape, scale: draft.scale)
             tv.attributedText = ShapeTextStyle.attributed(rich, shape: shape, darkPaper: dark, scale: scale)
-            session.committed = draft.committed
-            session.persisted = draft.persisted
+            tv.selectedRange = draft.textView.selectedRange
         }
         text = session
         var bare = shape
@@ -647,7 +646,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         host.setHidden([id], page: page)
         host.session.isEditingText = true
         host.session.editingTextRef = Self.ref(session)
-        host.session.editingTextRange = ShapeTextStyle.plainRange(tv.selectedRange, in: attributed)
+        host.session.editingTextRange = ShapeTextStyle.plainRange(tv.selectedRange, in: tv.attributedText)
         hideKnobs()
         layoutText(session, host: host)
         tv.becomeFirstResponder()

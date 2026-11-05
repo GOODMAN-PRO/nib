@@ -353,8 +353,11 @@ final class FeatStickyTests: XCTestCase {
         XCTAssertEqual(text(h), "External dirty")
         editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
         XCTAssertEqual(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last?.textView.text, "Local draft")
-        editor.endEditing(save: false)
+        let recovered = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        recovered.textView.attributedText = NSAttributedString(string: "Recovered edit", attributes: StickyText.typingAttributes(zoom: 1))
+        editor.endEditing(save: true)
         await editor.flush()
+        XCTAssertEqual(text(h), "Recovered edit")
     }
 
     func testSuspendedStickySaveRejectsChangedTextAtMutation() async throws {
@@ -386,8 +389,9 @@ final class FeatStickyTests: XCTestCase {
         await editor.flush()
         editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
         XCTAssertEqual(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last?.textView.text, "Queued draft")
-        editor.endEditing(save: false)
+        editor.endEditing(save: true)
         await editor.flush()
+        XCTAssertEqual(text(h), "Queued draft")
     }
 
     func testGuardedFallbackRefusesLegacyItemUpdateWithoutLosingDraft() async throws {

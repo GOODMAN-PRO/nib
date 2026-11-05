@@ -745,7 +745,11 @@ final class FeatShapesTests: XCTestCase {
         XCTAssertEqual(try shape(h, Fixtures.shapeID).text?.plainText, "External dirty")
         XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
         XCTAssertEqual(overlay.text?.textView.text, "Local label")
-        overlay.endTextEditing(commit: false)
+        let recovered = try XCTUnwrap(overlay.text?.textView)
+        recovered.attributedText = NSAttributedString(string: "Recovered label", attributes: recovered.typingAttributes)
+        overlay.endTextEditing(commit: true)
+        await overlay.pendingFlush?.value
+        XCTAssertEqual(try shape(h, Fixtures.shapeID).text?.plainText, "Recovered label")
         overlay.detach(from: host)
     }
 
@@ -780,7 +784,9 @@ final class FeatShapesTests: XCTestCase {
         await overlay.pendingFlush?.value
         XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
         XCTAssertEqual(overlay.text?.textView.text, "Queued label")
-        overlay.endTextEditing(commit: false)
+        overlay.endTextEditing(commit: true)
+        await overlay.pendingFlush?.value
+        XCTAssertEqual(try shape(h, Fixtures.shapeID).text?.plainText, "Queued label")
         overlay.detach(from: host)
     }
 

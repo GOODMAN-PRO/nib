@@ -671,7 +671,6 @@ struct TextSetText: NibCommand {
         var ref: String
         var text: RichText
         var expectedText: RichText? = nil
-        var deleteEmpty: Bool? = nil
     }
     struct Output: Codable {
         var ref: String
@@ -680,7 +679,6 @@ struct TextSetText: NibCommand {
         id: "text.setText", title: "Edit Text",
         summary: "Replace the rich text (or a plain string) of a text box, sticky note, shape or connector label; auto-growing boxes refit.",
         params: .obj(["ref": .ref, "expectedText": textSchema("Only replace this text if it is still current"),
-                      "deleteEmpty": .bool("Remove an empty text box when finishing editing"),
                       "text": textSchema("a plain string (one paragraph per line) or {paragraphs:[{runs:[{text, attrs}], align, list, indent, checked, lineSpacing}]}")],
                      required: ["ref", "text"]),
         examples: [["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "text": "Hello again"],
@@ -690,18 +688,6 @@ struct TextSetText: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let text = RichTextEdit.normalized(p.text)
         let (doc, page, id) = try TextRefs.item(p.ref, path: "$.ref")
-        if p.deleteEmpty == true, text.isEmpty {
-            try ctx.mutate { tx in
-                let item = try tx.item(doc, page: page, id: id)
-                _ = try TextItems.checked(item, doc: doc, page: page, path: "$.ref")
-                if let expected = p.expectedText, TextItems.richText(item) != expected {
-                    throw NibError(.conflict, String(localized: "Text changed elsewhere. Your draft has been kept."))
-                }
-                guard item.kind == .text else { throw NibError.invalid("Only text boxes can be removed on close") }
-                try tx.delete(item: id, doc: doc, page: page)
-            }
-            return Output(ref: NodeRef.item(doc, page, id).description)
-        }
         try TextItems.edit(ctx, refs: [p.ref], path: { _ in "$.ref" }) { t in
             if let expected = p.expectedText, TextItems.richText(t.item) != expected {
                 throw NibError(.conflict, String(localized: "Text changed elsewhere. Your draft has been kept."))
