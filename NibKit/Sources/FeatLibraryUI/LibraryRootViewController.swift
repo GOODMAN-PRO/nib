@@ -778,51 +778,58 @@ struct LibraryRootView: View {
     }
     @ViewBuilder private func content(compact: Bool, compactHeight: Bool) -> some View {
         if let tab = model.tab { LibraryPanelView(panel: tab, model: model) }
-        else {
+        else if compact {
+            // Keep the ScrollView directly in NavigationStack so UIKit can track
+            // its offset for the large title and navigation-bar scroll edge.
+            contentScroll(compact: true, compactHeight: compactHeight, viewport: nil)
+        } else {
             GeometryReader { viewport in
-                let topInset = compact ? (compactHeight ? NibSpacing.xs : NibSpacing.s) : topChromeClearance
-                let bottomInset = compact && (!compactHeight || model.selection.isSelecting)
-                    ? NibMetrics.barHeight + 2 * NibSpacing.l : 0
-                let spacing = compactHeight ? NibSpacing.xs : NibSpacing.s
-                ScrollView {
-                    VStack(alignment: .leading, spacing: spacing) {
-                        VStack(alignment: .leading, spacing: spacing) {
-                            if compact, model.app.services.get("library.inContainer", as: NSNumber.self)?.boolValue == true {
-                                compactContainerWarning
-                            } else if let banner = model.libraryBanner(isCompact: compact) {
-                                banner.frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            if !compact {
-                                HStack(spacing: NibSpacing.s) {
-                                    parentNavigation
-                                    Text(model.title).font(NibFont.display).foregroundStyle(NibColor.label)
-                                        .libraryChromeFrame("title")
-                                }
-                            }
-                            itemCount.libraryChromeFrame("metadata")
-                            if let error = model.error {
-                                NibBanner(error, action: NibAction(String(localized: "Try Again"), command: "library.setView") { model.setView(["folder": model.folderRef]) })
-                                    .libraryChromeFrame("banner")
-                            }
-                        }
-                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeaderHeight = $0 }
-                        LibraryGridView(model: model, compactHeight: compactHeight)
-                            .environment(\.horizontalSizeClass, compact ? .compact : .regular)
-                            .frame(minHeight: model.rows.isEmpty && !model.isLoading && model.error == nil
-                                ? LibraryPresentation.emptyContentHeight(viewport: viewport.size.height,
-                                    header: contentHeaderHeight, insets: topInset + bottomInset + spacing) : 0)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, compact ? NibSpacing.l : NibMetrics.libraryGutter)
-                    .padding(.top, topInset)
-                    // A short viewport uses a trailing control lane instead of a whole bottom row.
-                    .padding(.trailing, compactHeight ? LibraryPresentation.actionPairWidth + NibSpacing.l : 0)
-                    .frame(width: viewport.size.width)
-                }
-                .safeAreaInset(edge: .bottom, spacing: 0) {
-                    if bottomInset > 0 { Color.clear.frame(height: bottomInset) }
-                }
+                contentScroll(compact: false, compactHeight: compactHeight, viewport: viewport.size)
             }
+        }
+    }
+    private func contentScroll(compact: Bool, compactHeight: Bool, viewport: CGSize?) -> some View {
+        let topInset = compact ? (compactHeight ? NibSpacing.xs : NibSpacing.s) : topChromeClearance
+        let bottomInset = compact && (!compactHeight || model.selection.isSelecting)
+            ? NibMetrics.barHeight + 2 * NibSpacing.l : 0
+        let spacing = compactHeight ? NibSpacing.xs : NibSpacing.s
+        return ScrollView {
+            VStack(alignment: .leading, spacing: spacing) {
+                VStack(alignment: .leading, spacing: spacing) {
+                    if compact, model.app.services.get("library.inContainer", as: NSNumber.self)?.boolValue == true {
+                        compactContainerWarning
+                    } else if let banner = model.libraryBanner(isCompact: compact) {
+                        banner.frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if !compact {
+                        HStack(spacing: NibSpacing.s) {
+                            parentNavigation
+                            Text(model.title).font(NibFont.display).foregroundStyle(NibColor.label)
+                                .libraryChromeFrame("title")
+                        }
+                    }
+                    itemCount.libraryChromeFrame("metadata")
+                    if let error = model.error {
+                        NibBanner(error, action: NibAction(String(localized: "Try Again"), command: "library.setView") { model.setView(["folder": model.folderRef]) })
+                            .libraryChromeFrame("banner")
+                    }
+                }
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeaderHeight = $0 }
+                LibraryGridView(model: model, compactHeight: compactHeight)
+                    .environment(\.horizontalSizeClass, compact ? .compact : .regular)
+                    .frame(minHeight: model.rows.isEmpty && !model.isLoading && model.error == nil
+                        ? LibraryPresentation.emptyContentHeight(viewport: viewport?.height ?? 0,
+                            header: contentHeaderHeight, insets: topInset + bottomInset + spacing) : 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, compact ? NibSpacing.l : NibMetrics.libraryGutter)
+            .padding(.top, topInset)
+            // A short viewport uses a trailing control lane instead of a whole bottom row.
+            .padding(.trailing, compactHeight ? LibraryPresentation.actionPairWidth + NibSpacing.l : 0)
+            .frame(width: viewport?.width)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if bottomInset > 0 { Color.clear.frame(height: bottomInset) }
         }
     }
     private var itemCount: some View {
