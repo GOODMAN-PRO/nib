@@ -969,9 +969,15 @@ final class FeatZoomWindowTests: XCTestCase {
         h.app.services.renderer = renderer
         let (host, overlay) = try await openWindow(h)
         let controller = overlay.controller
-        _ = controller.writingView()
+        let view = controller.writingView()
+        let root = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        window.rootViewController = root
+        root.view.addSubview(view)
+        view.frame = root.view.bounds
+        window.makeKeyAndVisible()
         controller.paneAppeared()
-        defer { controller.paneDisappeared(); overlay.detach(from: host) }
+        defer { controller.paneDisappeared(); overlay.detach(from: host); window.isHidden = true }
         for _ in 0..<100 where renderer.requests.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
         XCTAssertFalse(renderer.requests.isEmpty)
         h.session.hiddenLayers = [0]
@@ -984,6 +990,16 @@ final class FeatZoomWindowTests: XCTestCase {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         XCTAssertEqual(renderer.requests.last?.layers?.contains(0), true)
+        h.session.replay = ReplayState(time: 123, mode: .reveal)
+        for _ in 0..<100 where renderer.requests.last?.replay?.time != 123 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(renderer.requests.last?.replay, h.session.replay)
+        h.session.replay = nil
+        for _ in 0..<100 where renderer.requests.last?.replay != nil {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertNil(renderer.requests.last?.replay)
     }
 
     func testHidingPaneFinishesCaptureBeforeClearingWetInk() async throws {
