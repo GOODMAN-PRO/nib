@@ -6,6 +6,19 @@ import NibContracts
 import NibTesting
 @testable import FeatAudio
 
+private final class FailingDeletionFiles: FileManager, @unchecked Sendable {
+    var failEnumeration = false
+    var failRemoval = false
+    override func contentsOfDirectory(atPath path: String) throws -> [String] {
+        if failEnumeration { throw CocoaError(.fileReadNoPermission) }
+        return try super.contentsOfDirectory(atPath: path)
+    }
+    override func removeItem(at URL: URL) throws {
+        if failRemoval { throw CocoaError(.fileWriteNoPermission) }
+        try super.removeItem(at: URL)
+    }
+}
+
 /// Observe rendered clock values without a microphone or an XCUITest session.
 private struct AudioClockProbe: UIViewRepresentable {
     let value: Double
@@ -742,6 +755,48 @@ final class FeatAudioTests: XCTestCase {
         XCTAssertFalse(exists(live))
         XCTAssertFalse(exists(transcript))
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth, "an irreversible delete is not an undo step")
+    }
+
+    func testFailedDeletionRetainsRetryEntryAndReportsFailure() async throws {
+        for enumeration in [true, false] {
+            let (h, _) = try harness()
+            let files = FailingDeletionFiles()
+            files.failEnumeration = enumeration
+            files.failRemoval = !enumeration
+            let audioFile = try file(h, "audio/FIXTUREAUD01.caf")
+            try Data([1, 2, 3]).write(to: audioFile)
+            let descriptor = CommandDescriptor(id: "test.deleteAudio", title: "Delete", summary: "Injected cleanup",
+                                               params: .obj([:]), effect: .irreversible)
+            h.app.commands.register(descriptor) { _, ctx in
+                _ = try await AudioDelete.delete(.init(clip: "audio:FIXTUREDOC01/FIXTUREAUD01"), ctx, files: files)
+                return [:]
+            }
+            do {
+                _ = try await h.run("test.deleteAudio")
+                XCTFail("Cleanup failure must reach the caller")
+            } catch {}
+            XCTAssertFalse(try clip(h, fixtureClip).deleted)
+            XCTAssertTrue(exists(audioFile))
+            files.failEnumeration = false
+            files.failRemoval = false
+            _ = try await h.run("test.deleteAudio")
+            XCTAssertTrue(try clip(h, fixtureClip).deleted)
+            XCTAssertFalse(exists(audioFile))
+            // A tombstone left by an earlier version must also remain eligible for cleanup retry.
+            try Data([4]).write(to: audioFile)
+            _ = try await h.run("audio.delete", ["clip": .string(fixtureClip)])
+            XCTAssertFalse(exists(audioFile))
+        }
+    }
+
+    func testLockedDeletionDoesNotRemoveFilesOrHideTheClip() async throws {
+        let (h, _) = try harness()
+        let audioFile = try file(h, "audio/FIXTUREAUD01.caf")
+        try Data([1, 2, 3]).write(to: audioFile)
+        h.app.services.lock = FakeLockService(locked: [Fixtures.docID])
+        await assertThrows(.locked) { try await h.run("audio.delete", ["clip": .string(self.fixtureClip)]) }
+        XCTAssertTrue(exists(audioFile))
+        XCTAssertFalse(try clip(h, fixtureClip).deleted)
     }
 
     func testDeletingTheClipThatRecordsStopsTheRecording() async throws {
