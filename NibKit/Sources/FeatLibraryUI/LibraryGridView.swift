@@ -56,9 +56,9 @@ struct LibraryGridView: View {
     private var contentWidth: CGFloat { viewportWidth ?? measuredContentWidth }
     @ScaledMetric(relativeTo: .footnote) private var labelAllowance = NibMetrics.libraryRowPitch - NibMetrics.coverSize.height
     @State private var frames: [String: CGRect] = [:]
-    @State private var dragSelection = LibrarySelection()
-    @State private var selecting = false
-    @State private var marquee: CGRect?
+    @State private var selectionDrag = LibrarySelectionDrag()
+    @GestureState private var selectionLive = false
+    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     var body: some View {
         Group {
@@ -87,21 +87,21 @@ struct LibraryGridView: View {
                     .coordinateSpace(name: "library.selection")
                     .background(NibColor.background)
                     .overlay(alignment: .topLeading) {
-                        if let marquee {
+                        if let marquee = selectionDrag.marquee {
                             Rectangle().fill(NibColor.accentWash).overlay(Rectangle().stroke(NibColor.accent, style: NibStroke.dashed))
                                 .frame(width: marquee.width, height: marquee.height).offset(x: marquee.minX, y: marquee.minY).allowsHitTesting(false)
                         }
                     }
                     .background(LibraryPointerMarquee { start, point, ended in
-                        if !selecting {
+                        if !selectionDrag.active {
                             guard !frames.values.contains(where: { $0.contains(start) }) else { return }
-                            selecting = true; dragSelection = model.selection; dragSelection.beginMarquee()
+                            selectionDrag.begin(selection: model.selection, anchor: nil)
                         }
                         let rect = CGRect(x: min(start.x, point.x), y: min(start.y, point.y), width: abs(point.x - start.x), height: abs(point.y - start.y))
-                        if ended { selecting = false; marquee = nil }
+                        if ended { selectionDrag.cancel() }
                         else {
-                            marquee = rect; dragSelection.marquee(rect, frames: frames)
-                            model.setView(["selection": "replace", "refs": .array(dragSelection.refs.sorted().map(JSONValue.string))])
+                            selectionDrag.marquee = rect; selectionDrag.selection.marquee(rect, frames: frames)
+                            model.setView(["selection": "replace", "refs": .array(selectionDrag.selection.refs.sorted().map(JSONValue.string))])
                         }
                     }.allowsHitTesting(false).accessibilityHidden(true))
                     .onPreferenceChange(LibraryFrames.self) { frames = $0 }
@@ -116,6 +116,10 @@ struct LibraryGridView: View {
                 }
             }
         }
+        .onChange(of: selectionLive) { _, live in if !live { selectionDrag.cancel() } }
+        .onChange(of: model.selection.isSelecting) { _, selecting in if !selecting { selectionDrag.cancel() } }
+        .onChange(of: scenePhase) { _, phase in if phase != .active { selectionDrag.cancel() } }
+        .onDisappear { selectionDrag.cancel() }
         .frame(width: viewportWidth)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { measuredContentWidth = $0 }
@@ -216,27 +220,26 @@ struct LibraryGridView: View {
     }
     private var selectionGesture: some Gesture {
         DragGesture(minimumDistance: NibSpacing.xs + NibSpacing.xxs, coordinateSpace: .named("library.selection"))
+            .updating($selectionLive) { _, live, _ in live = true }
             .onChanged { value in
                 guard model.selection.isSelecting else { return }
-                if !selecting {
+                if !selectionDrag.active {
                     guard abs(value.translation.width) > abs(value.translation.height) * 1.5,
                           frames.values.contains(where: { $0.contains(value.startLocation) }) else { return }
-                    selecting = true; dragSelection = model.selection
-                    if let index = model.visibleRows.firstIndex(where: { frames[$0.ref]?.contains(value.startLocation) == true }) {
-                        dragSelection.beginRange(at: index)
-                    } else { dragSelection.beginMarquee() }
+                    let anchor = model.visibleRows.firstIndex { frames[$0.ref]?.contains(value.startLocation) == true }
+                    selectionDrag.begin(selection: model.selection, anchor: anchor)
                 }
                 if let index = model.visibleRows.firstIndex(where: { frames[$0.ref]?.contains(value.startLocation) == true }) {
                     let end = model.visibleRows.firstIndex(where: { frames[$0.ref]?.contains(value.location) == true }) ?? index
-                    dragSelection.extendRange(to: end, order: model.visibleRefs)
+                    selectionDrag.selection.extendRange(to: end, order: model.visibleRefs)
                 } else {
                     let rect = CGRect(x: min(value.startLocation.x, value.location.x), y: min(value.startLocation.y, value.location.y),
                                       width: abs(value.location.x - value.startLocation.x), height: abs(value.location.y - value.startLocation.y))
-                    marquee = rect; dragSelection.marquee(rect, frames: frames)
+                    selectionDrag.marquee = rect; selectionDrag.selection.marquee(rect, frames: frames)
                 }
-                model.setView(["selection": "replace", "refs": .array(dragSelection.refs.sorted().map(JSONValue.string))])
+                model.setView(["selection": "replace", "refs": .array(selectionDrag.selection.refs.sorted().map(JSONValue.string))])
             }
-            .onEnded { _ in selecting = false; marquee = nil }
+            .onEnded { _ in selectionDrag.cancel() }
     }
 }
 
@@ -601,17 +604,40 @@ struct LibraryListRow: View {
     }
 }
 
+/// A clean field follows external renames; an edited draft never silently replaces one.
+struct LibraryRenameDraft {
+    private(set) var original = ""
+    var text = ""
+
+    mutating func reconcile(_ current: String) {
+        guard text == original else { return }
+        original = current
+        text = current
+    }
+
+    func titleForSubmission(current: String) throws -> String? {
+        guard text != original else { return nil }
+        let title = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { throw NibError(.invalidParams, String(localized: "Enter a name.")) }
+        guard title != current else { return nil }
+        guard original == current else {
+            throw NibError(.conflict, String(localized: "This item was renamed elsewhere. Cancel and rename it again to use the latest name."))
+        }
+        return title
+    }
+}
+
 struct LibraryRenameField: View {
     let row: LibraryRow
     @ObservedObject var model: LibraryViewModel
-    @State private var text = ""
+    @State private var draft = LibraryRenameDraft()
     @State private var error: String?
     @State private var saving = false
     @FocusState private var focused: Bool
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xs) {
             HStack(spacing: NibSpacing.xs) {
-                TextField(String(localized: "Name"), text: $text).font(NibFont.body).focused($focused).onSubmit(save)
+                TextField(String(localized: "Name"), text: $draft.text).font(NibFont.body).focused($focused).onSubmit(save)
                     .accessibilityLabel(String(localized: "Rename \(row.name)"))
                 NibIconButton(.checkmark, label: String(localized: "Save Name"), action: save)
                     .accessibilityIdentifier("cmd.library.rename")
@@ -620,7 +646,8 @@ struct LibraryRenameField: View {
             }.frame(minHeight: NibMetrics.hitTarget)
             .disabled(saving)
             if let error { Text(error).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
-        }.onAppear { text = row.name; focused = true }
+        }.onAppear { draft.reconcile(row.name); focused = true }
+            .onChange(of: row.name) { _, name in draft.reconcile(name) }
             .nibEscapeCancellation(isEnabled: !saving) {
                 focused = false
                 model.setView(["rename": ""])
@@ -628,8 +655,14 @@ struct LibraryRenameField: View {
     }
     private func save() {
         guard !saving else { return }
-        let title = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty else { error = String(localized: "Enter a name."); return }
+        let title: String
+        do {
+            guard let submitted = try draft.titleForSubmission(current: row.name) else {
+                model.setView(["rename": ""])
+                return
+            }
+            title = submitted
+        } catch { self.error = NibError.wrap(error).message; return }
         saving = true
         Task { @MainActor in
             defer { saving = false }

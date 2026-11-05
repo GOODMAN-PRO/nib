@@ -155,7 +155,15 @@ final class CommentsListModel: ObservableObject {
     }
 
     private func read(_ page: PageID, doc: DocumentID) {
-        index[page] = CommentsListModel.rows((try? app.workspace.items(doc, page: page)) ?? [], doc: doc, page: page)
+        // Read cold pages without enrolling them in the editing cache. Cached pages contain the live edits.
+        let workspace = app.workspace
+        let items: [Item]?
+        if workspace.cachedPages(doc).contains(page) {
+            items = try? workspace.items(doc, page: page)
+        } else {
+            items = try? workspace.persistence.loadItems(doc, page: page)
+        }
+        index[page] = CommentsListModel.rows(items ?? [], doc: doc, page: page)
     }
 
     /// Publishes the list from the index (page table only: no page is read here).

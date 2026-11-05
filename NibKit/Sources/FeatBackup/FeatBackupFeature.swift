@@ -251,18 +251,8 @@ final class BackupEngine {
     /// Exclude only the specified non-triggers; content, attachments, audio records and plugin data remain visible.
     func contentStamp(_ doc: DocumentID, persistence: DocumentPersistence, previous: BackupContentStamp? = nil) async throws -> BackupContentStamp {
         let head = try persistence.loadHead(doc)
-        let builder = BackupStampBuilder(previous: previous, pages: Set(head.livePages.map { $0.id.raw }))
-        var meta = head.meta
-        meta.rev = .zero; meta.favorite = false; meta.sourceBookmark = nil; meta.trashedFrom = nil
-        var records: [(String, JSONValue)] = [("meta", try JSONValue.from(meta))]
-        for var page in head.livePages {
-            page.rev = .zero; page.bookmarked = false
-            records.append(("page:" + page.id.raw, try JSONValue.from(page)))
-        }
-        for var block in head.liveBlocks { block.rev = .zero; records.append(("block:" + block.id.raw, try JSONValue.from(block))) }
-        for var card in head.liveCards { card.rev = .zero; records.append(("card:" + card.id.raw, try JSONValue.from(card))) }
-        for var audio in head.liveAudio { audio.rev = .zero; records.append(("audio:" + audio.id.raw, try JSONValue.from(audio))) }
-        try await builder.add(records)
+        let builder = BackupStampBuilder(previous: previous)
+        try await builder.addHead(head)
         for page in head.livePages {
             try Task.checkCancellation()
             let revision = persistence.contentRevision(doc, page: page.id)

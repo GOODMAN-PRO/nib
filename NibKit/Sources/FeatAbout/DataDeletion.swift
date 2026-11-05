@@ -429,7 +429,8 @@ struct DataEraser {
     // MARK: App data
 
     private func clearContents(of dir: URL, keep: Set<String>, quiet: [String], report: inout DeletionReport) {
-        for child in children(of: dir) {
+        guard let entries = children(of: dir, report: &report) else { return }
+        for child in entries {
             let path = AboutPaths.canonical(child)
             if keep.contains(path) { continue }
             if keep.contains(where: { $0.hasPrefix(path + "/") }) {
@@ -446,13 +447,15 @@ struct DataEraser {
     /// from it like from any library folder). The folder goes only when the copies were all it held.
     private func removeDiagnosticCopies(in dir: URL, keep: Set<String>, report: inout DeletionReport) {
         var removedAny = false
-        for child in children(of: dir)
+        guard let entries = children(of: dir, report: &report) else { return }
+        for child in entries
         where !isDirectory(child) && child.pathExtension.lowercased() == "zip" && !keep.contains(AboutPaths.canonical(child)) {
             if remove(child, coordinated: true, quiet: false, report: &report) { removedAny = true }
         }
         let path = AboutPaths.canonical(dir)
         guard removedAny, !keep.contains(path), !keep.contains(where: { $0.hasPrefix(path + "/") }),
-              children(of: dir).allSatisfy({ NibOwnership.isIgnorable($0.lastPathComponent) }) else { return }
+              let remaining = children(of: dir, report: &report),
+              remaining.allSatisfy({ NibOwnership.isIgnorable($0.lastPathComponent) }) else { return }
         remove(dir, coordinated: true, quiet: false, report: &report)
     }
 
@@ -463,21 +466,24 @@ struct DataEraser {
     @discardableResult
     private func removeNibContent(in dir: URL, keep: Set<String>, report: inout DeletionReport) -> Bool {
         var removedAny = false
-        for child in children(of: dir) {
+        guard let entries = children(of: dir, report: &report) else { return false }
+        for child in entries {
             let directory = isDirectory(child)
             if keep.contains(AboutPaths.canonical(child)) && !directory { continue }
             switch NibOwnership.classify(name: child.lastPathComponent, isDirectory: directory) {
             case .owned:
                 if remove(child, coordinated: true, quiet: false, report: &report) { removedAny = true }
             case .legacyCandidate:
-                if children(of: child).contains(where: { NibOwnership.isDocumentFile($0.lastPathComponent) }) {
+                if let entries = children(of: child, report: &report),
+                   entries.contains(where: { NibOwnership.isDocumentFile($0.lastPathComponent) }) {
                     if remove(child, coordinated: true, quiet: false, report: &report) { removedAny = true }
                 }
             case .other:
                 guard directory, removeNibContent(in: child, keep: keep, report: &report) else { continue }
                 removedAny = true
                 if !keep.contains(AboutPaths.canonical(child)),
-                   children(of: child).allSatisfy({ NibOwnership.isIgnorable($0.lastPathComponent) }) {
+                   let remaining = children(of: child, report: &report),
+                   remaining.allSatisfy({ NibOwnership.isIgnorable($0.lastPathComponent) }) {
                     remove(child, coordinated: true, quiet: false, report: &report)
                 }
             }
@@ -487,9 +493,19 @@ struct DataEraser {
 
     // MARK: File system
 
-    private func children(of dir: URL) -> [URL] {
-        (try? fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-                                              options: [])) ?? []
+    private func children(of dir: URL, report: inout DeletionReport) -> [URL]? {
+        do {
+            return try fileManager.contentsOfDirectory(at: dir,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [])
+        } catch {
+            let ns = error as NSError
+            // Absent optional app-data directories are normal. An unreadable directory is not empty.
+            if ns.domain == NSCocoaErrorDomain && (ns.code == NSFileNoSuchFileError || ns.code == NSFileReadNoSuchFileError) {
+                return nil
+            }
+            report.failures.append(dir.lastPathComponent + ": " + ns.localizedDescription)
+            return nil
+        }
     }
 
     /// A real directory: a symbolic link is never followed (it is removed as a link, never walked into).

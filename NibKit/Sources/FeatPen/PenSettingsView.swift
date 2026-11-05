@@ -323,7 +323,7 @@ extension PenStyle {
     var optionSymbol: NibSymbol {
         switch self {
         case .fountain: return .fountainPen
-        case .ball: return .pen
+        case .ball: return .ballPen
         case .brush: return .brushPen
         }
     }

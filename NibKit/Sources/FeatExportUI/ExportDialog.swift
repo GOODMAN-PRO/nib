@@ -103,6 +103,13 @@ struct ExportSelection {
         for ref in documentRefs {
             let doc = NodeRef.documentID(from: ref)
             try requireUnlocked(doc, ctx)
+            // Folder dialogs offer only All Pages and never save back to a source. The catalog already
+            // has their titles and kinds; avoid decoding every head and constructing unused page lists.
+            if folderExport, pages == nil, let node = ctx.services.library?.node(doc),
+               let kind = node.documentKind {
+                documents.append(ExportDocument(ref: ref, title: node.title, kind: kind, pages: [], hasSource: false))
+                continue
+            }
             let content = try ctx.workspace.peekContent(doc)
             let bookmark = content.meta.sourceBookmark
             let sourceName: String?

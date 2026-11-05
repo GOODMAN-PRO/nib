@@ -459,6 +459,37 @@ final class FeatReadOnlyTests: XCTestCase {
         XCTAssertFalse(attachment.presentWhenSettled, "the menu was asked for")
     }
 
+    func testOldHandleQueryCannotReplaceANewSamePageSelection() async throws {
+        let h = harness()
+        let host = FakeCanvasHost(app: h.app, session: h.session, doc: Fixtures.docID,
+                                  pages: [Fixtures.page1, Fixtures.page2, Fixtures.pdfPage])
+        let attachment = PDFTextMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        try await h.run("pdf.tapAt", PDFTapAt.example)
+        let original = try XCTUnwrap(attachment.selection)
+        let page = Fixtures.pdfPage
+        attachment.touchesBegan(CanvasSample(page: page, location: original.to, isPencil: false), host: host)
+        attachment.touchesEnded(CanvasSample(page: page, location: Point(300, 82), isPencil: false), host: host)
+        let obsolete = try XCTUnwrap(attachment.query)
+        // Install the new word before yielding to the old query's task/worker completion.
+        var newer = original
+        newer.text = "New word"
+        newer.to = Point(200, 82)
+        attachment.show(newer)
+        XCTAssertNil(attachment.query, "a new selection releases the obsolete query immediately")
+        await obsolete.value
+        XCTAssertEqual(attachment.selection, newer)
+        XCTAssertFalse(attachment.presentWhenSettled)
+
+        attachment.touchesBegan(CanvasSample(page: page, location: newer.to, isPencil: false), host: host)
+        attachment.touchesEnded(CanvasSample(page: page, location: Point(150, 82), isPencil: false), host: host)
+        let current = try XCTUnwrap(attachment.query, "the new selection can still query")
+        await current.value
+        XCTAssertEqual(attachment.selection?.to, Point(150, 82))
+        XCTAssertNil(attachment.query)
+    }
+
     /// contracts-v2 G2: in a document Nib will not write, the menu offers no marks (Define, Speak and Copy stay), and
     /// a tap on a selection handle stays with the selection instead of reaching the tap handlers.
     func testReadOnlyDocumentsOfferNoMarksAndHandleTapsStayWithTheSelection() async throws {

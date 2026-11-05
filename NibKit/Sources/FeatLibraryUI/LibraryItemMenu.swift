@@ -16,7 +16,11 @@ extension LibraryViewModel {
             do {
                 // Finish the menu command before presenting a sheet or inline editor.
                 _ = try await app.bus.execute(CommandIDs.librarySetView, ["menu": "none"], session: session)
-                _ = try await app.bus.execute(command, params, session: session)
+                let result = try await app.bus.execute(command, params, session: session)
+                if command == CommandIDs.batch,
+                   let failure = LibraryMenuOutcome.failure(params: params, result: result, rows: rows) {
+                    throw failure
+                }
             } catch {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                     userInfo: ["command": command, "error": NibError.wrap(error)])
@@ -470,5 +474,33 @@ final class LibraryNewTapRecognizer: UITapGestureRecognizer {
     override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
         if state == .possible, !(preventingGestureRecognizer is UITapGestureRecognizer) { return false }
         return super.canBePrevented(by: preventingGestureRecognizer)
+    }
+}
+
+/// Batch commands return per-item failures instead of throwing. Preserve successful changes and report the rest.
+enum LibraryMenuOutcome {
+    static func failure(params: JSONValue, result: JSONValue, rows: [LibraryRow]) -> NibError? {
+        let failures = messages(params: params, result: result, rows: rows)
+        guard !failures.isEmpty else { return nil }
+        let detail = failures.joined(separator: "\n")
+        return NibError(.unavailable, String(localized: "Some items couldn't be updated. Retry those items.\n\(detail)"))
+    }
+
+    private static func messages(params: JSONValue, result: JSONValue, rows: [LibraryRow]) -> [String] {
+        let calls = params["calls"]?.arrayValue ?? []
+        return (result["results"]?.arrayValue ?? []).enumerated().flatMap { index, outcome -> [String] in
+            let call = calls.indices.contains(index) ? calls[index] : .null
+            if outcome["ok"]?.boolValue == false {
+                let args = call["params"] ?? .null
+                let ref = args["doc"]?.stringValue ?? args["folder"]?.stringValue ?? args["ref"]?.stringValue
+                let name = rows.first(where: { $0.ref == ref })?.name ?? ref ?? String(localized: "Item")
+                let message = outcome["error"]?["message"]?.stringValue ?? String(localized: "The change failed.")
+                return [name + ": " + message]
+            }
+            if call["command"]?.stringValue == CommandIDs.batch {
+                return messages(params: call["params"] ?? .null, result: outcome["value"] ?? .null, rows: rows)
+            }
+            return []
+        }
     }
 }

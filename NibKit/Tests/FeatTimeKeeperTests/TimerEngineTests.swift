@@ -129,9 +129,40 @@ final class TimerEngineTests: XCTestCase {
             ("1 hour 30", 5400), ("5m 30", 330), ("24h", 86_400), ("I5", 900), ("O5:00", 300), (" 45 ", 2700),
             ("", nil), ("abc", nil), ("0", nil), ("25:99", nil), ("30 h", nil), ("5m 1h", nil), ("1:2:3:4", nil),
             ("1.2.3", nil), ("12 parsecs", nil),
+            ("1 Stunde", 3600), ("2 Stunden", 7200), ("3 Minuten", 180), ("4 Sekunden", 4),
+            ("1 sandwich", nil), ("1 month", nil), ("1 heartbeat", nil), ("1 ms", nil),
         ]
         for (text, expected) in cases {
             XCTAssertEqual(DurationParser.seconds(from: text), expected, "'\(text)'")
+        }
+        let localised: [(Int, [String])] = [
+            (3600, ["hora", "horas", "heure", "heures", "ora", "ore", "uur", "godz", "godzina", "godziny",
+                    "timme", "timmar", "saat"]),
+            (60, ["minuto", "minutos", "minuut", "minut", "minuty", "minuta", "minuter", "dakika", "minuti"]),
+            (1, ["segundo", "segundos", "seconde", "secondes", "secondo", "secondi", "seconden",
+                 "sekund", "sekundy", "sekunder", "saniye"])
+        ]
+        for (seconds, words) in localised {
+            for word in words {
+                XCTAssertEqual(DurationParser.seconds(from: "2 \(word)"), 2 * seconds, word)
+            }
+        }
+    }
+
+    func testPresetAndSavedModeSupersedePendingRecognition() {
+        for seconds in [1500, 3000] {
+            var input = TimerDurationInput()
+            input.writing = true
+            input.generation += 1
+            let pending = input.generation
+            input.select(seconds)
+            XCTAssertFalse(input.complete("5 min", generation: pending))
+            XCTAssertEqual(DurationParser.seconds(from: input.text), seconds)
+            // Even returning to handwriting cannot revive the older request.
+            input.writing = true
+            XCTAssertFalse(input.complete("5 min", generation: pending))
+            XCTAssertTrue(input.complete("10 min", generation: input.generation))
+            XCTAssertEqual(DurationParser.seconds(from: input.text), 600)
         }
     }
 

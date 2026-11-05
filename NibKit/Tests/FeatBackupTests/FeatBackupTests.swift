@@ -412,6 +412,25 @@ final class FeatBackupTests: XCTestCase {
         XCTAssertEqual(persistence.loads, [Fixtures.page2], "Unknown revisions require loading")
     }
 
+    func testHeadPreparationOnStampActorPreservesNormalization() async throws {
+        var head = Fixtures.sampleContent().0
+        let initialBuilder = BackupStampBuilder(previous: nil)
+        try await initialBuilder.addHead(head)
+        let initial = await initialBuilder.result()
+        head.meta.favorite.toggle()
+        head.meta.rev = Rev(wallMs: 10, counter: 0, device: 0)
+        head.pages[0].bookmarked.toggle()
+        let ignoredBuilder = BackupStampBuilder(previous: initial)
+        try await ignoredBuilder.addHead(head)
+        let ignored = await ignoredBuilder.result()
+        XCTAssertEqual(ignored, initial)
+        head.meta.language = "th"
+        let changedBuilder = BackupStampBuilder(previous: ignored)
+        try await changedBuilder.addHead(head)
+        let changed = await changedBuilder.result()
+        XCTAssertTrue(changed.hasChanges(since: ignored))
+    }
+
     func testFirstExternalEditAfterClearQueueIsBackedUp() async throws {
         let (h, engine, root) = try makeHarness()
         defer { try? FileManager.default.removeItem(at: root) }

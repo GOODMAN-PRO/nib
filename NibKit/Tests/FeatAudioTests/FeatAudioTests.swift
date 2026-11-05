@@ -6,6 +6,19 @@ import NibContracts
 import NibTesting
 @testable import FeatAudio
 
+private final class FailingDeletionFiles: FileManager, @unchecked Sendable {
+    var failEnumeration = false
+    var failRemoval = false
+    override func contentsOfDirectory(atPath path: String) throws -> [String] {
+        if failEnumeration { throw CocoaError(.fileReadNoPermission) }
+        return try super.contentsOfDirectory(atPath: path)
+    }
+    override func removeItem(at URL: URL) throws {
+        if failRemoval { throw CocoaError(.fileWriteNoPermission) }
+        try super.removeItem(at: URL)
+    }
+}
+
 /// Observe rendered clock values without a microphone or an XCUITest session.
 private struct AudioClockProbe: UIViewRepresentable {
     let value: Double
@@ -82,6 +95,7 @@ final class FakePlaybackEngine: PlaybackEngine {
     private(set) var stops = 0
     var played: Double? = 0
     var finish: (@MainActor () -> Void)?
+    var fail: (@MainActor (Error) -> Void)?
 
     init(length: Double) {
         self.length = length
@@ -92,17 +106,20 @@ final class FakePlaybackEngine: PlaybackEngine {
         return length
     }
 
-    func play(_ plan: PlaybackPlan, rate: Double, noiseReduction: Bool, onFinish: @escaping @MainActor () -> Void) throws {
+    func play(_ plan: PlaybackPlan, rate: Double, noiseReduction: Bool,
+              onFinish: @escaping @MainActor () -> Void, onFailure: @escaping @MainActor (Error) -> Void) throws {
         plans.append(plan)
         self.rate = rate
         self.noiseReduction = noiseReduction
         finish = onFinish
+        fail = onFailure
         played = 0
     }
 
     func stop() {
         stops += 1
         finish = nil
+        fail = nil
     }
 
     func setRate(_ rate: Double) { self.rate = rate }
@@ -744,6 +761,48 @@ final class FeatAudioTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth, "an irreversible delete is not an undo step")
     }
 
+    func testFailedDeletionRetainsRetryEntryAndReportsFailure() async throws {
+        for enumeration in [true, false] {
+            let (h, _) = try harness()
+            let files = FailingDeletionFiles()
+            files.failEnumeration = enumeration
+            files.failRemoval = !enumeration
+            let audioFile = try file(h, "audio/FIXTUREAUD01.caf")
+            try Data([1, 2, 3]).write(to: audioFile)
+            let descriptor = CommandDescriptor(id: "test.deleteAudio", title: "Delete", summary: "Injected cleanup",
+                                               params: .obj([:]), effect: .irreversible)
+            h.app.commands.register(descriptor) { _, ctx in
+                _ = try await AudioDelete.delete(.init(clip: "audio:FIXTUREDOC01/FIXTUREAUD01"), ctx, files: files)
+                return [:]
+            }
+            do {
+                _ = try await h.run("test.deleteAudio")
+                XCTFail("Cleanup failure must reach the caller")
+            } catch {}
+            XCTAssertFalse(try clip(h, fixtureClip).deleted)
+            XCTAssertTrue(exists(audioFile))
+            files.failEnumeration = false
+            files.failRemoval = false
+            _ = try await h.run("test.deleteAudio")
+            XCTAssertTrue(try clip(h, fixtureClip).deleted)
+            XCTAssertFalse(exists(audioFile))
+            // A tombstone left by an earlier version must also remain eligible for cleanup retry.
+            try Data([4]).write(to: audioFile)
+            _ = try await h.run("audio.delete", ["clip": .string(fixtureClip)])
+            XCTAssertFalse(exists(audioFile))
+        }
+    }
+
+    func testLockedDeletionDoesNotRemoveFilesOrHideTheClip() async throws {
+        let (h, _) = try harness()
+        let audioFile = try file(h, "audio/FIXTUREAUD01.caf")
+        try Data([1, 2, 3]).write(to: audioFile)
+        h.app.services.lock = FakeLockService(locked: [Fixtures.docID])
+        await assertThrows(.locked) { try await h.run("audio.delete", ["clip": .string(self.fixtureClip)]) }
+        XCTAssertTrue(exists(audioFile))
+        XCTAssertFalse(try clip(h, fixtureClip).deleted)
+    }
+
     func testDeletingTheClipThatRecordsStopsTheRecording() async throws {
         let (h, audio) = try harness()
         let source = SyntheticSource()
@@ -921,6 +980,65 @@ final class FeatAudioTests: XCTestCase {
         XCTAssertEqual(engine.plans.last?.origin, 0)
         XCTAssertEqual(audio.playback?.clip, try clip(h, second).id)
         XCTAssertEqual(audio.playback?.isPlaying, true)
+    }
+
+    func testReadFailurePausesAtLastPositionWithoutAdvancing() async throws {
+        let (h, audio) = try harness()
+        let source = SyntheticSource()
+        audio.makeSource = { source }
+        audio.clock = { 1_800_000_000 }
+        _ = try await record(h, source, seconds: 1)
+        let engine = FakePlaybackEngine(length: 600)
+        audio.makeEngine = { engine }
+        try Data([0]).write(to: try file(h, "audio/FIXTUREAUD01.caf"))
+        _ = try await h.run("audio.play", ["clip": .string(fixtureClip), "t": 12])
+        let staleFinish = engine.finish
+        engine.played = 3
+        let reported = expectation(description: "Playback error is reported")
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { _ in
+            reported.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        engine.fail?(CocoaError(.fileReadCorruptFile))
+        staleFinish?()
+        await fulfillment(of: [reported], timeout: 1)
+        XCTAssertEqual(audio.playback?.isPlaying, false)
+        XCTAssertEqual(audio.position, 15, accuracy: 0.01)
+        XCTAssertEqual(engine.opened.count, 1)
+        XCTAssertEqual(audio.playback?.clip, Fixtures.audioID)
+    }
+
+    func testStreamingReadFailureNeverBecomesNormalExhaustion() {
+        var progress = PlaybackProgress()
+        var reads = 0
+        XCTAssertNil(progress.read { reads += 1 })
+        progress.scheduled()
+        XCTAssertNotNil(progress.read { reads += 1; throw CocoaError(.fileReadCorruptFile) })
+        XCTAssertTrue(progress.failed)
+        progress.played()
+        progress.ranOut()
+        XCTAssertFalse(progress.isFinished)
+        _ = progress.read { reads += 1 }
+        XCTAssertEqual(reads, 2, "A pending buffer callback cannot resume reading after failure")
+    }
+
+    func testStreamingShortReadsOnlyFailBeforeTheFinalChunk() throws {
+        for isFinal in [false, true] {
+            XCTAssertNoThrow(try PlaybackProgress.validateRead(frames: 0, requested: 100, isFinal: isFinal))
+            XCTAssertNoThrow(try PlaybackProgress.validateRead(frames: 100, requested: 100, isFinal: isFinal))
+        }
+        XCTAssertNoThrow(try PlaybackProgress.validateRead(frames: 40, requested: 100, isFinal: true))
+        XCTAssertThrowsError(try PlaybackProgress.validateRead(frames: 40, requested: 100, isFinal: false)) { error in
+            XCTAssertEqual((error as? NibError)?.code, .unavailable)
+        }
+        let plan = PlaybackPlan.make(from: 0, duration: 3, silence: nil, skipSilence: false)
+        var cursor = PlaybackPlan.ChunkCursor(plan: plan, sampleRate: 100, fileLength: 250, maxFrames: 100)
+        _ = cursor.next()
+        XCTAssertFalse(cursor.isAtEnd)
+        _ = cursor.next()
+        XCTAssertFalse(cursor.isAtEnd)
+        XCTAssertEqual(cursor.next()?.count, 50)
+        XCTAssertTrue(cursor.isAtEnd)
     }
 
     func testThePlaybackBarShowsWhileAClipIsLoaded() async throws {

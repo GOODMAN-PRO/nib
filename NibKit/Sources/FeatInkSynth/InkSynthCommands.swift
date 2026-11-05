@@ -309,6 +309,10 @@ struct HandwritingReplaceWord: NibCommand {
                 guard !current.locked else {
                     throw NibError.invalid("\(NodeRef.item(doc, page, item.id).description) is locked", path: "$.refs")
                 }
+                guard current == item else {
+                    throw NibError(.conflict, String(localized: "The handwriting changed while replacing the word. Try again."),
+                                   path: "$.refs")
+                }
             }
             // Release dependents in the same undo step, preserving connector endpoints.
             var released: [Item] = []

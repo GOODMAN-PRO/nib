@@ -36,6 +36,7 @@ struct PresentSetMode: NibCommand {
     struct Params: Codable {
         var mode: String
         var blank: Bool?
+        var retry: Bool?
     }
 
     struct Output: Codable {
@@ -47,10 +48,11 @@ struct PresentSetMode: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "present.setMode", title: "Presentation Mode",
+        id: "present.setMode", title: String(localized: "Presentation Mode"),
         summary: "External display: mirror (whole screen), presenter (page follows zoom/scroll) or fullPage (whole page); blank true/false blacks out/shows; omitted keeps it.",
         params: .obj(["mode": .str("mirror | presenter | fullPage", choices: ExternalDisplayMode.allCases.map { $0.rawValue }),
-                      "blank": .bool("true blacks out the connected display, false shows it again; omit to keep the current state")],
+                      "blank": .bool("true blacks out the connected display, false shows it again; omit to keep the current state"),
+                      "retry": .bool("retry failed page renders on connected displays")],
                      required: ["mode"]),
         examples: [["mode": "presenter"], ["mode": "fullPage"], ["mode": "mirror"], ["mode": "presenter", "blank": true],
                    ["mode": "presenter", "blank": false]],
@@ -64,6 +66,7 @@ struct PresentSetMode: NibCommand {
         let controller = ctx.services.get(PresentationController.serviceKey, as: PresentationController.self)
         if let blank = p.blank { controller?.setBlank(blank) }
         ctx.services.settings.set(PresentationSettings.mode, mode)
+        if p.retry == true { await controller?.retry() }
         return Output(mode: mode.rawValue, blank: controller?.blank ?? false,
                       externalDisplay: controller?.isConnected ?? false, displays: controller?.displayNames ?? [])
     }

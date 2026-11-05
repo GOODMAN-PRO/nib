@@ -2225,7 +2225,7 @@ final class NibUI {
         let windows = app.windows.allElementsBoundByIndex
         var probeWindows = 0
         for (index, window) in windows.enumerated() {
-            let probes = window.otherElements["nib.qa.state"].allElementsBoundByIndex
+            let probes = window.otherElements.matching(identifier: "nib.qa.state").allElementsBoundByIndex
             if !probes.isEmpty { probeWindows += 1 }
             logQA("Window scene probe", "step=\(step) axWindow=\(index) " + elementFacts(window))
             for (probeIndex, stateProbe) in probes.enumerated() {

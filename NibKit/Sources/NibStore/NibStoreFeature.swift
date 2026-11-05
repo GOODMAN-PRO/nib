@@ -8,14 +8,27 @@ import NibContracts
 /// the workspace, `asset.*` (F003) and `sync.*` (F025).
 public enum NibStoreFeature: NibFeature {
     public static let id = "store"
+    /// Optional service for package-copy callers that depend only on NibContracts. False means a different
+    /// persistence implementation is active. Success means all submitted edits are durable; failures throw.
+    public typealias Checkpoint = @MainActor (DocumentID) throws -> Bool
+    public static let checkpointKey = "store.checkpoint"
 
     public static func register(_ app: NibApp) {
         let gate = ReadOnlyGate()
         // `deviceHex` is DeviceIdentity.hex in the app and the Harness id in two-device tests, so file names and rev
         // tiebreakers stay in step.
         app.workspace.persistence = PackagePersistence(device: app.deviceHex, locator: app.services.packages,
-                                                       events: app.events, gate: gate)
+                                                       events: app.events, gate: gate,
+                                                       isDocumentOpen: { [weak workspace = app.workspace] doc in
+                                                           workspace?.isLoaded(doc) == true
+                                                       })
         app.services.assets = PackageAssetStore(locator: app.services.packages, gate: gate)
+        let checkpoint: Checkpoint = { [weak workspace = app.workspace] doc in
+            guard let store = workspace?.persistence as? PackagePersistence else { return false }
+            try store.checkpoint(doc)
+            return true
+        }
+        app.services.set(checkpoint as AnyObject, for: checkpointKey)
         // The legacy set (`ServiceKeys.storeReadOnly`), kept until every consumer asks `isReadOnly` instead.
         app.services.set(gate.published, for: ServiceKeys.storeReadOnly)
     }

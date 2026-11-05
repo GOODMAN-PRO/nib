@@ -209,7 +209,8 @@ final class EditHandwritingModel: ObservableObject {
         var current: [ElementID: Item] = [:]
         for id in ids { current[id] = byID[id] }
         let glyphs = ids.compactMap { id -> InkGlyph? in current[id].flatMap { InkGlyph(item: $0) } }
-        let next = glyphs.isEmpty ? InkLayout.empty : await Handwriting.layout(glyphs, hints: hints)
+        let next = glyphs.isEmpty ? InkLayout.empty : await Handwriting.layout(glyphs, hints: hints,
+            rightToLeft: Handwriting.rightToLeft(t.doc, workspace: app.workspace))
         guard generation == self.generation, target == t, serial > appliedSerial else { return }
         appliedSerial = serial
         revision += 1
@@ -363,7 +364,8 @@ final class EditHandwritingModel: ObservableObject {
         picking = true
         let generation = self.generation
         Task { [weak self] in
-            let whole = await Handwriting.layout(glyphs, hints: [])
+            let whole = await Handwriting.layout(glyphs, hints: [],
+                                                 rightToLeft: Handwriting.rightToLeft(doc, workspace: app.workspace))
             guard let self else { return }
             self.picking = false
             let queued = self.queuedTap
@@ -504,11 +506,12 @@ final class EditHandwritingModel: ObservableObject {
         let width = layout.columns[c].box.width
         let left = layout.pageLeft(ofColumn: c)
         let group = NibID.make().raw
+        let removalRefs = JSONValue.array(word.ids.map { .string(NodeRef.item(t.doc, t.page, $0).description) })
         let reflow: JSONValue = ["refs": refs(columnIDs), "width": .number(width), "left": .number(left),
                                  "without": refs(word.ids)]
         guard await run(CommandIDs.handwritingReflow, reflow, group: group) != nil else { return }
         selectedWord = []
-        if await run(command, ["refs": refs(word.ids)], group: group) == nil,
+        if await run(command, ["refs": removalRefs], group: group) == nil,
            app.bus.history.entries(t.doc).last?.group == group {
             // The word could not be removed: put the column back as it was.
             app.bus.undo(t.doc)

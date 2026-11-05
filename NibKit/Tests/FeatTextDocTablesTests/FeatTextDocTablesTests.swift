@@ -1,6 +1,7 @@
 import XCTest
 import UIKit
 import SwiftUI
+import Combine
 import NibContracts
 import NibDesign
 import NibTesting
@@ -19,6 +20,117 @@ final class FeatTextDocTablesTests: XCTestCase {
     private func table(_ h: Harness) throws -> TableData {
         let b = try XCTUnwrap(h.app.workspace.content(doc).liveBlocks.first { $0.id == Fixtures.tableBlockID })
         return try XCTUnwrap(b.table)
+    }
+
+    func testCutKeepsContentSelectionAndUndoWhenCopyFails() async throws {
+        let h = harness(), v = try view(h)
+        let descriptor = CommandDescriptor(id: "clipboard.copyText", title: "Copy", summary: "Fail copying",
+                                           params: .obj(["text": .str("text")]), effect: .read)
+        h.app.commands.register(descriptor) { _, _ in throw NibError.invalid("Clipboard unavailable") }
+        v.select(.rows(0...0))
+        let before = try h.snapshot(doc)
+        let depth = h.undoDepth(doc)
+        v.keyAction(.cut)
+        await v.flushEdits()
+        XCTAssertEqual(try h.snapshot(doc), before)
+        XCTAssertEqual(v.selection, .rows(0...0))
+        XCTAssertEqual(h.undoDepth(doc), depth)
+    }
+
+    func testDelayedCutKeepsItsQueuePositionAndFlushIncludesDeletion() async throws {
+        let h = harness(), v = try view(h), mounted = mount(v)
+        defer { withExtendedLifetime(mounted) {} }
+        // Three rows leave the subsequently queued move valid after Cut removes the first row.
+        v.run(.addRowAtEnd, on: .table)
+        await v.flushEdits()
+        v.edit(TableEdit.Params(ref: ref, op: .setCell, row: 2, column: 0, text: RichText(plain: "A3")))
+        await v.flushEdits()
+        let gate = TableCommandGate()
+        defer { gate.open = true }
+        var copied: String?
+        h.app.commands.register(CommandDescriptor(id: "clipboard.copyText", title: "Copy", summary: "Delayed copy",
+                                                  params: .obj(["text": .str("text")]), effect: .read)) { params, _ in
+            copied = params["text"]?.stringValue
+            try await gate.wait()
+            return .null
+        }
+        v.select(.rows(0...0))
+        v.keyAction(.cut)
+        try await waitForTable { gate.started }
+        v.keyAction(.moveRowDown)
+        var flushed = false
+        var rowsAtFlush: [String]?
+        let flush = Task {
+            await v.flushEdits()
+            rowsAtFlush = try? self.table(h).rows.map { $0[0].text.plainText }
+            flushed = true
+        }
+        defer { flush.cancel() }
+        await Task.yield()
+        XCTAssertFalse(flushed)
+        gate.open = true
+        try await waitForTable { flushed }
+        XCTAssertTrue(copied?.hasPrefix("A1\t") == true)
+        XCTAssertEqual(try table(h).rows.map { $0[0].text.plainText }, ["A3", "A2"],
+                       "Cut must delete A1 before the queued move, and before flushEdits returns")
+        XCTAssertEqual(rowsAtFlush, ["A3", "A2"], "The deletion must already be complete at the flush boundary")
+    }
+
+    func testSuspendedWriteAcrossDetachAndRevisitKeepsNewerTyping() async throws {
+        let h = harness(), v = try view(h), mounted = mount(v)
+        defer { withExtendedLifetime(mounted) {} }
+        let gate = TableCommandGate()
+        defer { gate.open = true }
+        let entry = try XCTUnwrap(h.app.commands.entry("table.edit"))
+        var writes = 0
+        h.app.commands.register(entry.descriptor) { params, context in
+            writes += 1
+            if writes == 1 { try await gate.wait() }
+            return try await entry.handler(params, context)
+        }
+        let active = try XCTUnwrap(h.app.services.get("tables.activeQueues", as: CurrentValueSubject<Set<UIView>, Never>.self))
+        v.beginEditing(at: CellPosition(row: 0, column: 0))
+        type("Older write", into: v)
+        v.flushTyping()
+        try await waitForTable { gate.started }
+        v.endEditing()
+        v.removeFromSuperview()
+        XCTAssertTrue(active.value.contains(v), "The host must keep this view discoverable while detached")
+        mounted.1.addSubview(v)
+        v.beginEditing(at: CellPosition(row: 0, column: 0))
+        type("Newest text", into: v)
+        v.flushTyping()
+        gate.open = true
+        var flushed = false
+        let flush = Task { await v.flushEdits(); flushed = true }
+        defer { flush.cancel() }
+        try await waitForTable { flushed }
+        XCTAssertEqual(try table(h).rows[0][0].text.plainText, "Newest text")
+        XCTAssertEqual(v.editor.text, "Newest text")
+        XCTAssertFalse(active.value.contains(v))
+    }
+
+    private func waitForTable(_ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(1)
+        while !condition() {
+            guard Date() < deadline else { throw NibError(.internalError, "Timed out waiting for table command") }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+    }
+
+    func testDetachedTableRetainsItselfUntilPendingTypingIsSaved() async throws {
+        let h = harness()
+        var tableView: TableBlockView? = try view(h)
+        weak var released = tableView
+        let mounted = mount(try XCTUnwrap(tableView))
+        defer { withExtendedLifetime(mounted) {} }
+        tableView?.beginEditing(at: CellPosition(row: 0, column: 0))
+        type("Keep these edits", into: try XCTUnwrap(tableView))
+        tableView?.removeFromSuperview()
+        tableView = nil
+        for _ in 0..<1000 where released != nil { await Task.yield() }
+        XCTAssertEqual(try table(h).rows[0][0].text.plainText, "Keep these edits")
+        XCTAssertNil(released)
     }
     private func view(_ h: Harness, heightChanged: @escaping @MainActor (CGFloat) -> Void = { _ in }) throws -> TableBlockView {
         let b = try XCTUnwrap(h.app.workspace.content(doc).liveBlocks.first { $0.id == Fixtures.tableBlockID })
@@ -240,6 +352,12 @@ final class FeatTextDocTablesTests: XCTestCase {
         }
     }
 
+    func testResizeUsesTouchDownInsteadOfRecognitionLocation() {
+        let layout = TableGridLayout(columnWidths: [100, 100], rowHeights: [100])
+        XCTAssertNil(layout.resizeDivider(location: CGPoint(x: 82, y: 10), translation: CGPoint(x: 12, y: 0), origin: .zero))
+        XCTAssertEqual(layout.resizeDivider(location: CGPoint(x: 70, y: 10), translation: CGPoint(x: -12, y: 0), origin: .zero), 0)
+    }
+
     func testConformanceAndRegistryIntegration() async throws {
         let problems = await CommandConformance.check(features: [FeatTextDocTablesFeature.self])
         XCTAssertEqual(problems, [])
@@ -454,6 +572,21 @@ private struct TableExporterProbe: NibCommand {
     static func run(_ params: Params, _ ctx: CommandContext) async throws -> [String] {
         let exporter = try XCTUnwrap(ctx.content.exporters.get(TableExport.exporterID))
         return try await exporter.handler(ExportRequest(documents: [Fixtures.textDocID], fileName: "Chosen/Name"), ctx).map { $0.path }
+    }
+}
+
+@MainActor
+private final class TableCommandGate {
+    var started = false
+    var open = false
+
+    func wait() async throws {
+        started = true
+        let deadline = Date().addingTimeInterval(1)
+        while !open {
+            guard Date() < deadline else { throw NibError(.internalError, "Table gate timed out") }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
     }
 }
 

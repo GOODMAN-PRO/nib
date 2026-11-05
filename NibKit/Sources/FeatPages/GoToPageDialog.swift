@@ -44,6 +44,11 @@ enum PageDialogs {
 
 /// What the Go to Page field means: a 1-based page number, else the start (then any part) of a page title.
 enum GoToPageResolver {
+    static func outOfRangeMessage(count: Int) -> String {
+        if count == 1 { return String(localized: "This notebook has 1 page. Enter page 1.") }
+        return String(localized: "This notebook has \(count) pages. Enter a number from 1 to \(count).")
+    }
+
     enum Outcome: Equatable {
         case empty
         case page(Int)
@@ -73,14 +78,20 @@ enum GoToPageResolver {
 @MainActor
 struct GoToPageDialog: View {
     let context: PanelContext
+    private let focusesField: Bool
+    private let onJumpFrames: (([String: CGRect]) -> Void)?
     private let doc: DocumentID?
     private let pages: [PageRecord]
     private let current: Int?
     @State private var input = ""
     @FocusState private var fieldFocused: Bool
 
-    init(context: PanelContext) {
+    init(context: PanelContext, initialInput: String = "", focusesField: Bool = true,
+         onJumpFrames: (([String: CGRect]) -> Void)? = nil) {
         self.context = context
+        self.focusesField = focusesField
+        self.onJumpFrames = onJumpFrames
+        _input = State(initialValue: initialInput)
         let doc = context.session?.document
         let pages = doc.flatMap { try? context.app.workspace.content($0) }?.livePages ?? []
         self.doc = doc
@@ -93,49 +104,64 @@ struct GoToPageDialog: View {
         VStack(spacing: 0) {
             NibSheetHeader(String(localized: "Go to Page"), primaryTitle: String(localized: "Go"),
                            isPrimaryEnabled: outcome.index != nil, onCancel: { context.dismiss() }, onPrimary: { go() })
-            if pages.isEmpty {
-                NibEmptyState(symbol: .pages, title: String(localized: "No pages to go to"),
-                              message: String(localized: "Open a notebook, then choose Go to Page."))
-            } else {
-                VStack(spacing: NibSpacing.l) {
-                    HStack(alignment: .firstTextBaseline, spacing: NibSpacing.s) {
-                        NibField(text: $input, prompt: String(localized: "Page"))
-                            .multilineTextAlignment(.center)
-                            .keyboardType(.numbersAndPunctuation)
-                            .submitLabel(.go)
-                            .autocorrectionDisabled()
-                            .textInputAutocapitalization(.never)
-                            .focused($fieldFocused)
-                            .onSubmit { go() }
-                            .onChange(of: input) { _, text in
-                                // NibField grows vertically, so Return can arrive as a line break instead of a submit.
-                                guard text.contains("\n") else { return }
-                                input = text.replacingOccurrences(of: "\n", with: "")
-                                go()
-                            }
-                            .accessibilityLabel(String(localized: "Page number or title"))
-                            .accessibilityHint(String(localized: "\(pages.count) pages"))
-                        Text(String(localized: "of \(pages.count)"))
-                            .font(NibFont.title3)
+            ScrollView {
+                if pages.isEmpty {
+                    NibEmptyState(symbol: .pages, title: String(localized: "No pages to go to"),
+                                  message: String(localized: "Open a notebook, then choose Go to Page."))
+                } else {
+                    VStack(spacing: NibSpacing.l) {
+                        HStack(alignment: .firstTextBaseline, spacing: NibSpacing.s) {
+                            NibField(text: $input, prompt: String(localized: "Page"))
+                                .multilineTextAlignment(.center)
+                                .keyboardType(.numbersAndPunctuation)
+                                .submitLabel(.go)
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                                .focused($fieldFocused)
+                                .onSubmit { go() }
+                                .onChange(of: input) { _, text in
+                                    // NibField grows vertically, so Return can arrive as a line break instead of a submit.
+                                    guard text.contains("\n") else { return }
+                                    input = text.replacingOccurrences(of: "\n", with: "")
+                                    go()
+                                }
+                                .accessibilityLabel(String(localized: "Page number or title"))
+                                .accessibilityHint(String(localized: "\(pages.count) pages"))
+                            Text(String(localized: "of \(pages.count)"))
+                                .font(NibFont.title3)
+                                .foregroundStyle(NibColor.labelSecondary)
+                                .accessibilityHidden(true)
+                        }
+                        Text(message(outcome))
+                            .font(NibFont.footnote)
                             .foregroundStyle(NibColor.labelSecondary)
-                            .accessibilityHidden(true)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: NibSpacing.s) {
+                            jumpButton(String(localized: "First Page"), id: "first", index: 0)
+                            jumpButton(String(localized: "Last Page"), id: "last", index: pages.count - 1)
+                        }
                     }
-                    Text(message(outcome))
-                        .font(NibFont.footnote)
-                        .foregroundStyle(NibColor.labelSecondary)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: NibSpacing.s) {
-                        NibButton(String(localized: "First Page"), size: .compact) { jump(to: 0) }
-                        NibButton(String(localized: "Last Page"), size: .compact) { jump(to: pages.count - 1) }
-                    }
+                    .padding(NibSpacing.xl)
                 }
-                .padding(NibSpacing.xl)
             }
             Spacer(minLength: 0)
         }
         .presentationDetents([.medium, .large])
-        .onAppear { fieldFocused = true }
+        .onPreferenceChange(PageJumpFrames.self) { onJumpFrames?($0) }
+        .onAppear { fieldFocused = focusesField }
+    }
+
+    private func jumpButton(_ title: String, id: String, index: Int) -> some View {
+        NibButton(title, size: .compact) { jump(to: index) }
+            .background {
+                if onJumpFrames != nil {
+                    GeometryReader { proxy in
+                        Color.clear.preference(key: PageJumpFrames.self, value: [id: proxy.frame(in: .global)])
+                    }
+                    .allowsHitTesting(false)
+                }
+            }
     }
 
     private func message(_ outcome: GoToPageResolver.Outcome) -> String {
@@ -149,7 +175,7 @@ struct GoToPageDialog: View {
             if let title = pages[index].title, !title.isEmpty { return String(localized: "Page \(index + 1): \(title)") }
             return String(localized: "Page \(index + 1)")
         case .outOfRange:
-            return String(localized: "This notebook has \(pages.count) pages. Enter a number from 1 to \(pages.count).")
+            return GoToPageResolver.outOfRangeMessage(count: pages.count)
         case .noMatch:
             let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
             return String(localized: "No page title matches \u{201C}\(text)\u{201D}.")
@@ -166,6 +192,13 @@ struct GoToPageDialog: View {
         context.app.perform(CommandIDs.viewGoToPage, ["page": .string(NodeRef.page(doc, pages[index].id).description)],
                             session: context.session)
         context.dismiss()
+    }
+}
+
+private struct PageJumpFrames: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 
