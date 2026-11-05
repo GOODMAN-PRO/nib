@@ -190,7 +190,7 @@ final class ChromeUITests: XCTestCase {
 
     private func toggle(_ name: String, to on: Bool) throws {
         let target = ui.app.switches.matching(NSPredicate(format: "label == %@", name)).firstMatch
-        _ = try reachable(name)
+        _ = try reachable(name, type: .switch)
         XCTAssertTrue(target.exists, "Expected switch \(name)")
         try ui.setSwitch(target, to: on)
         try wait("\(name) must become \(on)") { (target.value as? String == "1") == on }

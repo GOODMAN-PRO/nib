@@ -22,7 +22,6 @@ final class InsertUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
-        ui.diagnoseKeyDelivery = true
         ui.logIdleSelectors(for: String(describing: type(of: self)))
         // A timed-out denial test cannot run teardown. Reset TCC before every fresh fixture.
         ui.app.resetAuthorizationStatus(for: .microphone)
@@ -253,20 +252,37 @@ final class InsertUITests: XCTestCase {
     private func canvasText(_ value: String) -> XCUIElement {
         ui.canvas.staticTexts.matching(NSPredicate(format: "value == %@", value)).firstMatch
     }
-    private func settledCanvasPoint(_ target: XCUIElement) throws -> XCUICoordinate {
+    private func settledCanvasPoint(_ target: XCUIElement, fallback: CGPoint? = nil) throws -> XCUICoordinate {
         var previousFrame: CGRect?
         var previousOffset: CGPoint?
         var visibleFrame = CGRect.zero
-        try wait("Canvas item and scroll position must settle after keyboard dismissal") {
-            guard !self.ui.app.keyboards.firstMatch.exists, target.exists,
-                  let state = try? self.ui.state() else { return false }
-            let frame = target.frame.intersection(self.ui.canvas.frame).intersection(self.ui.app.windows.firstMatch.frame)
-            let offset = CGPoint(x: state.contentOffset.x, y: state.contentOffset.y)
-            defer { previousFrame = frame; previousOffset = offset }
-            guard !frame.isNull, frame.width > 0, frame.height > 0,
-                  previousFrame == frame, previousOffset == offset else { return false }
-            visibleFrame = frame
-            return true
+        do {
+            try wait("Canvas item and scroll position must settle after keyboard dismissal") {
+                guard !self.ui.app.keyboards.firstMatch.exists, target.exists,
+                      let state = try? self.ui.state() else { return false }
+                let frame = target.frame.intersection(self.ui.canvas.frame).intersection(self.ui.app.windows.firstMatch.frame)
+                let offset = CGPoint(x: state.contentOffset.x, y: state.contentOffset.y)
+                defer { previousFrame = frame; previousOffset = offset }
+                guard !frame.isNull, frame.width > 0, frame.height > 0,
+                      previousFrame == frame, previousOffset == offset else { return false }
+                visibleFrame = frame
+                return true
+            }
+        } catch {
+            // Sticky/link/clipped multiline text need not expose the full string as an AX value.
+            // Keep the former canvas point and the caller's selection/edit/content assertions.
+            ui.logQA("Insert item point fallback", "reason=\(error) " + ui.elementFacts(target))
+            previousOffset = nil
+            previousFrame = nil
+            try wait("Fallback canvas and scroll position must settle after keyboard dismissal") {
+                guard !self.ui.app.keyboards.firstMatch.exists,
+                      let state = try? self.ui.state() else { return false }
+                let frame = self.ui.canvas.frame
+                let offset = CGPoint(x: state.contentOffset.x, y: state.contentOffset.y)
+                defer { previousFrame = frame; previousOffset = offset }
+                return frame.width > 0 && frame.height > 0 && previousFrame == frame && previousOffset == offset
+            }
+            return ui.coordinate(fallback ?? point)
         }
         ui.logQA("Insert settled item", "frame=\(visibleFrame) offset=\(String(describing: previousOffset))")
         return ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
@@ -279,7 +295,7 @@ final class InsertUITests: XCTestCase {
             ui.coordinate(CGPoint(x: 0.36, y: 0.84)).tap()
             _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 0 }
         }
-        if let target { try settledCanvasPoint(target).tap() }
+        if let target { try settledCanvasPoint(target, fallback: p).tap() }
         else { ui.coordinate(p ?? point).tap() }
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
     }
@@ -559,6 +575,8 @@ final class InsertUITests: XCTestCase {
         try counts(6, strokes: 1)
     }
     func testNativeTextInputRetainsUnicodeWithoutCanvasInk() throws {
+        ui.diagnoseKeyDelivery = true
+        defer { ui.diagnoseKeyDelivery = false }
         try beginText("Force 🧲 → 加速度"); try finish()
         XCTAssertEqual(try plain(snapshot("text")), "Force 🧲 → 加速度")
         try counts(5, strokes: 1)
@@ -1294,6 +1312,8 @@ final class InsertUITests: XCTestCase {
         try counts(5)
     }
     func testObjectCommentAnchorsSelectedShapeAndCopiesDeepLink() throws {
+        ui.diagnoseKeyDelivery = true
+        defer { ui.diagnoseKeyDelivery = false }
         try shape(); try menu("Add Comment")
         let input = try ui.textEditor("Add a comment")
         try ui.focusField(input); input.typeText("Shape annotation"); try tap("Send"); try counts(6)

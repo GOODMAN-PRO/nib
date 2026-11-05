@@ -441,7 +441,7 @@ final class NibUI {
             origin.withOffset(CGVector(dx: start.x - appFrame.minX, dy: start.y - appFrame.minY))
                 .press(forDuration: 0.01, thenDragTo: origin.withOffset(
                     CGVector(dx: end.x - appFrame.minX, dy: end.y - appFrame.minY)),
-                       withVelocity: hasSlider(snapshot) ? .slow : (homing ? .fast : .default), thenHoldForDuration: 0)
+                       withVelocity: hasSlider(snapshot) || !lazySearch ? .slow : (homing ? .fast : .default), thenHoldForDuration: 0)
             moves += 1
             if homing { homeMoves += 1 }
             logQA("Form move timing", "move=\(moves) homing=\(homing) seconds=\(Date().timeIntervalSince(moveStarted))")
@@ -1733,10 +1733,16 @@ final class NibUI {
             defer { logQA("Native form field duration", "field=\(name) seconds=\(Date().timeIntervalSince(started))") }
             let predicate = NSPredicate(format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)
             var field = container.textFields.matching(predicate).firstMatch
-            if !field.exists {
-                for kind in [XCUIElement.ElementType.textView, .searchField, .secureTextField] {
-                    let candidate = container.descendants(matching: kind).matching(predicate).firstMatch
-                    if candidate.exists { field = candidate; break }
+            var fieldContainer = container
+            let scopes = container === app ? [app] : [container, app]
+            search: for candidateScope in scopes {
+                for kind in [XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField] {
+                    let candidate = candidateScope.descendants(matching: kind).matching(predicate).firstMatch
+                    if candidate.exists {
+                        field = candidate
+                        fieldContainer = candidateScope
+                        break search
+                    }
                 }
             }
             if !field.exists {
@@ -1744,7 +1750,7 @@ final class NibUI {
                 if let failure = formRevealFailure { throw Failure.message(failure) }
             }
             guard field.waitForExistence(timeout: 8) else { throw Failure.message("Missing form field: " + name) }
-            try replaceNativeText(in: field, with: value, container: container)
+            try replaceNativeText(in: field, with: value, container: fieldContainer)
             last = field
         }
         guard let last else { throw Failure.message("Native form needs at least one field") }
@@ -2542,13 +2548,24 @@ final class NibUI {
         }
     }
 
+    /// Chrome and palette buds retain empty, on-screen ScrollViews after closing.
+    /// Their menu rows, including disabled buttons, distinguish presentation from those shells.
+    private func menuHasActiveContent(_ menu: XCUIElement) -> Bool {
+        guard hasVisibleFrame(menu) else { return false }
+        if menu.elementType == .scrollView { return menu.buttons.firstMatch.exists }
+        return true // Native surfaces and caller-supplied content sentinels.
+    }
+
     /// Query-only postcondition: never use a canvas tap to hide a failed menu action.
-    func waitForMenuClosed(_ menu: XCUIElement, named name: String) throws {
+    /// Pass the native cover belonging to this presentation, not a successor sheet's cover.
+    /// Custom DismissCatcher is AX-hidden and follows the bud's presentation state/row exposure.
+    func waitForMenuClosed(_ menu: XCUIElement, named name: String, dismissalCover: XCUIElement? = nil) throws {
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            !menu.exists || !hasVisibleFrame(menu)
+            !menuHasActiveContent(menu) && !(dismissalCover.map { hasVisibleFrame($0) } ?? false)
         }, object: nil)
         guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
             let facts = "menu=\(name) " + elementFacts(menu)
+                + (dismissalCover.map { " cover=" + elementFacts($0) } ?? "")
             logQA("Menu remained open", facts)
             logStateStep("Menu remained open " + name)
             recordDiagnostics("Menu remained open " + name, facts: facts)
@@ -2556,15 +2573,15 @@ final class NibUI {
         }
     }
 
-    /// Native popovers expose a dismissal region; custom buds expose labelled scroll views.
+    /// Native popovers expose a dismissal region; Replay's sheet can expose only Other/ScrollView.
     /// Refuse ambiguous geometry instead of silently returning with an input cover still up.
     private func dismissPresentedPopover() throws -> Bool {
         let region = app.otherElements["PopoverDismissRegion"].firstMatch
         let native = app.popovers.allElementsBoundByIndex.filter { hasVisibleFrame($0) }
-        let buds = app.scrollViews.matching(NSPredicate(format: "label IN {'More', 'More tools'}"))
-            .allElementsBoundByIndex.filter { hasVisibleFrame($0) }
-        guard region.exists || !native.isEmpty || !buds.isEmpty else { return false }
-        let surfaces = native + buds
+        guard hasVisibleFrame(region) || !native.isEmpty else { return false }
+        let replay = app.scrollViews.containing(.switch, identifier: "Replay handwriting")
+            .allElementsBoundByIndex.filter { menuHasActiveContent($0) }
+        let surfaces = native + replay
         guard !surfaces.isEmpty else {
             let facts = elementFacts(region)
             logQA("Popover still open", facts)
@@ -2581,8 +2598,9 @@ final class NibUI {
         let frame = app.frame
         app.coordinate(withNormalizedOffset: .zero).withOffset(
             CGVector(dx: point.x - frame.minX, dy: point.y - frame.minY)).tap()
-        for surface in surfaces { try waitForMenuClosed(surface, named: "dismissSheets popover") }
-        if region.exists { try waitForMenuClosed(region, named: "PopoverDismissRegion") }
+        for surface in surfaces {
+            try waitForMenuClosed(surface, named: "dismissSheets popover", dismissalCover: region)
+        }
         return true
     }
 
@@ -2608,8 +2626,12 @@ final class NibUI {
                 sheet.swipeDown(); continue
             }
             if let settings = try readState()?.toolSettingsOpen {
-                logQA("Popover still open", "toolSettingsOpen=\(settings)")
-                throw Failure.message("Tool settings popover still open after sheet dismissal: " + settings)
+                logQA("Popover closure pending", "toolSettingsOpen=\(settings)")
+                _ = try waitForState(timeout: 8) { $0.toolSettingsOpen == nil }
+            }
+            // Buds have no native dismissal region. Report active rows without a speculative corner tap.
+            for title in ["More", "More tools"] {
+                try waitForMenuClosed(app.scrollViews[title].firstMatch, named: "dismissSheets " + title)
             }
             return
         }
