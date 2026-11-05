@@ -1907,9 +1907,25 @@ final class NibUI {
     }
 
     func selectTool(_ id: String) throws {
-        // Tapping an already selected tool opens its settings, so select only when needed.
+        // Reselecting toggles its options strip (or settings for a tool without a strip).
         if try state().tool != id { try tapControl("tool." + id, overflow: ["tool.more"]) }
         _ = try waitForState { $0.tool == id }
+    }
+
+    /// Follow the visible UI: unfold a hidden strip, then use its settings chevron.
+    /// Tools without a strip still open settings on reselection.
+    func openToolSettings(_ id: String) throws {
+        try selectTool(id)
+        if try state().toolSettingsOpen == id { return }
+        if let chevron = try? requireControl("menu.toolSettings", type: .button, timeout: 3) {
+            chevron.tap()
+        } else {
+            try tapControl("tool." + id, overflow: ["tool.more"])
+            if try state().toolSettingsOpen != id {
+                try requireControl("menu.toolSettings", type: .button, timeout: 8).tap()
+            }
+        }
+        _ = try waitForState { $0.toolSettingsOpen == id }
     }
 
     private func tapControl(_ id: String, overflow: [String], diagnostics: Bool = false) throws {

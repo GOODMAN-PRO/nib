@@ -199,10 +199,13 @@ enum PresetRules {
     }
 
     /// Reads, changes and writes a tool's presets (normalised on both sides; nothing is written when nothing changed).
-    static func update(_ tool: String, in settings: SettingsStore,
+    static func update(_ tool: String, in settings: SettingsStore, expectedSwatches: [PresetSwatch]? = nil,
                        _ change: (ToolPresets) throws -> ToolPresets) throws -> ToolPresets {
         let setting = PresetRules.key(tool)
         let current = normalized(settings.get(setting), tool: tool)
+        if let expectedSwatches, current.swatches != expectedSwatches {
+            throw NibError.invalid(String(localized: "The saved colours changed. Reopen the colour picker and try again."), path: "$.expectedSwatches")
+        }
         let changed = try change(current)
         let next = normalized(changed, tool: tool)
         if next != current { settings.set(setting, next) }
@@ -262,6 +265,7 @@ struct PresetSetSwatch: NibCommand {
         var index: Int
         var color: String
         var pattern: String?
+        var expectedSwatches: [PresetSwatch]? = nil
     }
     static let descriptor = CommandDescriptor(
         id: "preset.setSwatch", title: "Change Colour Preset",
@@ -269,6 +273,7 @@ struct PresetSetSwatch: NibCommand {
         params: .obj(["tool": PresetRules.toolSchema(),
                       "index": .int("colour slot, 0-based", min: 0, max: 11),
                       "color": .color,
+                      "expectedSwatches": .arr(.anything(), "swatch list when the picker opened"),
                       "pattern": .str("tape only: pattern id from tape.patterns (bare or '<id>.png'); '' removes the pattern; omit to keep it")],
                      required: ["tool", "index", "color"]),
         examples: [["tool": "pen", "index": 0, "color": "#2156D9"], ["tool": "highlighter", "index": 1, "color": "#86E3AE"]],
@@ -282,7 +287,7 @@ struct PresetSetSwatch: NibCommand {
             throw NibError(.notFound, "tape pattern '\(id)' not found", path: "$.pattern",
                            hint: "call tape.patterns for the available pattern ids")
         }
-        let next = try PresetRules.update(p.tool, in: ctx.services.settings) {
+        let next = try PresetRules.update(p.tool, in: ctx.services.settings, expectedSwatches: p.expectedSwatches) {
             try PresetRules.setSwatch($0, tool: p.tool, index: p.index, color: colour, pattern: change)
         }
         return PresetOutput(tool: p.tool, applied: true, presets: next)

@@ -181,6 +181,69 @@ final class FeatObjectMenuTests: XCTestCase {
 
     // MARK: item.delete
 
+    func testDeleteWithExpectedRevisionsDeletesAndUndoesNormally() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let before = try h.snapshot()
+        let shape = try item(h, Fixtures.shapeID)
+        let shapeRef = NodeRef.item(doc, page, shape.id).description
+        let out = try await h.run("item.delete", ["refs": [.string(shapeRef)],
+            "expectedRevisions": try JSONValue.from([shapeRef: shape.rev])])
+        XCTAssertEqual(out["deleted"], [.string(shapeRef)])
+        XCTAssertThrowsError(try item(h, Fixtures.shapeID))
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testDeleteExpectedRevisionsRefusesEditedDeletedOrUnversionedTargetsAtomically() async throws {
+        for change in ["edit", "delete", "omit"] {
+            let h = Harness(features: [FeatObjectMenuFeature.self])
+            let shape = try item(h, Fixtures.shapeID), sticky = try item(h, Fixtures.stickyID)
+            let shapeRef = NodeRef.item(doc, page, shape.id).description
+            let stickyRef = NodeRef.item(doc, page, sticky.id).description
+            var revisions = [shapeRef: shape.rev, stickyRef: sticky.rev]
+            if change == "omit" { revisions[shapeRef] = nil }
+            h.app.commands.register(CommandDescriptor(id: "test.changeNeighbor", title: "Change neighbour",
+                summary: "Change after delete invocation but before its transaction.", effect: .edit)) { _, ctx in
+                try ctx.mutate { tx in
+                    if change == "delete" {
+                        try tx.delete(item: Fixtures.shapeID, doc: Fixtures.docID, page: Fixtures.page1)
+                    } else if change == "edit" {
+                        var changed = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
+                        changed.shape?.frame.x += 20
+                        _ = try tx.put(changed, doc: Fixtures.docID, page: Fixtures.page1)
+                    }
+                }
+                return [:]
+            }
+            var entered = false, resume = false
+            h.app.bus.hooks.register(CommandHookDescriptor.guarding(id: "test.changeBeforeDelete", owner: "test",
+                commands: [CommandIDs.itemDelete]) { _, _, _ in
+                entered = true
+                let deadline = Date().addingTimeInterval(3)
+                while !resume, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
+                guard resume else { throw NibError(.unavailable, "delete hook timed out") }
+                return nil
+            })
+            defer { resume = true }
+            let deletion = Task { @MainActor in
+                try await h.run("item.delete", ["refs": [.string(stickyRef), .string(shapeRef)],
+                    "expectedRevisions": try JSONValue.from(revisions)])
+            }
+            let deadline = Date().addingTimeInterval(2)
+            while !entered, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
+            XCTAssertTrue(entered)
+            _ = try await h.run("test.changeNeighbor")
+            let afterChange = try h.snapshot()
+            resume = true
+            do {
+                _ = try await deletion.value
+                XCTFail("Deleting a stale or unversioned target must fail")
+            } catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+            XCTAssertEqual(try h.snapshot(), afterChange)
+            XCTAssertEqual(try item(h, Fixtures.stickyID), sticky, "No target is removed on conflict")
+        }
+    }
+
     func testDeletingAShapeDetachesItsConnectorInOneUndoStep() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
         let before = try h.snapshot()

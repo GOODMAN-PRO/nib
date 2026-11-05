@@ -204,7 +204,9 @@ struct LibraryMenuRow: View {
                         .frame(width: NibSpacing.xxl)
                         .accessibilityHidden(true)
                 }
+                .libraryLayoutFrame("menu.accessory." + title, space: .global)
             }
+            .libraryLayoutFrame("menu.label." + title, space: .global)
         }
         .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
         .contentShape(Rectangle())
@@ -321,7 +323,7 @@ struct LibraryNewMenuPopover: View {
             let header = titleHeight + NibSpacing.m + 2 * NibSpacing.l
             let layout = LibraryMenuViewport(available: max(above, below), count: count,
                                              rowHeight: rowHeight, header: header, maximumHeight: max(above, below))
-            let width = min(NibMetrics.popoverWidth, max(0, proxy.size.width - 2 * inset))
+            let width = min(NibMetrics.panelWidth, max(0, proxy.size.width - 2 * inset))
             let y = layout.height <= below ? anchor.maxY + gap : max(top, anchor.minY - gap - layout.height)
             VStack(alignment: .leading, spacing: NibSpacing.m) {
                 Text(String(localized: "New")).font(NibFont.headline).foregroundStyle(NibColor.label)

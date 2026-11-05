@@ -23,7 +23,7 @@ public enum FeatTextBoxFeature: NibFeature {
             TextLayout.layoutInfo(item)
         })
 
-        // Select a box, then tap it (or double-tap it with any tool) to type; before selection.tapAt (400).
+        // Keep the normal item-filtered ordering; an open editor adds its outside-tap handler.
         for gesture in [CanvasGesture.tap, CanvasGesture.doubleTap] {
             app.content.tapHandlers.register(TapHandlerDescriptor(
                 id: CommandIDs.textTapAt + "." + gesture.rawValue, owner: id, gesture: gesture, command: CommandIDs.textTapAt,

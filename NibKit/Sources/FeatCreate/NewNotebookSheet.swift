@@ -946,8 +946,29 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
     let contentInset: CGFloat
     @ViewBuilder var form: Form
     @ViewBuilder var paper: Paper
+    @State private var hasMoreBelow = false
 
     var body: some View {
+        VStack(spacing: 0) {
+            scrollingForm
+            // Reserve the cue's measured height even at the end, so scrolling
+            // never changes the viewport or moves controls beneath an overlay.
+            Label(String(localized: "Scroll for more options"), systemImage: NibSymbol.chevronDown.name)
+                .font(NibFont.footnote)
+                .foregroundStyle(NibColor.labelSecondary)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, contentInset)
+                .padding(.vertical, NibSpacing.s)
+                .fixedSize(horizontal: false, vertical: true)
+                .opacity(hasMoreBelow ? 1 : 0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(!hasMoreBelow)
+                .accessibilityIdentifier("create.scrollCue")
+                .notebookLayoutFrame("cue")
+        }
+    }
+
+    private var scrollingForm: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.xl) {
                 form
@@ -955,13 +976,36 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
             }
             .padding(.top, NibSpacing.xl)
             .padding(.bottom, NibSpacing.l)
+            .anchorPreference(key: NotebookFormBounds.self, value: .bounds) { $0 }
         }
+        .overlayPreferenceValue(NotebookFormBounds.self) { anchor in
+            GeometryReader { geometry in
+                Color.clear.preference(key: NotebookFormContinuation.self,
+                    value: anchor.map { geometry[$0].maxY > geometry.size.height + 1 } ?? false)
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+        .onPreferenceChange(NotebookFormContinuation.self) { hasMoreBelow = $0 }
+        .scrollIndicators(.visible)
+        .scrollIndicatorsFlash(onAppear: true)
         .contentMargins(.horizontal, contentInset, for: .scrollContent)
         .scrollDismissesKeyboard(.interactively)
         .nibFadeBottomEdge()
         // A drawing mask alone does not constrain SwiftUI's hit testing after scrolling.
         .contentShape(Rectangle())
+        .notebookLayoutFrame("viewport")
     }
+}
+
+private struct NotebookFormBounds: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? { nil }
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = nextValue() ?? value }
+}
+
+private struct NotebookFormContinuation: PreferenceKey {
+    static var defaultValue: Bool { false }
+    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
 }
 
 /// Paper layout follows the space inside the sheet, independently of the presenting window's size class.
@@ -1016,6 +1060,7 @@ struct NewNotebookPaperChooser<Groups: View, Chips: View, Papers: View>: View {
 struct NewNotebookSheet: View {
     @StateObject private var model: NewNotebookModel
     let onDone: () -> Void
+    let idiom: UIUserInterfaceIdiom
     @State private var measuredWidth = NibMetrics.newDocumentSheetSize.width
     @State private var windowSize: CGSize?
     @Environment(\.dynamicTypeSize) private var typeSize
@@ -1023,7 +1068,8 @@ struct NewNotebookSheet: View {
     @FocusState private var focusedDimension: CustomDimension?
 
     init(app: NibApp, folder: FolderID?, kind: NewDocumentKind, session: EditorSession?, navigator: SceneNavigator?,
-         onDone: @escaping () -> Void) {
+         idiom: UIUserInterfaceIdiom? = nil, onDone: @escaping () -> Void) {
+        self.idiom = idiom ?? UIDevice.current.userInterfaceIdiom
         _model = StateObject(wrappedValue: NewNotebookModel(app: app, folder: folder, kind: kind, session: session,
                                                             navigator: navigator))
         self.onDone = onDone
@@ -1032,14 +1078,18 @@ struct NewNotebookSheet: View {
 
     // A form sheet can be narrower than its presenting window. Its width must not turn an iPad into a phone layout.
     private var compact: Bool {
-        UIDevice.current.userInterfaceIdiom == .phone
+        idiom == .phone
             || (windowSize?.width ?? NibMetrics.newDocumentSheetSize.width) < NibMetrics.compactBreakpoint
     }
     private var contentInset: CGFloat { compact ? NibSpacing.l : NibSpacing.xl }
     private var sheetSize: CGSize {
-        guard let windowSize else { return NibMetrics.newDocumentSheetSize }
+        // The continuous form needs room for a complete first paper row and its scroll cue.
+        let preferredHeight = NibMetrics.newDocumentSheetSize.height + NibMetrics.paperTileSize.height + NibSpacing.xl
+        guard let windowSize else {
+            return CGSize(width: NibMetrics.newDocumentSheetSize.width, height: preferredHeight)
+        }
         return CGSize(width: min(NibMetrics.newDocumentSheetSize.width, windowSize.width - NibSpacing.xl * 2),
-                      height: min(NibMetrics.newDocumentSheetSize.height, windowSize.height - NibSpacing.xl * 2))
+                      height: min(preferredHeight, windowSize.height - NibSpacing.xl * 2))
     }
     private var draft: NotebookDraft { model.draft }
 
@@ -1121,6 +1171,7 @@ struct NewNotebookSheet: View {
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { measuredWidth = $0 }
         .interactiveDismissDisabled(model.isWorking)
+        .notebookLayoutFrame("sheet")
     }
 
     private func create() {
@@ -1163,6 +1214,7 @@ struct NewNotebookSheet: View {
         // Names the group; each segment keeps its own title (a label on a plain container would replace them all).
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Document type"))
+        .notebookLayoutFrame("documentType")
     }
 
     @ViewBuilder
@@ -1173,6 +1225,7 @@ struct NewNotebookSheet: View {
         layout {
             DocumentPreview(model: model)
                 .frame(width: NibMetrics.coverPreviewSize.width, height: NibMetrics.coverPreviewSize.height)
+                .notebookLayoutFrame("preview")
             TextField(draft.kind.untitled, text: $model.draft.title)
                 .font(NibFont.body)
                 .focused($titleFocused)
@@ -1205,11 +1258,22 @@ struct NewNotebookSheet: View {
                                          params: draft.cover.id == option.id ? draft.coverRef(option.definition).params : [:],
                                          page: draft.pageSize, cloth: draft.cover.id == option.id ? draft.cloth : nil)
                         }
+                        .notebookLayoutFrame("cover." + option.id)
                     }
                 }
                 .scrollTargetLayout()
                 .padding(NibStroke.ring + NibStroke.ringOutset)
+                // Let the final name clear the fade when scrolled all the way to the end.
+                .padding(.trailing, NibSpacing.l)
             }
+            .mask {
+                HStack(spacing: 0) {
+                    Rectangle()
+                    LinearGradient(colors: [NibColor.label, .clear], startPoint: .leading, endPoint: .trailing)
+                        .frame(width: NibSpacing.l)
+                }
+            }
+            .notebookLayoutFrame("coverStrip")
             .scrollTargetBehavior(.viewAligned)
             .scrollIndicators(.visible)
             .scrollIndicatorsFlash(onAppear: true)
@@ -1302,6 +1366,7 @@ struct NewNotebookSheet: View {
                                 params: draft.paperRef(option.definition).params,
                                 page: draft.pageSize, paper: draft.paperColour ?? .white)
             }
+            .notebookLayoutFrame("paper." + option.id)
         }
     }
 
@@ -1356,18 +1421,24 @@ struct NewNotebookSheet: View {
 
     @ViewBuilder
     private var customSizeFields: some View {
-        HStack(spacing: NibSpacing.s) {
-            millimetreField(String(localized: "Width"), field: .width, value: $model.customWidth)
-            Text(String(localized: "by"))
-                .font(NibFont.footnote)
-                .foregroundStyle(NibColor.labelSecondary)
-            millimetreField(String(localized: "Height"), field: .height, value: $model.customHeight)
-            Text(String(localized: "mm"))
-                .font(NibFont.footnote)
-                .foregroundStyle(NibColor.labelSecondary)
+        // Each dimension keeps its own label and the full proposed width at accessibility sizes.
+        VStack(alignment: .leading, spacing: NibSpacing.m) {
+            dimensionRow(String(localized: "Width"), field: .width, value: $model.customWidth)
+            dimensionRow(String(localized: "Height"), field: .height, value: $model.customHeight)
         }
         if let message = model.dimensionMessage {
             NibBanner(message, style: .warning)
+        }
+    }
+
+    private func dimensionRow(_ label: String, field: CustomDimension, value: Binding<Double>) -> some View {
+        VStack(alignment: .leading, spacing: NibSpacing.xs) {
+            Text(String(localized: "\(label) in millimetres"))
+                .font(NibFont.footnote)
+                .foregroundStyle(NibColor.labelSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityHidden(true)
+            millimetreField(label, field: field, value: value)
         }
     }
 
@@ -1378,8 +1449,7 @@ struct NewNotebookSheet: View {
             .font(NibFont.body)
             .multilineTextAlignment(.trailing)
             .padding(.horizontal, NibSpacing.m)
-            .frame(minWidth: NibMetrics.hitTarget * 2, minHeight: NibMetrics.hitTarget)
-            .fixedSize(horizontal: true, vertical: false)
+            .frame(minWidth: 0, maxWidth: .infinity, minHeight: NibMetrics.hitTarget)
             .background(NibColor.backgroundTertiary, in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
             .onSubmit { model.applyCustomSize() }
             .onChange(of: value.wrappedValue) { _, _ in model.applyCustomSize() }
@@ -1645,5 +1715,44 @@ enum TemplateThumbnails {
             cg.scaleBy(x: fill, y: fill)
             ops.display.draw(in: cg)
         }
+    }
+}
+
+/// Geometry from the production form, used by layout regressions without rebuilding its contents.
+struct NotebookLayoutFrames: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private extension View {
+    func notebookLayoutFrame(_ id: String) -> some View {
+        modifier(NotebookLayoutProbe(id: id))
+    }
+}
+
+private struct NotebookLayoutDiagnosticsKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var notebookLayoutDiagnostics: Bool {
+        get { self[NotebookLayoutDiagnosticsKey.self] }
+        set { self[NotebookLayoutDiagnosticsKey.self] = newValue }
+    }
+}
+
+private struct NotebookLayoutProbe: ViewModifier {
+    let id: String
+    @Environment(\.notebookLayoutDiagnostics) private var enabled
+    func body(content: Content) -> some View {
+        if enabled {
+            content.background {
+                GeometryReader { geometry in
+                    Color.clear.preference(key: NotebookLayoutFrames.self, value: [id: geometry.frame(in: .global)])
+                }
+            }
+        } else { content }
     }
 }

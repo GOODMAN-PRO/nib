@@ -83,6 +83,13 @@ final class ToolbarRuntime: ObservableObject {
     private weak var app: NibApp?
     /// Windows whose palette is hidden (`toolbar.setVisible`). Window state: never persisted.
     @Published private(set) var hiddenSessions: Set<NibID> = []
+    /// Presentation choices belong to the window, including when its document chrome is rebuilt.
+    @Published private(set) var foldedOptions: [NibID: Set<String>] = [:]
+
+    func setOptionsFolded(_ tools: Set<String>, session: EditorSession) {
+        guard foldedOptions[session.id, default: []] != tools else { return }
+        foldedOptions[session.id] = tools
+    }
     private var windows: [NibID: ToolbarWindowState] = [:]
     /// Docks an Undo or Redo is replaying through `toolbar.dock`, per window: that run registers no undo of its own.
     private var replays: [NibID: ToolbarDockSetting] = [:]

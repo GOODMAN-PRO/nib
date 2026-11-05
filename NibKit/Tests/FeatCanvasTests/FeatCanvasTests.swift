@@ -4,7 +4,7 @@ import SwiftUI
 import PencilKit
 import NibContracts
 import NibTesting
-import NibDesign
+@testable import NibDesign
 @testable import FeatCanvas
 
 /// The canvas (F006) end to end on the fixture documents: registration, the view.* and canvas.* commands on a live
@@ -1151,7 +1151,8 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(probe.attached, 1)
         XCTAssertTrue(probe.marker.superview === vc.scrollView, "its view lives in canvasView")
         XCTAssertEqual(boardOnly.attached, 0, "only for the kinds it asks for")
-        XCTAssertEqual(vc.attachmentHost.entries.map { $0.id }, ["test.probe", DecorationAttachment.id])
+        // 23905db added the always-registered recovery attachment; keep its lifecycle order explicit.
+        XCTAssertEqual(vc.attachmentHost.entries.map { $0.id }, ["test.probe", DecorationAttachment.id, "canvas.failedInk"])
         XCTAssertTrue(vc.host.attachments.first === probe)
 
         // canvasDidChange on zoom, scroll, selection.
@@ -1173,7 +1174,7 @@ final class FeatCanvasTests: XCTestCase {
         let late = ProbeAttachment()
         h.app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "test.late", owner: "test", order: 1000) { _ in late })
         await waitUntil("the late attachment") { late.attached == 1 }
-        XCTAssertEqual(vc.attachmentHost.entries.map { $0.id }, ["test.probe", DecorationAttachment.id, "test.late"])
+        XCTAssertEqual(vc.attachmentHost.entries.map { $0.id }, ["test.probe", DecorationAttachment.id, "canvas.failedInk", "test.late"])
         let replacement = ProbeAttachment()
         h.app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "test.late", owner: "test", order: 1000) { _ in replacement })
         await waitUntil("the replacement") { replacement.attached == 1 }
@@ -1620,6 +1621,57 @@ final class FeatCanvasTests: XCTestCase {
         await waitUntil("tiles at the new level") { renderer.requests.contains { $0.region != nil && $0.scale == newScale } }
     }
 
+    func testPlaceholderBoundsAreReusedAndOnlyChangedItemsRecomputed() {
+        let index = PlaceholderBoundsIndex()
+        var items = (0..<100).map { _ in Item(kind: .stroke) }
+        var loads = 0, boundsCalls = 0
+        func paint(_ item: Item) -> Rect {
+            boundsCalls += 1
+            return Rect(x: Double(item.layer), y: 0, width: 10, height: 10)
+        }
+        for _ in 0..<32 {
+            let entries = index.entries(page: Fixtures.page1, load: { loads += 1; return items }, paint: paint)
+            XCTAssertEqual(entries.count, 100)
+        }
+        XCTAssertEqual(loads, 1)
+        XCTAssertEqual(boundsCalls, 100)
+        items[0].layer = 2
+        index.update(items[0], page: Fixtures.page1, paint: paint)
+        XCTAssertEqual(boundsCalls, 101)
+        let updated = index.entries(page: Fixtures.page1, load: { XCTFail("must reuse the page"); return [] }, paint: paint)
+        XCTAssertEqual(updated.first { $0.id == items[0].id }?.rect.x, 2)
+        items[0].deleted = true
+        index.update(items[0], page: Fixtures.page1, paint: paint)
+        XCTAssertEqual(index.entries(page: Fixtures.page1, load: { [] }, paint: paint).count, 99)
+        XCTAssertEqual(boundsCalls, 101)
+        index.reset()
+        XCTAssertEqual(index.entries(page: Fixtures.page1, load: { items }, paint: paint).count, 99)
+        XCTAssertEqual(boundsCalls, 200)
+    }
+
+    func testLargeHiddenSelectionTraversesPageOnce() {
+        let items = (0..<10_000).map { _ in Item(kind: .shape) }
+        let ids = Set(items.map(\.id))
+        for _ in 0..<2 { // hide and unhide have the same symmetric difference
+            var visits = 0, boundsCalls = 0
+            let sequence = AnySequence<Item> {
+                var iterator = items.makeIterator()
+                return AnyIterator<Item> {
+                    guard let item = iterator.next() else { return nil }
+                    visits += 1
+                    return item
+                }
+            }
+            let dirty = CanvasHostImpl.hiddenBounds(items: sequence, changed: ids) { _ in
+                boundsCalls += 1
+                return Rect(x: Double(boundsCalls), y: 0, width: 1, height: 1)
+            }
+            XCTAssertEqual(visits, 10_000)
+            XCTAssertEqual(boundsCalls, 10_000)
+            XCTAssertEqual(dirty, Rect(x: 1, y: 0, width: 10_000, height: 1))
+        }
+    }
+
     func testHiddenLayersAndHiddenItemsRedrawTheTiles() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let renderer = RecordingRenderer()
@@ -2039,6 +2091,33 @@ final class FeatCanvasTests: XCTestCase {
 
     // MARK: HUD
 
+    func testCancelledScrubStartsAtTheCurrentPage() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let hud = CanvasPageHUD(model: vc.hud)
+        // Guard the actual view's lifetime wiring too: replacing GestureState with State must
+        // fail this regression even if the pure reset handler still exists and works.
+        let storage = try XCTUnwrap(Mirror(reflecting: hud).children.first { $0.label == "_scrub" }?.value
+            as? GestureState<PageScrubState>)
+        let state = storage.wrappedValue
+        state.begin(at: 0)
+        vc.hud.go(to: state.destination(current: 0, translation: 10, step: 10))
+        await waitUntil("first scrub reaches page 2") { vc.hud.pageIndex == 1 }
+        state.begin(at: 1)
+        XCTAssertEqual(state.origin, 0, "an ongoing scrub keeps its original page")
+
+        // Invoke the production GestureState cancellation callback, without an onEnded event
+        // and without constructing a replacement state. SwiftUI supplies this same value.
+        var transaction = Transaction()
+        PageScrubState.reset(state, transaction: &transaction)
+        XCTAssertNil(state.origin)
+        state.begin(at: try XCTUnwrap(vc.hud.pageIndex))
+        vc.hud.go(to: state.destination(current: 1, translation: 10, step: 10))
+        await waitUntil("second scrub reaches page 3") { vc.hud.pageIndex == 2 }
+        XCTAssertEqual(h.session.page, Fixtures.pdfPage)
+    }
+
     func testPageAndZoomHUDs() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h)
@@ -2368,7 +2447,11 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertGreaterThan(vc.errorView.frame.height, 0)
         let paper = try XCTUnwrap(vc.host.pageFrame(Fixtures.page1))
         let visiblePaper = vc.scrollView.convert(paper, to: vc.fixedOverlay).intersection(vc.fixedOverlay.bounds)
-        XCTAssertEqual(vc.errorView.frame, visiblePaper)
+        // UIKit frame storage and coordinate conversion can differ by subpixel rounding.
+        XCTAssertEqual(vc.errorView.frame.minX, visiblePaper.minX, accuracy: 0.1)
+        XCTAssertEqual(vc.errorView.frame.minY, visiblePaper.minY, accuracy: 0.1)
+        XCTAssertEqual(vc.errorView.frame.width, visiblePaper.width, accuracy: 0.1)
+        XCTAssertEqual(vc.errorView.frame.height, visiblePaper.height, accuracy: 0.1)
         XCTAssertTrue(vc.errorView.isOpaque)
         vc.errorView.layoutIfNeeded()
         XCTAssertEqual(vc.errorView.hosting.view.center.x, vc.errorView.bounds.midX, accuracy: 0.5)
@@ -2397,6 +2480,84 @@ final class FeatCanvasTests: XCTestCase {
         vc.errorView.actions[0].handler()
         XCTAssertTrue(vc.errorView.isHidden)
         XCTAssertTrue(vc.failedPages.isEmpty)
+    }
+
+    func testAX5RecoveryButtonsScrollIntoShortFittedPaperAndReceiveTouches() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = FailingRenderer()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open Panel",
+            summary: "Recovery panel fixture.", effect: .session)) { _, _ in .null }
+        h.app.ui.panels.register(PanelDescriptor(id: PanelIDs.cloudBackup, title: "Cloud & Backup", icon: "externaldrive",
+            placement: .sheet, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
+        h.app.commands.register(CommandDescriptor(id: "test.fitHorizontalPaper", title: "Fit Paper",
+            summary: "Short fitted paper fixture.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var meta = try tx.content(Fixtures.docID).meta
+                meta.scrollDirection = .horizontal
+                try tx.putMeta(meta)
+            }
+            return .null
+        }
+        try await h.run("test.fitHorizontalPaper")
+        let size = CGSize(width: 667, height: 375)
+        let vc = try makeCanvas(h, size: size)
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        window.rootViewController = vc
+        window.isHidden = false
+        defer { vc.closeCanvas(); window.isHidden = true; window.rootViewController = nil }
+        vc.traitOverrides.preferredContentSizeCategory = .accessibilityExtraExtraExtraLarge
+        vc.errorView.hosting.traitOverrides.preferredContentSizeCategory = .accessibilityExtraExtraExtraLarge
+        vc.view.layoutIfNeeded()
+        vc.setZoom(vc.fitZoom, anchor: nil, centreFit: true)
+        vc.pageDidFail(Fixtures.page1)
+        let renderedPage = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        await waitUntil("failed fitted tiles to settle") { renderedPage.isSettled }
+        let error = vc.errorView
+        var retried = 0, restored = 0
+        error.onRetry = { retried += 1 }
+        error.onRestore = { restored += 1 }
+        func taps(_ view: UIView) -> [NibActionTapRecognizer] {
+            (view.gestureRecognizers ?? []).compactMap { $0 as? NibActionTapRecognizer }
+                + view.subviews.flatMap(taps)
+        }
+        for _ in 0..<50 {
+            vc.view.layoutIfNeeded(); error.layoutIfNeeded(); error.hosting.view.layoutIfNeeded()
+            if taps(error.hosting.view).count == 2, error.viewport.contentSize.height > error.bounds.height { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let paper = try XCTUnwrap(vc.host.pageFrame(Fixtures.page1))
+        let visiblePaper = vc.scrollView.convert(paper, to: vc.fixedOverlay).intersection(vc.fixedOverlay.bounds)
+        XCTAssertEqual(error.frame.minX, visiblePaper.minX, accuracy: 0.1)
+        XCTAssertEqual(error.frame.minY, visiblePaper.minY, accuracy: 0.1)
+        XCTAssertEqual(error.frame.width, visiblePaper.width, accuracy: 0.1)
+        XCTAssertEqual(error.frame.height, visiblePaper.height, accuracy: 0.1)
+        XCTAssertFalse(error.isHidden)
+        XCTAssertLessThanOrEqual(error.bounds.height, 375)
+        XCTAssertLessThan(error.bounds.width, 300, "Use fitted portrait paper, not a full-width error panel")
+        XCTAssertEqual(error.hosting.traitCollection.preferredContentSizeCategory, .accessibilityExtraExtraExtraLarge)
+        XCTAssertTrue(error.viewport.isScrollEnabled)
+        XCTAssertGreaterThan(error.viewport.contentSize.height, error.viewport.bounds.height)
+        let actions = taps(error.hosting.view).sorted { a, b in
+            (a.view?.convert(CGPoint.zero, to: error.viewport).y ?? 0)
+                < (b.view?.convert(CGPoint.zero, to: error.viewport).y ?? 0)
+        }
+        XCTAssertEqual(actions.count, 2)
+        let last = try XCTUnwrap(actions.last?.view)
+        XCTAssertGreaterThan(last.convert(last.bounds, to: error.viewport).maxY, error.viewport.bounds.maxY,
+                             "The regression must start with a recovery control below the visible paper")
+        for action in actions {
+            let target = try XCTUnwrap(action.view)
+            error.viewport.scrollRectToVisible(target.convert(target.bounds, to: error.viewport), animated: false)
+            for _ in 0..<5 { error.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            let frame = target.convert(target.bounds, to: error)
+            XCTAssertTrue(error.bounds.insetBy(dx: -1, dy: -1).contains(frame), "Show the whole recovery button")
+            let point = target.convert(CGPoint(x: target.bounds.midX, y: target.bounds.midY), to: window)
+            let hit = try XCTUnwrap(window.hitTest(point, with: nil))
+            XCTAssertTrue(hit === target || hit.isDescendant(of: target), "Recovery receives the touch instead of the canvas")
+            action.activate()
+        }
+        XCTAssertEqual(retried, 1)
+        XCTAssertEqual(restored, 1)
     }
 
     func testSuccessfulRerenderClearsFailureWithoutTryAgain() async throws {
@@ -2446,11 +2607,15 @@ final class FeatCanvasTests: XCTestCase {
 
     func testOneFailedTileStaysReportedWhenPreviewAndSiblingTilesLand() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = RecordingRenderer()
         let renderer = OneTileFailureRenderer()
-        h.app.services.renderer = renderer
         let vc = try makeCanvas(h)
         defer { renderer.releaseSuccessfulRenders(); vc.closeCanvas() }
         let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        await waitUntil("initial healthy render") { page.isSettled }
+        // Initial layout can retire requests. Fail only work belonging to the settled coverage.
+        h.app.services.renderer = renderer
+        page.invalidate(nil)
         await waitUntil("one tile to fail") { vc.failedPages.contains(Fixtures.page1) }
         XCTAssertFalse(vc.errorView.isHidden)
         XCTAssertGreaterThan(page.tileKeys.count, 1)

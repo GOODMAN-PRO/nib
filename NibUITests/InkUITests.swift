@@ -105,9 +105,8 @@ final class InkUITests: XCTestCase {
     }
 
     private func settings(_ tool: String, alreadySelected: Bool = false, revealTop: Bool = true) throws {
-        if !alreadySelected { try ui.selectTool(tool) }
-        // Tapping the active tool opens its settings even when navigation has folded the options bar.
-        try tap("tool." + tool)
+        if alreadySelected { XCTAssertEqual(try ui.state().tool, tool) }
+        try ui.openToolSettings(tool)
         if !revealTop { return }
         // Popover ScrollViews keep their offset when closed. Start at the type/mode grid each time.
         let topLabel: String

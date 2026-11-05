@@ -215,6 +215,7 @@ struct TrashPanel: View {
     let window: OrganizeWindow
     @StateObject private var library: LibraryWatch
     @ObservedObject private var index: PageIndex
+    @State private var indexConsumer = UUID()
     @State private var sort: TrashSort
     @State private var isSelecting = false
     @State private var selection = Set<String>()
@@ -255,7 +256,8 @@ struct TrashPanel: View {
             if isSelecting && !entries.isEmpty { selectionBar(selected) }
         }
         .animation(NibMotion.bud.animation, value: isSelecting)
-        .onAppear { library.reload() }
+        .onAppear { library.reload(); index.attach(indexConsumer) }
+        .onDisappear { index.detach(indexConsumer) }
         .onChange(of: entries.map { $0.id }) { _, ids in
             selection.formIntersection(ids)
             if ids.isEmpty { isSelecting = false }
