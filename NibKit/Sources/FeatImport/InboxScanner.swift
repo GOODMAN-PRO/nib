@@ -191,8 +191,9 @@ enum ShareHandoff {
     static var isWaiting: Bool { board.contains(dataType) }
 
     /// Writes the waiting items into `dir` and clears them from the pasteboard. [] when they were just taken.
+    /// Allow time for the person to answer iOS's paste permission prompt before timing out a provider.
     @MainActor
-    static func take(into dir: URL, timeoutNanoseconds: UInt64 = 5_000_000_000) async throws -> [URL] {
+    static func take(into dir: URL, timeoutNanoseconds: UInt64 = 60_000_000_000) async throws -> [URL] {
         try Task.checkCancellation()
         // Deep link and activation scan can arrive together while the providers are still loading.
         guard !taking else { return [] }
