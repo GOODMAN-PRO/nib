@@ -137,7 +137,8 @@ final class NibIndexTests: XCTestCase {
         _ = try await h.run("index.rebuild")
         _ = await indexer.runBackgroundTask()
         XCTAssertTrue(indexer.db?.keys(doc: doc).contains(IndexKeys.docUnit) == true)
-        XCTAssertFalse(results(try await h.run("search.text", ["query": "Remember"])).isEmpty)
+        let remembered = results(try await h.run("search.text", ["query": "Remember"]))
+        XCTAssertFalse(remembered.isEmpty)
     }
 
     func testNewDocumentDuringScheduledSweepDoesNotCancelIt() async throws {
