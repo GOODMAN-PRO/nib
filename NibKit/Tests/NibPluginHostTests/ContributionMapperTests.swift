@@ -315,6 +315,24 @@ final class ContributionMapperTests: XCTestCase {
         XCTAssertThrowsError(try PluginPaths.resolve("/etc/hosts", in: empty, path: "$"))
     }
 
+    func testNumberFieldsParseFullLocalizedNumbers() {
+        let us = Locale(identifier: "en_US")
+        let de = Locale(identifier: "de_DE")
+        XCTAssertEqual(PluginNumberField.parse("1,234", min: nil, max: nil, integer: false, locale: us), .number(1234))
+        XCTAssertEqual(PluginNumberField.parse("1,234", min: nil, max: nil, integer: true, locale: us), .number(1234))
+        XCTAssertEqual(PluginNumberField.parse("1,234", min: nil, max: nil, integer: false, locale: de), .number(1.234))
+        XCTAssertEqual(PluginNumberField.parse("1,234", min: nil, max: nil, integer: true, locale: de), .number(1))
+        for value in ["12,34", "1,234junk", "1,234.5.6", "1,,234", "1e", "1e2x"] {
+            XCTAssertNil(PluginNumberField.parse(value, min: nil, max: nil, integer: false, locale: us))
+        }
+        for locale in [us, de, Locale(identifier: "ar_EG"), Locale(identifier: "fa_IR"), Locale(identifier: "sv_SE")] {
+            for number in [1.234, 1234.5, -42, 1e30, 1e100, 1e-100] {
+                let text = PluginNumberField.format(number, integer: false, locale: locale)
+                XCTAssertEqual(PluginNumberField.parse(text, min: nil, max: nil, integer: false, locale: locale), .number(number))
+            }
+        }
+    }
+
     func testNumberFieldsKeepLargeStoredValuesReadableAndRejectNonFiniteEdits() {
         for n in [1e30, -1e30, Double(Int.max), Double.infinity, -Double.infinity, Double.nan] {
             XCTAssertFalse(PluginNumberField.format(n, integer: false).isEmpty)

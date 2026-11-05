@@ -1773,14 +1773,71 @@ struct SchemaFieldControl: View {
 
 /// Keep legacy large values readable without converting an untrusted Double with a trapping initializer.
 enum PluginNumberField {
-    static func format(_ n: Double, integer: Bool) -> String {
-        guard n.isFinite, let whole = Int(exactly: n.rounded()) else { return String(format: "%g", n) }
-        if integer || n == n.rounded() { return String(whole) }
-        return String(format: "%.2f", n)
+    static func format(_ n: Double, integer: Bool, locale: Locale = .current) -> String {
+        guard n.isFinite else { return String(n) }
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = false
+        formatter.usesSignificantDigits = true
+        formatter.minimumSignificantDigits = 1
+        formatter.maximumSignificantDigits = 17
+        formatter.maximumIntegerDigits = 309
+        formatter.maximumFractionDigits = 340
+        return formatter.string(from: NSNumber(value: integer ? n.rounded() : n)) ?? String(n)
     }
 
-    static func parse(_ draft: String, min: Double?, max: Double?, integer: Bool) -> JSONValue? {
-        guard let n = Double(draft.replacingOccurrences(of: ",", with: ".")), n.isFinite else { return nil }
+    static func parse(_ draft: String, min: Double?, max: Double?, integer: Bool,
+                      locale: Locale = .current) -> JSONValue? {
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .decimal
+        let decimal = formatter.decimalSeparator ?? "."
+        let grouping = formatter.groupingSeparator ?? ","
+        // Normalize digits, but validate the entire input before Double conversion. NumberFormatter
+        // alone can accept a valid prefix and silently ignore a malformed suffix or grouping.
+        func withoutDirectionMarks(_ value: String) -> String {
+            value.replacingOccurrences(of: "\u{061C}", with: "")
+                .replacingOccurrences(of: "\u{200E}", with: "")
+                .replacingOccurrences(of: "\u{200F}", with: "")
+        }
+        var text = withoutDirectionMarks(draft.trimmingCharacters(in: .whitespacesAndNewlines))
+        let minus = withoutDirectionMarks(formatter.minusSign ?? "-")
+        let plus = withoutDirectionMarks(formatter.plusSign ?? "+")
+        if !minus.isEmpty { text = text.replacingOccurrences(of: minus, with: "-") }
+        if !plus.isEmpty { text = text.replacingOccurrences(of: plus, with: "+") }
+        text = text.map { character -> String in
+            if let digit = character.wholeNumberValue, (0...9).contains(digit) { return String(digit) }
+            return String(character)
+        }.joined()
+        let exponentParts = text.lowercased().components(separatedBy: "e")
+        guard exponentParts.count <= 2 else { return nil }
+        var mantissa = exponentParts[0]
+        var sign = ""
+        if mantissa.first == "-" || mantissa.first == "+" { sign = String(mantissa.removeFirst()) }
+        let parts = mantissa.components(separatedBy: decimal)
+        guard parts.count <= 2 else { return nil }
+        let groups = parts[0].components(separatedBy: grouping)
+        func digits(_ value: String) -> Bool { !value.isEmpty && value.allSatisfy { $0 >= "0" && $0 <= "9" } }
+        if groups.count > 1 {
+            let primary = Swift.max(1, formatter.groupingSize)
+            let secondary = formatter.secondaryGroupingSize > 0 ? formatter.secondaryGroupingSize : primary
+            guard groups.allSatisfy(digits), groups.last?.count == primary,
+                  (1...secondary).contains(groups[0].count),
+                  groups.dropFirst().dropLast().allSatisfy({ $0.count == secondary }) else { return nil }
+        } else if !parts[0].isEmpty && !digits(parts[0]) { return nil }
+        let whole = groups.joined()
+        let fraction = parts.count == 2 ? parts[1] : ""
+        guard !whole.isEmpty || !fraction.isEmpty, fraction.isEmpty || digits(fraction) else { return nil }
+        var normalized = sign + (whole.isEmpty ? "0" : whole)
+        if parts.count == 2 { normalized += "." + fraction }
+        if exponentParts.count == 2 {
+            var exponent = exponentParts[1]
+            if exponent.first == "-" || exponent.first == "+" { exponent.removeFirst() }
+            guard digits(exponent) else { return nil }
+            normalized += "e" + exponentParts[1]
+        }
+        guard let n = Double(normalized), n.isFinite else { return nil }
         let value = integer ? n.rounded() : n
         if let lo = min, value < lo { return nil }
         if let hi = max, value > hi { return nil }
