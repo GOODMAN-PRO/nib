@@ -181,6 +181,36 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
     }
 
+    func testOpenRevalidatesLibraryAfterSuspendedGate() async throws {
+        for change in ["trash", "delete", "folder"] {
+            let h = Harness(features: [FeatDocChromeFeature.self])
+            let current = h.session.document
+            let target = Fixtures.textDocID
+            XCTAssertTrue(ShellChromePolicy.validateOpen(target, app: h.app))
+            let notice = expectation(forNotification: .nibCommandFailed, object: h.app) { note in
+                (note.userInfo?["command"] as? String) == CommandIDs.docOpen
+                    && (note.userInfo?["error"] as? NibError)?.code == .notFound
+            }
+            let gate: @MainActor () async throws -> Bool = {
+                await Task.yield()
+                if change == "trash" {
+                    try h.library.trash(target)
+                } else {
+                    try h.library.deletePermanently(target)
+                    if change == "folder" {
+                        _ = try h.library.createFolder(title: "Replacement", in: nil, style: nil, id: target)
+                    }
+                }
+                return true
+            }
+            let allowed = try await gate()
+            XCTAssertTrue(allowed)
+            XCTAssertFalse(ShellChromePolicy.validateOpen(target, app: h.app))
+            await fulfillment(of: [notice], timeout: 1)
+            XCTAssertEqual(h.session.document, current)
+        }
+    }
+
     func testTabBarIsRequestedForRemainingTabsBehindLibrary() {
         let h = Harness(features: [FeatDocChromeFeature.self])
         var documents: [DocumentID] = ["TAB_A", "TAB_B", "TAB_C"]

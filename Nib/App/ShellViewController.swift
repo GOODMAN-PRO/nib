@@ -178,6 +178,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     }
 
     private func performOpen(_ doc: DocumentID, page: PageID?, mode: OpenMode) {
+        guard ShellChromePolicy.validateOpen(doc, app: app) else { return }
         if mode == .newWindow {
             let activity = NSUserActivity(activityType: "app.nib.openDocument")
             activity.userInfo = ["doc": doc.raw, "page": page?.raw ?? ""]
