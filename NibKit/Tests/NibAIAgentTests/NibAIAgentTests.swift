@@ -167,6 +167,38 @@ final class NibAIAgentTests: XCTestCase {
         XCTAssertTrue(fresh.summaries(doc: nil, all: true).isEmpty)
     }
 
+    func testRenameAndFeedbackCommandsAwaitDurabilityAndRetryFailures() async throws {
+        for command in ["ai.chat.rename", "ai.chat.feedback"] {
+            let (h, agent) = AgentFixture.make(P(events: []))
+            let chat = "MUTATIONSAVE"
+            let original = agent.chatStore
+            original.ensureChat(chat, title: "Original", doc: nil)
+            original.append([original.makeMessage(role: "assistant", text: "Answer")], chat: chat)
+            XCTAssertNil(original.flush())
+            let directory = h.library.metadataURL.appendingPathComponent("ai")
+            let destination = directory.appendingPathComponent(original.ownFileName(chat))
+            let backup = try Data(contentsOf: destination)
+            try FileManager.default.removeItem(at: destination)
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+            let params: JSONValue = command == "ai.chat.rename"
+                ? ["chat": .string(chat), "title": "Renamed"]
+                : ["chat": .string(chat), "message": "last", "rating": "up"]
+            do {
+                _ = try await h.run(command, params)
+                XCTFail("Commands must await their queued writes and report persistence failures")
+            } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+            try FileManager.default.removeItem(at: destination)
+            try backup.write(to: destination)
+            _ = try await h.run(command, params)
+            let fresh = store(directory, device: 0x0B)
+            if command == "ai.chat.rename" {
+                XCTAssertEqual(fresh.summaries(doc: nil).first?.title, "Renamed")
+            } else {
+                XCTAssertEqual(fresh.messages(chat).first?.rating, "up")
+            }
+        }
+    }
+
     func testFailedTurnWriteRecoversThroughSaveCommandWithoutRegeneration() async throws {
         let provider = P(events: [P.answer("Saved on retry")])
         let (h, agent) = AgentFixture.make(provider)
@@ -379,6 +411,7 @@ final class NibAIAgentTests: XCTestCase {
         let remote = store(dir, device: 0x0B)
         XCTAssertEqual(remote.messages("UNSAVED").first?.text, "Keep until durable")
         try remote.rate("CACHE0", message: "last", rating: "up")
+        XCTAssertNil(remote.flush())
         let reloaded = await writer.stateAsync("CACHE0")
         XCTAssertEqual(reloaded?.messages.first?.rating, "up")
         XCTAssertEqual(writer.messageCount("CACHE0"), 1)
@@ -408,6 +441,7 @@ final class NibAIAgentTests: XCTestCase {
         try FileManager.default.removeItem(at: file)
         try metadata.write(to: file)
         try a.delete(chat)
+        XCTAssertNil(a.flush())
 
         let deletedReader = store(dir, device: 0x0D)
         let deleted = await deletedReader.summariesAsync(doc: nil, all: true)

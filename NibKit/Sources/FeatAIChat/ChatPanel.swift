@@ -184,6 +184,21 @@ struct ChatPanel: View {
 
     private var threadContent: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xl) {
+            if !model.isConfigured && !model.entries.isEmpty {
+                Menu {
+                    ForEach(ChatViewModel.connectionActions, id: \.self) { provider in
+                        Button(provider) {
+                            model.perform(CommandIDs.settingsOpen, ["page": .string(ChatViewModel.connectionPage(for: provider))])
+                        }
+                    }
+                } label: {
+                    Label { Text(String(localized: "Connect a model")) } icon: { Image(nib: .link) }
+                        .font(NibFont.button)
+                        .foregroundStyle(NibColor.accent)
+                        .frame(minHeight: NibMetrics.hitTarget)
+                }
+                .accessibilityIdentifier("aichat.connect")
+            }
             if model.entries.isEmpty {
                 Text(String(localized: "Ask about your notes, or switch to Edit to change them."))
                     .font(NibFont.chat).foregroundStyle(NibColor.labelSecondary)

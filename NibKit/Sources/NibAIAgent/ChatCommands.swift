@@ -297,8 +297,10 @@ struct AIChatRename: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
         try ChatCommands.checkChatID(p.chat)
         let agent = try ChatCommands.agent(ctx)
-        try agent.chatStore.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
-        try agent.chatStore.rename(p.chat, title: p.title)
+        let store = agent.chatStore
+        try store.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
+        try store.rename(p.chat, title: p.title)
+        if let error = await store.flushAsync() { throw error }
         return NoResult()
     }
 }
@@ -317,9 +319,11 @@ struct AIChatDelete: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
         try ChatCommands.checkChatID(p.chat)
         let agent = try ChatCommands.agent(ctx)
-        try agent.chatStore.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
+        let store = agent.chatStore
+        try store.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
         agent.cancel(chatID: p.chat)
-        try agent.chatStore.delete(p.chat)
+        try store.delete(p.chat)
+        if let error = await store.flushAsync() { throw error }
         return NoResult()
     }
 }
@@ -346,8 +350,10 @@ struct AIChatFeedback: NibCommand {
             throw NibError(.invalidParams, "rating is 'up', 'down' or 'none'", path: "$.rating")
         }
         let agent = try ChatCommands.agent(ctx)
-        try agent.chatStore.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
-        try agent.chatStore.rate(p.chat, message: p.message, rating: p.rating == "none" ? nil : p.rating)
+        let store = agent.chatStore
+        try store.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
+        try store.rate(p.chat, message: p.message, rating: p.rating == "none" ? nil : p.rating)
+        if let error = await store.flushAsync() { throw error }
         return NoResult()
     }
 }

@@ -143,7 +143,13 @@ final class AgentService: AIService {
     func deleteChat(_ chatID: String) {
         cancel(chatID: chatID)
         do {
-            try chatStore.delete(chatID)
+            let store = chatStore
+            try store.delete(chatID)
+            Task { @MainActor in
+                if let error = await store.flushAsync() {
+                    agentLog.error("chat not deleted: \(error.description, privacy: .public)")
+                }
+            }
         } catch {
             agentLog.error("chat not deleted: \(NibError.wrap(error).description, privacy: .public)")
         }

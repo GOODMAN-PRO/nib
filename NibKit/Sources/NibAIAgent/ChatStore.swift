@@ -397,6 +397,7 @@ final class ChatStore {
         compactIfNeeded(chat)
     }
 
+    /// Mutations enqueue writes; command callers await flushAsync before reporting success.
     func rename(_ chat: String, title: String) throws {
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { throw NibError.invalid("the title is empty", path: "$.title") }
@@ -407,7 +408,6 @@ final class ChatStore {
         meta.title = String(clean.prefix(200))
         meta.rev = clock.tick()
         append([meta], chat: chat)
-        if let error = flush() { throw error }
     }
 
     /// Deletes a conversation everywhere: a tombstone replaces this device's file; other devices' files lose to it
@@ -417,8 +417,7 @@ final class ChatStore {
         guard let state = chats[chat] else { throw ChatStore.unknownChat(chat) }
         if state.isDeleted {
             // A previous attempt may have installed the tombstone but failed to write it.
-            // Deletion is idempotent; success still requires the queued write to be durable.
-            if let error = flush() { throw error }
+            // Deletion is idempotent; the command awaits flushAsync before acknowledging it.
             return
         }
         var meta = state.meta ?? ChatRecord(id: ChatRecord.metaID, rev: .zero, type: ChatRecord.metaType)
@@ -432,7 +431,6 @@ final class ChatStore {
         generation &+= 1
         pendingChats.insert(chat)
         rewriteOwnFile(chat, records: [meta])
-        if let error = flush() { throw error }
     }
 
     /// Rates an assistant message ("up" / "down"; nil clears the rating). `message` is a message id, "last" (the
@@ -455,7 +453,6 @@ final class ChatStore {
         r.rating = rating
         r.rev = clock.tick()
         append([r], chat: chat)
-        if let error = flush() { throw error }
         return r
     }
 
