@@ -159,7 +159,7 @@ enum PlannerTemplates {
     /// Monthly planner: `month` 1–12 with `year` gives a dated calendar; month 0 is an undated grid.
     static let monthly = makeMonthly()
 
-    static func makeMonthly(locale: Locale = .current) -> TemplateDefinition {
+    static func makeMonthly(locale: Locale? = nil) -> TemplateDefinition {
         TemplateFactory.paper("builtin.plannerMonthly", String(localized: "Monthly Planner"), category: "Planners", order: 330,
                                                params: colours + [
                                                    TemplateParam(name: "month", title: "Month (0 = undated)", kind: "number",
@@ -169,6 +169,7 @@ enum PlannerTemplates {
                                                    ParamSpec.startMonday
                                                ],
                                                defaults: ["startMonday": true]) { c in
+            let locale = locale ?? .current
             let m = Layout.margin(c)
             let month = Int(c.number("month", 0, in: 0...12).rounded())
             let year = Int(c.number("year", 0, in: 0...9999).rounded())

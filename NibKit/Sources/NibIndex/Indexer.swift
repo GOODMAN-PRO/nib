@@ -737,11 +737,18 @@ final class Indexer {
     /// Indexes one page when its version changed (or `force`). Returns true when it was (re)indexed.
     @discardableResult
     func indexPage(_ doc: DocumentID, _ page: PageID, head: DocumentContent, force: Bool = false) async -> Bool {
+        var currentHead = head
+        return await indexPage(doc, page, currentHead: &currentHead, force: force)
+    }
+
+    @discardableResult
+    private func indexPage(_ doc: DocumentID, _ page: PageID, currentHead: inout DocumentContent, force: Bool = false) async -> Bool {
         guard let db = db else { return false }
         let key = unitKey(doc, page.raw)
-        await waitForUnit(key)
-        // A sweep's head can predate a completed deletion even when this unit was never in flight.
-        guard let currentHead = try? reader.head(doc) else { return false }
+        if await waitForUnit(key) {
+            guard let fresh = try? reader.head(doc) else { return false }
+            currentHead = fresh
+        }
         let ink = indexInk
         guard let snapshot = (try? pageSnapshot(doc, page, head: currentHead, includeInk: ink)) ?? nil else {
             try? db.removeUnit(doc: doc, key: page.raw)
@@ -769,10 +776,18 @@ final class Indexer {
 
     @discardableResult
     func indexDocUnit(_ doc: DocumentID, head: DocumentContent, force: Bool = false) async -> Bool {
+        var currentHead = head
+        return await indexDocUnit(doc, currentHead: &currentHead, force: force)
+    }
+
+    @discardableResult
+    private func indexDocUnit(_ doc: DocumentID, currentHead: inout DocumentContent, force: Bool = false) async -> Bool {
         guard let db = db else { return false }
         let key = unitKey(doc, IndexKeys.docUnit)
-        await waitForUnit(key)
-        guard let currentHead = try? reader.head(doc) else { return false }
+        if await waitForUnit(key) {
+            guard let fresh = try? reader.head(doc) else { return false }
+            currentHead = fresh
+        }
         let snapshot = docSnapshot(doc, head: currentHead)
         if !force, db.version(doc: doc, key: IndexKeys.docUnit) == snapshot.version { return false }
         let env = self.env(includeInk: indexInk)
@@ -821,31 +836,38 @@ final class Indexer {
                                progress: SweepProgress?) async -> DocumentPass {
         var pass = DocumentPass()
         guard let db = db else { return pass }
-        indexTitle(doc, kind: head.meta.kind)
-        if await indexDocUnit(doc, head: head, force: force) {
+        var currentHead = head
+        indexTitle(doc, kind: currentHead.meta.kind)
+        if await indexDocUnit(doc, currentHead: &currentHead, force: force) {
             pass.units += 1
             progress?.unitIndexed()
+            if let fresh = try? reader.head(doc) { currentHead = fresh }
         }
-        let live = head.livePages
+        let live = currentHead.livePages
         let liveKeys = Set(live.map { $0.id.raw })
         // Pages that are gone, including ones whose extraction is still running (it finishes before the removal).
         let stale = Set(db.keys(doc: doc)).union(inFlightKeys(doc)).filter { !$0.hasPrefix("#") && !liveKeys.contains($0) }
         for key in stale.sorted() {
             await removeUnit(doc, key: key)
         }
-        for page in live {
+        if !stale.isEmpty, let fresh = try? reader.head(doc) { currentHead = fresh }
+        for (offset, page) in live.enumerated() {
             if shouldStop(pausable: pausable) {
                 pass.completed = false
                 break
             }
-            if await indexPage(doc, page.id, head: head, force: force) {
+            if await indexPage(doc, page.id, currentHead: &currentHead, force: force) {
                 pass.units += 1
                 progress?.unitIndexed()
+                if let fresh = try? reader.head(doc) { currentHead = fresh }
             }
-            // An unchanged page returns without suspending: yield so a long walk never holds the main actor.
-            await Task.yield()
+            // Batch unchanged pages. Reload after yielding, because another task may delete a later page.
+            if (offset + 1) % 32 == 0 {
+                await Task.yield()
+                if let fresh = try? reader.head(doc) { currentHead = fresh }
+            }
         }
-        if let fresh = try? reader.head(doc) { updatePageIndexes(doc, head: fresh) }
+        updatePageIndexes(doc, head: currentHead)
         return pass
     }
 
@@ -1038,7 +1060,7 @@ final class Indexer {
         }
     }
 
-    private func processDirty() async {
+    func processDirty() async {
         guard !processing else { return }
         processing = true
         let pages = dirtyPages, docs = dirtyDocs, whole = wholeDocs, moved = reorderedDocs, titles = titlesDirty
@@ -1064,14 +1086,15 @@ final class Indexer {
             done += 1
         }
         for (doc, set) in pages where !whole.contains(doc) {
-            guard let head = try? reader.head(doc) else {
+            guard var head = try? reader.head(doc) else {
                 done += set.count
                 continue
             }
             for page in set {
-                await indexPage(doc, page, head: head)
+                let indexed = await indexPage(doc, page, currentHead: &head)
                 done += 1
                 emitProgress(running: true, done: done, total: total)
+                if indexed, let fresh = try? reader.head(doc) { head = fresh }
             }
             if moved.contains(doc) { updatePageIndexes(doc, head: (try? reader.head(doc)) ?? head) }
         }
@@ -1094,26 +1117,26 @@ final class Indexer {
                 await indexDocument(doc)
                 continue
             }
-            guard docLevel || moved || !pages.isEmpty, let head = try? reader.head(doc) else { continue }
-            if docLevel { await indexDocUnit(doc, head: head) }
-            for page in pages { await indexPage(doc, page, head: head) }
+            guard docLevel || moved || !pages.isEmpty, var head = try? reader.head(doc) else { continue }
+            if docLevel, await indexDocUnit(doc, currentHead: &head), let fresh = try? reader.head(doc) { head = fresh }
+            for page in pages {
+                if await indexPage(doc, page, currentHead: &head), let fresh = try? reader.head(doc) { head = fresh }
+            }
             if moved { updatePageIndexes(doc, head: (try? reader.head(doc)) ?? head) }
         }
     }
 
-    private func libraryChanged(_ payload: JSONValue?) {
+    func libraryChanged(_ payload: JSONValue?) {
         titlesDirty = true
         let refs = payload?["refs"]?.arrayValue
-        // Refresh refs are capped at 500 by FolderLibrary. A root change or an unspecified/capped list must
-        // check the whole library, including documents that already have a document-unit row.
-        let docs: Set<DocumentID>
-        if let refs, !refs.isEmpty, refs.count < 500, payload?["root"]?.boolValue != true {
-            docs = Set(refs.compactMap { $0.stringValue.flatMap { NodeRef($0)?.documentID } })
-        } else {
-            docs = Set(libraryDocuments())
-        }
-        for doc in docs where app.services.library?.node(doc)?.trashedAt == nil {
-            wholeDocs.insert(doc)
+        // Broad refreshes use the stamp-aware sweep. Routine library metadata events only refresh titles.
+        if payload?["root"]?.boolValue == true || (refs?.count ?? 0) >= 500 {
+            startSweep(after: 2)
+        } else if payload?["refresh"]?.boolValue == true, let refs, !refs.isEmpty {
+            let docs = Set(refs.compactMap { $0.stringValue.flatMap { NodeRef($0)?.documentID } })
+            for doc in docs where app.services.library?.node(doc)?.trashedAt == nil {
+                wholeDocs.insert(doc)
+            }
         }
         scheduleDebounce()
     }
@@ -1210,8 +1233,9 @@ final class Indexer {
             indexTitle(doc, kind: head.meta.kind)
             return DocumentPass()
         }
+        guard let currentHead = checkPages ? head : (try? reader.head(doc)) else { return DocumentPass() }
         let committed = committedDocs.remove(doc) != nil
-        var pass = await indexDocument(doc, head: head, force: false, pausable: pausable, progress: progress)
+        var pass = await indexDocument(doc, head: currentHead, force: false, pausable: pausable, progress: progress)
         // Cancellation can land during the final extraction or its trailing yield. Background sweeps can also
         // outlive a rebuild without owning sweepTask, so reject their old generation as well.
         if Task.isCancelled || generation != rebuildGeneration { pass.completed = false }

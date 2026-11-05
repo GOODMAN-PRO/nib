@@ -29,6 +29,8 @@ public final class UndoHistory {
     public var limit = NibLimits.undoDepth
     private var undoStacks: [DocumentID: [UndoEntry]] = [:]
     private var redoStacks: [DocumentID: [UndoEntry]] = [:]
+    /// Only the current top group needs an index. Dropped whenever stack operations change its positions.
+    private var topIndexes: [DocumentID: [RecordKey: Int]] = [:]
     /// Groups whose entries undo across documents together (bounded: oldest dropped first).
     private var linkedGroups: [String] = []
 
@@ -44,6 +46,7 @@ public final class UndoHistory {
     public func clear(_ doc: DocumentID) {
         undoStacks[doc] = nil
         redoStacks[doc] = nil
+        topIndexes[doc] = nil
     }
 
     /// True when `group` was linked across documents (`CommandContext.linkUndoAcrossDocuments()`).
@@ -63,14 +66,19 @@ public final class UndoHistory {
         let linked = linkedGroups.contains(cs.group)
         for doc in cs.documents {
             let muts = cs.mutations.filter { $0.document == doc }
-            var stack = undoStacks[doc] ?? []
-            if var top = stack.last, top.group == cs.group {
-                UndoHistory.appendCompacting(muts, to: &top.mutations)
+            // Transfer ownership while editing: copying the stack/top would also copy a growing mutation array.
+            var stack = undoStacks.removeValue(forKey: doc) ?? []
+            if stack.last?.group == cs.group, var top = stack.popLast() {
+                var latest = topIndexes.removeValue(forKey: doc) ?? UndoHistory.index(top.mutations)
+                UndoHistory.appendCompacting(muts, to: &top.mutations, latest: &latest)
+                topIndexes[doc] = latest
                 top.linked = top.linked || linked
-                stack[stack.count - 1] = top
+                stack.append(top)
             } else {
                 var compact: [Mutation] = []
-                UndoHistory.appendCompacting(muts, to: &compact)
+                var latest: [RecordKey: Int] = [:]
+                UndoHistory.appendCompacting(muts, to: &compact, latest: &latest)
+                topIndexes[doc] = latest
                 var entry = UndoEntry(group: cs.group, label: cs.label, principal: cs.principal, mutations: compact)
                 entry.linked = linked
                 stack.append(entry)
@@ -81,11 +89,15 @@ public final class UndoHistory {
         }
     }
 
-    /// Keep the first before-value and last after-value of a revision-linked run. A remote edit breaks the
-    /// chain, so its surrounding segments stay separate and selective undo still skips the conflicting segment.
-    private static func appendCompacting(_ writes: [Mutation], to stored: inout [Mutation]) {
+    private static func index(_ stored: [Mutation]) -> [RecordKey: Int] {
         var latest: [RecordKey: Int] = [:]
         for (i, mutation) in stored.enumerated() { latest[mutation.recordKey] = i }
+        return latest
+    }
+
+    /// Keep the first before-value and last after-value of a revision-linked run. A remote edit breaks the
+    /// chain, so its surrounding segments stay separate and selective undo still skips the conflicting segment.
+    private static func appendCompacting(_ writes: [Mutation], to stored: inout [Mutation], latest: inout [RecordKey: Int]) {
         for write in writes {
             let key = write.recordKey
             if let i = latest[key], let merged = stored[i].followed(by: write) {
@@ -119,13 +131,20 @@ public final class UndoHistory {
             .sorted { $0.raw < $1.raw }
     }
 
-    func popUndo(_ doc: DocumentID) -> UndoEntry? { undoStacks[doc]?.popLast() }
+    func popUndo(_ doc: DocumentID) -> UndoEntry? {
+        topIndexes[doc] = nil
+        return undoStacks[doc]?.popLast()
+    }
     func popRedo(_ doc: DocumentID) -> UndoEntry? { redoStacks[doc]?.popLast() }
-    func pushUndo(_ e: UndoEntry, doc: DocumentID) { undoStacks[doc, default: []].append(e) }
+    func pushUndo(_ e: UndoEntry, doc: DocumentID) {
+        topIndexes[doc] = nil
+        undoStacks[doc, default: []].append(e)
+    }
     func pushRedo(_ e: UndoEntry, doc: DocumentID) { redoStacks[doc, default: []].append(e) }
 
     func removeEntry(id: String, doc: DocumentID) -> UndoEntry? {
         guard let i = undoStacks[doc]?.lastIndex(where: { $0.id == id }) else { return nil }
+        topIndexes[doc] = nil
         return undoStacks[doc]?.remove(at: i)
     }
 }

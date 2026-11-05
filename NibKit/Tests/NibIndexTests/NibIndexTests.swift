@@ -254,6 +254,67 @@ final class NibIndexTests: XCTestCase {
         XCTAssertFalse(h.app.workspace.isLoaded(doc))
     }
 
+    func testLibraryMetadataEventsScheduleNoDocumentWork() async throws {
+        let (h, indexer) = harness()
+        for doc in Fixtures.allDocuments { await indexer.indexDocument(doc) }
+        let counting = CountingIndexPersistence(base: h.persistence)
+        h.app.workspace.persistence = counting
+        var progress = 0
+        let subscription = h.app.events.subscribe { event in
+            if event.type == NibEventType.indexProgress { progress += 1 }
+        }
+        defer { subscription.cancel() }
+        // Exercise the event handler and drain synchronously, without waiting for its debounce timer.
+        let payloads: [JSONValue?] = [
+            ["modified": true], ["folder": "root"], ["templates": true], nil,
+            ["refs": [.string(NodeRef.document(Fixtures.docID).description)]],
+            ["refresh": true], ["refresh": true, "refs": []]
+        ]
+        for payload in payloads {
+            indexer.libraryChanged(payload)
+            await indexer.processDirty()
+            XCTAssertEqual(counting.headLoads, 0)
+            XCTAssertEqual(counting.itemLoads, 0)
+            XCTAssertEqual(progress, 0)
+            XCTAssertNil(indexer.sweepTask)
+        }
+    }
+
+    func testBroadLibraryRefreshSchedulesStampAwareSweep() async throws {
+        let (h, indexer) = harness()
+        for doc in Fixtures.allDocuments { await indexer.indexDocument(doc) }
+        let counting = CountingIndexPersistence(base: h.persistence)
+        h.app.workspace.persistence = counting
+        let refs = Array(repeating: JSONValue.string(NodeRef.document(Fixtures.docID).description), count: 500)
+        let payloads: [JSONValue] = [["root": true], ["refresh": true, "refs": .array(refs)]]
+        for payload in payloads {
+            indexer.libraryChanged(payload)
+            XCTAssertNotNil(indexer.sweepTask)
+            indexer.sweepTask?.cancel()
+            await indexer.processDirty()
+            XCTAssertEqual(counting.headLoads, 0, "broad refresh must not enter wholeDocs")
+            XCTAssertEqual(counting.itemLoads, 0)
+        }
+    }
+
+    func testUnchangedDocumentReusesHeadBetweenCooperativeYields() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        var head = try XCTUnwrap(h.persistence.heads[doc])
+        head.pages = (0..<96).map { i in
+            PageRecord(id: NibID("HEADPAGE" + String(format: "%04d", i)), order: String(format: "%04d", i), size: .a4)
+        }
+        h.persistence.heads[doc] = head
+        await indexer.indexDocument(doc)
+        let counting = CountingIndexPersistence(base: h.persistence)
+        h.app.workspace.persistence = counting
+        let indexed = await indexer.indexDocument(doc)
+        XCTAssertEqual(indexed, 0)
+        XCTAssertEqual(counting.itemLoads, 96)
+        XCTAssertLessThanOrEqual(counting.headLoads, 4, "one initial head plus one after each 32-page yield")
+        XCTAssertFalse(h.app.workspace.isLoaded(doc))
+    }
+
     private var strokeRef: String { NodeRef.item(Fixtures.docID, Fixtures.page1, Fixtures.strokeID).description }
 
     private func harness(_ script: [TextRecognition] = []) -> (Harness, Indexer) {
@@ -1134,4 +1195,28 @@ private final class GatedIndexRecognizer: TextRecognizer {
         return []
     }
     func recognize(image: CGImage, language: String) async throws -> [TextRecognition] { [] }
+}
+
+@MainActor
+private final class CountingIndexPersistence: DocumentPersistence {
+    let base: InMemoryPersistence
+    private(set) var headLoads = 0
+    private(set) var itemLoads = 0
+    init(base: InMemoryPersistence) { self.base = base }
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent {
+        headLoads += 1
+        return try base.loadHead(doc)
+    }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
+        itemLoads += 1
+        return try base.loadItems(doc, page: page)
+    }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL {
+        try base.fileURL(doc, relativePath: relativePath)
+    }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
 }

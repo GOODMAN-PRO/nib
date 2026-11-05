@@ -525,6 +525,65 @@ final class NibRenderTests: XCTestCase {
         XCTAssertEqual(renderer.tiles.count(page: key), 0)
     }
 
+    func testClosingOneDocumentPreservesOtherDocumentsAndTheirWorkers() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+        let (doc, page) = try makePage(h, items: [])
+        let (otherDoc, otherPage) = try makePage(h, items: [])
+        let closedKey = TileCache.pageKey(doc, page)
+        let otherKey = TileCache.pageKey(otherDoc, otherPage)
+        let closedRender = try await renderer.render(RenderRequest(doc: doc, page: page, scale: 0.5))
+        _ = try await renderer.render(RenderRequest(doc: otherDoc, page: otherPage, scale: 0.5))
+        _ = await renderer.thumbnail(doc: otherDoc, page: otherPage, maxPixelSize: 100)
+        let probe = try renderer.thumbnailProbe(doc: otherDoc, page: otherPage)
+        let thumbKey = ThumbnailCache.Key(doc: otherDoc, page: otherPage, rev: probe.rev, size: 100, fingerprint: probe.fingerprint)
+        let otherGeneration = renderer.tiles.generation(otherKey)
+        let pendingKey = TileCache.pageKey(doc, "PENDINGPAGE1")
+        let pendingGeneration = renderer.tiles.generation(pendingKey)
+        h.app.workspace.close(doc)
+        XCTAssertEqual(renderer.tiles.count(page: closedKey), 0)
+        XCTAssertGreaterThan(renderer.tiles.count(page: otherKey), 0)
+        XCTAssertEqual(renderer.tiles.generation(otherKey), otherGeneration)
+        XCTAssertNotNil(renderer.thumbnails.memoryImage(thumbKey))
+        let rect = Rect(x: 0, y: 0, width: 100, height: 100)
+        XCTAssertFalse(renderer.tiles.insert(closedRender.image, key: "closed-worker", page: pendingKey,
+                                             rect: rect, generation: pendingGeneration))
+        XCTAssertTrue(renderer.tiles.insert(closedRender.image, key: "other-worker", page: otherKey,
+                                            rect: rect, generation: otherGeneration))
+        await diskSettled(renderer)
+    }
+
+    func testFallbackThumbnailProbeDoesNotCacheItemsAndHashesOncePerGeneration() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+        let (doc, page) = try makePage(h, items: [shortStroke()])
+        let original = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 100)
+        XCTAssertNotNil(original)
+        await diskSettled(renderer)
+        h.app.workspace.close(doc)
+        let counting = CountingPersistence(base: h.persistence)
+        counting.knowsFingerprints = false  // Production currently only implements contentRevision.
+        h.app.workspace.persistence = counting
+        let fromDisk = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 100)
+        XCTAssertNotNil(fromDisk)
+        XCTAssertEqual(counting.itemLoads, 1)
+        XCTAssertFalse(h.app.workspace.isPageCached(doc, page: page))
+        let probe = try renderer.thumbnailProbe(doc: doc, page: page)
+        let repeated = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 100)
+        XCTAssertNotNil(repeated)
+        XCTAssertEqual(counting.itemLoads, 1, "a memory hit must not reload or hash the page")
+        XCTAssertEqual(counting.fingerprintReads, 1)
+        renderer.invalidate(doc: doc, page: page, rect: nil)
+        let fresh = try renderer.thumbnailProbe(doc: doc, page: page)
+        XCTAssertNotEqual(probe.generation, fresh.generation)
+        XCTAssertEqual(counting.itemLoads, 2)
+        XCTAssertFalse(h.app.workspace.isPageCached(doc, page: page))
+        h.app.workspace.close(doc)
+        _ = try h.app.workspace.contentFingerprint(doc, page: page)
+        XCTAssertFalse(h.app.workspace.isLoaded(doc), "a standalone fingerprint must not open the document")
+        XCTAssertFalse(h.app.workspace.isPageCached(doc, page: page))
+    }
+
     func testThumbnailDiskHitDoesNotLoadThePageWhenPersistenceKnowsItsRevision() async throws {
         let h = Harness(features: [NibRenderFeature.self])
         let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
@@ -540,17 +599,18 @@ final class NibRenderTests: XCTestCase {
         renderer.purgeCaches()
         let fromDiskThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 100)
         let fromDisk = try XCTUnwrap(fromDiskThumb)
-        XCTAssertEqual(counting.itemLoads, 0, "the content revision came from persistence")
+        XCTAssertEqual(counting.itemLoads, 0, "the complete fingerprint came from persistence")
         XCTAssertFalse(h.app.workspace.isPageCached(doc, page: page))
         XCTAssertEqual(bitmap(fromDisk).bytes, bitmap(first).bytes)
 
-        // Without a revision from persistence the page is loaded to find it (and the disk file still serves).
+        // Without a fingerprint from persistence, validation reads items transiently; the disk file still serves.
         counting.knowsRevisions = false
         h.app.workspace.close(doc)
         renderer.purgeCaches()
         let loadedThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 100)
         XCTAssertNotNil(loadedThumb)
         XCTAssertEqual(counting.itemLoads, 1)
+        XCTAssertFalse(h.app.workspace.isPageCached(doc, page: page))
     }
 
     func testThumbnailFollowsCommitsAndMergesOfOlderRevisions() async throws {
@@ -568,6 +628,7 @@ final class NibRenderTests: XCTestCase {
         await diskSettled(renderer)
         XCTAssertTrue(FileManager.default.fileExists(atPath: editedFile.path))
         let newest = try renderer.thumbnailProbe(doc: doc, page: page).rev
+        let newestContentRev = h.app.workspace.contentRevision(doc, page: page)
 
         // Ink another device wrote offline before the local edit: merged, yet the page's newest rev does not move.
         var remote = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 20, y: 150), StrokePoint(x: 220, y: 150)]))
@@ -575,6 +636,7 @@ final class NibRenderTests: XCTestCase {
         let merged = h.app.bus.applyRemote(DocumentPatch(doc: doc, items: [page.raw: [remote]]), origin: "device-8")
         XCTAssertFalse(merged.isEmpty)
         XCTAssertEqual(try renderer.thumbnailProbe(doc: doc, page: page).rev, newest)
+        XCTAssertEqual(h.app.workspace.contentRevision(doc, page: page), newestContentRev)
         await diskSettled(renderer)
         XCTAssertFalse(FileManager.default.fileExists(atPath: editedFile.path), "the merge deleted the stale file")
 
@@ -599,12 +661,14 @@ final class NibRenderTests: XCTestCase {
         let originalImage = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 120)
         let original = try XCTUnwrap(originalImage)
         let oldProbe = try renderer.thumbnailProbe(doc: doc, page: page)
+        XCTAssertEqual(h.app.workspace.contentRevision(doc, page: page), high.rev)
         await diskSettled(renderer)
         h.app.workspace.close(doc)
         var items = try XCTUnwrap(h.persistence.pageItems[doc]?[page])
         let index = try XCTUnwrap(items.firstIndex { $0.id == changed.id })
         items[index].deleted = true
         items[index].rev = Rev(wallMs: 50, counter: 0, device: 8)
+        XCTAssertEqual(items.map { $0.rev }.max(), high.rev, "the offline edit leaves the maximum revision unchanged")
         h.persistence.pageItems[doc]?[page] = items
         let restarted = NibPageRenderer(app: h.app, thumbnailDirectory: renderer.thumbnails.directory)
         let newProbe = try restarted.thumbnailProbe(doc: doc, page: page)
@@ -962,6 +1026,8 @@ private final class RegionLog: @unchecked Sendable {
 private final class CountingPersistence: DocumentPersistence {
     let base: InMemoryPersistence
     var knowsRevisions = true
+    var knowsFingerprints = true
+    private(set) var fingerprintReads = 0
     private(set) var itemLoads = 0
 
     init(base: InMemoryPersistence) {
@@ -989,7 +1055,8 @@ private final class CountingPersistence: DocumentPersistence {
     }
 
     func contentFingerprint(_ doc: DocumentID, page: PageID) -> String? {
-        guard knowsRevisions, let items = base.pageItems[doc]?[page] else { return nil }
+        fingerprintReads += 1
+        guard knowsRevisions, knowsFingerprints, let items = base.pageItems[doc]?[page] else { return nil }
         return LWW.fingerprint(items)
     }
 }

@@ -171,6 +171,12 @@ final class PageLooks {
         return pages.compactMap { $0.value.keys.isDisjoint(with: keys) ? nil : $0.key }
     }
 
+    func removeDocument(_ doc: DocumentID) {
+        lock.lock()
+        pages = pages.filter { !$0.key.hasPrefix(doc.raw + "/") }
+        lock.unlock()
+    }
+
     func removeAll() {
         lock.lock()
         pages.removeAll()

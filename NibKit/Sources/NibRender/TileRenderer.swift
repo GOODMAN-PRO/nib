@@ -87,7 +87,10 @@ final class TileCache {
     func generation(_ page: String) -> Generation {
         lock.lock()
         defer { lock.unlock() }
-        return Generation(epoch: epoch, page: generations[page] ?? 0)
+        // Track snapshots before their workers finish, so closing a document invalidates in-flight pages too.
+        let value = generations[page, default: 0]
+        generations[page] = value
+        return Generation(epoch: epoch, page: value)
     }
 
     /// Caches a tile rendered from a snapshot taken at `generation`; refused (false) if the page changed since.
@@ -119,6 +122,21 @@ final class TileCache {
             }
         }
         index[page] = kept.isEmpty ? nil : kept
+    }
+
+    /// Invalidates only this document, including pages whose first tile is still in flight.
+    func removeDocument(_ doc: DocumentID) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        let prefix = doc.raw + "/"
+        let pages = generations.keys.filter { $0.hasPrefix(prefix) }
+        for page in pages {
+            generations[page, default: 0] += 1
+            for key in (index.removeValue(forKey: page) ?? [:]).keys {
+                cache.removeObject(forKey: key as NSString)
+            }
+        }
+        return pages
     }
 
     /// Outdates every render already running (they cannot cache their tiles) without dropping cached tiles.
@@ -215,6 +233,9 @@ final class NibPageRenderer: PageRenderer {
     private var commitSubscription: EventSubscription?
     private var lifetimeSubscription: EventSubscription?
     private var observers: [NSObjectProtocol] = []
+    /// One fingerprint per page generation, bounded independently of the bitmap cache.
+    @MainActor private var thumbnailProbes: [String: ThumbnailProbe] = [:]
+    typealias ThumbnailProbe = (rev: Rev, fingerprint: String, generation: TileCache.Generation)
 
     @MainActor
     init(app: NibApp, thumbnailDirectory: URL? = ThumbnailCache.defaultDirectory) {
@@ -229,8 +250,9 @@ final class NibPageRenderer: PageRenderer {
         disk.qualityOfService = .utility
         commitSubscription = app.bus.observeCommits { [weak self] cs in self?.invalidate(after: cs) }
         lifetimeSubscription = app.events.subscribe { [weak self] event in
-            if event.type == NibEventType.docClosed ||
-                (event.type == NibEventType.libraryChanged && event.payload?["root"]?.boolValue == true) {
+            if event.type == NibEventType.docClosed, let doc = event.doc {
+                self?.closeDocument(doc)
+            } else if event.type == NibEventType.libraryChanged && event.payload?["root"]?.boolValue == true {
                 // Advance the tile epoch as well: workers from the old library cannot repopulate caches.
                 self?.purgeCaches()
             }
@@ -272,7 +294,7 @@ final class NibPageRenderer: PageRenderer {
     func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? {
         guard maxPixelSize > 0, let probe = try? await thumbnailProbe(doc: doc, page: page) else { return nil }
         let key = ThumbnailCache.Key(doc: doc, page: page, rev: probe.rev, size: maxPixelSize, fingerprint: probe.fingerprint)
-        if let image = thumbnails.memoryImage(key) { return image }
+        if let image = thumbnails.memoryImage(key), tiles.generation(key.pageKey) == probe.generation { return image }
         // A disk hit counts only if nothing outdated the page (a commit, a template or drawer change) meanwhile.
         if let hit = try? await run({ self.thumbnails.diskImage(key) }), tiles.generation(key.pageKey) == probe.generation {
             looks.record(key.pageKey, generation: probe.generation) { hit.looks }
@@ -311,6 +333,17 @@ final class NibPageRenderer: PageRenderer {
         pdf.purge()
         rasters.purge()
         inks.purge()
+        onMain { [weak self] in self?.thumbnailProbes.removeAll() }
+    }
+
+    @MainActor
+    private func closeDocument(_ doc: DocumentID) {
+        for key in tiles.removeDocument(doc) {
+            thumbnails.forget(pageKey: key)
+            thumbnailProbes[key] = nil
+        }
+        looks.removeDocument(doc)
+        // Immutable assets/ink remain in their bounded caches; a library-root change purges those too.
     }
 
     // MARK: Invalidation
@@ -382,16 +415,21 @@ final class NibPageRenderer: PageRenderer {
     /// The key combines the record revision and every item revision. Persistence may supply the fingerprint;
     /// otherwise loading items is necessary to detect offline changes below the maximum revision.
     @MainActor
-    func thumbnailProbe(doc: DocumentID, page: PageID) throws -> (rev: Rev, fingerprint: String, generation: TileCache.Generation) {
+    func thumbnailProbe(doc: DocumentID, page: PageID) throws -> ThumbnailProbe {
         guard let app = app else { throw NibError.unavailable("page renderer") }
         guard let record = try app.workspace.content(doc).page(page) else {
             throw NibError.notFound("page \(page.raw) in document \(doc.raw)")
         }
-        let generation = tiles.generation(TileCache.pageKey(doc, page))
+        let key = TileCache.pageKey(doc, page)
+        let generation = tiles.generation(key)
+        if let probe = thumbnailProbes[key], probe.generation == generation, probe.rev == record.rev { return probe }
         let fingerprint = try app.workspace.contentFingerprint(doc, page: page)
-        let itemsRev = try app.workspace.contentRevision(doc, page: page)
-            ?? app.workspace.allItems(doc, page: page).map { $0.rev }.max() ?? .zero
-        return (max(record.rev, itemsRev), record.rev.description + "_" + fingerprint, generation)
+        // The fingerprint already covers every item revision. Using only the page record here avoids a second
+        // item load when persistence cannot supply a maximum revision, and keeps cold/warm keys identical.
+        let probe: ThumbnailProbe = (record.rev, record.rev.description + "_" + fingerprint, generation)
+        if thumbnailProbes.count >= 1024 { thumbnailProbes.removeAll() }
+        thumbnailProbes[key] = probe
+        return probe
     }
 
     /// Everything a worker needs, captured on the main actor: the page record, its z-ordered items (the workspace's

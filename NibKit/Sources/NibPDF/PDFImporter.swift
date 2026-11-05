@@ -112,6 +112,8 @@ enum PDFImporter {
         let chosen = target.ids ?? [], count = prepared.sizes.count
         _ = try pageIDs(chosen, count: min(chosen.count, count), in: ctx.workspace.content(doc))  // before storing
         let asset = try await store(prepared.data, doc: doc, assets: assets, dryRun: ctx.dryRun)
+        // Cancellation can leave an unreferenced, content-addressed asset. AssetStore has no removal API;
+        // deleting its URL here could remove a deduplicated asset already used by another page or command.
         try Task.checkCancellation()
         // Read the neighbours and check the ids after the await: other commands may have changed the page list.
         let content = try ctx.workspace.content(doc)

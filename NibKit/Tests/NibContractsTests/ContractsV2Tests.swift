@@ -185,6 +185,44 @@ final class ContractsV2Tests: XCTestCase {
         XCTAssertEqual(try h.snapshot(Fixtures.textDocID), after)
     }
 
+    func testCompactionIndexFollowsStackChangesAndDistinctRecords() throws {
+        let history = UndoHistory()
+        let doc = Fixtures.docID
+        var pages = (0..<512).map { i in
+            PageRecord(id: NibID("UNDOPAGE" + String(format: "%04d", i)), order: "V", size: .a4)
+        }
+        func record(_ group: String, before: PageRecord?, after: PageRecord) {
+            history.record(Changeset(seq: 1, principal: .user, group: group, label: "Test", command: "test",
+                                     mutations: [.page(doc, before: before, after: after)]))
+        }
+        for i in pages.indices {
+            pages[i].rev = Rev(wallMs: 1, counter: 0, device: 7)
+            record("large", before: nil, after: pages[i])
+        }
+        for i in pages.indices.reversed() {
+            let before = pages[i]
+            pages[i].rev = Rev(wallMs: 2, counter: 0, device: 7)
+            record("large", before: before, after: pages[i])
+        }
+        XCTAssertEqual(history.entries(doc).last?.mutations.count, pages.count)
+        let saved = try XCTUnwrap(history.popUndo(doc))
+        history.pushUndo(saved, doc: doc)
+        let before = pages[0]
+        pages[0].rev = Rev(wallMs: 3, counter: 0, device: 7)
+        record("large", before: before, after: pages[0])
+        XCTAssertEqual(history.entries(doc).last?.mutations.count, pages.count)
+        XCTAssertEqual(history.entries(doc).last?.mutations.first?.afterRev, pages[0].rev)
+        XCTAssertEqual(saved.mutations.first?.afterRev, before.rev, "previous snapshots retain value semantics")
+        record("other", before: pages[1], after: pages[1])
+        let other = try XCTUnwrap(history.entries(doc).last)
+        _ = history.removeEntry(id: other.id, doc: doc)
+        record("large", before: pages[0], after: pages[0])
+        XCTAssertEqual(history.entries(doc).last?.mutations.count, pages.count)
+        history.clear(doc)
+        record("large", before: nil, after: pages[1])
+        XCTAssertEqual(history.entries(doc).last?.mutations.count, 1)
+    }
+
     func testGroupedCompactionKeepsSegmentsAcrossARemoteWrite() async throws {
         let h = Harness()
         let ctx = try await probeContext(h, group: "CONFLICTGROUP")

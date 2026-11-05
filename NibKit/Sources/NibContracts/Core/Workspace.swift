@@ -166,7 +166,8 @@ public final class Workspace {
     public func contentFingerprint(_ doc: DocumentID, page: PageID) throws -> String {
         if let items = pageItems[doc]?[page] { return LWW.fingerprint(items) }
         if let fingerprint = persistence.contentFingerprint(doc, page: page) { return fingerprint }
-        return LWW.fingerprint(try allItems(doc, page: page))
+        // Validation of an unopened page must not populate the workspace item cache or sort by z.
+        return LWW.fingerprint(try persistence.loadItems(doc, page: page))
     }
 
     /// contracts-v2: true when persistence refuses to write the document (see `DocumentPersistence.isReadOnly`).
