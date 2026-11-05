@@ -316,9 +316,12 @@ final class NibPluginRuntimeTests: XCTestCase {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("nib-entry-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
-        let inside = try PluginRuntime.entryURL(PluginManifest.fixture(entry: "dist/main.js"), folder: folder)
-        XCTAssertTrue(inside.path.hasSuffix("/dist/main.js"))
-        for entry in ["../main.js", "/etc/main.js", "a/../../main.js", "", ".main.js", ".x/main.js", "dist/.main.js"] {
+        for (entry, expected) in [("dist/main.js", "dist/main.js"), ("./main.js", "main.js"),
+                                  ("dist/./main.js", "dist/main.js"), ("./dist/main.js", "dist/main.js")] {
+            let inside = try PluginRuntime.entryURL(PluginManifest.fixture(entry: entry), folder: folder)
+            XCTAssertEqual(inside, folder.appendingPathComponent(expected).standardizedFileURL.resolvingSymlinksInPath(), entry)
+        }
+        for entry in ["../main.js", "/etc/main.js", "a/../../main.js", "", ".main.js", ".x/main.js", "dist/.main.js", "a/.b", ".."] {
             XCTAssertThrowsError(try PluginRuntime.entryURL(PluginManifest.fixture(entry: entry), folder: folder), entry)
         }
         let script = folder.appendingPathComponent("main.js")

@@ -107,7 +107,7 @@ final class PluginRuntime: PluginRuntimeProviding {
     nonisolated static func entryURL(_ manifest: PluginManifest, folder: URL) throws -> URL {
         let entry = manifest.entry
         guard !entry.isEmpty, !entry.hasPrefix("/"), !entry.contains("\\"), !entry.contains("\0"),
-              !entry.split(separator: "/").contains(where: { $0.hasPrefix(".") }) else {
+              !entry.split(separator: "/").contains(where: { $0.hasPrefix(".") && $0 != "." }) else {
             throw NibError(.invalidParams, "the entry must be a path inside the plugin folder", path: "$.entry")
         }
         let base = folder.standardizedFileURL.resolvingSymlinksInPath()

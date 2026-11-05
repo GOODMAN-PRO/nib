@@ -362,8 +362,27 @@ final class ContributionMapperTests: XCTestCase {
                 XCTAssertTrue(paths.contains(expected), expected)
             }
         }
-        for path in [".main.js", ".x/main.js", "panels/.main.html"] {
+        for path in [".main.js", ".x/main.js", "panels/.main.html", "dist/.main.js", "a/.b", ".."] {
+            XCTAssertFalse(PluginPaths.isValid(path), path)
             XCTAssertThrowsError(try PluginPaths.resolve(path, in: folder, path: "$.entry"))
+        }
+    }
+
+    func testManifestAcceptsSingleDotPathComponents() throws {
+        let kit = PluginTestKit()
+        for entry in ["./main.js", "dist/./main.js", "./dist/main.js"] {
+            XCTAssertTrue(PluginPaths.isValid(entry), entry)
+            let value = kit.manifest(Self.pid, contributes: [
+                "panels": [["id": "dev.test.all.panel", "title": "Stats", "entry": "./panels/stats.html"]]
+            ]).merging(["entry": .string(entry)])
+            let manifest = try value.decode(PluginManifest.self)
+            let folder = try kit.install(value, files: [
+                "dist/main.js": Data("// entry".utf8),
+                "panels/stats.html": Data("<p>stats</p>".utf8)
+            ])
+            XCTAssertNoThrow(try ManifestValidator.validate(manifest, folder: nil), entry)
+            XCTAssertNoThrow(try ManifestValidator.validate(manifest, folder: folder), entry)
+            XCTAssertNoThrow(try PluginPaths.existing(entry, in: folder, path: "$.entry"), entry)
         }
     }
 

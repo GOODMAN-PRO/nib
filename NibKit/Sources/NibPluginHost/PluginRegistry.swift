@@ -48,7 +48,7 @@ enum PluginPaths {
     static func isValid(_ relative: String) -> Bool {
         let trimmed = relative.trimmingCharacters(in: .whitespaces)
         return !trimmed.isEmpty && !trimmed.hasPrefix("/") && !trimmed.contains("\\") && !trimmed.contains("\0")
-            && !trimmed.split(separator: "/").contains(where: { $0.hasPrefix(".") })
+            && !trimmed.split(separator: "/").contains(where: { $0.hasPrefix(".") && $0 != "." })
     }
 
     static func resolve(_ relative: String, in folder: URL, path: String) throws -> URL {
