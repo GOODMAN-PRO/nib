@@ -440,7 +440,7 @@ final class ToolbarModel: ObservableObject {
         scrollTravel = 0
     }
 
-    /// The options bar fused to the palette (`NibToolPalette(toolOptions:)`) and, when the tool's menu has one, the
+    /// The options bar beside the palette (`NibToolPalette(toolOptions:)`) and, when the tool's menu has one, the
     /// popover that buds from a control inside it (`ToolMenuDescriptor.makePopover`, contracts-v2): the palette places
     /// it beside the bar and closes it with the bar. nil while either fold hides the bar.
     func toolOptions(for id: String) -> NibToolOptions? {

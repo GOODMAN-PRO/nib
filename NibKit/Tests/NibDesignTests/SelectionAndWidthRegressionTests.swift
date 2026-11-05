@@ -19,11 +19,41 @@ final class SelectionAndWidthRegressionTests: XCTestCase {
                 }
                 .background(Color.white)
                 let image = try XCTUnwrap(NibSnapshot.image(view, size: size))
-                let y = placement == .above ? anchor.minY - 22 : anchor.maxY + 22
+                let y = placement == .above ? anchor.minY - NibToolOptionsPlacement.gap - 22
+                    : anchor.maxY + NibToolOptionsPlacement.gap + 22
                 XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: 15, y: y)), .white)
                 XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: 17, y: y)), RGBA(0, 0, 0, 255))
                 XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: width - 17, y: y)), RGBA(0, 0, 0, 255))
                 XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: width - 15, y: y)), .white)
+            }
+        }
+    }
+
+    func testOptionsHaveSixteenPointClearanceOnEveryDockInBothAppearances() throws {
+        let size = CGSize(width: 800, height: 600)
+        let bounds = CGRect(origin: .zero, size: size)
+        let anchor = CGRect(x: 372, y: 272, width: 56, height: 56)
+        for variant in [NibSnapshot.Variant.light, .dark] {
+            for placement in [NibBudPlacement.above, .below, .leading, .trailing] {
+                let view = NibToolOptionsPlacement(containerSize: size, bounds: bounds,
+                                                   anchor: anchor, placement: placement) {
+                    Color.black.frame(width: 120, height: 44)
+                }.background(Color.white)
+                let image = try XCTUnwrap(NibSnapshot.image(view, size: size, variant: variant))
+                let edge: CGPoint
+                let direction: CGVector
+                switch placement {
+                case .above: edge = CGPoint(x: anchor.midX, y: anchor.minY); direction = CGVector(dx: 0, dy: -1)
+                case .below: edge = CGPoint(x: anchor.midX, y: anchor.maxY); direction = CGVector(dx: 0, dy: 1)
+                case .leading: edge = CGPoint(x: anchor.minX, y: anchor.midY); direction = CGVector(dx: -1, dy: 0)
+                case .trailing: edge = CGPoint(x: anchor.maxX, y: anchor.midY); direction = CGVector(dx: 1, dy: 0)
+                }
+                for distance in [CGFloat(2), 8, 14] {
+                    let point = CGPoint(x: edge.x + direction.dx * distance, y: edge.y + direction.dy * distance)
+                    XCTAssertEqual(NibSnapshot.pixel(image, at: point), .white)
+                }
+                let inside = CGPoint(x: edge.x + direction.dx * 18, y: edge.y + direction.dy * 18)
+                XCTAssertEqual(NibSnapshot.pixel(image, at: inside), RGBA(0, 0, 0, 255))
             }
         }
     }

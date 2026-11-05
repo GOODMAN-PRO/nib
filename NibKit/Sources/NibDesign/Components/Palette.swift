@@ -547,7 +547,8 @@ public struct NibToolPalette<Settings: View>: View {
                     // Placement adds chromeInset itself, so expand that region by the inset first.
                     let optionsBounds = CGRect(x: r.minX - NibMetrics.chromeInset, y: bounds.minY,
                                                width: r.width + 2 * NibMetrics.chromeInset, height: bounds.height)
-                    let available = placement(d).availableSize(beside: slotAt(along), gap: 0, in: optionsBounds)
+                    let available = placement(d).availableSize(beside: slotAt(along), gap: NibToolOptionsPlacement.gap,
+                                                               in: optionsBounds)
                     if showsOptions {
                         NibToolOptionsPlacement(containerSize: proxy.size, bounds: optionsBounds,
                                             anchor: slotAt(along), placement: placement(d)) {
@@ -939,6 +940,8 @@ public struct NibToolPalette<Settings: View>: View {
 /// Measure and position the bounded viewport in the same layout pass. A cached size from the previous
 /// tool/orientation can otherwise place the new, wider viewport beyond the inset for its first frame.
 struct NibToolOptionsPlacement: Layout {
+    /// Independent rounded glass bodies need clear space; a one-point frame overlap does not fuse their caps.
+    static let gap: CGFloat = NibSpacing.l
     let containerSize: CGSize
     let bounds: CGRect
     let anchor: CGRect
@@ -949,11 +952,11 @@ struct NibToolOptionsPlacement: Layout {
     }
 
     func placeSubviews(in rect: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let available = placement.availableSize(beside: anchor, gap: 0, in: bounds)
+        let available = placement.availableSize(beside: anchor, gap: Self.gap, in: bounds)
         let proposed = ProposedViewSize(width: available.width, height: NibMetrics.barHeight)
         for subview in subviews {
             let size = subview.sizeThatFits(proposed)
-            let centre = placement.centre(size: size, beside: anchor, gap: -1, in: bounds, alignment: .centre)
+            let centre = placement.centre(size: size, beside: anchor, gap: Self.gap, in: bounds, alignment: .centre)
             subview.place(at: CGPoint(x: rect.minX + centre.x, y: rect.minY + centre.y),
                           anchor: .center, proposal: proposed)
         }

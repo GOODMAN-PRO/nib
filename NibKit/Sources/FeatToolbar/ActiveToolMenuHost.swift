@@ -3,7 +3,7 @@ import NibContracts
 import NibDesign
 
 /// The active tool's contextual options and its settings. The options bar is a `NibToolOptionsBar` that
-/// `NibToolPalette(toolOptions:)` fuses to the palette's far side, level with the selected tool (DESIGN.md §13.3), so
+/// `NibToolPalette(toolOptions:)` places 16 pt from the palette's far side, level with the selected tool (DESIGN.md §13.3), so
 /// it floats with the palette and docks with it on any screen edge. Its content comes from `ui.toolMenus` (registered
 /// under the tool id) and otherwise from the toolbar item's own `activeToolMenu`; a `ui.toolMenus` entry may add a
 /// popover of its own, which the palette buds beside the bar.

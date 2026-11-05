@@ -33,7 +33,7 @@ public struct NibToolOptionsState: Equatable {
     }
 }
 
-/// What `NibToolPalette(toolOptions:)` shows for the active tool (DESIGN.md §13.3): the options bar fused to the
+/// What `NibToolPalette(toolOptions:)` shows for the active tool (DESIGN.md §13.3): the options bar beside the
 /// palette and, optionally, one popover budded from a control inside that bar. The bar's droplet clips its content,
 /// so a popover cannot live inside it; the palette places this one as a full-size child of the container instead.
 public struct NibToolOptions {
