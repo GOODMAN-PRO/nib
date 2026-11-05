@@ -13,7 +13,7 @@ final class FeatMathTests: XCTestCase {
     private func registerRenderPage(_ h: Harness) throws -> MathRenderPageDouble {
         let render = MathRenderPageDouble(asset: try h.assets.putTemporary(Fixtures.pngData, ext: "png"))
         h.app.commands.register(CommandDescriptor(id: CommandIDs.renderPage, title: "Render Page", summary: "Test selection render",
-            params: .obj(["page": .ref, "region": .rect, "background": .bool(), "layers": .arr(.int(min: 0, max: 4))], required: ["page"]),
+            params: .obj(["page": .ref, "region": .rect, "background": .bool(), "layers": .arr(.int(min: 0, max: 4)), "refs": .arr(.ref)], required: ["page"]),
             effect: .read)) { params, _ in
             render.requests.append(params)
             return ["asset": .string("tmp:" + render.asset.name), "pxPerPt": 1, "region": params["region"] ?? .null]
@@ -74,7 +74,8 @@ final class FeatMathTests: XCTestCase {
         let bounds = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID).bounds
         XCTAssertEqual(render.requests.first?["page"], .string(NodeRef.page(Fixtures.docID, Fixtures.page1).description))
         XCTAssertEqual(render.requests.first?["region"], try JSONValue.from([bounds.x, bounds.y, bounds.width, bounds.height]))
-        XCTAssertEqual(render.requests.first?["background"], true)
+        XCTAssertEqual(render.requests.first?["background"], false)
+        XCTAssertEqual(render.requests.first?["refs"], [.string(ink)])
         XCTAssertEqual(render.requests.first?["layers"], [0])
         XCTAssertEqual(try h.snapshot(), before)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)

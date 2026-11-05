@@ -57,8 +57,11 @@ enum MathRecognizer {
         let region = selection.bounds
         let pageRef = NodeRef.page(selection.doc, selection.page).description
         let layers = Set(selection.items.map(\.layer))
-        let result = try await ctx.execute(CommandIDs.renderPage,
-                                          ["page": .string(pageRef), "region": try JSONValue.from([region.x, region.y, region.width, region.height]), "background": true, "layers": try JSONValue.from(layers.sorted())])
+        let params: JSONValue = ["page": .string(pageRef),
+            "region": try JSONValue.from([region.x, region.y, region.width, region.height]),
+            "background": false, "layers": try JSONValue.from(layers.sorted()),
+            "refs": .array(selection.refs.map(JSONValue.string))]
+        let result = try await ctx.execute(CommandIDs.renderPage, params)
         guard let name = result["asset"]?.stringValue else { throw NibError(.internalError, "render.page returned no image") }
         let url = try await ctx.inputFile(name)
         let image = try await Task.detached(priority: .userInitiated) {

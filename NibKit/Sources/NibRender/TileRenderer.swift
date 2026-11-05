@@ -247,10 +247,15 @@ final class NibPageRenderer: PageRenderer {
     // MARK: PageRenderer
 
     func render(_ request: RenderRequest) async throws -> RenderResult {
+        try await render(request, including: nil)
+    }
+
+    /// Filter at snapshot time so content added during an await cannot enter a selection image.
+    func render(_ request: RenderRequest, including ids: Set<ElementID>?) async throws -> RenderResult {
         guard request.scale.isFinite, request.scale > 0 else {
             throw NibError.invalid("scale must be a positive number", path: "$.scale")
         }
-        let job = try await snapshot(request)
+        let job = try await snapshot(request, including: ids)
         let region = try await self.region(for: job)
         return try await produce(job, region: region, scale: request.scale, marks: request.marks)
     }
@@ -383,13 +388,14 @@ final class NibPageRenderer: PageRenderer {
     /// own array, shared copy-on-write — filtering and culling happen off-main), the resolved template, the PDF URL
     /// and the asset store.
     @MainActor
-    func snapshot(_ request: RenderRequest) throws -> RenderJob {
+    func snapshot(_ request: RenderRequest, including ids: Set<ElementID>? = nil) throws -> RenderJob {
         guard let app = app else { throw NibError.unavailable("page renderer") }
         let content = try app.workspace.content(request.doc)
         guard let page = content.page(request.page) else {
             throw NibError.notFound("page \(request.page.raw) in document \(request.doc.raw)")
         }
-        let items = try app.workspace.allItems(request.doc, page: request.page)
+        let allItems = try app.workspace.allItems(request.doc, page: request.page)
+        let items = ids.map { selected in allItems.filter { selected.contains($0.id) } } ?? allItems
         let layers = request.layers ?? RenderGeometry.visibleLayers(app.services.sessions.active, doc: request.doc)
         var template: TemplateSource?
         if page.background.kind == .template, let ref = page.background.template, let def = registries.template(ref) {
@@ -400,7 +406,7 @@ final class NibPageRenderer: PageRenderer {
         if page.background.kind == .pdf, let ref = page.background.asset { pdfURL = assets?.url(ref, doc: request.doc) }
         let animating = request.replay.map { $0.mode != .showAll } ?? false
         var variant: String?
-        if request.hidden.isEmpty && !animating {
+        if ids == nil && request.hidden.isEmpty && !animating {
             var parts = ["L" + layers.sorted().map { String($0) }.joined(separator: ","), request.purpose.rawValue]
             if request.background { parts.append("bg") }
             if request.annotations { parts.append("ann") }

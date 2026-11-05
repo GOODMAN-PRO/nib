@@ -196,6 +196,40 @@ final class NibRenderTests: XCTestCase {
 
     // MARK: render.page
 
+    func testRenderPageIncludesOnlySelectedInkAndOmitsBackground() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let selected = Item.makeStroke(Stroke(style: .defaultPen,
+            points: [StrokePoint(x: 20, y: 20), StrokePoint(x: 200, y: 180)]))
+        let other = Item.makeStroke(Stroke(style: .defaultPen,
+            points: [StrokePoint(x: 20, y: 180), StrokePoint(x: 200, y: 20)]))
+        let (doc, page) = try makePage(h, items: [selected, other], background: .ofColor(.paperDark))
+        let pageRef = NodeRef.page(doc, page).description
+        // Warm the unfiltered query tiles first: a selected render must never reuse them.
+        _ = try await h.run("render.page", ["page": .string(pageRef), "scale": 1])
+        let ref = NodeRef.item(doc, page, selected.id).description
+        let out = try await h.run("render.page", ["page": .string(pageRef), "scale": 1,
+            "background": false, "refs": [.string(ref)]])
+        let bmp = bitmap(try XCTUnwrap(png(h, out)))
+        func alpha(_ x: Int, _ y: Int) -> UInt8 { bmp.bytes[(y * bmp.width + x) * 4 + 3] }
+        XCTAssertGreaterThan(alpha(65, 60), 0, "selected diagonal is drawn")
+        XCTAssertEqual(alpha(65, 140), 0, "overlapping unselected diagonal is excluded")
+        XCTAssertEqual(alpha(220, 100), 0, "page background is excluded")
+        let marked = try await h.run("render.page", ["page": .string(pageRef), "refs": [.string(ref)], "marks": true])
+        XCTAssertEqual(marked["marks"], ["1": .string(ref)])
+    }
+
+    func testRenderPageRejectsSelectionRefsFromAnotherPage() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        do {
+            _ = try await h.run("render.page", ["page": .string(NodeRef.page(Fixtures.docID, Fixtures.pdfPage).description),
+                "refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01"]])
+            XCTFail("Cross-page selection was rendered")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .invalidParams)
+            XCTAssertEqual(error.path, "$.refs[0]")
+        }
+    }
+
     func testRenderPageMarksEveryLiveFixtureItem() async throws {
         let h = Harness(features: [NibRenderFeature.self])
         let out = try await h.run("render.page", ["page": "page:FIXTUREDOC01/FIXTUREPG001", "marks": true])
