@@ -258,6 +258,64 @@ final class NibAIAgentTests: XCTestCase {
         XCTAssertEqual(records.count, 3)
     }
 
+    func testDeletingChatClearsOnlyItsLibraryPendingSaveThroughBothEntrypoints() async throws {
+        for command in [false, true] {
+            let provider = P(events: [P.answer("Unsaved A"), P.answer("Unsaved B")])
+            let (h, agent) = AgentFixture.make(provider)
+            let other = Harness()
+            let chat = "CHATTEST0001"
+            let original = agent.chatStore
+            var destinations: [URL] = []
+            for library in [h.library, other.library] {
+                h.app.services.library = library
+                let destination = library.metadataURL.appendingPathComponent("ai")
+                    .appendingPathComponent(agent.chatStore.ownFileName(chat))
+                destinations.append(destination)
+                try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+                do {
+                    _ = try await agent.complete(AgentFixture.request("Question"))
+                    XCTFail("Saving must fail")
+                } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+                XCTAssertNotNil(agent.pendingSaves[ObjectIdentifier(agent.chatStore)]?[chat])
+            }
+            let otherStore = agent.chatStore
+            h.app.services.library = h.library
+            if command {
+                do {
+                    _ = try await h.run("ai.chat.delete", ["chat": .string(chat)])
+                    XCTFail("The tombstone is still blocked")
+                } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+            } else { agent.deleteChat(chat) }
+            XCTAssertNil(agent.pendingSaves[ObjectIdentifier(original)]?[chat])
+            XCTAssertNotNil(agent.pendingSaves[ObjectIdentifier(otherStore)]?[chat])
+            try FileManager.default.removeItem(at: destinations[0])
+            let failure = await original.flushAsync()
+            XCTAssertNil(failure)
+            let fresh = store(destinations[0].deletingLastPathComponent(), device: 0x0B)
+            XCTAssertTrue(fresh.isDeleted(chat))
+            XCTAssertTrue(fresh.messages(chat).isEmpty)
+            XCTAssertEqual(provider.requests.count, 2)
+        }
+    }
+
+    func testDeletedInFlightTurnDoesNotReinstallPendingSave() async throws {
+        let provider = P(events: [P.answer("Cancelled answer")])
+        let (h, agent) = AgentFixture.make(provider)
+        let chat = "CHATTEST0001"
+        let original = agent.chatStore
+        let destination = h.library.metadataURL.appendingPathComponent("ai")
+            .appendingPathComponent(original.ownFileName(chat))
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        provider.beforeEvents = { agent.deleteChat(chat) }
+        _ = try await agent.complete(AgentFixture.request("Delete while answering"))
+        XCTAssertTrue(original.isDeleted(chat))
+        XCTAssertNil(agent.pendingSaves[ObjectIdentifier(original)]?[chat])
+        try FileManager.default.removeItem(at: destination)
+        let failure = await original.flushAsync()
+        XCTAssertNil(failure)
+        XCTAssertTrue(store(destination.deletingLastPathComponent(), device: 0x0B).isDeleted(chat))
+    }
+
     func testPendingAnswerRecoversThroughCompleteAndStreamWithoutRegeneration() async throws {
         for streaming in [false, true] {
             for flushedElsewhere in [false, true] {
@@ -520,22 +578,24 @@ final class NibAIAgentTests: XCTestCase {
 
     func testConflictCopySurvivesFailedMergeWriteAndRetries() throws {
         let dir = tempFolder()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
         let a = store(dir, device: 0x0A)
         let chat = "CHATCONFLICT"
         let record = a.makeMessage(role: "user", text: "Only in the conflict copy")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let conflict = dir.appendingPathComponent("\(chat).0000000a 2.jsonl")
         try ChatStore.encodeLines([record]).write(to: conflict)
-        // A directory at the destination makes the atomic file replacement fail reliably.
-        let own = dir.appendingPathComponent(a.ownFileName(chat))
-        try FileManager.default.createDirectory(at: own, withIntermediateDirectories: true)
+        // Keep every source readable while preventing atomic replacement in the folder.
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
         a.refresh(force: true)
-        a.flush()
+        XCTAssertNotNil(a.flush())
         XCTAssertTrue(FileManager.default.fileExists(atPath: conflict.path))
         XCTAssertEqual(a.messages(chat).map(\.id), [record.id])
         a.flush()
-        try FileManager.default.removeItem(at: own)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
         a.refresh(force: true)
         a.flush()
         XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
@@ -544,21 +604,23 @@ final class NibAIAgentTests: XCTestCase {
 
     func testChangedConflictSurvivesRetainedFlushWithoutRescanning() throws {
         let dir = tempFolder()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
         let writer = store(dir, device: 0x0A)
         let chat = "CHATMERGELATE"
         let first = writer.makeMessage(role: "user", text: "Captured before storage failed")
         let second = writer.makeMessage(role: "assistant", text: "Synced while storage was blocked")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let conflict = dir.appendingPathComponent("\(chat).0000000a 2.jsonl")
-        let destination = dir.appendingPathComponent(writer.ownFileName(chat))
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         try ChatStore.encodeLines([first]).write(to: conflict)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
         writer.refresh(force: true)
         XCTAssertNotNil(writer.flush())
         let updated = ChatStore.encodeLines([first, second])
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
         try updated.write(to: conflict, options: .atomic)
-        try FileManager.default.removeItem(at: destination)
         // Deliberately no refresh/messages/state call between sync and recovery.
         XCTAssertNil(writer.flush())
         XCTAssertEqual(try Data(contentsOf: conflict), updated)
@@ -571,28 +633,32 @@ final class NibAIAgentTests: XCTestCase {
 
     func testRepeatedConflictScansKeepOnePendingMergePerSnapshot() throws {
         let dir = tempFolder()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
         let writer = store(dir, device: 0x0A)
         let chat = "CHATMERGEQUEUE"
         let first = writer.makeMessage(role: "user", text: "First conflict record")
         let second = writer.makeMessage(role: "assistant", text: "Later conflict record")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let conflict = dir.appendingPathComponent("\(chat).0000000a 2.jsonl")
-        let destination = dir.appendingPathComponent(writer.ownFileName(chat))
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         try ChatStore.encodeLines([first]).write(to: conflict)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
         for _ in 0..<10 {
             writer.refresh(force: true)
             XCTAssertNotNil(writer.flush())
             XCTAssertEqual(writer.pendingWriteCount, 1, "An unchanged blocked merge must not accumulate snapshots")
         }
         // A newer synced copy must still be queued, even while the older snapshot is blocked.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
         try ChatStore.encodeLines([first, second]).write(to: conflict)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
         for _ in 0..<10 {
             writer.refresh(force: true)
             XCTAssertEqual(writer.pendingWriteCount, 2)
         }
-        try FileManager.default.removeItem(at: destination)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
         XCTAssertNil(writer.flush())
         XCTAssertEqual(writer.pendingWriteCount, 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
@@ -604,6 +670,40 @@ final class NibAIAgentTests: XCTestCase {
         XCTAssertNil(writer.flush())
         XCTAssertEqual(writer.pendingWriteCount, 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
+    }
+
+    func testUnreadableDeviceFileDefersConflictMergeWithoutLosingRecords() throws {
+        for sourceDevice in ["0000000a", "0000000b"] {
+            let dir = tempFolder()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let writer = store(dir, device: 0x0A)
+            let chat = "CHATUNREADDEVICE"
+            let original = writer.makeMessage(role: "user", text: "Only in the device file")
+            let extra = writer.makeMessage(role: "assistant", text: "Only in the conflict copy")
+            let source = dir.appendingPathComponent("\(chat).\(sourceDevice).jsonl")
+            let backup = ChatStore.encodeLines([original])
+            // A directory stands in for a temporarily unreadable device file; this store has
+            // never cached its records, just like a chat evicted from the bounded body cache.
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+            let conflict = dir.appendingPathComponent("\(chat).0000000a 2.jsonl")
+            let conflictData = ChatStore.encodeLines([extra])
+            try conflictData.write(to: conflict)
+            writer.refresh(force: true)
+            XCTAssertEqual(writer.pendingWriteCount, 0, "An incomplete snapshot must never be queued")
+            XCTAssertNil(writer.flush())
+            XCTAssertEqual(try Data(contentsOf: conflict), conflictData)
+            try FileManager.default.removeItem(at: source)
+            try backup.write(to: source)
+            // Restoring access must not let a retained incomplete job overwrite the source.
+            XCTAssertNil(writer.flush())
+            XCTAssertEqual(try Data(contentsOf: source), backup)
+            writer.refresh(force: true)
+            XCTAssertNil(writer.flush())
+            XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
+            let reopened = store(dir, device: 0x0C)
+            XCTAssertEqual(reopened.messages(chat).map(\.id), [original.id, extra.id])
+        }
     }
 
     func testUnreadableConflictCopyIsRetried() throws {

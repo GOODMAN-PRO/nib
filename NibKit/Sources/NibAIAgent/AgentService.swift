@@ -27,7 +27,7 @@ final class AgentService: AIService {
     // Retained per visited library for this process lifetime: failed writes and security-scoped
     // access must survive a switch. Growth is bounded by the libraries visited during this run.
     private var chatStores: [URL?: ChatStore] = [:]
-    private var pendingSaves: [ObjectIdentifier: [String: AIResponse]] = [:]
+    private(set) var pendingSaves: [ObjectIdentifier: [String: AIResponse]] = [:]
     var chatStore: ChatStore {
         let library = app?.services.library
         let directory = library?.metadataURL.appendingPathComponent("ai", isDirectory: true)
@@ -141,10 +141,9 @@ final class AgentService: AIService {
     }
 
     func deleteChat(_ chatID: String) {
-        cancel(chatID: chatID)
         do {
             let store = chatStore
-            try store.delete(chatID)
+            try deleteChat(chatID, from: store)
             Task { @MainActor in
                 if let error = await store.flushAsync() {
                     agentLog.error("chat not deleted: \(error.description, privacy: .public)")
@@ -153,6 +152,13 @@ final class AgentService: AIService {
         } catch {
             agentLog.error("chat not deleted: \(NibError.wrap(error).description, privacy: .public)")
         }
+    }
+
+    func deleteChat(_ chatID: String, from store: ChatStore) throws {
+        cancel(chatID: chatID)
+        try store.delete(chatID)
+        // The tombstone now owns recovery, including when its durable write must retry.
+        pendingSaves[ObjectIdentifier(store)]?[chatID] = nil
     }
 
     func transcribe(audio: URL, language: String?) async throws -> [TranscriptSegment] {
@@ -316,7 +322,7 @@ final class AgentService: AIService {
         let persistenceError = persisted ? await chatStore.flushAsync() : nil
         let response = AIResponse(text: text, changes: outcome.changes, group: group, usage: outcome.usage,
                                   chatID: persisted ? chatID : nil)
-        if persistenceError != nil && outcome.error == nil {
+        if persistenceError != nil && outcome.error == nil && !chatStore.isDeleted(chatID) {
             pendingSaves[ObjectIdentifier(chatStore), default: [:]][chatID] = response
         }
         // Preserve provider errors and successful cancellation receipts. Save failures carry a

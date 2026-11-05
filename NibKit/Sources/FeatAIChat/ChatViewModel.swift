@@ -569,6 +569,9 @@ final class ChatViewModel: ObservableObject {
                     }
                     if let changes { entries[i].changes.merge(changes) }
                 case .finished(let response):
+                    // The agent has already saved this receipt. Keep it before any library
+                    // check or suspension so recovery never asks it to save a nonexistent draft.
+                    saveRecovery?.response = response
                     try checkOrigin(origin)
                     entries[i].text = response.text
                     resolveEntryCitations(i)
@@ -607,8 +610,12 @@ final class ChatViewModel: ObservableObject {
             if generation == token, let i = entries.firstIndex(where: { $0.id == answerID }) {
                 entries[i].finishText(citationLabel)
             }
-            if generation == token, !(error is CancellationError) { self.error = NibError.wrap(error) }
+            let failure = NibError.wrap(error)
+            let reported = saveRecovery?.response == nil ? failure
+                : NibError(failure.code, failure.message, path: "$.chat.persistence", hint: failure.hint)
+            if generation == token, !(error is CancellationError) { self.error = reported }
             try? await persistConversation()
+            if !(error is CancellationError) { throw reported }
             throw error
         }
     }
@@ -638,6 +645,8 @@ final class ChatViewModel: ObservableObject {
             }
             let previousTokens = entries[answer].usage.input + entries[answer].usage.output
             totalTokens += response.usage.input + response.usage.output - previousTokens
+            entries[answer].text = response.text
+            resolveEntryCitations(answer)
             entries[answer].usage = response.usage
             entries[answer].changes.merge(response.changes)
             entries[answer].group = response.group ?? entries[answer].group

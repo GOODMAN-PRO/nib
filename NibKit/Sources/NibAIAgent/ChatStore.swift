@@ -576,9 +576,13 @@ final class ChatStore {
             var state = input.states[chat] ?? ChatState()
             if let meta = input.overviews[chat]?.meta { state.absorb(meta, now: now) }
             var conflicts: [URL: Data] = [:]
+            var unreadableDeviceFile = false
             for file in entries {
                 let url = dir.appendingPathComponent(file.name)
-                guard let data = try? Data(contentsOf: url) else { continue }
+                guard let data = try? Data(contentsOf: url) else {
+                    if isDeviceHex(file.device) { unreadableDeviceFile = true }
+                    continue
+                }
                 let (records, lines) = decodeLines(data)
                 let conflict = file.device != device && !isDeviceHex(file.device)
                 if conflict {
@@ -597,7 +601,9 @@ final class ChatStore {
             result.overviews[chat] = Overview(chat: chat, state: state)
             if input.states[chat] != nil || loading == chat { result.states[chat] = state }
             let shrink = state.isDeleted && result.ownLines[chat] != nil && !result.tombstoned.contains(chat)
-            if !conflicts.isEmpty || shrink {
+            // A bounded cache may not contain the unreadable file's records. Never replace
+            // the own file with that incomplete snapshot; leave conflicts for a later scan.
+            if !unreadableDeviceFile && (!conflicts.isEmpty || shrink) {
                 let records = state.isDeleted ? state.meta.map { [$0] } ?? [] : ordered(state)
                 let data = encodeLines(records)
                 let destination = dir.appendingPathComponent("\(chat).\(device).\(fileExtension)")

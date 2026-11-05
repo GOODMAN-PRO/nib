@@ -321,8 +321,7 @@ struct AIChatDelete: NibCommand {
         let agent = try ChatCommands.agent(ctx)
         let store = agent.chatStore
         try store.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
-        agent.cancel(chatID: p.chat)
-        try store.delete(p.chat)
+        try agent.deleteChat(p.chat, from: store)
         if let error = await store.flushAsync() { throw error }
         return NoResult()
     }
