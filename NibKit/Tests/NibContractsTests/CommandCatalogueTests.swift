@@ -87,6 +87,8 @@ final class CommandCatalogueTests: XCTestCase {
 
         ("canvas.decorate", CommandIDs.canvasDecorate),
         ("canvas.clearDecorations", CommandIDs.canvasClearDecorations),
+        ("canvas.retainFailedInk", CommandIDs.canvasRetainFailedInk),
+        ("canvas.recoverInk", CommandIDs.canvasRecoverInk),
 
         ("card.add", CommandIDs.cardAdd),
         ("card.update", CommandIDs.cardUpdate),

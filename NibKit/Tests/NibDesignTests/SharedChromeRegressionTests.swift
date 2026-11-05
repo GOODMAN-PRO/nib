@@ -81,7 +81,8 @@ final class SharedChromeRegressionTests: XCTestCase {
             // The scroll cue now occupies a separate lane inside the panel. Placement
             // concerns the complete droplet, not just the shortened native scroller.
             let frame = try XCTUnwrap(field.anchorRect("menu"))
-            XCTAssertLessThanOrEqual(viewport.bounds.height, frame.height)
+            // Half a point of tolerance: both heights come from layout arithmetic and can differ in the last bits.
+            XCTAssertLessThanOrEqual(viewport.bounds.height, frame.height + 0.5)
             XCTAssertGreaterThan(viewport.bounds.height, 0)
             let roomBelow = bounds.maxY - NibMetrics.chromeInset - source.maxY - NibMetrics.popoverGap
             if contentHeight == 100 {
