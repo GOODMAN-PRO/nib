@@ -968,7 +968,13 @@ final class WebDAVMirrorRun {
         let parent = remotePath.split(separator: "/").dropLast().joined(separator: "/")
         try await client.ensureCollections(client.serverComponents(libraryPath: parent))
         let etag = try await client.put(file: copy, to: target, precondition: precondition)
-        let observed = try? await client.version(ofLibraryFile: remotePath)
+        let observed: String?
+        do { observed = try await client.version(ofLibraryFile: remotePath) }
+        catch {
+            let failure = WebDAVError.from(error, host: client.host)
+            if failure.isFatal { throw failure }
+            observed = nil
+        }
         let uploaded = etag.map { "e:" + WebDAVPaths.normalizeETag($0) }
         // A later PROPFIND may already describe another device's write. Never pair that version with our bytes.
         let version: String?

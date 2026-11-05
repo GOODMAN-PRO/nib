@@ -86,6 +86,7 @@ enum WebDAVError: Error, Equatable {
     case notFound(String)
     case changedDuringSync(String)
     case insufficientStorage
+    case busy
     case notWebDAV
     case http(Int, String)
     case invalidResponse(String)
@@ -103,6 +104,7 @@ enum WebDAVError: Error, Equatable {
         case .notFound: return "notFound"
         case .changedDuringSync: return "changedDuringSync"
         case .insufficientStorage: return "serverFull"
+        case .busy: return "serverBusy"
         case .notWebDAV: return "notWebDAV"
         case .http: return "server"
         case .invalidResponse: return "invalidResponse"
@@ -131,6 +133,8 @@ enum WebDAVError: Error, Equatable {
             return String(localized: "\(path) changed during the sync; it is retried next time")
         case .insufficientStorage:
             return String(localized: "The server is out of storage space")
+        case .busy:
+            return String(localized: "The server is busy. Try syncing again later.")
         case .notWebDAV:
             return String(localized: "The address does not point to a WebDAV folder")
         case .http(let status, let what):
@@ -148,7 +152,7 @@ enum WebDAVError: Error, Equatable {
     var isFatal: Bool {
         switch self {
         case .notConfigured, .credentialsMissing, .authenticationFailed, .untrustedCertificate, .unreachable,
-             .insufficientStorage, .notWebDAV, .cancelled:
+             .insufficientStorage, .busy, .notWebDAV, .cancelled:
             return true
         default:
             return false
@@ -759,6 +763,7 @@ final class WebDAVClient {
         case 404, 410: throw WebDAVError.notFound(label(url))
         case 412: throw WebDAVError.changedDuringSync(label(url))
         case 507: throw WebDAVError.insufficientStorage
+        case 429, 503: throw WebDAVError.busy
         default: throw WebDAVError.http(status, "\(method) \(label(url))")
         }
     }

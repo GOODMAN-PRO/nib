@@ -451,6 +451,26 @@ final class WebDAVMirrorTests: XCTestCase {
         XCTAssertEqual(r.uploaded + r.downloaded, 0, "the version read back after PUT matches the listing")
     }
 
+    func testBusyServerStopsSchedulingCopies() async throws {
+        for status in [429, 503] {
+            for method in ["PUT", "PROPFIND"] {
+                let server = FakeDAVServer.install()
+                let root = DAVTest.tempDir("busy"), state = DAVTest.tempDir("state")
+                for i in 0..<10 { try DAVTest.write(root, "file\(i).json", "keep") }
+                server.intercept = { request, path in
+                    request == method && path.hasSuffix(".json") ? (status, [:], Data()) : nil
+                }
+                let run = try makeRun(server, root: root, state: state, device: dev)
+                run.concurrency = 1
+                let result = await run.run()
+                XCTAssertEqual(result.failure, "serverBusy")
+                XCTAssertEqual(result.errors.count, 1)
+                XCTAssertEqual(server.requestCount("PUT"), 1)
+                XCTAssertEqual(result.deletedRemote + result.deletedLocal, 0)
+            }
+        }
+    }
+
     func testAuthenticationFailureStopsTheRunAndKeepsTheLibrary() async throws {
         let server = FakeDAVServer.install()
         let a = DAVTest.tempDir("A")
