@@ -276,6 +276,11 @@ final class FeatClipboardTests: XCTestCase {
     }
 
     func testCopyAndCutCompleteWhenRecognitionNeverAnswers() async throws {
+        let window = Clipboard.recognitionWindow
+        Clipboard.recognitionWindow = 0.02
+        defer { Clipboard.recognitionWindow = window; restoreBoard() }
+        // Initialise UIKit's PNG encoder outside the bounded command wait on a cold simulator.
+        _ = UIImage(cgImage: FakeRenderer.blank(CGSize(width: 16, height: 16))).pngData()
         for command in ["clipboard.copy", "clipboard.cut"] {
             let board = useMemoryBoard()
             let h = Harness(features: [FeatClipboardFeature.self])
@@ -334,6 +339,9 @@ final class FeatClipboardTests: XCTestCase {
     }
 
     func testLateRecognitionCannotReplaceANewerCopyOrAnExpiredEntry() async throws {
+        let window = Clipboard.recognitionWindow
+        Clipboard.recognitionWindow = 0.02
+        defer { Clipboard.recognitionWindow = window; restoreBoard() }
         for replace in [true, false] {
             let board = useMemoryBoard()
             let h = Harness(features: [FeatClipboardFeature.self])
