@@ -225,3 +225,9 @@ Audited all Photos callers: Pages AddImage and Insert ImageReplace/TapeImport se
 
 C5 source-review correction to the diagnosis's inferred label: baseline ui-PagesUITests/ui.log lines 12365-12370 (chunk 24) actually show Button identifier `Add`, label `Done`, frame (995,210,36,36). It is a title-bar sibling of the inner Other labelled Photos, not its descendant. Thus the failed Add/Done lookup was scoped too narrowly; the label itself is not unknown. Inventory and identifier rebinding now include title-bar siblings within the picker frame. The selected-state postcondition and actual-button requirement remain. This current artifact evidence supersedes the summary's missing-label inference.
 
+
+### C6 - cross-window chord attribution
+
+P:pages-drag-select#4's verifier overturns the scene attribution: 5B77B4C2 was original, 0198F6CA new; the missing press log does not prove delivery to no scene or a simulator limitation. Current test calls pages() immediately after Open in New Window. It now logs the AX window list and each window's full raw probe before that chord, including current keyWindowState.isKey/sceneActivation and keyResponder/keyLog. Later control discovery uses H3. All cross-window copy/source/content expectations remain.
+
+The current probe does not identify UIScenes or tie its global responder class to a specific scene; keyboard-focus ownership therefore remains explicitly unavailable under the NibUITests-only scope. Next CI must correlate per-window probe facts with app scene logs to determine which window is key and whether the chord arrives. Authoritative keyboard-focus scene IDs need an app-side probe extension; no focus-reset workaround is added. Uses H3's Window scene probe/count and top-control diagnostics with the unique before-Pages-chord step label.

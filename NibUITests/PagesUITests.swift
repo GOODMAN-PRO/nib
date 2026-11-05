@@ -327,10 +327,10 @@ final class PagesUITests: XCTestCase {
         let card = ui.app.buttons.matching(identifier: "cmd.doc.open").matching(NSPredicate(format: "label BEGINSWITH %@", notebook)).firstMatch
         try require(card).press(forDuration: 0.8); try tap("Open in New Window")
         try wait("Open in New Window must expose the source document") { self.ui.app.buttons["cmd.sidebar.toggle"].exists }
+        ui.logWindowScenes("after Open in New Window, before Pages chord")
         try pages()
         // iPadOS windowing control places this scene beside the other Nib scene.
-        let multitasking = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'multitasking' OR label == 'Window Controls'")).firstMatch
-        ui.diagnoseWindowControls()
+        let multitasking = ui.systemWindowControls()
         try require(multitasking, "Window controls must allow arranging two Nib windows for page drag").tap()
         try tap("Split View", prefix: true)
         let other = XCUIApplication(bundleIdentifier: "com.apple.springboard").icons["Nib"].firstMatch
