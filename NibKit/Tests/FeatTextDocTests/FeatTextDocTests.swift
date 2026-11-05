@@ -945,6 +945,25 @@ final class FeatTextDocTests: XCTestCase {
                      "entries see the block they are for")
     }
 
+    func testConsumedShiftReturnDoesNotAffectTheNextReturn() async throws {
+        let h = harness()
+        let editor = openEditor(h)
+        let tv = BlockTextView()
+        tv.blockID = Fixtures.paragraphBlockID
+        let style = BlockStyle.make(kind: .paragraph)
+        tv.style = style
+        tv.attributedText = style.attributed(RichText(plain: "Hello blocks"))
+        tv.softBreakPending = true
+        TextDocHooks.addTextInterceptor("test.consumeReturn", order: -100) { _, _ in true }
+        defer { TextDocHooks.removeAll(prefix: "test.consumeReturn") }
+        XCTAssertFalse(editor.textView(tv, shouldChangeTextIn: NSRange(location: 5, length: 0), replacementText: "\n"))
+        XCTAssertFalse(tv.softBreakPending)
+        TextDocHooks.removeAll(prefix: "test.consumeReturn")
+        XCTAssertFalse(editor.textView(tv, shouldChangeTextIn: NSRange(location: 5, length: 0), replacementText: "\n"))
+        await editor.flushEdits()
+        XCTAssertEqual(try block(h, "FIXTUREBLK02").text.plainText, "Hello")
+    }
+
     func testReturningToTheCurrentFirstLineCancelsPendingRename() async throws {
         let h = harness()
         registerRename(h)

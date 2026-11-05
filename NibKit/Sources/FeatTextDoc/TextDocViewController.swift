@@ -1389,13 +1389,15 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
     }
 
     func textView(_ textView: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String) -> Bool {
-        guard let tv = textView as? BlockTextView, let id = tv.blockID, let block = byID[id] else { return true }
+        guard let tv = textView as? BlockTextView else { return true }
+        let softBreak = tv.softBreakPending
+        tv.softBreakPending = false
+        guard let id = tv.blockID, let block = byID[id] else { return true }
         guard !isReadOnly else { return false }
         let change = TextDocTextChange(block: block, isCaption: tv.role == .caption, textView: tv, range: range, replacement: text)
         for hook in TextDocHooks.textInterceptors where hook.value(change, self) { return false }
         guard text == "\n", tv.markedTextRange == nil else { return true }
-        if tv.softBreakPending {
-            tv.softBreakPending = false
+        if softBreak {
             if tv.role == .body { return true }
         }
         if tv.role == .caption {
