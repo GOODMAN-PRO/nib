@@ -197,6 +197,97 @@ final class FeatLassoTests: XCTestCase {
         }
     }
 
+    func testSelectionSetChecksExpectedSessionAfterSuspendedHook() async throws {
+        for changeDocument in [false, true] {
+            for clear in [false, true] {
+                let h = harness()
+                try await h.run("selection.set", ["refs": [.string(ref(Fixtures.shapeID))]])
+                let before = h.session.selection
+                let paused = expectation(description: "Selection hook entered")
+                let release = expectation(description: "Selection hook released")
+                let finished = expectation(description: "Selection rejected")
+                h.app.bus.hooks.register(CommandHookDescriptor(id: "test.selectionGate", owner: "test",
+                    commands: ["selection.set"]) { _, _ in
+                    paused.fulfill()
+                    await self.fulfillment(of: [release], timeout: 2)
+                    return nil
+                })
+                let params: JSONValue = ["refs": clear ? [] : [.string(ref(Fixtures.imageID))],
+                    "expectedSession": ["document": .string(Fixtures.docID.raw), "page": .string(Fixtures.page1.raw)]]
+                let pending = Task { @MainActor in
+                    defer { finished.fulfill() }
+                    do {
+                        try await h.run("selection.set", params)
+                        XCTFail("The precondition must be checked after the hook")
+                    } catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+                    catch { XCTFail("Unexpected error: \(error)") }
+                }
+                defer { pending.cancel() }
+                await fulfillment(of: [paused], timeout: 2)
+                if changeDocument { h.session.document = "FIXTUREDOC04" }
+                else { h.session.page = Fixtures.page2 }
+                release.fulfill()
+                await fulfillment(of: [finished], timeout: 2)
+                XCTAssertEqual(h.session.selection, before)
+                XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+            }
+        }
+    }
+
+    func testSelectionSetCancelledPreconditionRejectsReturnToOriginButOmissionKeepsLegacyBehaviour() async throws {
+        for guarded in [false, true] {
+            let h = harness()
+            try await h.run("selection.set", ["refs": [.string(ref(Fixtures.shapeID))]])
+            let before = h.session.selection
+            let paused = expectation(description: "Selection hook entered")
+            let release = expectation(description: "Selection hook released")
+            let finished = expectation(description: "Selection completed")
+            h.app.bus.hooks.register(CommandHookDescriptor(id: "test.selectionGate", owner: "test",
+                commands: ["selection.set"]) { _, _ in
+                paused.fulfill()
+                await self.fulfillment(of: [release], timeout: 2)
+                return nil
+            })
+            var params: JSONValue = ["refs": [.string(ref(Fixtures.imageID))]]
+            if guarded {
+                params = ["refs": [.string(ref(Fixtures.imageID))],
+                    "expectedSession": ["document": .string(Fixtures.docID.raw), "page": .string(Fixtures.page1.raw)]]
+            }
+            let pending = Task { @MainActor in
+                defer { finished.fulfill() }
+                do {
+                    try await h.run("selection.set", params)
+                    XCTAssertFalse(guarded, "A cancelled snapshot must not select after A -> B -> A")
+                } catch let error as NibError {
+                    XCTAssertTrue(guarded)
+                    XCTAssertEqual(error.code, .conflict)
+                } catch { XCTFail("Unexpected error: \(error)") }
+            }
+            defer { pending.cancel() }
+            await fulfillment(of: [paused], timeout: 2)
+            h.session.page = Fixtures.page2
+            // ImageNavigationTracker cancels only the pending selection task on this transition.
+            pending.cancel()
+            h.session.page = Fixtures.page1
+            release.fulfill()
+            await fulfillment(of: [finished], timeout: 2)
+            if guarded { XCTAssertEqual(h.session.selection, before) }
+            else { XCTAssertEqual(h.session.selection.items, [Fixtures.imageID]) }
+        }
+    }
+
+    func testSelectionSetSnapshotUsesSessionPageRatherThanSelectedItemsPage() async throws {
+        let h = harness()
+        h.session.page = Fixtures.page2
+        let params: JSONValue = ["refs": [.string(ref(Fixtures.imageID))],
+            "expectedSession": ["document": .string(Fixtures.docID.raw), "page": .string(Fixtures.page2.raw)]]
+        XCTAssertTrue(SelectionSet.descriptor.params.validate(params).isEmpty)
+        try await h.run("selection.set", params)
+        XCTAssertEqual(h.session.selection.items, [Fixtures.imageID])
+        XCTAssertEqual(h.session.selection.page, Fixtures.page1)
+        XCTAssertEqual(h.session.page, Fixtures.page2)
+    }
+
     // MARK: Circle to Lasso
 
     func testEmptySelectionAttemptsKeepTemporaryLassoUntilExplicitClear() async throws {
@@ -680,6 +771,27 @@ final class FeatLassoTests: XCTestCase {
         XCTAssertFalse(overlay.view.isAccessibilityElement)
         overlay.detach(from: host)
         XCTAssertNil(overlay.view.superview)
+    }
+
+    func testLooseCompletedLassoUsesTightVisualBoundsWithoutChangingSelectionGeometry() {
+        let h = harness()
+        let host = FakeCanvasHost(h)
+        let overlay = SelectionOverlay()
+        overlay.attach(to: host)
+        defer { overlay.detach(from: host) }
+        let outline = [Point(100, 100), Point(400, 100), Point(400, 400), Point(100, 400)]
+        let selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID],
+                                  bounds: Rect(x: 180, y: 200, width: 160, height: 90), outline: outline)
+        h.session.selection = selection
+        for scale in [CGFloat(1), 2] {
+            host.zoomScale = Double(scale)
+            overlay.canvasDidChange(host)
+            let expected = CGRect(x: 180 * scale, y: 200 * scale, width: 160 * scale, height: 90 * scale)
+                .insetBy(dx: -SelectionStyle.boxPadding, dy: -SelectionStyle.boxPadding)
+            XCTAssertEqual(overlay.view.content?.outline.boundingBoxOfPath, expected)
+            XCTAssertEqual(overlay.view.content?.drawsBox, false)
+            XCTAssertEqual(h.session.selection, selection, "Display fitting must not mutate selected items or transform geometry")
+        }
     }
 
     // MARK: Geometry

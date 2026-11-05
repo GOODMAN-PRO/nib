@@ -29,6 +29,19 @@ final class EscapeRoutingTests: XCTestCase {
             dismissalDisabled: false, delegateAllowsDismissal: false))
     }
 
+    func testResponderCommandCanBeOwnedByAnAncestorOfTheFocusedView() {
+        let shell = UIView()
+        let owner = EscapeCommandView()
+        let focused = UIView()
+        shell.addSubview(owner)
+        owner.addSubview(focused)
+        XCTAssertTrue(NibEscapeRouting.offer(to: focused, stoppingAt: shell))
+        XCTAssertEqual(owner.cancellations, 1)
+        owner.enabled = false
+        XCTAssertFalse(NibEscapeRouting.offer(to: focused, stoppingAt: shell))
+        XCTAssertEqual(owner.cancellations, 1)
+    }
+
     func testEscapeCallsTopmostOwnersCancelRatherThanDismissingController() {
         let root = UIView()
         let underlying = NibEscapeCancellationView()

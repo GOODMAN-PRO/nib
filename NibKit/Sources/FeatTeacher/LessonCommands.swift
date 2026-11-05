@@ -26,7 +26,9 @@ final class LessonRuntime {
                                                appropriateFor: nil, create: true)
                 .appendingPathComponent("Nib/PrivateLessons", isDirectory: true)
         }
-        let store = PrivateLessonPersistence(base: ctx.workspace.persistence, root: root)
+        let store = PrivateLessonPersistence(base: ctx.workspace.persistence, root: root, report: { [weak app = ctx.app] doc, message in
+            if let app { PrivateLessonPersistence.reportStatus(doc, message: message, app: app) }
+        })
         let assets = try ctx.services.require(ctx.services.assets, "asset store")
         ctx.workspace.persistence = store
         ctx.services.assets = PrivateLessonAssets(base: assets, root: root)
@@ -446,15 +448,16 @@ struct LessonSetState: NibCommand {
             guard ctx.services.library?.node(target) == nil else { throw NibError(.conflict, "The private presentation id is already in use.") }
             if ctx.dryRun { return Output(ref: NodeRef.document(target).description, state: mode, snapshot: nil) }
             let store = try LessonRuntime.privateStore(ctx)
-            let old: LessonSnapshot?
-            if (try? store.loadHead(target)) != nil {
+            func currentPrivateSnapshot() throws -> LessonSnapshot? {
+                guard (try? store.loadHead(target)) != nil else { return nil }
                 var previous = try LessonManager.capture(target, workspace: ctx.workspace)
-                // Keep private annotations on deleted pages recoverable without displaying those pages again.
+                // Preserve private annotations on deleted pages as recoverable records.
                 for page in previous.content.pages where page.deleted {
                     previous.items[page.id] = try ctx.workspace.allItems(target, page: page.id)
                 }
-                old = previous
-            } else { old = nil }
+                return previous
+            }
+            let old = try currentPrivateSnapshot()
             var value = try LessonManager.capture(doc, workspace: ctx.workspace)
             // Include source tombstones when upgrading a private copy made before provenance was recorded.
             var copied = LessonPresentSource(pages: Set(value.content.pages.map(\.id)), items: [])
@@ -481,7 +484,9 @@ struct LessonSetState: NibCommand {
             let inputs = try LessonCreate.copyInputs(value, source: doc, ctx: ctx)
             try FileManager.default.createDirectory(at: store.package(target), withIntermediateDirectories: true)
             value = try await LessonCreate.transfer(value, to: [target], inputs: inputs, ctx: ctx)
-            if let old {
+            // Ordinary annotation commands can run during transfer. Capture again and complete the
+            // merge and replacement without suspending, including current deletion state.
+            if let old = try currentPrivateSnapshot() {
                 for page in old.content.pages {
                     if !copied.pages.contains(page.id) {
                         value.content.pages.removeAll { $0.id == page.id }

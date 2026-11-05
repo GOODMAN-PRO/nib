@@ -196,6 +196,11 @@ final class FeatHighlighterTests: XCTestCase {
             picks += 1
             edit.apply(to: &presets)
         }
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            let displayed = RGBA(UIColor(binding.wrappedValue).resolvedColor(with: UITraitCollection(userInterfaceStyle: style)))
+            XCTAssertEqual(displayed, RGBA(presets.color.r, presets.color.g, presets.color.b),
+                           "The colour well previews the opaque hue, not translucent ink over chrome")
+        }
         // This is the binding passed to the production NibCustomColourPicker.
         binding.wrappedValue = Color(uiColor: RGBA(expected.r, expected.g, expected.b).uiColor)
         XCTAssertEqual(picks, 1)

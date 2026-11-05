@@ -57,6 +57,73 @@ enum CropEditing {
     }
 }
 
+/// Named action equivalents for translating the crop and moving each edge independently.
+enum CropAdjustment: CaseIterable {
+    case moveLeft, moveRight, moveUp, moveDown
+    case leftOut, leftIn, rightIn, rightOut, topOut, topIn, bottomIn, bottomOut
+
+    var title: String {
+        switch self {
+        case .moveLeft: return String(localized: "Move crop left")
+        case .moveRight: return String(localized: "Move crop right")
+        case .moveUp: return String(localized: "Move crop up")
+        case .moveDown: return String(localized: "Move crop down")
+        case .leftOut: return String(localized: "Move left edge left")
+        case .leftIn: return String(localized: "Move left edge right")
+        case .rightIn: return String(localized: "Move right edge left")
+        case .rightOut: return String(localized: "Move right edge right")
+        case .topOut: return String(localized: "Move top edge up")
+        case .topIn: return String(localized: "Move top edge down")
+        case .bottomIn: return String(localized: "Move bottom edge up")
+        case .bottomOut: return String(localized: "Move bottom edge down")
+        }
+    }
+
+    func apply(to rect: Rect) -> Rect {
+        let delta: (handle: CropHandle?, dx: Double, dy: Double)
+        switch self {
+        case .moveLeft: delta = (nil, -0.05, 0)
+        case .moveRight: delta = (nil, 0.05, 0)
+        case .moveUp: delta = (nil, 0, -0.05)
+        case .moveDown: delta = (nil, 0, 0.05)
+        case .leftOut: delta = (.left, -0.05, 0)
+        case .leftIn: delta = (.left, 0.05, 0)
+        case .rightIn: delta = (.right, -0.05, 0)
+        case .rightOut: delta = (.right, 0.05, 0)
+        case .topOut: delta = (.top, 0, -0.05)
+        case .topIn: delta = (.top, 0, 0.05)
+        case .bottomIn: delta = (.bottom, 0, -0.05)
+        case .bottomOut: delta = (.bottom, 0, 0.05)
+        }
+        return CropEditing.drag(rect, handle: delta.handle, dx: delta.dx, dy: delta.dy)
+    }
+}
+
+/// A gesture owns its preview only. The gesture-lifetime reset discards it on cancellation;
+/// completed geometry lives separately.
+struct CropGestureDraft {
+    var rectangle: Rect?
+    var points: [Point] = []
+
+    /// Shared lifecycle handler for the sheet's GestureState, which becomes false even when onEnded is skipped.
+    mutating func activityChanged(_ active: Bool) {
+        if !active {
+            rectangle = nil
+            points = []
+        }
+    }
+
+    mutating func move(from committed: Rect, handle: CropHandle?, dx: Double, dy: Double) {
+        rectangle = CropEditing.drag(committed, handle: handle, dx: dx, dy: dy)
+    }
+
+    mutating func append(_ point: Point) {
+        points.append(Point(min(max(point.x, 0), 1), min(max(point.y, 0), 1)))
+    }
+
+    func outline(or committed: [Point]) -> [Point] { points.count >= 3 ? points : committed }
+}
+
 enum CropMode: CaseIterable {
     case rectangle, freehand
 
@@ -106,8 +173,8 @@ struct ImageCropSheet: View {
     @State private var mode: CropMode
     @State private var rect: Rect
     @State private var outline: [Point]
-    @State private var drawing: [Point] = []
-    @State private var dragStart: Rect?
+    @State private var draft = CropGestureDraft()
+    @GestureState private var gestureActive = false
     @State private var aspect: CropAspect?
 
     init(image: UIImage, rect: Rect, mask: [Point]?, onCancel: @escaping () -> Void,
@@ -150,6 +217,9 @@ struct ImageCropSheet: View {
         }
         .padding(.bottom, NibSpacing.l)
         .background(NibColor.backgroundSecondary)
+        .onChange(of: gestureActive) { _, active in
+            draft.activityChanged(active)
+        }
     }
 
     private func fitted(in space: CGSize) -> CGSize {
@@ -159,8 +229,9 @@ struct ImageCropSheet: View {
     }
 
     private func rectangleOverlay(_ size: CGSize) -> some View {
-        let r = CGRect(x: rect.x * Double(size.width), y: rect.y * Double(size.height),
-                       width: rect.width * Double(size.width), height: rect.height * Double(size.height))
+        let preview = draft.rectangle ?? rect
+        let r = CGRect(x: preview.x * Double(size.width), y: preview.y * Double(size.height),
+                       width: preview.width * Double(size.width), height: preview.height * Double(size.height))
         return ZStack(alignment: .topLeading) {
             Path { p in
                 p.addRect(CGRect(origin: .zero, size: size))
@@ -191,8 +262,16 @@ struct ImageCropSheet: View {
         .frame(width: size.width, height: size.height)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(String(localized: "Crop area"))
-        .accessibilityValue(String(localized: "\(Int((rect.width * 100).rounded())) per cent wide, \(Int((rect.height * 100).rounded())) per cent tall"))
-        .accessibilityHint(String(localized: "Swipe up or down to grow or shrink the crop."))
+        .accessibilityValue(cropAccessibilityValue)
+        .accessibilityHint(String(localized: "Swipe up or down to grow or shrink the crop. Use Actions to move the crop or its edges."))
+        .accessibilityActions {
+            ForEach(CropAdjustment.allCases, id: \.self) { adjustment in
+                Button(adjustment.title) {
+                    rect = adjustment.apply(to: rect)
+                    aspect = nil
+                }
+            }
+        }
         .accessibilityAdjustableAction { direction in
             switch direction {
             case .increment: rect = CropEditing.scaled(rect, by: 1.1)
@@ -203,22 +282,31 @@ struct ImageCropSheet: View {
         }
     }
 
+    private var cropAccessibilityValue: String {
+        let x = Int((rect.x * 100).rounded()), y = Int((rect.y * 100).rounded())
+        let width = Int((rect.width * 100).rounded()), height = Int((rect.height * 100).rounded())
+        return String(localized: "\(x) per cent from left, \(y) per cent from top, \(width) per cent wide, \(height) per cent tall")
+    }
+
     private func drag(_ handle: CropHandle?, _ size: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 0)
+            .updating($gestureActive) { _, active, _ in active = true }
             .onChanged { g in
-                let start = dragStart ?? rect
-                if dragStart == nil { dragStart = rect }
-                rect = CropEditing.drag(start, handle: handle, dx: Double(g.translation.width / max(size.width, 1)),
+                draft.move(from: rect, handle: handle, dx: Double(g.translation.width / max(size.width, 1)),
+                           dy: Double(g.translation.height / max(size.height, 1)))
+            }
+            .onEnded { g in
+                rect = CropEditing.drag(rect, handle: handle, dx: Double(g.translation.width / max(size.width, 1)),
                                         dy: Double(g.translation.height / max(size.height, 1)))
                 aspect = nil
+                draft.activityChanged(false)
             }
-            .onEnded { _ in dragStart = nil }
     }
 
     private func freehandOverlay(_ size: CGSize) -> some View {
-        let source = drawing.isEmpty ? outline : drawing
+        let source = draft.points.isEmpty ? outline : draft.points
         let pts = source.map { CGPoint(x: $0.x * Double(size.width), y: $0.y * Double(size.height)) }
-        let closed = drawing.isEmpty && outline.count >= 3
+        let closed = draft.points.isEmpty && outline.count >= 3
         return ZStack(alignment: .topLeading) {
             if closed {
                 Path { p in
@@ -240,13 +328,14 @@ struct ImageCropSheet: View {
             Color.clear
                 .contentShape(Rectangle())
                 .gesture(DragGesture(minimumDistance: 0)
+                    .updating($gestureActive) { _, active, _ in active = true }
                     .onChanged { g in
-                        drawing.append(Point(min(max(Double(g.location.x / max(size.width, 1)), 0), 1),
-                                             min(max(Double(g.location.y / max(size.height, 1)), 0), 1)))
+                        draft.append(Point(Double(g.location.x / max(size.width, 1)),
+                                           Double(g.location.y / max(size.height, 1))))
                     }
                     .onEnded { _ in
-                        if drawing.count >= 3 { outline = drawing }
-                        drawing = []
+                        outline = draft.outline(or: outline)
+                        draft.activityChanged(false)
                     })
         }
         .frame(width: size.width, height: size.height)
@@ -297,7 +386,7 @@ struct ImageCropSheet: View {
 /// Presents the crop sheet for `image.crop` called by the user without rect or mask (the object menu's Crop).
 @MainActor
 enum ImageCropPresenter {
-    static func ask(doc: DocumentID, page: PageID, id: ElementID, ctx: CommandContext) async throws -> CropRequest? {
+    static func ask(doc: DocumentID, page: PageID, id: ElementID, ctx: CommandContext) async throws -> ImageCrop.Preview? {
         let item = try ctx.workspace.item(doc, page: page, id: id)
         // Refused before the sheet opens, so nobody draws a crop that cannot be applied.
         let image = try ImageRefs.editable(item)
@@ -313,8 +402,8 @@ enum ImageCropPresenter {
         let result = await present(UIImage(cgImage: whole), rect: flip.mirror(image.crop ?? ImageGeometry.unit),
                                    mask: image.mask.map { flip.mirror($0) }, from: presenter)
         switch result {
-        case .rect(let r)?: return .rect(flip.mirror(r))
-        case .mask(let m)?: return .mask(flip.mirror(m))
+        case .rect(let r)?: return ImageCrop.Preview(request: .rect(flip.mirror(r)), revision: item.rev)
+        case .mask(let m)?: return ImageCrop.Preview(request: .mask(flip.mirror(m)), revision: item.rev)
         case nil: return nil
         }
     }

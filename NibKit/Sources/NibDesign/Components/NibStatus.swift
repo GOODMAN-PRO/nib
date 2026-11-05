@@ -251,6 +251,14 @@ public struct NibBanner: View {
 public struct NibTraceRow: View {
     public enum Phase: Sendable {
         case running, done, warning
+
+        var accessibilityValue: String {
+            switch self {
+            case .running: return String(localized: "In progress", bundle: .module)
+            case .done: return String(localized: "Completed", bundle: .module)
+            case .warning: return String(localized: "Needs attention", bundle: .module)
+            }
+        }
     }
 
     let text: String
@@ -284,7 +292,7 @@ public struct NibTraceRow: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityValue(phase == .running ? String(localized: "In progress", bundle: .module) : "")
+        .accessibilityValue(phase.accessibilityValue)
     }
 }
 

@@ -208,6 +208,50 @@ final class FeatStudyIOTests: XCTestCase {
         XCTAssertEqual(r["csv"]?.stringValue, csv)
     }
 
+    func testLargeExportWritesOnWorkerAndRoundTripsTenThousandCards() async throws {
+        let h = harness()
+        let doc = DocumentID("LARGEEXPORT01")
+        let keys = FractionalIndex.balanced(count: 10_000)
+        let cards = keys.enumerated().map { i, key in
+            StudyCard(id: NibID("EXPORT\(i)"), front: CardFace(text: RichText(plain: "Question \(i), quoted")),
+                      back: CardFace(text: RichText(plain: "Answer \(i)\nSecond line")), order: key)
+        }
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: doc, kind: .studySet), cards: cards), title: "Large", in: nil)
+        let assets = WorkerCheckingExportAssets(base: h.assets)
+        h.app.services.assets = assets
+        let result = try await h.run("study.exportCSV", ["doc": .string(doc.raw)])
+        XCTAssertFalse(assets.wroteOnMain)
+        XCTAssertEqual(result["cards"]?.intValue, 10_000)
+        XCTAssertNil(result["csv"]?.stringValue)
+        XCTAssertEqual(result["truncated"]?.boolValue, true)
+        let asset = try XCTUnwrap(result["asset"]?.stringValue)
+        let ref = AssetRef(String(asset.dropFirst(4)))
+        let url = try XCTUnwrap(assets.temporaryURL(ref))
+        let data = try Data(contentsOf: url)
+        let rows = StudyImport.rows(from: String(decoding: data, as: UTF8.self), format: .csv)
+        XCTAssertEqual(rows.count, 10_000)
+        XCTAssertEqual(rows.first, StudyRow(front: "Question 0, quoted", back: "Answer 0\nSecond line"))
+        XCTAssertEqual(rows.last, StudyRow(front: "Question 9999, quoted", back: "Answer 9999\nSecond line"))
+        let exporter = try XCTUnwrap(h.app.content.exporters.get("study.csv"))
+        var files: [URL] = []
+        try await inCommand(h) { ctx in files = try await exporter.handler(ExportRequest(documents: [doc]), ctx) }
+        let exported = try XCTUnwrap(files.first)
+        defer { try? FileManager.default.removeItem(at: exported.deletingLastPathComponent()) }
+        XCTAssertEqual(try Data(contentsOf: exported), data)
+    }
+
+    func testInlineExportBoundUsesBytesAndRetainsExactJSONCheck() throws {
+        let limit = NibLimits.aiToolResultBytes
+        XCTAssertTrue(StudyExportCSV.inlineCandidate(String(repeating: "a", count: limit)))
+        XCTAssertFalse(StudyExportCSV.inlineCandidate(String(repeating: "a", count: limit + 1)))
+        XCTAssertFalse(StudyExportCSV.inlineCandidate(String(repeating: "é", count: limit)))
+        let escaped = StudyExport.File(name: "quotes.csv", csv: String(repeating: "\"", count: limit / 2 + 1), cards: 1)
+        XCTAssertTrue(StudyExportCSV.inlineCandidate(escaped.csv))
+        let output = try StudyExportCSV.output(escaped, asset: "tmp:test.csv")
+        XCTAssertNil(output.csv)
+        XCTAssertEqual(output.truncated, true)
+    }
+
     func testExportRefusesNotebooksAndLockedSets() async {
         let h = harness()
         await assertFails(h, "study.exportCSV", ["doc": "doc:FIXTUREDOC01"], .invalidParams)
@@ -368,4 +412,20 @@ final class FeatStudyIOTests: XCTestCase {
             XCTAssertEqual(e.code, .invalidParams)
         }
     }
+}
+
+private final class WorkerCheckingExportAssets: AssetStore {
+    let base: AssetStore
+    private let lock = NSLock()
+    private var onMain = true
+    var wroteOnMain: Bool { lock.lock(); defer { lock.unlock() }; return onMain }
+    init(base: AssetStore) { self.base = base }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef {
+        lock.lock(); onMain = Thread.isMainThread; lock.unlock()
+        return try base.putTemporary(data, ext: ext)
+    }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { try base.put(data, ext: ext, doc: doc) }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
 }

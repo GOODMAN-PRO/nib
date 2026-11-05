@@ -11,10 +11,12 @@ import NibDesign
 final class FakeGiphyTransport: GiphyTransport {
     var status = 200
     var body = Data()
+    var failure: Error?
     private(set) var requests: [URLRequest] = []
 
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
         requests.append(request)
+        if let failure { throw failure }
         guard let url = request.url,
               let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil) else {
             throw URLError(.badURL)
@@ -101,6 +103,63 @@ final class FeatElementsTests: XCTestCase {
     // MARK: Registration
 
     func testFeatureID() { XCTAssertEqual(FeatElementsFeature.id, "elements") }
+
+    func testCollectionEditPreservesUnreadableOwnIndex() throws {
+        let root = temporaryRoot("unreadable-index")
+        defer { try? fm.removeItem(at: root) }
+        let peer = ElementStore(metadataURL: root, device: 8, tick: { Rev(wallMs: 1, counter: 0, device: 8) })
+        let local = ElementStore(metadataURL: root, device: 7, tick: { Rev(wallMs: 2, counter: 0, device: 7) })
+        _ = try peer.createCollection(id: "shared", title: "Shared")
+        let own = local.folder("shared").appendingPathComponent("index.00000007.json")
+        let damaged = Data("{\"elements\": [\"only-local-record\"".utf8)
+        try damaged.write(to: own)
+        let fragment = local.folder("shared").appendingPathComponent("local.00000007.json")
+        let originalFragment = Data("only local fragment".utf8)
+        try originalFragment.write(to: fragment)
+        XCTAssertThrowsError(try local.updateCollection("shared", title: "Renamed", position: nil)) { error in
+            XCTAssertEqual((error as? NibError)?.code, .unavailable)
+        }
+        XCTAssertEqual(try Data(contentsOf: own), damaged)
+        XCTAssertThrowsError(try local.addElement("shared", id: "local", title: "New", defaultTitle: { _ in "New" }, fragment: Self.box))
+        XCTAssertEqual(try Data(contentsOf: fragment), originalFragment)
+        XCTAssertEqual(local.index("shared").collection?.title, "Shared")
+        try fm.removeItem(at: own)
+        XCTAssertNoThrow(try local.updateCollection("shared", title: "Renamed", position: nil))
+        XCTAssertEqual(local.index("shared").collection?.title, "Renamed")
+    }
+
+    func testInsertRejectsAnIDClaimedWhileLoading() async throws {
+        let h = harness()
+        let loading = expectation(description: "Fragment load started")
+        let finished = expectation(description: "Insertion finished")
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+        let fragment = try JSONValue.from(Self.box)
+        h.app.content.elementCollections.register(ElementCollectionDescriptor(id: "race-pack", title: "Race", owner: "test") {
+            loading.fulfill()
+            guard gate.wait(timeout: .now() + 5) == .success else { throw NibError.unavailable("test gate") }
+            return [ElementEntry(id: "box", title: "Box", fragment: fragment)]
+        })
+        var failure: NibError?
+        Task { @MainActor in
+            defer { finished.fulfill() }
+            do {
+                try await h.run("element.insert", ["page": "page:FIXTUREDOC01/FIXTUREPG002",
+                    "collection": "race-pack", "element": "box", "ids": ["CLAIMED"]])
+            } catch { failure = NibError.wrap(error) }
+        }
+        await fulfillment(of: [loading], timeout: 2)
+        var claimed = Self.box.items[0]
+        claimed.id = "CLAIMED"
+        claimed.rev = h.app.clock.tick()
+        h.app.bus.applyRemote(DocumentPatch(doc: Fixtures.docID, items: [Fixtures.page2.raw: [claimed]]), origin: "test")
+        let before = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: claimed.id)
+        gate.signal()
+        await fulfillment(of: [finished], timeout: 2)
+        XCTAssertEqual(failure?.code, .conflict)
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: claimed.id), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
 
     func testCommandConformance() async {
         let problems = await CommandConformance.check(features: [FeatElementsFeature.self], owners: [FeatElementsFeature.id])
@@ -1041,6 +1100,29 @@ final class FeatElementsTests: XCTestCase {
         await model.searchGIFs()
         XCTAssertEqual(model.gifState, .loaded)
         XCTAssertEqual(model.gifQuery, "physics")
+    }
+
+    func testGiphyFailuresUseLocalisedPresentationCopy() async throws {
+        let h = harness()
+        let originalKey = GiphyKey.load()
+        defer { GiphyKey.save(originalKey) }
+        XCTAssertTrue(GiphyKey.save("unit-test-key"))
+        let transport = FakeGiphyTransport()
+        let runtime = try XCTUnwrap(h.app.services.get(ElementsRuntime.key, as: ElementsRuntime.self))
+        runtime.giphy = GiphyClient(transport: transport)
+        let model = ElementsModel(app: h.app, session: h.session)
+        defer { model.stop() }
+        model.gifQuery = "physics"
+        for (status, message) in [(403, String(localized: "GIPHY did not accept the API key")),
+                                  (429, String(localized: "GIPHY's search limit for this key is used up"))] {
+            transport.status = status
+            await model.searchGIFs()
+            XCTAssertEqual(model.gifState, .failed(message))
+            XCTAssertEqual(GiphyClient.error(status: status).code, .unavailable)
+        }
+        transport.failure = NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "raw transport diagnostic"])
+        await model.searchGIFs()
+        XCTAssertEqual(model.gifState, .failed(String(localized: "GIPHY could not be reached")))
     }
 
     func testGIFLinkPromptDispatchesOneAnimatedInsertAndRejectsInvalidInput() async throws {

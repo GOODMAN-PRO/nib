@@ -202,6 +202,21 @@ final class ShippingPolishTests: XCTestCase {
         XCTAssertEqual(NibSegmentedControl<String>.Sizing.intrinsic.minimumLabelScale, 1)
     }
 
+    func testCompactFittingSegmentsPreserveTargetsAndAccessibleFallbackBesideMenu() {
+        let tabs = ["Pages", "Outline", "Bookmarks"]
+        let control = NibSegmentedControl(selection: .constant("Bookmarks"), options: tabs,
+                                          sizing: .compactFitting) { $0 }
+        let width = NibMetrics.navigatorWidth - NibMetrics.hitTarget - 2 * NibSpacing.xs
+        for direction in [LayoutDirection.leftToRight, .rightToLeft] {
+            let size = NibSnapshot.fittingSize(control.environment(\.layoutDirection, direction), width: width)
+            XCTAssertEqual(size.width, width, accuracy: 1)
+            XCTAssertEqual(size.height, NibMetrics.hitTarget, accuracy: 1)
+        }
+        let accessible = NibSnapshot.fittingSize(control, width: width, variant: .largeText)
+        XCTAssertLessThanOrEqual(accessible.width, width)
+        XCTAssertGreaterThanOrEqual(accessible.height, 3 * NibMetrics.hitTarget)
+    }
+
     func testPanelHeaderPreservesLongProviderAndKeyInformation() {
         let header = NibPanelHeader(title: "Assistant",
             subtitle: "OpenAI-compatible provider · Local language model · API key is not configured",
@@ -213,5 +228,19 @@ final class ShippingPolishTests: XCTestCase {
         XCTAssertLessThanOrEqual(regular.width, 312)
         XCTAssertLessThanOrEqual(accessible.width, 312)
         XCTAssertGreaterThan(accessible.height, regular.height + 40)
+    }
+
+    func testPluginChromeAcceptsTheNarrowViewportAtAccessibilityFive() {
+        let chrome = NibPluginPanelChrome(name: "Word Count", symbol: .puzzle, onReload: {},
+                                         onPermissions: {}, onReport: {}, onClose: {}) {
+            Color.clear
+        }
+        .environment(\.horizontalSizeClass, .regular)
+        .environment(\.dynamicTypeSize, .accessibility5)
+        let host = UIHostingController(rootView: chrome)
+        let size = host.sizeThatFits(in: CGSize(width: 300, height: 560))
+        XCTAssertEqual(size.width, 300, accuracy: 1,
+                       "Both sidebars can leave only 300 pt; plugin chrome must not insist on 420 pt")
+        XCTAssertLessThanOrEqual(size.height, 560)
     }
 }

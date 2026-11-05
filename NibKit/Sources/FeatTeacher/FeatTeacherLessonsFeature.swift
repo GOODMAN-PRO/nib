@@ -113,7 +113,9 @@ public enum FeatTeacherLessonsFeature: NibFeature {
                                                              appropriateFor: nil, create: true) else { return }
             root = support.appendingPathComponent("Nib/PrivateLessons", isDirectory: true)
         }
-        let store = PrivateLessonPersistence(base: app.workspace.persistence, root: root)
+        let store = PrivateLessonPersistence(base: app.workspace.persistence, root: root, report: { [weak app] doc, message in
+            if let app { PrivateLessonPersistence.reportStatus(doc, message: message, app: app) }
+        })
         app.workspace.persistence = store
         app.services.assets = PrivateLessonAssets(base: assets, root: root)
         for url in (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {

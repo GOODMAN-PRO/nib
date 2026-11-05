@@ -223,8 +223,8 @@ struct MathAssistOptions: View {
                     if evaluating { ProgressView().accessibilityLabel(String(localized: "Calculating answer")) }
                     if let error { Text(verbatim: error).font(NibFont.footnote).foregroundStyle(NibColor.destructive) }
                     NibButton(String(localized: "Write answer"), kind: .primary, shortcut: KeyboardShortcut(.return, modifiers: .command)) {
-                        app.perform(CommandIDs.mathAssist, ["page": .string(page), "line": .number(Double(index)),
-                            "format": .string(format), "latex": .string(latex), "refs": .array(line.refs.map(JSONValue.string))], session: session)
+                        app.perform(CommandIDs.mathAssist, Self.writeParameters(page: page, index: index,
+                            line: line, latex: latex, format: format), session: session)
                     }
                     .accessibilityIdentifier("cmd." + CommandIDs.mathAssist).disabled(evaluating || preview == nil || !latex.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("="))
                     NibInspectorSection(String(localized: "Strategies")) {
@@ -245,6 +245,14 @@ struct MathAssistOptions: View {
         }
         .task(id: latex + "\u{0}" + format) { await evaluatePreview() }
         .onChange(of: presented) { _, showing in if !showing { dismiss() } }
+    }
+
+    static func writeParameters(page: String, index: Int, line: AssistLine, latex: String, format: String) -> JSONValue {
+        var params: [String: JSONValue] = ["page": .string(page), "line": .number(Double(index)), "format": .string(format),
+            "refs": .array(line.refs.map(JSONValue.string)),
+            "sourceRevisions": .array(line.ink.map { .string($0.revision) })]
+        if latex != line.latex { params["latex"] = .string(latex) }
+        return .object(params)
     }
 
     private func dismiss() {
