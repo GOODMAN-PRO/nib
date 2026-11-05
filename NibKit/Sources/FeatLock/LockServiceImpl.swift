@@ -741,6 +741,7 @@ final class LockServiceImpl: LockService {
 
     /// `lock.changed` for a document whose `meta.locked` flipped.
     private func lockDidChange(_ doc: DocumentID, added: Bool) {
+        if !added { presenter?.uncover(doc) }
         app?.events.emit(LockServiceImpl.changedEvent, doc: doc,
                          payload: ["docs": [.string(NodeRef.document(doc).description)], "locked": .bool(isLocked(doc)),
                                    "reason": .string(added ? "lockAdded" : "lockRemoved")])

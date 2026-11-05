@@ -638,6 +638,39 @@ final class LockServiceTests: XCTestCase {
         XCTAssertNil(LockPresentation.lockedDocument(shownBy: window, service: s.service))
     }
 
+    func testRemovingLockLocallyOrRemotelyUncoversShownDocument() async throws {
+        for remote in [false, true] {
+            let s = try await LockTesting.make()
+            let h = s.harness
+            await FeatLockFeature.start(h.app)
+            _ = try await h.run("doc.setLocked", ["doc": "doc:FIXTUREDOC01", "locked": true], as: .ai("chat"))
+            XCTAssertTrue(s.service.isLocked(Fixtures.docID))
+            XCTAssertEqual(s.presenter.coverCalls, 1)
+            if remote {
+                var meta = try h.app.workspace.content(Fixtures.docID).meta
+                meta.locked = false
+                meta.rev = Rev(wallMs: UInt64(Date().timeIntervalSince1970 * 1000) + 1_000, counter: 0, device: 99)
+                h.app.bus.applyRemote(DocumentPatch(doc: Fixtures.docID, meta: meta), origin: "test")
+            } else {
+                s.presenter.passwords = [LockTesting.password]
+                _ = try await h.run("doc.setLocked", ["doc": "doc:FIXTUREDOC01", "locked": false])
+            }
+            XCTAssertFalse(s.service.isLocked(Fixtures.docID))
+            XCTAssertTrue(s.presenter.uncovered.contains(Fixtures.docID))
+        }
+    }
+
+    func testAlreadyUnlockedCommandClearsStaleCoverButDryRunDoesNot() async throws {
+        let s = try await LockTesting.make()
+        let h = s.harness
+        _ = try await h.app.bus.execute(Invocation(command: "doc.unlock", params: ["doc": "doc:FIXTUREDOC01"],
+            principal: .user, session: h.session, dryRun: true))
+        XCTAssertTrue(s.presenter.uncovered.isEmpty)
+        _ = try await h.run("doc.unlock", ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertEqual(s.presenter.uncovered, [Fixtures.docID])
+        XCTAssertTrue(s.presenter.unlockRequests.isEmpty)
+    }
+
     func testALockFromElsewhereCoversTheDocumentOnScreen() async throws {
         let s = try await LockTesting.make()
         let h = s.harness
