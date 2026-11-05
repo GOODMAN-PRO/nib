@@ -265,7 +265,8 @@ enum TransformTargets {
         var byID: [ElementID: Item] = [:]
         for it in items { byID[it.id] = it }
         guard s.selection.items.allSatisfy({ byID[$0] != nil }) else { return }
-        let bounds = TransformMath.union(s.selection.items.compactMap { byID[$0] }.map(TransformMath.box))
+        // Selection bounds include stroke padding, just like lasso housekeeping. Handle boxes do not.
+        let bounds = TransformMath.union(s.selection.items.compactMap { byID[$0] }.map { $0.bounds })
         let outline = s.selection.outline.map { $0.map { t.apply($0) } }
         let next = Selection(doc: doc, page: to, items: s.selection.items, bounds: bounds, outline: outline)
         if next != s.selection { s.selection = next }

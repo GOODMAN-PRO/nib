@@ -251,12 +251,28 @@ final class FeatTransformTests: XCTestCase {
             XCTAssertEqual(a.x, b.x, accuracy: 1e-9)
             XCTAssertEqual(a.y, b.y, accuracy: 1e-9)
         }
+        XCTAssertEqual(h.session.selection.bounds, try item(h, Fixtures.shapeID).bounds,
+                       "lasso housekeeping must see the same padded bounds after a rotation")
         try await h.run("item.moveToPage", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "offset": [0, 40]])
         XCTAssertEqual(h.session.selection.page, page2)
         let moved = try XCTUnwrap(h.session.selection.outline)
         for (a, b) in zip(moved, expected) {
             XCTAssertEqual(a.x, b.x, accuracy: 1e-9)
             XCTAssertEqual(a.y, b.y + 40, accuracy: 1e-9)
+        }
+        XCTAssertEqual(h.session.selection.bounds, try item(h, Fixtures.shapeID, on: page2).bounds)
+    }
+
+    func testRepeatedShapeNudgesKeepPaddedSelectionBoundsAndOutline() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let shape = try item(h, Fixtures.shapeID)
+        let outline = [Point(90, 190), Point(270, 190), Point(270, 300), Point(90, 300)]
+        h.session.selection = Selection(doc: doc, page: page1, items: [shape.id], bounds: shape.bounds, outline: outline)
+        for step in 1...3 {
+            try await h.run("item.transform", ["translate": [10, 0]])
+            XCTAssertEqual(h.session.selection.bounds, try item(h, shape.id).bounds,
+                           "a housekeeping refresh must not rescale the already transformed outline")
+            XCTAssertEqual(h.session.selection.outline, outline.map { Point($0.x + Double(step * 10), $0.y) })
         }
     }
 
