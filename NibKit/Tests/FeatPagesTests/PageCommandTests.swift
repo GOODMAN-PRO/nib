@@ -602,6 +602,46 @@ final class PageCommandTests: XCTestCase {
         XCTAssertEqual(refs(r).count, 1)
     }
 
+    func testMoveRefusesAnUnavailableCloudAssetWithoutAURL() async throws {
+        let h = harness()
+        let photo = try h.assets.put(Data("cloud photo".utf8), ext: "png", doc: Fixtures.docID)
+        var image = try XCTUnwrap(h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).first { $0.kind == .image })
+        image.image?.asset = photo
+        _ = try await h.insert([image])
+        h.app.services.assets = UnreadableAssetStore(h.assets, unreadable: photo.name, hidesURL: true)
+        let before = try h.snapshotAll()
+        let depths = h.undoDepths()
+        await assertFails("page.moveTo", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "doc": "doc:FIXTUREDOC04"],
+                          code: .unavailable, in: h)
+        XCTAssertEqual(try h.snapshotAll(), before)
+        XCTAssertEqual(h.undoDepths(), depths)
+    }
+
+    func testMoveRefusesChangedImageDependenciesAfterCopying() async throws {
+        let h = harness()
+        // Fixtures install their standard assets in every document, which intentionally bypasses copying.
+        var image = try XCTUnwrap(h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).first { $0.kind == .image })
+        image.image?.asset = try h.assets.put(Data("source-only image".utf8), ext: "png", doc: Fixtures.docID)
+        _ = try await h.insert([image])
+        let started = expectation(description: "asset read started")
+        let store = GatedMoveAssetStore(h.assets, started: started)
+        h.app.services.assets = store
+        let move = Task {
+            await self.assertFails("page.moveTo", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "doc": "doc:FIXTUREDOC04"],
+                                   code: .unavailable, in: h)
+        }
+        defer { store.release.signal() }
+        await fulfillment(of: [started], timeout: 2)
+        image.image?.asset = try h.assets.put(Data("new image".utf8), ext: "png", doc: Fixtures.docID)
+        _ = try await h.insert([image])
+        let before = try h.snapshotAll()
+        let depths = h.undoDepths()
+        store.release.signal()
+        await move.value
+        XCTAssertEqual(try h.snapshotAll(), before, "the interleaved edit survives and no page moves")
+        XCTAssertEqual(h.undoDepths(), depths)
+    }
+
     func testDryRunMovePreviewsWithoutCopyingBytes() async throws {
         let h = harness()
         let before = try h.snapshotAll()
@@ -806,14 +846,18 @@ private final class CountingAssetStore: AssetStore {
 private final class UnreadableAssetStore: AssetStore {
     let inner: InMemoryAssetStore
     let unreadable: String
+    let hidesURL: Bool
 
-    init(_ inner: InMemoryAssetStore, unreadable: String) {
+    init(_ inner: InMemoryAssetStore, unreadable: String, hidesURL: Bool = false) {
         self.inner = inner
         self.unreadable = unreadable
+        self.hidesURL = hidesURL
     }
 
     func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { try inner.put(data, ext: ext, doc: doc) }
-    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { inner.url(ref, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? {
+        hidesURL && ref.name == unreadable ? nil : inner.url(ref, doc: doc)
+    }
     func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try inner.putTemporary(data, ext: ext) }
     func temporaryURL(_ ref: AssetRef) -> URL? { inner.temporaryURL(ref) }
 
@@ -821,4 +865,37 @@ private final class UnreadableAssetStore: AssetStore {
         if ref.name == unreadable { throw CocoaError(.fileReadUnknown) }
         return try inner.data(ref, doc: doc)
     }
+}
+
+/// Blocks only the first source read; every wait is bounded even if the test fails before releasing it.
+private final class GatedMoveAssetStore: AssetStore {
+    let inner: InMemoryAssetStore
+    let started: XCTestExpectation
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var didWait = false
+
+    init(_ inner: InMemoryAssetStore, started: XCTestExpectation) {
+        self.inner = inner
+        self.started = started
+    }
+
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data {
+        lock.lock()
+        let shouldWait = !didWait
+        didWait = true
+        lock.unlock()
+        if shouldWait {
+            started.fulfill()
+            guard release.wait(timeout: .now() + 2) == .success else {
+                XCTFail("the test did not release the asset read")
+                throw CocoaError(.fileReadUnknown)
+            }
+        }
+        return try inner.data(ref, doc: doc)
+    }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { try inner.put(data, ext: ext, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { inner.url(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try inner.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { inner.temporaryURL(ref) }
 }

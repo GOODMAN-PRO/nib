@@ -435,7 +435,7 @@ struct PageMoveTo: NibCommand {
         let target = NodeRef.documentID(from: p.doc)
         let sources = try PageArgs.pages(p.pages, ctx)
         let chosen = try NewPageIDs.parse(id: nil, ids: p.ids, count: sources.count)
-        // Every refusal comes before any bytes are copied.
+        // Validate records before copying, then validate their dependencies again before mutation.
         var plan = try MovePlan(sources, to: target, ids: chosen, ctx)
         var map = AssetMap()
         // Assets travel with the pages, copied off the main actor in ONE job for every page that leaves, whichever
@@ -447,12 +447,15 @@ struct PageMoveTo: NibCommand {
             let assets = plan.assets
             let pdfUse = plan.pdfUse
             map = try await Task.detached(priority: .userInitiated) { () -> AssetMap in
-                // Everything is read first: a file that is there but unreadable stops the move before anything is stored.
+                // Everything is read first: any unresolved asset stops the move before anything is stored.
                 let filled = try AssetTransfer.fill(assets, pdfUse: pdfUse, for: target, store: store, strict: true)
                 return try AssetTransfer.install(filled, into: target, store: store)
             }.value
             // The documents may have changed while the bytes were copied: plan again from their current state.
             plan = try MovePlan(sources, to: target, ids: chosen, ctx)
+            guard plan.assets == assets, plan.pdfUse == pdfUse else {
+                throw NibError(.unavailable, String(localized: "The pages changed while their assets were being copied. Nothing was moved. Try again."))
+            }
         }
         let defaultSize = ctx.services.settings.get(NibSettings.defaultPageSize)
         // Across documents the move is ONE undo step: undoing it in either document restores both (contracts-v2 G4).

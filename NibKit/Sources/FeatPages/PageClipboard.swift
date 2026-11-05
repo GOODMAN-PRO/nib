@@ -286,8 +286,8 @@ enum AssetTransfer {
     /// down to those pages, each PDF once however many pages show it. An asset `target` already holds is left out:
     /// names are content hashes, so its references work there as they are, and nothing is read, cut or stored for it
     /// (moving pages back into a document that has their PDF copies nothing). An asset that cannot be read is left out
-    /// and keeps its reference, unless `strict` (moves) and its file is there: then this throws, before anything was
-    /// stored.
+    /// and keeps its reference, unless `strict` (moves): then this throws before anything is stored, including when
+    /// the store cannot yet provide a URL for an unavailable cloud asset.
     static func fill(_ assets: [PagesPayload.Asset], pdfUse: [String: [Int]], for target: DocumentID? = nil,
                      store: AssetStore, strict: Bool) throws -> [PagesPayload.Asset] {
         var out: [PagesPayload.Asset] = []
@@ -354,17 +354,9 @@ enum AssetTransfer {
         do {
             return try store.data(ref, doc: doc)
         } catch {
-            // A reference that already dangles (no file) moves as it is; a file that is there but unreadable does not.
-            guard strict, let url = store.url(ref, doc: doc), isPresent(url) else { return nil }
-            throw NibError(.unavailable, "asset \(ref.name) could not be read; nothing was moved",
-                           hint: "try again when the file has downloaded")
+            guard strict else { return nil }
+            throw NibError(.unavailable, String(localized: "An asset could not be read. Nothing was moved. Try again when the file has downloaded."))
         }
-    }
-
-    /// On disk, or an iCloud placeholder of a file that has not downloaded yet.
-    private static func isPresent(_ url: URL) -> Bool {
-        let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
-        return FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path)
     }
 }
 
