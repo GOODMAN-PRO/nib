@@ -508,6 +508,16 @@ struct InkStylePatch: Equatable {
         return p
     }
 
+    func ignoresColor(on stroke: Stroke) -> Bool {
+        color != nil && (tool ?? stroke.style.tool) == .tape && stroke.style.tapePattern != nil
+    }
+
+    var changesOnlyColor: Bool {
+        var other = self
+        other.color = nil
+        return color != nil && other == InkStylePatch()
+    }
+
     /// The stroke in the new style. A new width scales the captured nib sizes with it; a new tool or pen type derives
     /// them again from the new ink (`InkModel.fillSizes`, which follows the recorded pressure); a new pressure
     /// sensitivity rescales the width's swing around its mean.
@@ -518,7 +528,7 @@ struct InkStylePatch: Equatable {
         if let t = tool { style.tool = t }
         if let t = pen { style.pen = t }
         style.pen = style.tool == .pen ? (style.pen ?? .fountain) : nil
-        if let c = color, !(style.tool == .tape && style.tapePattern != nil) {
+        if let c = color, !ignoresColor(on: stroke) {
             style.color = style.tool == .highlighter && c.a == 255
                 ? RGBA(c.r, c.g, c.b, RGBA.highlighterAlpha) : c
         }
@@ -564,6 +574,7 @@ struct InkSetStyle: NibCommand {
 
     struct Output: Codable, Equatable {
         var updated: Int
+        var ignoredColorRefs: [String] = []
     }
 
     static let descriptor = CommandDescriptor(
@@ -597,6 +608,7 @@ struct InkSetStyle: NibCommand {
         var order: [Target] = []
         var changes: [Target: [Item]] = [:]
         var seen = Set<String>()
+        var ignoredColorRefs: [String] = []
         for (i, ref) in refs.enumerated() where seen.insert(ref).inserted {
             let (doc, page, id) = try InkParse.item(.string(ref), path: "$.refs[\(i)]")
             let item = try ctx.workspace.item(doc, page: page, id: id)
@@ -606,6 +618,13 @@ struct InkSetStyle: NibCommand {
             }
             guard !item.locked else {
                 throw NibError(.invalidParams, "item \(id.raw) is locked", path: "$.refs[\(i)]", hint: "unlock it first")
+            }
+            if patch.ignoresColor(on: stroke) {
+                guard !patch.changesOnlyColor else {
+                    throw NibError(.invalidParams, String(localized: "Patterned tape cannot be recoloured."), path: "$.style.color",
+                                   hint: String(localized: "Change width or another style field, or use solid tape to change colour."))
+                }
+                ignoredColorRefs.append(ref)
             }
             var updated = item
             updated.stroke = patch.applied(to: stroke)
@@ -621,6 +640,6 @@ struct InkSetStyle: NibCommand {
                 try tx.put(changes[key] ?? [], doc: key.doc, page: key.page)
             }
         }
-        return Output(updated: changes.values.reduce(0) { $0 + $1.count })
+        return Output(updated: changes.values.reduce(0) { $0 + $1.count }, ignoredColorRefs: ignoredColorRefs)
     }
 }
