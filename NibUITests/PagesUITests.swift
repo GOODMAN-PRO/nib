@@ -12,6 +12,7 @@ final class PagesUITests: XCTestCase {
     private var fixture: URL!
     private var inputs: URL?
     private var doc = ""
+    private var diagnosePageKeys = false
     private let notebook = "Physics — Motion"
 
     override func setUpWithError() throws {
@@ -81,6 +82,8 @@ final class PagesUITests: XCTestCase {
 
     // sidebar.select: individual toggles, Select All, contextual Cmd-A and swipe are real actions.
     func testSelectToggleAllAndBatchBookmarkScope() throws {
+        diagnosePageKeys = true
+        defer { diagnosePageKeys = false }
         try pages(window: true); try beginSelection()
         try tapThumb(1); try tapThumb(2)
         XCTAssertTrue(thumb(1).isSelected); XCTAssertTrue(thumb(2).isSelected)
@@ -92,6 +95,7 @@ final class PagesUITests: XCTestCase {
         try wait("Select All must check every thumbnail") { self.ui.app.staticTexts["4 Selected"].exists || (1...4).allSatisfy { self.thumb($0).isSelected } }
         try tap("Deselect All")
         XCTAssertFalse(thumb(2).isSelected)
+        logPageKey("Command-A")
         try ui.chord("a", .command) {
             try self.wait("Command-A must check all four thumbnails") { (1...4).allSatisfy { self.thumb($0).isSelected } }
         }
@@ -654,6 +658,7 @@ final class PagesUITests: XCTestCase {
         if !state.openPanels.contains(where: navigatorIDs.contains) {
             // Other page tests use the real navigator shortcut so a HUD regression does not mask them.
             // The sidebar button and HUD have their own direct-tap acceptance tests above.
+            logPageKey("Control-Command-S")
             try ui.chord("s", [.control, .command]) {
                 try self.ui.waitForState { $0.openPanels.contains(where: navigatorIDs.contains) }
             }
@@ -671,11 +676,18 @@ final class PagesUITests: XCTestCase {
     }
     private func closeNavigator() throws {
         if try ui.state().openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) {
+            logPageKey("Control-Command-S")
             try ui.chord("s", [.control, .command]) {
                 try self.ui.waitForState { !$0.openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) }
             }
         }
     }
+    private func logPageKey(_ chord: String) {
+        guard diagnosePageKeys else { return }
+        let raw = ui.probe.exists ? ui.probe.value : nil
+        ui.logQA("Pages key responder", "before=\(chord) probe=\(String(describing: raw))")
+    }
+
     private func dragThumbnail(_ source: XCUIElement, to target: XCUIElement, offset: CGVector) throws {
         // Baseline session startup took 1.7-1.9s after touch-down. Keep the original lift/travel
         // and add 1.5s of contact at the destination for startup and move-proposal acceptance.
@@ -775,11 +787,14 @@ final class PagesUITests: XCTestCase {
         try ui.tapCommand("edit.redo"); try count(5)
     }
     private func copyPaste(keyboard: Bool) throws {
+        diagnosePageKeys = keyboard
+        defer { diagnosePageKeys = false }
         try draw()
         let before = try ids(), kinds = try itemKinds(try ids()[0]), content = try contentSignature(try ids()[0])
         try pages(); try beginSelection(); try tapThumb(1); try tapThumb(2)
         let revision = try ui.state().clipboardChangeCount ?? 0
         if keyboard {
+            logPageKey("Command-C")
             try ui.chord("c", .command) { try self.ui.waitForState { ($0.clipboardChangeCount ?? 0) > revision } }
         } else { try selectionAction("Copy") }
         try ui.waitForState { ($0.clipboardChangeCount ?? 0) > revision }

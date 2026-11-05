@@ -242,3 +242,23 @@ No claim that denser handwriting fixes Vision. Next CI must show source HI and p
 | --- | --- | --- |
 | Selection NeatenHandwriting | Neaten source ink | What 16-point paths and visible source did the test actually draw? |
 | Same | Neaten source recognition and stroke geometry / Neaten source recognition final | What text/placeholder and source records existed before and after the bounded source assertion? |
+
+### C8 - thumbnail key ownership
+
+Confirmed P:pages-drag-select#2/#3 with #2's downgrade: canvas focus takeover is observed, its exact path inferred; Command-C arrived at the grid then shell-routed to canvas copy. Current ThumbnailGridController already has the parallel app job's pressesBegan fallback and drag diagnostics. Added one raw probe read before each chord in SelectToggleAllAndBatchBookmarkScope and ContextualCommandCCopiesSelectedPages, including Control-Command-S in shared navigator helpers. No focus workaround, command rerouting or assertion changes.
+
+Next CI must show ThumbnailGridController before Command-A/C, app key action=selectAll/copy, the correct selection/clipboard change, and unchanged bookmark/paste/Undo content checks. A different responder or missing app key action remains attributable from these logs.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Pages SelectToggleAllAndBatchBookmarkScope / ContextualCommandCCopiesSelectedPages | Pages key responder | Which keyResponder/keyResponderIsText/keyWindowState and prior key log preceded each chord? |
+
+### Round 9b final review and validation
+
+Re-read every changed Swift block with its surrounding callers in Support, Pages, Selection, Library and Insert, and the current NibTouchPaths.h/.m synthesis signatures. Reviewed typed query APIs, snapshot attributes, pointer hover/support API, XCUIGestureVelocity(rawValue:), coordinate conversions, optionals, escaping predicate captures, throwing calls, predicate arguments and string-expression complexity. No Objective-C edits. H2 dismissal additionally requires no native Menu or Preview marker for two consecutive observations; a changed item frame alone cannot qualify as disappearance unless the same-labelled replacement belongs to an alert/confirmation sheet. Existing board press/tap signatures and other gesture behavior are unchanged.
+
+`python Scripts/lint.py`: **0 errors, 25 warnings**. `git diff --check f6bbe0b` and `git diff --check`: pass. Python source audit preserves all **586 test declarations and 14 allowance lines**. Every existing XCTAssert remains, except the equivalent Provider saved assertion now uses the single typed `saved` query; C3 adds one assertion that partial swipe has not yet deleted Third. No sleep/skip calls added. Exactly six paths changed, all under NibUITests. Eleven cluster commits have the required subjects and exact two-line attribution bodies. No push. The supplemental audit first hit Windows' default cp1252 decoding on an unchanged Swift file; rerunning with explicit UTF-8 passed.
+
+Runtime estimate, not measured: the menu paths cover the **11 observed 60-second waits (about 660 seconds)** in the baseline Pages log. The three provider fields consumed 124 seconds; meeting the proposed under-10-seconds-per-field target would save roughly another 94 seconds, but host AX cost remains unmeasured. The two thumbnail gestures add 3 seconds of actual contact in total; diagnostic queries and screenshots add overhead. These are potential avoided costs, not a predicted CI pass or measured net saving.
+
+Windows has no Swift/Objective-C toolchain or simulator, so compilation and every runtime outcome remain unverified. Reviewer/CI should especially verify the new menu dismissal/successor queries, Photos title-bar sibling inventory/remote-tree rebinding, scoped native focus and remote-editor fallback, hover API behavior, drag move acceptance and handwriting recognition. Authoritative scene IDs/keyboard-focus ownership and the typed-text Vision control/InkRender raster remain app-side limitations explicitly explained in H3/C6/C7. All requested clusters have a change or a scope-limited explanation; none is silently deferred.
