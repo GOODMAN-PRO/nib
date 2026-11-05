@@ -254,3 +254,24 @@ Logged immediately before activate and elapsed wall time after it returns; a syn
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | Both Calendar note tests | Calendar activation boundary / Calendar activation duration; Native form field duration; Form reveal timing | Did time disappear inside activation, title entry or event reveal? |
+
+### K3 - unproven idle and nil-probe failures
+
+Confirmed create#3/#4 corrections: two animation-idle timeouts with an asleep app do not identify a caret animation; nil runner reads do not establish whether the probe was absent or valueless. Round 10a already logs immediately before focus and modified typeKey; retained both actions and the exact expectations. SuggestedTitle now captures pre-focus screenshot/AX facts, and Create failure hierarchy is sent through logQA (text attachments alone are unavailable). Layer-owner/animation census at the stall needs app instrumentation and CI sample timing outside this job's paths.
+
+TypeSwitch enables diagnostic-only per-read begin/result logs. readState reuses its existing single exists and single value read, reports exists, valueIsNil, decode outcome and elapsed duration even on throw; all other callers default off. No caching, retries, poll-based extension or deadline change. CI must distinguish absent versus nil value and locate long round trips while retaining creation identity/type/title assertions. The AX getter's own timing cannot be measured from the runner; app-side instrumentation is explicitly still needed.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| SuggestedTitleUseReachesCreatedDocument | Create suggested title before focus / Stall boundary / Create failure hierarchy | What field/overlay preceded the timeout, and which XCTest action was in progress? |
+| TypeSwitchRetainsTitleAndChangesFields | State read begin / State read result | Was each probe absent or present with nil value, did decoding succeed, and how long did that poll cost? |
+
+### Round 10b final source review and validation
+
+Re-read the changed Swift blocks and surrounding callers in Insert, Create, Pages and NibUI; inspected the unchanged NibTouchPaths.h/.m contract. Reviewed XCTest element/query/snapshot APIs, optional values and bindings, throwing expressions/closures, access levels, predicate arguments, native form scoping and interface-to-screen coordinate conversion. All callers of changed shared helpers were grepped across every class. Native menu position/dismissal, native-key focus reuse and clear diagnostics have defaults preserving existing callers; Photos retains its legacy-cell route. Pages uses exactly its previous gesture parameters through the shared helper. No Objective-C file changed.
+
+Final `python Scripts/lint.py`: **0 errors, 25 warnings**. `git diff --check bc4a146` and `git diff --check`: pass. Source audit preserves all **593 test declarations and 14 executionTimeAllowance assignments**, with no added sleep or skip calls. Every existing XCTAssert line is retained except the equivalent exported-file assertion, whose same ten-second existence result is stored once to permit a failure inventory before assertion. Additional Calendar visibility and menu/keyboard postconditions do not replace outcome checks. Exactly five paths changed, all under NibUITests. Thirteen cluster commits retain the exact required attribution bodies; review corrections were folded into their owning commits. Worktree clean after commit; no push.
+
+Windows provides no Swift/Objective-C compilation or simulator validation. CI/reviewer must validate remote Files save/import marker/sidebar identities, Photos readiness and Cancel hittability, native menu same-named successors/outside cancellation, foreign Calendar field focus, full multiline text AX values after scrolling, and held system-drop acceptance. No unproven app/host cause is labelled fixed. The audible Skip Silence input and SilenceMap spans (I7), app hit-test/animation/getter instrumentation (I4/I10/K3), and timeout screenshot extraction/sample scheduling remain explicitly outside this job's permitted paths. All clusters have committed changes or these explicit explanations; the audible-input portion of I7 remains technically unfinished pending app/CI support.
+
+Runtime estimate, **not measured**: I1 targets the two observed 60-second menu waits, about **120 seconds** in CreateElementSourceRemainsRenameDeleteAndReuse. Reusing one preset focus and batching provider fields should remove repeated AX work, but 9b/10a already reduced some of that baseline cost, so no additive saving is claimed. The longer recording adds up to 26 seconds and the Elements destination contact adds 1.5 seconds; remote readiness and new diagnostic reads also cost time. There is no defensible net runtime estimate until CI measures these paths under the unchanged allowances.

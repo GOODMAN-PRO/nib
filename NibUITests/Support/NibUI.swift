@@ -44,6 +44,7 @@ final class NibUI {
     var probe: XCUIElement { app.otherElements["nib.qa.state"].firstMatch }
     private(set) var formRevealFailure: String?
     var diagnoseKeyDelivery = false
+    var diagnoseStateReads = false
     var canvas: XCUIElement { app.scrollViews["nib.canvas"].firstMatch }
 
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
@@ -1964,8 +1965,24 @@ final class NibUI {
         // Read the attribute itself: an XCUIElementSnapshot truncates long values, and the probe's JSON is long.
         // The snapshot-based read of round 8 failed the first decode of the smoke gate (run 41996886696,
         // "The given data was not valid JSON ... Unexpected end of file").
-        guard probe.exists,
-              let state = try NibUITestSnapshot.decode(probe.value, as: QAState.self) else { return nil }
+        let started = Date()
+        var exists: Bool?
+        var valueIsNil: Bool?
+        var decoded = false
+        if diagnoseStateReads { logQA("State read begin", "before probe.exists") }
+        defer {
+            if diagnoseStateReads {
+                let facts = "exists=\(String(describing: exists)) valueIsNil=\(String(describing: valueIsNil)) decoded=\(decoded)"
+                logQA("State read result", facts + " seconds=\(Date().timeIntervalSince(started))")
+            }
+        }
+        let present = probe.exists
+        exists = present
+        guard present else { return nil }
+        let raw = probe.value
+        valueIsNil = raw == nil
+        guard let state = try NibUITestSnapshot.decode(raw, as: QAState.self) else { return nil }
+        decoded = true
         if let failure = state.fixtureError { throw Failure.message("Fixture failed: \(failure)") }
         return state
     }

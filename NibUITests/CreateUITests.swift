@@ -36,6 +36,7 @@ final class CreateUITests: XCTestCase {
             shot.lifetime = .keepAlways
             add(shot)
             let tree = (testRun?.totalFailureCount ?? 0) > 0 ? ui.app.debugDescription : ""
+            if !tree.isEmpty { ui.logQA("Create failure hierarchy", tree) }
             let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(tree)")
             state.name = "Create-\(name)-state-and-accessibility"
             state.lifetime = .keepAlways
@@ -88,6 +89,8 @@ final class CreateUITests: XCTestCase {
     }
 
     func testTypeSwitchRetainsTitleAndChangesFields() throws {
+        ui.diagnoseStateReads = true
+        defer { ui.diagnoseStateReads = false }
         try notebook("Retained draft")
         for (kind, heading) in [("Whiteboard", "New Whiteboard"), ("Text document", "New Text Document"),
                                 ("Study set", "New Study Set"), ("Notebook", "New Notebook")] {
@@ -892,6 +895,9 @@ final class CreateUITests: XCTestCase {
                          matching matcher: ((String, String) -> Bool)? = nil) throws {
         try require(field, "Missing editable field: \(field)")
         try scrollTo(field, name: field.label, in: application)
+        if name.contains("testSuggestedTitleUseReachesCreatedDocument") {
+            ui.recordDiagnostics("Create suggested title before focus", facts: ui.elementFacts(field, includeOverlaps: true))
+        }
         ui.logQA("Stall boundary", "Create replacement field focus tap; field=\(field.label)")
         field.tap()
         try ui.clearNativeText(in: field, diagnoseClear: field.label.contains("millimetres"))
