@@ -578,6 +578,11 @@ final class ChromeUITests: XCTestCase {
         try tap("Save current layout"); try replace("Layout name", name); try tap("cmd.toolbar.saveLayout")
         _ = try reachable("Apply " + name)
     }
+    private func reorderHighlighterAbovePen(_ handle: XCUIElement) throws {
+        let destination = try reachable("Hide Fountain Pen").coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.2))
+        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.5, thenDragTo: destination)
+    }
     func testCustomizeHideShowAndReorderPersistsWithLassoFixedFirst() throws {
         try open(); try customize()
         XCTAssertFalse(query("Hide Lasso").firstMatch.exists, "Lasso cannot be hidden")
@@ -588,7 +593,7 @@ final class ChromeUITests: XCTestCase {
         try customize(); try tap("Show Highlighter")
         let handle = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Highlighter'")).firstMatch
         XCTAssertTrue(handle.waitForExistence(timeout: 5), "Customise must expose a real reorder handle")
-        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.5, thenDragTo: try reachable("Hide Fountain Pen").coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.2)))
+        try reorderHighlighterAbovePen(handle)
         try doneCustomizing(); try customize()
         XCTAssertFalse(query("Hide Lasso").firstMatch.exists)
         XCTAssertLessThan(try reachable("Hide Highlighter").frame.minY, try reachable("Hide Fountain Pen").frame.minY, "Reordered layout must persist")
@@ -617,12 +622,7 @@ final class ChromeUITests: XCTestCase {
         XCTAssertTrue(pen.exists && pen.isHittable, "Pen reorder handle must define the insertion row")
         let row = ui.app.collectionViews.cells.containing(.button, identifier: pen.label).firstMatch
         XCTAssertTrue(row.exists, "Reorder destination must be the Pen row")
-        let insertion = pen.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .withOffset(CGVector(dx: 0, dy: row.frame.minY + 4 - pen.frame.midY))
-        let trace = XCTAttachment(string: "toolbar.setLayout via onMove: Highlighter \(handle.frame), Pen \(pen.frame), insertion \(insertion.screenPoint)\n\(ui.app.debugDescription)")
-        trace.name = "reorder-insertion-target"; trace.lifetime = .keepAlways; add(trace)
-        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .press(forDuration: 0.05, thenDragTo: insertion, withVelocity: XCUIGestureVelocity(rawValue: 100), thenHoldForDuration: 0.5)
+        try reorderHighlighterAbovePen(handle)
         try wait("Reordering must move Highlighter above Pen") {
             self.query("Hide Highlighter").firstMatch.frame.minY < self.query("Hide Fountain Pen").firstMatch.frame.minY
         }
