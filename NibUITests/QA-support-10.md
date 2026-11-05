@@ -77,3 +77,11 @@ Confirmed chrome-state-pdf#1 correction against current More row actions: the op
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | HideShowTools; every Chrome More action | More scoped row | Did the selected button belong to More rather than the palette's same-labelled reveal droplet? |
+
+### C4 - draw on the visible counted page
+
+Confirmed chrome-state-pdf#2 correction: fixed canvas y=671 was on Page 2 while the probe counted Page 1 (whose visible bottom was y=553). The scroll test now asserts the original page is still counted, intersects its real AX frame with window and canvas, and derives the stroke inside that visible rectangle. Exact stroke +1 and Undo assertions remain. Raw probe logs retain inkInput/nativeStrokeCount and geometry before/after. CI must show committed ink on the counted page; a missing surface on Page 2 remains an independent unproven app hypothesis, requiring app contact/hit-view logs rather than an invented test fix.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| PageScrollCollapsesOptionsAndChoosingToolRestoresThem | Page scroll ink geometry / State step (Page scroll wet ink) | Which page/visible rectangle received the stroke and which native wet-ink facts bracket it? |

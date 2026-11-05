@@ -679,7 +679,29 @@ final class ChromeUITests: XCTestCase {
         try ui.diagnoseAction("Thickness 2 after settings", facts: { self.ui.elementFacts(self.query("Thickness 2").firstMatch, includeOverlaps: true) }) {
             try tap("Thickness 2")
         }
-        outside(); try draw()
+        outside()
+        try ui.waitForMenuClosed(ui.app.scrollViews["More"].firstMatch, named: "More before page-scroll ink")
+        let counted = try ui.state()
+        XCTAssertEqual(counted.page, before.page, "This scroll must leave the counted fixture page selected")
+        let page = ui.app.otherElements["Page 1 of 4"].firstMatch
+        XCTAssertTrue(page.exists)
+        let canvas = ui.canvas.frame
+        let visible = page.frame.intersection(ui.app.windows.firstMatch.frame).intersection(canvas)
+        guard !visible.isNull, visible.width > 80, visible.height > 80 else {
+            throw NibUI.Failure.message("Counted page has no safe visible drawing region: \(visible)")
+        }
+        func normalized(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(x: (visible.minX + visible.width * x - canvas.minX) / canvas.width,
+                    y: (visible.minY + visible.height * y - canvas.minY) / canvas.height)
+        }
+        let points = [normalized(0.35, 0.65), normalized(0.65, 0.70)]
+        ui.logQA("Page scroll ink geometry", "page=\(String(describing: counted.page)) pageFrame=\(page.frame) visible=\(visible) points=\(points)")
+        ui.logStateStep("Page scroll wet ink before")
+        defer { ui.logStateStep("Page scroll wet ink completion") }
+        try ui.drawStroke(points)
+        _ = try ui.waitForState(timeout: 12) {
+            $0.strokeCountOnPage == counted.strokeCountOnPage + 1 && $0.undoAvailable
+        }
     }
     private func customize() throws { try more("Customise Toolbar"); try panel("toolbar.customize") }
     private func doneCustomizing() throws { try tap("sheet.dismiss"); try panel("toolbar.customize", shown: false) }
