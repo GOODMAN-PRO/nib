@@ -2,7 +2,7 @@ import UIKit
 
 /// An opaque confirmation in the editor's view hierarchy. Both actions are real controls in every size class;
 /// this does not depend on a modal presenter, a popover's implicit Cancel, or an application singleton.
-public final class NibConfirmationPanel: UIView {
+public final class NibConfirmationPanel: UIView, NibEscapeHandling {
     private let panel = UIView()
     private let textScroll = UIScrollView()
     private let heading = UILabel()
@@ -105,6 +105,25 @@ public final class NibConfirmationPanel: UIView {
     }
 
     @objc private func cancelPressed() { finish(confirmed: false) }
+
+    @discardableResult public func handleEscape() -> Bool {
+        // Consume while the panel remains visible, including callback-driven removal.
+        // finish clears the decision before invoking it, so cancellation is one-shot.
+        cancelPressed()
+        return true
+    }
+
+    public override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandled = presses
+        for press in presses {
+            guard let key = press.key, key.keyCode == .keyboardEscape,
+                  key.modifierFlags.union(event?.modifierFlags ?? []).intersection([.command, .shift, .alternate, .control]).isEmpty
+            else { continue }
+            handleEscape()
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
 
     public override func accessibilityPerformEscape() -> Bool {
         finish(confirmed: false)
