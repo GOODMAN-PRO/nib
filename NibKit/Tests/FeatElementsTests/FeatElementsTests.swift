@@ -102,6 +102,39 @@ final class FeatElementsTests: XCTestCase {
 
     func testFeatureID() { XCTAssertEqual(FeatElementsFeature.id, "elements") }
 
+    func testInsertRejectsAnIDClaimedWhileLoading() async throws {
+        let h = harness()
+        let loading = expectation(description: "Fragment load started")
+        let finished = expectation(description: "Insertion finished")
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+        let fragment = try JSONValue.from(Self.box)
+        h.app.content.elementCollections.register(ElementCollectionDescriptor(id: "race-pack", title: "Race", owner: "test") {
+            loading.fulfill()
+            guard gate.wait(timeout: .now() + 5) == .success else { throw NibError.unavailable("test gate") }
+            return [ElementEntry(id: "box", title: "Box", fragment: fragment)]
+        })
+        var failure: NibError?
+        Task { @MainActor in
+            defer { finished.fulfill() }
+            do {
+                try await h.run("element.insert", ["page": "page:FIXTUREDOC01/FIXTUREPG002",
+                    "collection": "race-pack", "element": "box", "ids": ["CLAIMED"]])
+            } catch { failure = NibError.wrap(error) }
+        }
+        await fulfillment(of: [loading], timeout: 2)
+        var claimed = Self.box.items[0]
+        claimed.id = "CLAIMED"
+        claimed.rev = h.app.clock.tick()
+        h.app.bus.applyRemote(DocumentPatch(doc: Fixtures.docID, items: [Fixtures.page2.raw: [claimed]]), origin: "test")
+        let before = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: claimed.id)
+        gate.signal()
+        await fulfillment(of: [finished], timeout: 2)
+        XCTAssertEqual(failure?.code, .conflict)
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: claimed.id), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
     func testCommandConformance() async {
         let problems = await CommandConformance.check(features: [FeatElementsFeature.self], owners: [FeatElementsFeature.id])
         XCTAssertEqual(problems, [])
