@@ -530,7 +530,7 @@ final class PackageMergeTests: XCTestCase {
         XCTAssertEqual(relaunched.contentRevision(doc, page: page), try loaded())
     }
 
-    func testRealStoreValidatesUnchangedThumbnailFingerprintWithoutLoadingItems() throws {
+    func testRealStoreClosedThumbnailProbeWithWALDoesNotReplayOrDecodePages() throws {
         let lib = TestLibrary()
         let (head, pages) = Fixtures.sampleContent()
         let doc = head.meta.id, page = Fixtures.page1
@@ -538,16 +538,155 @@ final class PackageMergeTests: XCTestCase {
         let writer = lib.store("00000007")
         writer.didChange(doc, head: head, pages: pages)
         writer.flush(doc)
+        // The existing thumbnail already describes this content, but a redundant WAL entry survives a crash.
+        try writer.wal.append(WriteAheadLog.Entry(head: head, pages: [page.raw: try XCTUnwrap(pages[page])]), doc: doc)
         let thumbnailFingerprint = LWW.fingerprint(try XCTUnwrap(pages[page]))
-        // The decorator delegates fingerprinting to production, rather than supplying a fake fingerprint.
+        let thumbnailRevision = try XCTUnwrap(head.page(page)).rev
         let observed = ObservedPackagePersistence(lib.store("00000007"))
+        let store = observed.base
         let workspace = Workspace(clock: HLCClock(device: 7), persistence: observed, events: EventBus())
+        // These are both reads made by TileRenderer.thumbnailProbe, before either thumbnail cache lookup.
         for _ in 0..<3 {
+            XCTAssertEqual(try workspace.peekContent(doc).page(page)?.rev, thumbnailRevision)
             XCTAssertEqual(try workspace.contentFingerprint(doc, page: page), thumbnailFingerprint)
             XCTAssertFalse(workspace.isPageCached(doc, page: page))
             XCTAssertFalse(workspace.isLoaded(doc))
         }
         XCTAssertEqual(observed.itemLoads, 0)
+        XCTAssertEqual(store.wal.replayReads, 0, "a peek must not enter internal WAL recovery")
+        XCTAssertEqual(store.itemPageReads, 0, "internal mergedPage calls also decode payloads")
+        XCTAssertEqual(store.headFileReads, 1, "unchanged heads are reused even across separate probes")
+        XCTAssertEqual(store.metadataFileReads, 1)
+        XCTAssertEqual(store.metadataScans, 1)
+        XCTAssertEqual(store.metadataFallbacks, 0)
+        XCTAssertEqual(store.wal.metadataReads, 2, "one head and one fingerprint read, then stamp cache hits")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.wal.url(doc).path))
+        // Opening still performs recovery, and produces the same content that the metadata path described.
+        XCTAssertEqual(try workspace.content(doc), head)
+        XCTAssertEqual(try workspace.allItems(doc, page: page), try XCTUnwrap(pages[page]))
+        XCTAssertGreaterThan(store.wal.replayReads, 0)
+    }
+
+    func testLargePageRevisionUsesScannerAndStampCache() throws {
+        let lib = TestLibrary()
+        let (head, _) = Fixtures.sampleContent()
+        let doc = head.meta.id, page = Fixtures.page1
+        lib.package(doc)
+        let points = (0..<100_000).map { StrokePoint(x: Float($0), y: Float($0 % 100)) }
+        var stroke = Item.makeStroke(Stroke(style: .defaultPen, points: points))
+        stroke.rev = Rev(wallMs: 99, counter: 0, device: 7)
+        let writer = lib.store("00000007")
+        writer.didChange(doc, head: head, pages: [page: [stroke]])
+        writer.flush(doc)
+        let reader = lib.store("00000007")
+        for _ in 0..<3 {
+            XCTAssertEqual(reader.contentRevision(doc, page: page), stroke.rev)
+        }
+        XCTAssertEqual(reader.metadataFileReads, 1, "revision-only clients scan once and do not hash all the items")
+        for _ in 0..<3 {
+            XCTAssertEqual(reader.contentFingerprint(doc, page: page), LWW.fingerprint([stroke]))
+        }
+        XCTAssertEqual(reader.metadataFileReads, 2, "the first fingerprint re-scans without retaining item metadata")
+        XCTAssertEqual(reader.metadataScans, 2)
+        XCTAssertEqual(reader.metadataFallbacks, 0, "large compact ink must not enter JSONDecoder")
+        XCTAssertEqual(reader.itemPageReads, 0)
+    }
+
+    func testRevisionProbeCachesUnreadableFilesWithoutStatusEvents() throws {
+        let lib = TestLibrary()
+        let (head, pages) = Fixtures.sampleContent()
+        let doc = head.meta.id, page = Fixtures.page1
+        let pkg = lib.package(doc)
+        let writer = lib.store("00000007")
+        writer.didChange(doc, head: head, pages: pages)
+        writer.flush(doc)
+        let foreign = pkg.appendingPathComponent("pages/\(page.raw)/00000008.nibpage")
+        try Data("partial download".utf8).write(to: foreign)
+        let events = EventBus()
+        var statuses: [SyncStatusPayload] = []
+        let subscription = events.subscribe { event in
+            if let status = event.decode(SyncStatusPayload.self) { statuses.append(status) }
+        }
+        defer { subscription.cancel() }
+        let reader = lib.store("00000007", events: events)
+        let items = try XCTUnwrap(pages[page])
+        let expected = items.map(\.rev).max() ?? .zero
+        for _ in 0..<3 {
+            XCTAssertEqual(reader.contentRevision(doc, page: page), expected)
+            XCTAssertEqual(reader.contentFingerprint(doc, page: page), LWW.fingerprint(items))
+        }
+        XCTAssertEqual(reader.metadataFileReads, 3, "revision and fingerprint each read the valid file; the failure is read once")
+        XCTAssertTrue(statuses.isEmpty)
+        // Changing a WAL input must not retry the unchanged broken file either.
+        try reader.wal.append(WriteAheadLog.Entry(head: nil, pages: [page.raw: items]), doc: doc)
+        XCTAssertEqual(reader.contentRevision(doc, page: page), expected)
+        XCTAssertEqual(reader.metadataFileReads, 4)
+        var updated = try XCTUnwrap(items.first)
+        updated.rev = Rev(wallMs: 1000, counter: 0, device: 8)
+        try PackageCodec.encodeItems([updated]).write(to: foreign)
+        XCTAssertEqual(reader.contentRevision(doc, page: page), updated.rev, "a repaired file is retried")
+        XCTAssertTrue(statuses.isEmpty)
+        // The old revision probe also tolerated an unreadable own file; retain that read-only behavior.
+        try Data("partial own download".utf8).write(to: pkg.appendingPathComponent("pages/\(page.raw)/00000007.nibpage"))
+        XCTAssertEqual(reader.contentRevision(doc, page: page), updated.rev)
+        XCTAssertTrue(statuses.isEmpty)
+    }
+
+    func testRealStoreHeadStampRevalidatesDeletionAfterSuspension() async throws {
+        let lib = TestLibrary()
+        var (head, pages) = Fixtures.sampleContent()
+        let doc = head.meta.id, page = Fixtures.page1
+        lib.package(doc)
+        let store = lib.store("00000007")
+        store.didChange(doc, head: head, pages: pages)
+        store.flush(doc)
+        let workspace = Workspace(clock: HLCClock(device: 7), persistence: store, events: EventBus())
+        _ = try workspace.peekContent(doc)
+        let oldStamp = try XCTUnwrap(store.headReadStamp(doc))
+        let entered = expectation(description: "pass suspended after unchanged page")
+        let resume = expectation(description: "deletion committed before pass resumes")
+        let finished = expectation(description: "pass revalidated head")
+        let pass = Task { @MainActor in
+            entered.fulfill()
+            await self.fulfillment(of: [resume], timeout: 2)
+            XCTAssertNotEqual(store.headReadStamp(doc), oldStamp)
+            let fresh = try? workspace.peekContent(doc)
+            XCTAssertFalse(fresh?.livePages.contains { $0.id == page } ?? true)
+            finished.fulfill()
+        }
+        defer { pass.cancel() }
+        await fulfillment(of: [entered], timeout: 2)
+        let index = try XCTUnwrap(head.pages.firstIndex { $0.id == page })
+        head.pages[index].deleted = true
+        head.pages[index].trashedAt = Date().timeIntervalSince1970
+        head.pages[index].rev = Rev(wallMs: 10, counter: 0, device: 8)
+        store.didChange(doc, head: head, pages: [:])
+        // Check the in-memory change even before the asynchronous WAL append reaches disk.
+        XCTAssertNotEqual(store.headReadStamp(doc), oldStamp)
+        resume.fulfill()
+        await fulfillment(of: [finished], timeout: 2)
+        store.flush(doc)
+        _ = try workspace.peekContent(doc)
+        let stable = try XCTUnwrap(store.headReadStamp(doc))
+        let reads = store.headFileReads
+        for _ in 0..<96 {
+            XCTAssertEqual(store.headReadStamp(doc), stable)
+            _ = try workspace.peekContent(doc)
+        }
+        XCTAssertEqual(store.headFileReads, reads)
+        var remote = head
+        remote.meta.favorite.toggle()
+        remote.meta.rev = Rev(wallMs: 20, counter: 0, device: 8)
+        let remoteFile = try store.files.package(doc).appendingPathComponent("doc.00000008.json")
+        try PackageCodec.encodeHead(remote).write(to: remoteFile)
+        XCTAssertNotEqual(store.headReadStamp(doc), stable, "external head changes invalidate the pass cache")
+        XCTAssertEqual(try workspace.peekContent(doc).meta.favorite, remote.meta.favorite)
+        let beforeEviction = try XCTUnwrap(store.headReadStamp(doc))
+        store.forget(doc)
+        XCTAssertNotEqual(store.headReadStamp(doc), beforeEviction, "eviction also drops clock-skew expiry state")
+        XCTAssertEqual(store.itemPageReads, 0)
+        XCTAssertEqual(store.wal.replayReads, 0)
+        XCTAssertFalse(workspace.isLoaded(doc))
     }
 
     func testRealStoreIntermediateRevisionInvalidatesThumbnailFingerprint() throws {
@@ -673,6 +812,8 @@ private final class ObservedPackagePersistence: DocumentPersistence {
     var itemLoads = 0
     init(_ base: PackagePersistence) { self.base = base }
     func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
+    func peekHead(_ doc: DocumentID) throws -> DocumentContent { try base.peekHead(doc) }
+    func headReadStamp(_ doc: DocumentID) -> String? { base.headReadStamp(doc) }
     func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
         itemLoads += 1
         return try base.loadItems(doc, page: page)

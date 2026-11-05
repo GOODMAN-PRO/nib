@@ -197,6 +197,7 @@ final class NibStoreTests: XCTestCase {
                                         walDirectory: writer.wal.directory, debounce: 3600,
                                         isDocumentOpen: { $0 == pinned })
         for head in heads {
+            XCTAssertEqual(try reader.peekHead(head.meta.id), head)
             XCTAssertEqual(try reader.loadHead(head.meta.id), head)
             for (page, expected) in items {
                 XCTAssertEqual(try reader.loadItems(head.meta.id, page: page), expected)
@@ -363,7 +364,11 @@ final class NibStoreTests: XCTestCase {
         nudged.stroke?.points[0].x += 10
         nudged.rev = clock.tick()
         store.didChange(doc, head: head, pages: [Fixtures.page2: [nudged]])
+        let pendingStamp = try XCTUnwrap(store.headReadStamp(doc))
+        XCTAssertEqual(try store.peekHead(doc), head)
         store.write(doc, synchronously: false)
+        XCTAssertNotEqual(store.headReadStamp(doc), pendingStamp)
+        XCTAssertEqual(try store.peekHead(doc), head, "queued metadata reads do not wait for the held writer")
 
         // This clean document has no durability obligation. Eviction must finish before releasing the held
         // writer above; draining the shared queue here would hit that writer's bounded watchdog.

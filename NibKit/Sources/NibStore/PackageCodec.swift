@@ -6,12 +6,18 @@ import NibContracts
 /// `doc.<dev>.json` holds `DocumentContent`, `pages/<pageId>/<dev>.nibpage` holds LZFSE-compressed `[Item]` JSON, both
 /// with stroke points in compact form. Every reader merges every device file last-writer-wins.
 enum PackageCodec {
-    /// The only fields thumbnail validation needs. Unknown payload keys are skipped by Codable, so neither
-    /// compact stroke points nor text/images are materialized, including for older JSON spellings.
+    /// The only fields thumbnail validation needs. The byte scanner skips payloads; Codable handles older JSON
+    /// spellings without materializing compact stroke points or text/images.
     struct ItemMetadata: LWWRecord {
         var id: NibID
         var rev: Rev
         var deleted: Bool
+
+        init(id: NibID, rev: Rev, deleted: Bool) {
+            self.id = id
+            self.rev = rev
+            self.deleted = deleted
+        }
 
         init(_ item: Item) {
             id = item.id
@@ -30,8 +36,17 @@ enum PackageCodec {
         }
     }
 
-    static func itemMetadata(_ data: Data) throws -> [ItemMetadata] {
+    static func itemMetadata(_ data: Data, didScan: ((Bool) -> Void)? = nil) throws -> [ItemMetadata] {
         let json = try (data as NSData).decompressed(using: .lzfse) as Data
+        return try metadataJSON(json, didScan: didScan)
+    }
+
+    static func metadataJSON(_ json: Data, didScan: ((Bool) -> Void)? = nil) throws -> [ItemMetadata] {
+        if let records = PageReader.metadata(json) {
+            didScan?(true)
+            return records
+        }
+        didScan?(false)
         return try JSONDecoder().decode([ItemMetadata].self, from: json)
     }
 
@@ -243,11 +258,38 @@ struct PageReader {
     /// they hold). nil when the JSON is not a plain array of objects, or an element's "id" or "rev" is missing,
     /// repeated or not in the plain form `encodeItems` writes: the caller then decodes the page.
     static func revisions(_ json: Data) -> [(id: NibID, rev: Rev)]? {
-        json.withUnsafeBytes { raw -> [(id: NibID, rev: Rev)]? in
+        metadata(json)?.map { ($0.id, $0.rev) }
+    }
+
+    static func metadata(_ json: Data) -> [PackageCodec.ItemMetadata]? {
+        json.withUnsafeBytes { raw -> [PackageCodec.ItemMetadata]? in
             guard raw.count >= 2, let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
             let scratch = UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1) // no points are read
             defer { scratch.deallocate() }
             return PageReader(p: base, n: raw.count, scratch: scratch).revisionList()
+        }
+    }
+
+    /// Select fields from a canonical WAL object without parsing strings inside skipped page payloads.
+    /// nil asks the caller to use Codable for legacy whitespace/escaped-key spellings.
+    static func fields(_ json: Data) -> [String: Range<Int>]? {
+        json.withUnsafeBytes { raw -> [String: Range<Int>]? in
+            guard raw.count >= 2, let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            let scratch = UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1)
+            defer { scratch.deallocate() }
+            let reader = PageReader(p: base, n: raw.count, scratch: scratch)
+            var i = 0
+            guard reader.lit(&i, "{") else { return nil }
+            var result: [String: Range<Int>] = [:]
+            if reader.lit(&i, "}"), i == raw.count { return result }
+            repeat {
+                guard let key = reader.plainString(&i), result[key] == nil, reader.lit(&i, ":"),
+                      let end = reader.valueEnd(i), end > i else { return nil }
+                result[key] = i..<end
+                i = end
+            } while reader.lit(&i, ",")
+            guard reader.lit(&i, "}"), i == raw.count else { return nil }
+            return result
         }
     }
 
@@ -461,15 +503,16 @@ struct PageReader {
 
     // MARK: Revisions
 
-    private func revisionList() -> [(id: NibID, rev: Rev)]? {
+    private func revisionList() -> [PackageCodec.ItemMetadata]? {
         guard p[0] == 0x5B, p[n - 1] == 0x5D else { return nil } // [ … ]
-        var out: [(id: NibID, rev: Rev)] = []
+        var out: [PackageCodec.ItemMetadata] = []
         var i = 1
         guard i < n - 1 else { return out } // []
         while true {
             guard lit(&i, "{") else { return nil }
             var id: String?
             var revision: Rev?
+            var deleted: Bool?
             repeat {
                 guard let key = plainString(&i), lit(&i, ":") else { return nil }
                 switch key {
@@ -479,13 +522,18 @@ struct PageReader {
                 case "rev":
                     guard revision == nil, let r = rev(&i) else { return nil }
                     revision = r
+                case "deleted":
+                    guard deleted == nil else { return nil }
+                    if lit(&i, "true") { deleted = true }
+                    else if lit(&i, "false") { deleted = false }
+                    else { return nil }
                 default:
                     guard let end = valueEnd(i), end > i else { return nil }
                     i = end
                 }
             } while lit(&i, ",")
             guard lit(&i, "}"), let id = id, let revision = revision else { return nil }
-            out.append((NibID(id), revision))
+            out.append(PackageCodec.ItemMetadata(id: NibID(id), rev: revision, deleted: deleted ?? false))
             if i == n - 1 { return out }
             guard lit(&i, ","), i < n - 1 else { return nil } // a comma, then another element
         }

@@ -8,6 +8,8 @@ import Foundation
 public protocol DocumentPersistence: AnyObject {
     /// Loads and merges the document head from every device file. Throws `not_found`.
     func loadHead(_ doc: DocumentID) throws -> DocumentContent
+    /// Read-only head snapshot. Stores with recovery logs must skip page payload replay here.
+    func peekHead(_ doc: DocumentID) throws -> DocumentContent
     /// Cheap validation token for `loadHead`, or nil when no reliable token is available. Must change when
     /// ANY input to the merged head changes (disk, WAL, queued/pending writes, or effective revision ordering).
     /// Callers validate before and after reading, and must scope cached heads to this persistence instance.
@@ -36,6 +38,7 @@ public protocol DocumentPersistence: AnyObject {
 
 @MainActor
 public extension DocumentPersistence {
+    func peekHead(_ doc: DocumentID) throws -> DocumentContent { try loadHead(doc) }
     func headReadStamp(_ doc: DocumentID) -> String? { nil }
     func isReadOnly(_ doc: DocumentID) -> Bool { false }
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? { nil }
@@ -161,11 +164,12 @@ public final class Workspace {
     public func cachedPages(_ doc: DocumentID) -> Set<PageID> { Set(pageItems[doc]?.keys.map { $0 } ?? []) }
 
     /// contracts-v2: the document head WITHOUT opening it: the loaded head when the document is open, else a fresh
-    /// read from persistence that is neither cached nor announced (`doc.opened` is not emitted). For library-wide
+    /// read from persistence that is neither cached in the workspace nor announced (`doc.opened` is not emitted).
+    /// Persistence may memoize metadata by its input stamps, without replaying page payloads. For library-wide
     /// scans (favourite and trashed pages, catalogues). Throws `not_found`.
     public func peekContent(_ doc: DocumentID) throws -> DocumentContent {
         if let h = heads[doc] { return h }
-        return try persistence.loadHead(doc)
+        return try persistence.peekHead(doc)
     }
 
     /// contracts-v2: the highest revision among a page's items (tombstones included): from memory when the page is

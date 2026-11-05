@@ -17,6 +17,8 @@ final class WriteAheadLog {
 
     let directory: URL
     private let lock = NSLock()
+    private(set) var replayReads = 0
+    private(set) var metadataReads = 0
 
     init(directory: URL) {
         self.directory = directory
@@ -63,6 +65,7 @@ final class WriteAheadLog {
     /// Entries in append order. A torn last line (the app died mid-append) is skipped.
     func read(_ doc: DocumentID) -> [Entry] {
         lock.lock()
+        replayReads += 1
         let data = try? Data(contentsOf: url(doc))
         lock.unlock()
         guard let data else { return [] }
@@ -70,19 +73,44 @@ final class WriteAheadLog {
         return data.split(separator: 0x0A).compactMap { try? decoder.decode(Entry.self, from: Data($0)) }
     }
 
-    /// The same append order and torn-line policy as replay, without decoding item payloads or document heads.
-    func metadata(_ doc: DocumentID, page: PageID) -> [[PackageCodec.ItemMetadata]] {
-        struct MetadataEntry: Decodable {
+    /// Same append order and torn-line policy as replay. Only the requested page's metadata and/or heads are
+    /// decoded; payloads of all other pages are skipped. No replay side effects or retained page arrays.
+    func metadata(_ doc: DocumentID, page: PageID? = nil) -> (heads: [DocumentContent], items: [[PackageCodec.ItemMetadata]]) {
+        struct HeadEntry: Decodable {
+            var head: DocumentContent?
+        }
+        struct PageEntry: Decodable {
             var pages: [String: [PackageCodec.ItemMetadata]]
         }
         lock.lock()
+        metadataReads += 1
         let data = try? Data(contentsOf: url(doc))
         lock.unlock()
-        guard let data else { return [] }
+        guard let data else { return ([], []) }
         let decoder = JSONDecoder()
-        return data.split(separator: 0x0A).compactMap {
-            (try? decoder.decode(MetadataEntry.self, from: Data($0)))?.pages[page.raw]
+        var heads: [DocumentContent] = []
+        var items: [[PackageCodec.ItemMetadata]] = []
+        for line in data.split(separator: 0x0A) {
+            let json = Data(line)
+            if let fields = PageReader.fields(json) {
+                if page == nil, let range = fields["head"],
+                   let head = try? PackageCodec.decodeHead(json.subdata(in: range)) { heads.append(head) }
+                if let page, let range = fields["pages"] {
+                    let pages = json.subdata(in: range)
+                    if let fields = PageReader.fields(pages) {
+                        if let range = fields[page.raw],
+                           let records = try? PackageCodec.metadataJSON(pages.subdata(in: range)) { items.append(records) }
+                    } else if let values = try? decoder.decode([String: [PackageCodec.ItemMetadata]].self, from: pages),
+                              let records = values[page.raw] { items.append(records) }
+                }
+            } else if let page {
+                if let entry = try? decoder.decode(PageEntry.self, from: json),
+                   let records = entry.pages[page.raw] { items.append(records) }
+            } else if let entry = try? decoder.decode(HeadEntry.self, from: json), let head = entry.head {
+                heads.append(head)
+            }
         }
+        return (heads, items)
     }
 
     /// Everything logged so far is in the package files now.
