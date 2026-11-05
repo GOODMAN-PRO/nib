@@ -29,6 +29,13 @@ struct SearchViewport: Equatable {
         let visible = proposed.intersection(viewport?.visibleBounds ?? proposed)
         return visible.isEmpty ? .zero : visible
     }
+    /// The library supplies its laid-out content column in floating-host coordinates.
+    /// Never paint or catch taps over its sibling sidebar or top chrome.
+    static func libraryContentBounds(hostBounds: CGRect, column: CGRect?) -> CGRect {
+        guard let column else { return hostBounds }
+        let bounds = hostBounds.intersection(column)
+        return bounds.isEmpty ? .zero : bounds
+    }
     static func resultsHeight(availableHeight: CGFloat, reservesNavigation: Bool) -> CGFloat {
         max(0, min(NibMetrics.searchResultsMaxHeight,
             availableHeight - NibMetrics.barHeight - NibMetrics.minimumRestingGap

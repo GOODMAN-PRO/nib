@@ -21,6 +21,13 @@ final class LibraryModels {
         if let existing = app.services.get(serviceKey, as: LibraryModels.self) { return existing }
         let store = LibraryModels(app)
         app.services.set(store, for: serviceKey)
+        // F056 consumes window-local geometry through the service escape hatch;
+        // feature modules must not import each other's view models.
+        let contentBounds: @MainActor (EditorSession) -> AnyPublisher<CGRect?, Never> = { [weak store] session in
+            guard let model = store?.models[session.id] else { return Just<CGRect?>(nil).eraseToAnyPublisher() }
+            return model.$searchContentBounds.removeDuplicates().eraseToAnyPublisher()
+        }
+        app.services.set(contentBounds as AnyObject, for: "libraryui.searchContentBounds")
         return store
     }
     func model(_ session: EditorSession) -> LibraryViewModel {
@@ -55,6 +62,7 @@ final class LibraryViewModel: ObservableObject {
     let reflow = NibReflow<String>(combines: true)
     let folderReflow = NibReflow<String>(combines: false)
     let floatingAdapter: LibraryFloatingAdapter
+    @Published var searchContentBounds: CGRect?
     @Published var collection: LibraryCollection = .documents
     @Published private(set) var sidebarCounts: [String: Int] = [:]
     @Published var folder: FolderID?
@@ -611,6 +619,7 @@ struct LibraryRootView: View {
                             content(compact: compact, compactHeight: short)
                                 .frame(width: LibraryPresentation.contentWidth(viewport: geometry.size.width,
                                     inlineSidebar: inlineSidebar), height: geometry.size.height)
+                                .libraryChromeFrame("content.column")
                         }
                     }
                 }
@@ -685,6 +694,13 @@ struct LibraryRootView: View {
             .onPreferenceChange(LibraryChromeFrames.self) { frames in
                 chromeFrames = frames
                 model.updateMenuAnchors(from: frames)
+                let chromeHeight = frames.filter { $0.key.hasPrefix("top.") }.values.map(\.height).max() ?? NibMetrics.barHeight
+                let clearance = chromeHeight + NibSpacing.l + NibMetrics.minimumRestingGap
+                let contentBounds = frames["content.column"].map { frame in
+                    CGRect(x: frame.minX, y: frame.minY + clearance, width: frame.width,
+                        height: max(0, frame.height - clearance))
+                }
+                if model.searchContentBounds != contentBounds { model.searchContentBounds = contentBounds }
             }
             .nibLiquidMode(model.liquidMode)
             .nibSheet(item: sheetBinding) { panel in LibraryPanelView(panel: panel, model: model) }

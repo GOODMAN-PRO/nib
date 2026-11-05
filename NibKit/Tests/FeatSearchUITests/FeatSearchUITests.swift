@@ -335,6 +335,20 @@ final class FeatSearchUITests: XCTestCase {
         XCTAssertEqual(SearchViewport.hostBounds(proposedSize: window.size, viewport: outside), .zero)
     }
 
+    func testLibrarySearchSurfaceStaysInsideMeasuredContentColumn() {
+        let host = CGRect(x: 0, y: 0, width: 1194, height: 834)
+        let content = CGRect(x: 320, y: 80, width: 874, height: 754)
+        let surface = SearchViewport.libraryContentBounds(hostBounds: host, column: content)
+        XCTAssertEqual(surface, content)
+        XCTAssertFalse(surface.contains(CGPoint(x: 160, y: 300)), "sidebar stays usable")
+        XCTAssertFalse(surface.contains(CGPoint(x: 900, y: 40)), "toolbar stays usable")
+        XCTAssertTrue(surface.contains(CGPoint(x: 340, y: 90)), "banner/title cannot bleed through")
+        let resized = CGRect(x: 0, y: 0, width: 834, height: 600)
+        XCTAssertEqual(SearchViewport.libraryContentBounds(hostBounds: resized, column: content),
+            CGRect(x: 320, y: 80, width: 514, height: 520))
+        XCTAssertEqual(SearchViewport.libraryContentBounds(hostBounds: host, column: nil), host)
+    }
+
     func testLibrarySearchKeepsPortraitWidthWhenKeyboardChangesVisibleHeight() {
         let window = CGRect(x: 0, y: 0, width: 834, height: 1194)
         let keyboard = CGRect(x: 0, y: 600, width: 834, height: 594)

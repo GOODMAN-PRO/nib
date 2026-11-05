@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Combine
 import NibContracts
 import NibDesign
 
@@ -126,19 +127,29 @@ struct LibrarySearchFloatingContent: View {
     let session: EditorSession
     @ObservedObject var state: SearchState
     @State private var viewport: SearchViewport?
+    @State private var libraryContentBounds: CGRect?
     var belowBars = false
+
+    private var contentBoundsPublisher: AnyPublisher<CGRect?, Never>? {
+        let bounds = app.services.get("libraryui.searchContentBounds",
+            as: (@MainActor (EditorSession) -> AnyPublisher<CGRect?, Never>).self)
+        return bounds?(session)
+    }
 
     var body: some View {
         GeometryReader { geometry in
-            let bounds = SearchViewport.hostBounds(proposedSize: geometry.size, viewport: viewport)
+            let hostBounds = SearchViewport.hostBounds(proposedSize: geometry.size, viewport: viewport)
+            let measuredColumn = belowBars ? nil : libraryContentBounds
+            let bounds = SearchViewport.libraryContentBounds(hostBounds: hostBounds, column: measuredColumn)
             let width = SearchViewport.panelWidth(availableWidth: bounds.width - 2 * NibMetrics.chromeInset,
                 windowSize: viewport?.windowSize ?? geometry.size)
-            let top = belowBars ? 0 : NibMetrics.barTopGap + NibMetrics.barHeight + NibMetrics.minimumRestingGap
+            let top = belowBars || measuredColumn != nil ? 0
+                : NibMetrics.barTopGap + NibMetrics.barHeight + NibMetrics.minimumRestingGap
             let height = SearchViewport.resultsHeight(availableHeight: min(bounds.height,
                 (viewport?.availableHeight ?? geometry.size.height) - bounds.minY) - top, reservesNavigation: false)
             ZStack(alignment: .top) {
-                // Search owns this surface while open. An invisible catcher left fragments
-                // of the banner and title around the field, especially in landscape.
+                // Cover the replaced content, including its banner/title, but leave the
+                // measured sidebar and toolbar outside both the paint and the tap catcher.
                 (belowBars ? Color.clear : NibColor.background)
                     .contentShape(Rectangle())
                     .onTapGesture { close() }
@@ -174,6 +185,9 @@ struct LibrarySearchFloatingContent: View {
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
+        }
+        .onReceive(contentBoundsPublisher ?? Just<CGRect?>(nil).eraseToAnyPublisher()) { bounds in
+            if libraryContentBounds != bounds { libraryContentBounds = bounds }
         }
     }
     private var presentationBinding: Binding<Bool> {
