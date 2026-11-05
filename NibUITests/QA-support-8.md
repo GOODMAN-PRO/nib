@@ -174,3 +174,11 @@ D:controls-menus#5 proves Highlighter settings covers Thickness 2. PageScrollCol
 ## C8 - retained tool settings assertions
 
 D:app-round-4#4 correction confirms settings=true->false before highlighter selection while the old Fountain Pen ScrollView remains retained. QAState decodes optional toolSettingsOpen. The switch test replaces its two impossible existence assertions with bounded presentation assertions: when the JSON key is present (including null), expect nil after switching and highlighter after reopening; older probes require no in-window hittable old-tool ScrollView. Existing Straight line readiness proves the new settings in fallback mode. This proves dismissal/replacement intent without requiring destruction of a retained AX node. CI with app round 5 must report exact probe values; absent-field runs remain compatible.
+
+## C9 - bounded creation scroll stalls
+
+D:controls-menus#4 correction / D:app-round-4#7 show Size stopped at y869.5 below viewport bottom823 after one no-change drag; lost versus unsettled gesture remains unknown. scrollTo now requires two consecutive unchanged target frames with the same nonempty unchanged visible-row signature, varying the start 16pt inward on a stall. Missing snapshots/signatures never prove exhaustion. Twelve-drag bound and final reachability assertions remain. Expected B5; CI must show the new signature and either progress on the alternate start or two genuine unchanged observations.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Create scrolling, especially B5 | Creation scroll unchanged | Did target and visible rows remain unchanged twice, or was one drag a no-op? |

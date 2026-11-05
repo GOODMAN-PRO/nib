@@ -808,6 +808,8 @@ final class CreateUITests: XCTestCase {
             let signature = rows(snapshot)
             return signature.isEmpty ? nil : signature
         }
+        var unchanged = 0
+        var stalledRows: [String]?
         for _ in 0..<12 {
             let exists = element.exists
             if exists && element.elementType != .textField && element.isHittable { return }
@@ -843,21 +845,23 @@ final class CreateUITests: XCTestCase {
                 if element.elementType != .textField || visible.contains(required) { return }
             }
             let targetY = name == "Title" ? target.map { $0.midY - 68 } : target?.midY
-            let beforeRows = target == nil ? visibleRows(scroll, viewport: visible) : nil
+            let beforeRows = visibleRows(scroll, viewport: visible)
             let drag = NibUITestScrollGeometry.drag(in: visible, toward: targetY)
+            let startY = unchanged > 0 ? drag.start.y + (drag.start.y > visible.midY ? -16 : 16) : drag.start.y
             let origin = app.coordinate(withNormalizedOffset: .zero)
-            origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
+            origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: startY - app.frame.minY))
                 .press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(
                     dx: drag.end.x - app.frame.minX, dy: drag.end.y - app.frame.minY)),
                     withVelocity: XCUIGestureVelocity(rawValue: 80), thenHoldForDuration: 0.3)
             let after = element.exists ? element.frame : nil
             ui.logQA("Creation scroll", "name=\(name) target=\(String(describing: target)) after=\(String(describing: after)) viewport=\(visible)")
-            if let target, let after, after == target { break }
-            if target == nil, after == nil, let beforeRows,
+            if after == target, let beforeRows,
                let afterRows = visibleRows(scroll, viewport: visible), beforeRows == afterRows {
-                ui.logQA("Creation scroll exhausted", "name=\(name) visible rows unchanged=\(afterRows)")
-                break
-            }
+                unchanged = stalledRows == afterRows ? unchanged + 1 : 1
+                stalledRows = afterRows
+                ui.logQA("Creation scroll unchanged", "name=\(name) consecutive=\(unchanged) target=\(String(describing: after)) signature=\(afterRows)")
+                if unchanged >= 2 { break }
+            } else { unchanged = 0; stalledRows = nil }
         }
         try require(element, "Missing required creation control: \(name)")
         XCTAssertTrue(element.isHittable, "Creation control is unreachable after scrolling")
