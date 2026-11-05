@@ -306,6 +306,9 @@ struct BridgeDetailsPopover: View {
             await monitor.refresh()
             #if DEBUG
             NSLog("%@", "[Nib QA bridge] pill turnOff awaited enabled=\(String(describing: monitor.snapshot?.enabled)) state=\(String(describing: monitor.snapshot?.state))")
+            let context = ChromeContext(app: app, session: nil, kind: .notebook)
+            let content = app.ui.toolbar.get(BridgeUIIDs.statusItem)?.compactStatus?(context)
+            NSLog("%@", "[Nib QA bridge] compact status after turnOff returned=\(content == nil ? "nil" : "view")")
             #endif
         } catch {
             state.error = NibError.wrap(error).message

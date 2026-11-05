@@ -363,8 +363,7 @@ struct NavBarView: View {
     private func status(_ item: NavStatusItem) -> some View {
         let context = ChromeContext(app: chrome.app, session: chrome.session, navigator: chrome.navigator,
                                     kind: kind, isCompact: compact)
-        if let provider = chrome.app.ui.toolbar.get(item.id)?.compactStatus,
-           let content = provider(context) {
+        if let content = statusContent(item, context: context) {
             content
                 .nibCommand(chrome.app.ui.toolbar.get(item.id)?.command)
                 .font(NibFont.caption1)
@@ -375,6 +374,16 @@ struct NavBarView: View {
                 .clipped()
                 .disabled(!(chrome.app.ui.toolbar.get(item.id)?.isEnabled?(chrome.session) ?? true))
         }
+    }
+
+    private func statusContent(_ item: NavStatusItem, context: ChromeContext) -> AnyView? {
+        let content = chrome.app.ui.toolbar.get(item.id)?.compactStatus?(context)
+        #if DEBUG
+        if item.id == "bridgeui.status" {
+            NSLog("%@", "[Nib QA bridge] navigation status slot rebuilt returned=\(content == nil ? "nil" : "view")")
+        }
+        #endif
+        return content
     }
 
     @ViewBuilder
