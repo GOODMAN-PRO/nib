@@ -1004,9 +1004,16 @@ final class FeatCalendarTests: XCTestCase {
         store.notifier = notifier
         store.cache.store([soon], from: Date().addingTimeInterval(-3_600), to: Date().addingTimeInterval(Self.day), at: Date())
         h.app.settings.set(CalendarSettings.reminderMinutes, 30)
+        var reports = 0
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { _ in
+            reports += 1
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
         await store.rescheduleReminders()
         XCTAssertNotNil(store.reminderError)
         XCTAssertTrue(requests.pending[id] === original)
+        await store.rescheduleReminders()
+        XCTAssertEqual(reports, 1, "the lasting Retry banner does not need another identical toast on every refresh")
         notifier.status = .denied
         await store.rescheduleReminders()
         XCTAssertNil(store.reminderError, "a retry banner is not actionable without notification authorization")

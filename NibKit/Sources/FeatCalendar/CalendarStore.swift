@@ -1482,8 +1482,9 @@ final class CalendarStore: ObservableObject {
             try await notifier.replace(prefix: CalendarReminderNames.identifierPrefix, with: plan)
             reminderError = nil
         } catch {
-            reminderError = NibError.wrap(error).message
-            report(error, command: CalendarEvents.descriptor.id)
+            let message = NibError.wrap(error).message
+            if reminderError != message { report(error, command: CalendarEvents.descriptor.id) }
+            reminderError = message
         }
     }
 
