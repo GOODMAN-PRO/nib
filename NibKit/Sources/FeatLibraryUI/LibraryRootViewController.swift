@@ -848,7 +848,7 @@ struct LibraryRootView: View {
                             } else { model.setView(["panel": .string(place.id)]) }
                         } label: {
                             NibSidebarRow(place.title, symbol: place.symbol, count: model.sidebarCounts[place.id],
-                                          isSelected: place.collection.map { model.tab == nil && model.folder == nil && model.collection == $0 } ?? (model.tab?.id == place.id))
+                                          isSelected: place.collection.map { model.tab == nil && model.collection == $0 } ?? (model.tab?.id == place.id))
                         }
                         .accessibilityIdentifier("cmd.library.setView")
                         .libraryDropTarget(place.id == PanelIDs.trash ? "trash" : "card:tab:" + place.id)
@@ -952,9 +952,16 @@ struct LibraryRootView: View {
     }
     @ViewBuilder var parentNavigation: some View {
         if let parent = model.parentNavigation {
-            NibButton(parent.title, symbol: .back, kind: .plain, size: .compact) {
+            Button {
                 model.setView(["folder": .string(parent.ref)])
+            } label: {
+                Label { Text(parent.title) } icon: { Image(nib: .back) }
+                    .font(NibFont.button)
+                    .foregroundStyle(NibColor.accent)
+                    .frame(minHeight: NibMetrics.hitTarget, alignment: .leading)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .accessibilityIdentifier("cmd.library.setView")
             .accessibilityLabel(String(localized: "Back to \(parent.title)"))
             .libraryDropTarget("breadcrumb:" + parent.ref)
