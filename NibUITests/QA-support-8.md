@@ -194,3 +194,7 @@ D:keyboard-and-state#4 proves selectionCount changed 5->0 during chord focus pre
 ## C12 - nonwaiting zoom-box predicate
 
 D:keyboard-and-state#2 correction identifies the inner page waiter only on a transient miss in the final outer poll. Added boxRectNow for predicates: one page/box/probe read, nil when unavailable, no require/page/state waiting helper. The Option-Return predicate uses it; other boxRect calls keep readiness. CI must report the actual Option-Return timeout or pass, never interrupted waiter rawValue5. Return non-arrival remains owned by the separate key probe job.
+
+## C13 - observe library template sheet
+
+D:keyboard-and-state#6 confirms the visible Notebook Templates sheet while the library probe openPanels remains empty. Only the App Menu route now waits for Notebook Templates and Import Template UI; document shortcut probe checks remain. Expected ManageTemplatesShortcutAndAppMenuDisplayBuiltinAndCustomEntries reaches its Covers assertions. CI must show both title and action after the library route.

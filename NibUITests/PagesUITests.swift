@@ -498,7 +498,9 @@ final class PagesUITests: XCTestCase {
         try tap("Done")
         try ui.tapCommand("window.showLibrary")
         try tap("App Menu"); try tap("Manage Templates", prefix: true)
-        try ui.waitForState { $0.openPanels.contains("templateui.manage") }
+        try wait("Library must present Notebook Templates with Import Template") {
+            self.label("Notebook Templates").exists && self.button("Import Template").exists
+        }
         try require(button("Import Template"))
         try tap("Covers"); try require(button("No cover"))
     }
