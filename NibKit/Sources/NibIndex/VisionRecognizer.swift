@@ -138,6 +138,11 @@ final class VisionRecognizer: TextRecognizer {
             request.minimumTextHeight = Float(min(1.0 / 32, minimumTextPixels / Double(max(image.height, 1))))
             let handler = VNImageRequestHandler(cgImage: image, options: [:])
             try handler.perform([request])
+            #if DEBUG
+            let candidates = (request.results ?? []).flatMap { $0.topCandidates(3) }
+            let top = (request.results ?? []).prefix(5).compactMap { $0.topCandidates(1).first?.string }
+            NSLog("%@", String("[Nib QA recognize] bitmap=\(image.width)x\(image.height) observations=\(request.results?.count ?? 0) candidates=\(candidates.count) top=\(top)".prefix(890)))
+            #endif
             return request.results ?? []
         }
         do {

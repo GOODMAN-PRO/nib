@@ -313,6 +313,12 @@ final class EditHandwritingModel: ObservableObject {
     }
 
     private func handleTap(at point: Point, page: PageID, isDouble: Bool) {
+        #if DEBUG
+        let hitWord = layout.word(at: point, slop: max(4, 0.3 * layout.xHeight))
+        defer {
+            NSLog("%@", String("[Nib QA edit] point=\(point) isDouble=\(isDouble) hitWord=\(String(describing: hitWord)) selected=\(selectedWord) picking=\(picking) target=\(target != nil)".prefix(890)))
+        }
+        #endif
         guard let t = target else {
             if picking {
                 queuedTap = (point: point, page: page, isDouble: isDouble)
@@ -735,7 +741,12 @@ final class EditHandwritingTool: CanvasTool {
 
     private func deliverTap(_ sample: CanvasSample, host: CanvasHost) {
         let now = CACurrentMediaTime()
-        if let d = delivered, now - d.time < 0.05, d.point.distance(to: sample.location) < 1 { return }
+        if let d = delivered, now - d.time < 0.05, d.point.distance(to: sample.location) < 1 {
+            #if DEBUG
+            NSLog("%@", "[Nib QA edit] dedupe dropped point=\(sample.location) elapsed=\(now - d.time) threshold=0.05")
+            #endif
+            return
+        }
         delivered = (point: sample.location, time: now)
         editModel(host).tap(at: sample.location, page: sample.page, time: now)
     }
