@@ -1040,14 +1040,16 @@ final class FeatZoomWindowTests: XCTestCase {
             try await waitFor("Deliver the next replay tick during rendering") { deliveredTime == nextTime }
             renderer.release(index)
             try await waitFor("Display render \(index) even though a newer replay tick is pending") {
-                view.paper.image?.cgImage === frame
+                view.paper.image?.cgImage?.width == frame.width
             }
         }
         try await waitFor("The final dirty replay state must start rendering") { renderer.requests.count > 3 }
         let finalFrame = try XCTUnwrap(renderer.frame(at: 3))
         XCTAssertEqual(renderer.requests.last?.replay, h.session.replay)
         renderer.release(3)
-        try await waitFor("The final dirty replay state must also be displayed") { view.paper.image?.cgImage === finalFrame }
+        try await waitFor("The final dirty replay state must also be displayed") {
+            view.paper.image?.cgImage?.width == finalFrame.width
+        }
     }
 
     func testHidingPaneFinishesCaptureBeforeClearingWetInk() async throws {
@@ -1416,12 +1418,14 @@ private final class ReplayCadenceRenderer: PageRenderer {
     func release(_ index: Int) { _ = lock.withLock { released.insert(index) } }
 
     func render(_ request: RenderRequest) async throws -> RenderResult {
-        let image = FakeRenderer.blank(CGSize(width: 2, height: 2))
-        let index = lock.withLock {
+        // Each render has a unique width, which survives UIImage wrapping without relying on
+        // CGImage object identity. Allocate and publish it under the same lock as its index.
+        let (index, image) = lock.withLock {
             let index = started.count
+            let image = FakeRenderer.blank(CGSize(width: CGFloat(index + 2), height: 2))
             started.append(request)
             frames.append(image)
-            return index
+            return (index, image)
         }
         let deadline = Date().addingTimeInterval(3)
         while !lock.withLock({ released.contains(index) }) {

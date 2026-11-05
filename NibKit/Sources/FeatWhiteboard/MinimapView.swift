@@ -352,9 +352,9 @@ final class MinimapModel: ObservableObject {
         guard showsMap, let renderer = app.services.renderer, let board else { return }
         let world = geometry.world
         let scale = max(geometry.scale * Double(displayScale), 0.001)
-        // The overview is chrome, not a second sheet of paper. Render only board content so the
-        // shared Deep droplet remains visible in either appearance, including over white boards.
-        let request = RenderRequest(doc: doc, page: board, region: world, scale: scale, background: false, annotations: true)
+        // Preserve ink against its own paper, including templates and image backgrounds. The view
+        // clips this bitmap inside the glass rim; paper must never become the card's square backing.
+        let request = RenderRequest(doc: doc, page: board, region: world, scale: scale, background: true, annotations: true)
         renderTask = Task { @MainActor [weak self] in
             // Renders after the viewport or the content stops changing, never per frame.
             try? await Task.sleep(nanoseconds: 300_000_000)
@@ -663,8 +663,10 @@ struct MinimapMap: View {
             .droplet("whiteboard.minimap", style: .floatingPanel)
     }
 
-    /// Content fills the Deep surface edge to edge, with no paper fill or second rounded card.
-    private var overview: some View {
+    /// Paper belongs to the preview, inset from the Deep surface. Keep the existing world mapping
+    /// for the bitmap, viewport and gestures; only clip the padded world margin, never rescale ink.
+    /// Internal so hostless pixel tests can exercise the content without system glass compositing.
+    var overview: some View {
         let g = model.geometry
         return ZStack(alignment: .topLeading) {
             if let image = model.image, let world = model.imageWorld {
@@ -672,6 +674,11 @@ struct MinimapMap: View {
                 Image(decorative: image, scale: 1)
                     .resizable()
                     .frame(width: r.width, height: r.height)
+                    .mask {
+                        NibDropletShape(cornerRadius: NibRadius.concentric(
+                            NibRadius.panel, inset: NibSpacing.s))
+                            .padding(NibSpacing.s)
+                    }
                     .offset(x: r.minX, y: r.minY)
             } else {
                 Canvas { context, _ in

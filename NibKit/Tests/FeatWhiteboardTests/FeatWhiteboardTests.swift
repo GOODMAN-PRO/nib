@@ -12,18 +12,20 @@ private struct WhiteboardHitTarget: UIViewRepresentable {
     func updateUIView(_ view: UIButton, context: Context) {}
 }
 
-/// A renderer that runs `before` on every render, then fails or returns a blank image.
+/// A renderer that runs `before` on every render, then fails or returns a supplied (otherwise blank) image.
 private final class ScriptedRenderer: PageRenderer {
     var before: (@MainActor () async throws -> Void)?
     var fails = false
     var requests: [RenderRequest] = []
+    var draw: ((RenderRequest) -> CGImage)?
 
     func render(_ request: RenderRequest) async throws -> RenderResult {
         requests.append(request)
         if let before { try await before() }
         if fails { throw NibError(.internalError, "the test renderer fails") }
         let region = request.region ?? Rect(x: 0, y: 0, width: PageSize.a4.width, height: PageSize.a4.height)
-        return RenderResult(image: FakeRenderer.blank(CGSize(width: 12, height: 16)), region: region, scale: request.scale)
+        let image = draw?(request) ?? FakeRenderer.blank(CGSize(width: 12, height: 16))
+        return RenderResult(image: image, region: region, scale: request.scale)
     }
 
     func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { nil }
@@ -1349,7 +1351,7 @@ final class FeatWhiteboardTests: XCTestCase {
 
     // MARK: Minimap attachment
 
-    func testMinimapRendersContentWithoutPaintingPaperOverChrome() async throws {
+    func testMinimapRendersContentWithItsPaperForContrast() async throws {
         let h = harness(), renderer = ScriptedRenderer()
         h.app.services.renderer = renderer
         h.session.document = Fixtures.whiteboardID
@@ -1361,8 +1363,82 @@ final class FeatWhiteboardTests: XCTestCase {
         let request = try XCTUnwrap(renderer.requests.last)
         XCTAssertEqual(request.page, Fixtures.boardID)
         XCTAssertEqual(request.region, model.geometry.world)
-        XCTAssertFalse(request.background, "White paper must not obscure the dark Deep minimap surface")
+        XCTAssertTrue(request.background, "Preserve the paper, templates and image backgrounds beneath unchanged ink")
         XCTAssertTrue(request.annotations, "The overview still renders the board's content")
+    }
+
+    func testPopulatedMinimapPreservesInkContrastAndRoundedPaperInBothAppearances() async throws {
+        // Exercise the actual overview in a hostless image. Only the glass is replaced with its
+        // opaque chrome token: system optics must not decide whether ink keeps its paper contrast.
+        for size in [CGSize(width: 320, height: 480), CGSize(width: 480, height: 320)] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                let h = harness(), renderer = ScriptedRenderer()
+                let paper: UIColor = variant == .dark ? .white : .black
+                let ink: UIColor = variant == .dark ? .black : .white
+                renderer.draw = { request in
+                    let format = UIGraphicsImageRendererFormat()
+                    format.scale = 1
+                    format.opaque = false
+                    // A colour-preserving page renderer stand-in: paper is optional, ink is not.
+                    return UIGraphicsImageRenderer(size: CGSize(width: 200, height: 200), format: format).image { ctx in
+                        if request.background {
+                            paper.setFill()
+                            ctx.fill(CGRect(x: 0, y: 0, width: 200, height: 200))
+                        }
+                        ink.setStroke()
+                        ctx.cgContext.setLineWidth(8)
+                        ctx.cgContext.move(to: CGPoint(x: 40, y: 100))
+                        ctx.cgContext.addLine(to: CGPoint(x: 160, y: 100))
+                        ctx.cgContext.strokePath()
+                    }.cgImage!
+                }
+                h.app.services.renderer = renderer
+                h.session.document = Fixtures.whiteboardID
+                h.session.page = Fixtures.boardID
+                let model = MinimapModel(app: h.app, doc: Fixtures.whiteboardID, session: h.session)
+                model.reloadContent()
+                for _ in 0..<100 where model.image == nil { try await Task.sleep(nanoseconds: 20_000_000) }
+                XCTAssertNotNil(model.image)
+                let world = try XCTUnwrap(model.imageWorld)
+                let map = model.geometry.size
+                let origin = CGPoint(x: (size.width - map.width) / 2, y: (size.height - map.height) / 2)
+                let tile = model.geometry.map(world).offsetBy(dx: origin.x, dy: origin.y)
+                let view = modelOverview(model)
+                    .frame(width: size.width, height: size.height)
+                    .background(Color.white)
+                let image = try XCTUnwrap(NibSnapshot.image(view, size: size, variant: variant))
+                let empty = NibDropletShape(cornerRadius: DropletStyle.floatingPanel.cornerRadius)
+                    .fill(NibColor.backgroundSecondary)
+                    .frame(width: map.width, height: map.height)
+                    .frame(width: size.width, height: size.height)
+                    .background(Color.white)
+                let emptyImage = try XCTUnwrap(NibSnapshot.image(empty, size: size, variant: variant))
+                let strokePoint = CGPoint(x: tile.midX, y: tile.midY)
+                let paperPoint = CGPoint(x: tile.midX, y: tile.midY - tile.height / 4)
+                let rimPoint = CGPoint(x: tile.midX, y: tile.minY + 2)
+                // Inside the inset rectangle, but outside its rounded corner.
+                let cornerPoint = CGPoint(x: tile.minX + NibSpacing.s + 1, y: tile.minY + NibSpacing.s + 1)
+                let stroke = try XCTUnwrap(NibSnapshot.pixel(image, at: strokePoint))
+                let background = try XCTUnwrap(NibSnapshot.pixel(image, at: paperPoint))
+                let rim = try XCTUnwrap(NibSnapshot.pixel(image, at: rimPoint))
+                let corner = try XCTUnwrap(NibSnapshot.pixel(image, at: cornerPoint))
+                let emptyCorner = try XCTUnwrap(NibSnapshot.pixel(emptyImage, at: cornerPoint))
+                let geometry = "variant=\(variant), size=\(size), tile=\(tile)"
+                let samples = "stroke@\(strokePoint)=\(stroke), paper@\(paperPoint)=\(background)"
+                XCTAssertGreaterThan(abs(Int(stroke.r) - Int(background.r)), 160, "Readable ink: \(geometry); \(samples)")
+                XCTAssertEqual(Double(stroke.r), variant == .dark ? 0 : 255, accuracy: 8, "Original ink: \(samples)")
+                XCTAssertGreaterThan(abs(Int(background.r) - Int(rim.r)), 160,
+                                     "Paper stays inset: \(geometry); rim@\(rimPoint)=\(rim); \(samples)")
+                XCTAssertEqual(Double(corner.r), Double(emptyCorner.r), accuracy: 8,
+                               "No square paper corner: \(geometry); corner@\(cornerPoint)=\(corner), empty=\(emptyCorner)")
+            }
+        }
+    }
+
+    private func modelOverview(_ model: MinimapModel) -> some View {
+        MinimapMap(model: model).overview
+            .background(NibColor.backgroundSecondary,
+                        in: NibDropletShape(cornerRadius: DropletStyle.floatingPanel.cornerRadius))
     }
 
     func testMinimapUsesRoundedChromeInBothAppearancesAndOrientations() async throws {
@@ -1377,19 +1453,27 @@ final class FeatWhiteboardTests: XCTestCase {
                     .background(Color.white)
                 let captured = try await NibSnapshot.hostedImage(view, size: size, variant: variant)
                 let image = try XCTUnwrap(captured)
-                let centre = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: size.width / 2, y: size.height / 2)))
+                let map = model.geometry.size
+                let rect = CGRect(x: (size.width - map.width) / 2, y: (size.height - map.height) / 2,
+                                  width: map.width, height: map.height)
+                let centrePoint = CGPoint(x: rect.midX, y: rect.midY)
+                let centre = try XCTUnwrap(NibSnapshot.pixel(image, at: centrePoint))
+                let geometry = "card=\(rect), centre@\(centrePoint)=\(centre), variant=\(variant), size=\(size)"
                 let channels = [centre.r, centre.g, centre.b]
                 if variant == .dark {
-                    XCTAssertTrue(channels.allSatisfy { $0 < 128 }, "Dark minimap chrome over white paper: \(centre)")
+                    XCTAssertTrue(channels.allSatisfy { $0 < 128 }, "Dark minimap chrome over white paper: \(geometry)")
                 } else {
-                    XCTAssertTrue(channels.allSatisfy { $0 > 180 }, "Light minimap chrome: \(centre)")
+                    XCTAssertTrue(channels.allSatisfy { $0 > 128 }, "Light minimap chrome: \(geometry)")
                 }
-                let map = model.geometry.size
                 // Just outside the rounded corner but inside the former square backing rectangle.
-                let corner = CGPoint(x: (size.width - map.width) / 2 + 1, y: (size.height - map.height) / 2 + 1)
+                let corner = CGPoint(x: rect.minX + 1, y: rect.minY + 1)
+                let referencePoint = CGPoint(x: rect.minX - 20, y: rect.minY - 20)
                 let outside = try XCTUnwrap(NibSnapshot.pixel(image, at: corner))
-                XCTAssertTrue([outside.r, outside.g, outside.b].allSatisfy { $0 > 200 },
-                              "No square backdrop behind the rounded minimap: \(outside), \(variant), \(size)")
+                let reference = try XCTUnwrap(NibSnapshot.pixel(image, at: referencePoint))
+                let difference = zip([outside.r, outside.g, outside.b], [reference.r, reference.g, reference.b])
+                    .map { abs(Int($0.0) - Int($0.1)) }.max() ?? 255
+                XCTAssertLessThan(difference, 80,
+                                  "No square backdrop: \(geometry); corner@\(corner)=\(outside), reference@\(referencePoint)=\(reference)")
             }
         }
     }

@@ -2558,7 +2558,9 @@ final class FeatCanvasTests: XCTestCase {
                 try await Task.sleep(for: .milliseconds(20))
             }
             let frame = target.convert(target.bounds, to: error)
-            let geometry = "button=\(frame), error=\(error.bounds), host=\(error.hosting.view.frame)"
+            let fitted = error.hosting.sizeThatFits(in: CGSize(width: error.viewport.bounds.width,
+                                                             height: CGFloat.greatestFiniteMagnitude))
+            let geometry = "button=\(frame), error=\(error.bounds), host=\(error.hosting.view.frame), fitted=\(fitted)"
             let scrolling = "viewport=\(error.viewport.bounds), content=\(error.viewport.contentSize)"
             let insets = "adjusted=\(error.viewport.adjustedContentInset), safe=\(vc.view.safeAreaInsets), paper=\(visiblePaper)"
             XCTAssertTrue(error.bounds.insetBy(dx: -1, dy: -1).contains(frame),
