@@ -292,6 +292,18 @@ final class FeatTemplateUITests: XCTestCase {
         XCTAssertEqual(PDFDocument(data: try h.assets.data(asset, doc: Fixtures.docID))?.pageCount, 1)
     }
 
+    func testCustomSizeParsesLocalDecimalsAndRejectsPartialOrOutOfRangeInput() throws {
+        XCTAssertEqual(try TemplateSizing.parse(width: "595.5", height: "842", locale: Locale(identifier: "fr_FR")),
+                       PageSize(595.5, 842))
+        for (locale, width) in [("fr_FR", "595,5"), ("en_GB", "595.5")] {
+            let size = try TemplateSizing.parse(width: width, height: "842", locale: Locale(identifier: locale))
+            XCTAssertEqual(size, PageSize(595.5, 842))
+            for invalid in ["595junk", "35", "14401", "nan", "inf", "1,2,3", ""] {
+                XCTAssertThrowsError(try TemplateSizing.parse(width: invalid, height: "842", locale: Locale(identifier: locale)))
+            }
+        }
+    }
+
     func testPickerReturnsPinnedBackgroundSizeAndCancellation() async throws {
         let h = harness(); registerPaper(h)
         let picker = PickerStandIn()
