@@ -52,24 +52,30 @@ final class HandoffTestFixture {
 
 private struct ImportStepTimeout: Error {}
 
+/// Task callbacks share actor-isolated storage without mutating a captured local variable.
+@MainActor
+final class HandoffTestBox<Value> {
+    var value: Value?
+}
+
 extension XCTestCase {
     /// Unstructured task deliberately: a task group would wait forever for an unresumed continuation on exit.
     @MainActor
     func importStep<T>(_ description: String, file: StaticString = #filePath, line: UInt = #line,
                        operation: @escaping @MainActor () async throws -> T) async throws -> T {
         let completed = expectation(description: description)
-        var result: Result<T, Error>?
+        let result = HandoffTestBox<Result<T, Error>>()
         let task = Task { @MainActor in
-            do { result = .success(try await operation()) }
-            catch { result = .failure(error) }
+            do { result.value = .success(try await operation()) }
+            catch { result.value = .failure(error) }
             completed.fulfill()
         }
         defer { task.cancel() }
         await fulfillment(of: [completed], timeout: 2)
-        guard let result else {
+        guard let outcome = result.value else {
             XCTFail("Import step did not complete within 2 seconds: \(description)", file: file, line: line)
             throw ImportStepTimeout()
         }
-        return try result.get()
+        return try outcome.get()
     }
 }

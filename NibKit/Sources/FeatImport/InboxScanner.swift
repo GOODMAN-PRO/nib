@@ -159,6 +159,7 @@ enum ShareHandoff {
     static let nameType = "app.nib.share.name"
     static let dataType = "app.nib.share.data"
     static let inboxFolder = "Inbox"
+    static let defaultProviderTimeoutNanoseconds: UInt64 = 60_000_000_000
 
     @MainActor static var board: ShareHandoffBoard = SystemShareHandoffBoard()
     @MainActor private static var taking = false
@@ -193,7 +194,7 @@ enum ShareHandoff {
     /// Writes the waiting items into `dir` and clears them from the pasteboard. [] when they were just taken.
     /// Allow time for the person to answer iOS's paste permission prompt before timing out a provider.
     @MainActor
-    static func take(into dir: URL, timeoutNanoseconds: UInt64 = 60_000_000_000) async throws -> [URL] {
+    static func take(into dir: URL, timeoutNanoseconds: UInt64 = defaultProviderTimeoutNanoseconds) async throws -> [URL] {
         try Task.checkCancellation()
         // Deep link and activation scan can arrive together while the providers are still loading.
         guard !taking else { return [] }

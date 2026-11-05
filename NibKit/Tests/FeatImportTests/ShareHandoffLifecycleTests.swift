@@ -12,32 +12,25 @@ final class ShareHandoffLifecycleTests: XCTestCase {
         return dir
     }
 
-    func testDefaultDeadlineAllowsProviderToFinishAfterSlowPastePermissionResponse() async throws {
+    func testDefaultDeadlineAndDelayedProviderCompletion() async throws {
+        // Pin the permission budget without spending it in real time on every CI run.
+        XCTAssertEqual(ShareHandoff.defaultProviderTimeoutNanoseconds, 60_000_000_000)
         let fixture = HandoffTestFixture()
         defer { fixture.restore() }
         let dir = try directory()
         let bytes = Data("shared after permission".utf8)
         let provider = NSItemProvider()
         provider.registerDataRepresentation(forTypeIdentifier: ShareHandoff.dataType, visibility: .all) { completion in
-            // Model a person answering Allow Paste after the former five-second deadline.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { completion(bytes, nil) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { completion(bytes, nil) }
             return nil
         }
         fixture.board.providers = [provider]
-        let finished = expectation(description: "handoff completes after a slow paste permission response")
-        let task = Task { @MainActor in
-            defer { finished.fulfill() }
-            do {
-                let saved = try await ShareHandoff.take(into: dir)
-                XCTAssertEqual(saved.count, 1)
-                if let url = saved.first { XCTAssertEqual(try Data(contentsOf: url), bytes) }
-                XCTAssertFalse(ShareHandoff.isWaiting)
-            } catch {
-                XCTFail("A provider completing after six seconds must succeed: \(error)")
-            }
+        let saved = try await importStep("handoff completes after a delayed paste permission response") {
+            try await ShareHandoff.take(into: dir, timeoutNanoseconds: 1_000_000_000)
         }
-        defer { task.cancel() }
-        await fulfillment(of: [finished], timeout: 10)
+        XCTAssertEqual(saved.count, 1)
+        if let url = saved.first { XCTAssertEqual(try Data(contentsOf: url), bytes) }
+        XCTAssertFalse(ShareHandoff.isWaiting)
     }
 
     func testUnresponsiveDataOrNameProviderTimesOutWithoutConsumingAndCanRetry() async throws {
@@ -47,12 +40,12 @@ final class ShareHandoffLifecycleTests: XCTestCase {
             let dir = try directory()
             let provider = NSItemProvider()
             let loading = Progress(totalUnitCount: 1)
-            var late: ((Data?, Error?) -> Void)?
+            let late = HandoffTestBox<(Data?, Error?) -> Void>()
             for (type, data) in [ShareHandoff.dataType: Data("original".utf8),
                                  ShareHandoff.nameType: Data("shared.pdf".utf8)] {
                 provider.registerDataRepresentation(forTypeIdentifier: type, visibility: .all) { completion in
                     Task { @MainActor in
-                        if type == stalledType { late = completion }
+                        if type == stalledType { late.value = completion }
                         else { completion(data, nil) }
                     }
                     return type == stalledType ? loading : nil
@@ -67,7 +60,7 @@ final class ShareHandoffLifecycleTests: XCTestCase {
             } catch { XCTAssertEqual(NibError.wrap(error).code, .unavailable) }
             XCTAssertTrue(ShareHandoff.isWaiting)
             XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
-            late?(Data("late".utf8), nil)
+            late.value?(Data("late".utf8), nil)
             fixture.board.items = [[ShareHandoff.nameType: "shared.pdf", ShareHandoff.dataType: Data("original".utf8)]]
             let saved = try await importStep("retry after provider timeout releases handoff ownership") {
                 try await ShareHandoff.take(into: dir)
@@ -84,10 +77,10 @@ final class ShareHandoffLifecycleTests: XCTestCase {
         let dir = try directory()
         let started = expectation(description: "provider requested")
         let finished = expectation(description: "cancelled handoff returned")
-        var late: ((Data?, Error?) -> Void)?
+        let late = HandoffTestBox<(Data?, Error?) -> Void>()
         let provider = NSItemProvider()
         provider.registerDataRepresentation(forTypeIdentifier: ShareHandoff.dataType, visibility: .all) { completion in
-            Task { @MainActor in late = completion; started.fulfill() }
+            Task { @MainActor in late.value = completion; started.fulfill() }
             return Progress(totalUnitCount: 1)
         }
         fixture.board.providers = [provider]
@@ -108,7 +101,7 @@ final class ShareHandoffLifecycleTests: XCTestCase {
         await fulfillment(of: [finished], timeout: 2)
         XCTAssertTrue(ShareHandoff.isWaiting)
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
-        late?(Data("late".utf8), nil)
+        late.value?(Data("late".utf8), nil)
         fixture.board.items = [[ShareHandoff.nameType: "retry.pdf", ShareHandoff.dataType: Data("original".utf8)]]
         let saved = try await importStep("retry after cancellation completes") { try await ShareHandoff.take(into: dir) }
         XCTAssertEqual(saved.count, 1)
