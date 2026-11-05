@@ -713,7 +713,7 @@ struct CatalogScanner {
     let device: String
     /// The previous catalog, by path.
     let previous: [String: CatalogEntry]
-    /// Skip the root's `Inbox` (the library lives in the app's Documents folder).
+    /// The default root can contain the system hand-off inbox as well as older user folders named Inbox.
     let skipInbox: Bool
     /// Keep the previous entry of a package or folder whose files are unchanged (false = read everything again, as a
     /// repair does; `previous` still decides which path keeps an id claimed twice).
@@ -798,7 +798,8 @@ struct CatalogScanner {
             }
             let values = try? url.resourceValues(forKeys: Set(CatalogScanner.keys))
             guard values?.isDirectory == true else { continue }
-            if isRoot && skipInbox && name == LibraryLayout.inboxName { continue }
+            if isRoot && skipInbox && name == LibraryLayout.inboxName,
+               Self.isHandoffInbox(url) { continue }
             let ext = url.pathExtension.lowercased()
             if Self.isDocumentPackage(url) {
                 out.entries.append(document(url, path: path, parent: parent, values: values, legacy: ext != NibFormat.packageExtension,
@@ -807,6 +808,15 @@ struct CatalogScanner {
                 folder(url, path: path, parent: parent, values: values, inTrash: inTrash, trashTop: trashTop, into: &out)
             }
         }
+    }
+
+    /// createFolder writes a .nibfolder record; LocalDocumentStorage.prepare and
+    /// iOS Open In only create the directory and deposit incoming files/packages.
+    /// A record (even a damaged one) proves this is a user folder, not staging.
+    /// On a failed listing, keep it visible rather than hiding potentially owned data.
+    static func isHandoffInbox(_ url: URL) -> Bool {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: url.path) else { return false }
+        return !names.contains(where: LibraryLayout.isFolderFile)
     }
 
     /// Preserve recorded folders from older versions, while still listing damaged packages as documents.
