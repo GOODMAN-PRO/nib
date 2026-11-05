@@ -451,6 +451,9 @@ struct StudySessionView: View {
 
     private var grading: some View {
         VStack(spacing: NibSpacing.s) {
+            // Grading stays disabled until the answer is revealed. Keep the enabled next action visible
+            // beside those controls instead of making an unflipped card look like an inactive session.
+            flip
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: NibSpacing.l) { ForEach(StudyRating.allCases, id: \.self) { gradeButton($0) } }
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: NibSpacing.l) {
