@@ -335,6 +335,18 @@ final class ChromeUITests: XCTestCase {
     }
 
     // chrome.options; chrome.moreTools; chrome.scrubTools
+    private func assertToolSettings(_ expected: String?, obsolete label: String) throws {
+        try wait("Tool settings must match the current presentation") {
+            guard let snapshot = try? self.ui.probe.snapshot(), let value = snapshot.value as? String,
+                  let data = value.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let state = try? JSONDecoder().decode(QAState.self, from: data) else { return false }
+            if object.keys.contains("toolSettingsOpen") { return state.toolSettingsOpen == expected }
+            return !self.ui.app.scrollViews.matching(NSPredicate(format: "label == %@", label))
+                .allElementsBoundByIndex.contains { self.ui.hasVisibleFrame($0) && $0.isHittable }
+        }
+    }
+
     func testToolSettingsSwitchReplacesPopoverAndInkToolsActuallyDraw() throws {
         try open()
         for (tool, option) in [("pen", "Fountain Pen"), ("highlighter", "Straight line"), ("eraser", "Whole stroke")] {
@@ -346,9 +358,9 @@ final class ChromeUITests: XCTestCase {
         try settings("pen")
         try tap("tool.highlighter")
         _ = try ui.waitForState { $0.tool == "highlighter" }
-        XCTAssertFalse(query("Fountain Pen").firstMatch.exists, "Switching tools must dismiss the old settings popover")
+        try assertToolSettings(nil, obsolete: "Fountain Pen")
         try tap("menu.toolSettings"); _ = try require("Straight line")
-        XCTAssertFalse(query("Fountain Pen").firstMatch.exists)
+        try assertToolSettings("highlighter", obsolete: "Fountain Pen")
     }
 
     func testSelectedToolTapOpensSettingsAndChangesPenType() throws {

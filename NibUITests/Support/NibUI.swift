@@ -14,6 +14,7 @@ struct QAState: Decodable {
     let page: String?
     let pageCount: Int
     let tool: String
+    let toolSettingsOpen: String?
     let zoom: Double
     let contentOffset: Offset
     let itemCountOnPage: Int

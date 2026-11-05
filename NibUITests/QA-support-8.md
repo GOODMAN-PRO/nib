@@ -170,3 +170,7 @@ D:app-round-4#3 arithmetic proves (0.83,0.82) is inside the right-docked Fountai
 ## C6 - close settings before quick width
 
 D:controls-menus#5 proves Highlighter settings covers Thickness 2. PageScrollCollapsesOptionsAndChoosingToolRestoresThem now dismisses settings and waits until no visible Highlighter settings scroll view is hittable before the same quick-strip tap. Existing before/after overlap diagnostics and ink checks remain. CI must show closed settings and a successful Thickness 2 action.
+
+## C8 - retained tool settings assertions
+
+D:app-round-4#4 correction confirms settings=true->false before highlighter selection while the old Fountain Pen ScrollView remains retained. QAState decodes optional toolSettingsOpen. The switch test replaces its two impossible existence assertions with bounded presentation assertions: when the JSON key is present (including null), expect nil after switching and highlighter after reopening; older probes require no in-window hittable old-tool ScrollView. Existing Straight line readiness proves the new settings in fallback mode. This proves dismissal/replacement intent without requiring destruction of a retained AX node. CI with app round 5 must report exact probe values; absent-field runs remain compatible.
