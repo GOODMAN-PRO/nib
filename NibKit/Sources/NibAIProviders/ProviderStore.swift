@@ -147,14 +147,23 @@ final class ProviderStore: AIProviderStore {
             providerLog.error("delete ignored: \(error.description, privacy: .public)")
             return
         }
-        _ = secrets.set(nil, service: AIProviderConfig.keychainService, account: id.uuidString)
         guard let i = entries.firstIndex(where: { $0.config.id == id }) else { return }
+        let before = (entries, active)
         entries.remove(at: i)
         if active == id { active = entries.first?.config.id }
         do {
             try persist()
         } catch {
+            (entries, active) = before
             providerLog.error("delete not saved: \(NibError.wrap(error).description, privacy: .public)")
+            return
+        }
+        // The nonthrowing contract reports failure by retaining the entry. Do not remove its key
+        // until the list is durable; the settings command checks both stores before reporting success.
+        if !secrets.set(nil, service: AIProviderConfig.keychainService, account: id.uuidString) {
+            (entries, active) = before
+            do { try persist() }
+            catch { providerLog.error("delete rollback not saved: \(NibError.wrap(error).description, privacy: .public)") }
         }
     }
 

@@ -251,8 +251,7 @@ struct ProviderDelete: NibCommand {
         let store = try providerStore(ctx), id = try providerID(p.id)
         guard store.configs.contains(where: { $0.id == id }) else { throw NibError(.notFound, "AI provider not found.", hint: "call ai.provider.list") }
         if !ctx.dryRun {
-            // Contract gap: AIProviderStore.delete must throw on persistence failure; its
-            // current nonthrowing contract cannot guarantee deletion survives relaunch.
+            // The nonthrowing store retains the entry when deletion cannot be saved.
             store.delete(id)
             guard !store.configs.contains(where: { $0.id == id }) else { throw NibError.unavailable("The provider could not be deleted. Try again.") }
             guard Keychain.get(service: AIProviderConfig.keychainService, account: id.uuidString) == nil else {

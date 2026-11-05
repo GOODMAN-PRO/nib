@@ -53,6 +53,29 @@ final class NibAIProvidersTests: XCTestCase {
 
     // MARK: Store
 
+    func testFailedDeletePreservesProviderActiveIDAndKeyAndCanRetry() throws {
+        let url = tempFile()
+        let secrets = InMemorySecretStore()
+        let store = ProviderStore(fileURL: url, secrets: secrets)
+        let config = anthropicConfig()
+        try store.save(config, apiKey: "keep-this-key")
+        let saved = try Data(contentsOf: url)
+        // A directory at the file destination makes the atomic write fail deterministically.
+        try FileManager.default.removeItem(at: url)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+        store.delete(config.id)
+        XCTAssertEqual(store.configs.map(\.id), [config.id])
+        XCTAssertEqual(store.activeID, config.id)
+        XCTAssertEqual(secrets.get(service: AIProviderConfig.keychainService, account: config.keychainAccount), Data("keep-this-key".utf8))
+        try FileManager.default.removeItem(at: url)
+        try saved.write(to: url)
+        XCTAssertEqual(ProviderStore(fileURL: url, secrets: secrets).configs.map(\.id), [config.id])
+        store.delete(config.id)
+        XCTAssertTrue(store.configs.isEmpty)
+        XCTAssertTrue(ProviderStore(fileURL: url, secrets: secrets).configs.isEmpty)
+        XCTAssertNil(secrets.get(service: AIProviderConfig.keychainService, account: config.keychainAccount))
+    }
+
     func testStorePersistsConfigsButNeverKeys() throws {
         let url = tempFile()
         let secrets = InMemorySecretStore()
