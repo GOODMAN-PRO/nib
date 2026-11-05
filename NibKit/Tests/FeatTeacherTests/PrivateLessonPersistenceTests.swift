@@ -4,6 +4,94 @@ import NibContracts
 
 @MainActor
 final class PrivateLessonPersistenceTests: XCTestCase {
+    func testSavedPrivatePagesAreReleasedWithoutWorkspaceCloseOrFlush() async throws {
+        let base = LessonMetadataPersistence()
+        defer { try? FileManager.default.removeItem(at: base.memory.root) }
+        let store = PrivateLessonPersistence(base: base, root: base.memory.root.appendingPathComponent("private"))
+        for index in 0..<3 {
+            let doc = DocumentID("PRESENT_RELEASE\(index)")
+            let snapshot = largeSnapshot(doc)
+            try store.seed(snapshot)
+            XCTAssertEqual(store.retainedPageCount, 0, "seed must not cache a whole notebook")
+            let page = try XCTUnwrap(snapshot.content.pages.first?.id)
+            let note = Item.makeText(TextBoxItem(frame: Frame(x: 0, y: 0, w: 100, h: 30),
+                                                text: RichText(plain: "Private annotation")))
+            store.didChange(doc, head: nil, pages: [page: [note]])
+            // Ordinary UI tab closure does not flush/close Workspace. The writer releases on completion itself.
+            for _ in 0..<200 where store.retainedPageCount != 0 {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertEqual(store.retainedPageCount, 0)
+            XCTAssertEqual(try store.loadItems(doc, page: page), [note])
+            XCTAssertEqual(store.retainedPageCount, 0, "reads must not install a permanent payload cache")
+            let fresh = PrivateLessonPersistence(base: base, root: store.root)
+            XCTAssertEqual(try fresh.loadItems(doc, page: page), [note])
+        }
+    }
+
+    func testSlowSharedWriterCoalescesPagesAndFlushPreservesOtherDocuments() async throws {
+        let base = LessonMetadataPersistence()
+        defer { try? FileManager.default.removeItem(at: base.memory.root) }
+        let started = expectation(description: "first document save blocked")
+        let gate = CoalescingPrivateWriter(started: started)
+        defer { gate.release() }
+        let store = PrivateLessonPersistence(base: base, root: base.memory.root.appendingPathComponent("private"),
+                                             write: { try gate.write($0, to: $1) })
+        let a = largeSnapshot("PRESENT_BLOCKED"), b = largeSnapshot("PRESENT_BURST")
+        try store.seed(a)
+        try store.seed(b)
+        let filesBefore = try Set(FileManager.default.contentsOfDirectory(atPath: store.package(b.content.meta.id).path))
+        let page = try XCTUnwrap(b.content.pages.first?.id)
+        var headA = a.content
+        headA.meta.layers[0].name = "Blocked"
+        store.didChange(a.content.meta.id, head: headA, pages: [:])
+        await fulfillment(of: [started], timeout: 1)
+        var latest = try XCTUnwrap(b.items[page]?.first)
+        for index in 0..<100 {
+            latest.text?.text = RichText(plain: "Edit \(index)")
+            store.didChange(b.content.meta.id, head: nil, pages: [page: [latest]])
+        }
+        XCTAssertEqual(store.retainedPageCount, 1, "one dirty page, not 100 notebook versions")
+        // A later update for the blocked document also belongs before this flush barrier.
+        headA.meta.layers[0].name = "Latest A"
+        store.didChange(a.content.meta.id, head: headA, pages: [:])
+        gate.release()
+        store.flush(b.content.meta.id)
+        XCTAssertEqual(store.retainedPageCount, 0)
+        XCTAssertEqual(gate.savedPages(for: b.content.meta.id), [500, 1])
+        XCTAssertEqual(gate.savedDocuments, [a.content.meta.id, b.content.meta.id,
+                                             a.content.meta.id, b.content.meta.id, a.content.meta.id])
+        let filesAfter = try Set(FileManager.default.contentsOfDirectory(atPath: store.package(b.content.meta.id).path))
+        XCTAssertEqual(filesBefore.intersection(filesAfter).filter { $0.hasPrefix("page-") }.count, 499)
+        let fresh = PrivateLessonPersistence(base: base, root: store.root)
+        XCTAssertEqual(try fresh.loadItems(b.content.meta.id, page: page), [latest])
+        XCTAssertEqual(try fresh.loadHead(a.content.meta.id), headA)
+    }
+
+    func testLegacySnapshotMigratesWithoutRewritingUnchangedPagesAgain() throws {
+        let base = LessonMetadataPersistence()
+        defer { try? FileManager.default.removeItem(at: base.memory.root) }
+        let store = PrivateLessonPersistence(base: base, root: base.memory.root.appendingPathComponent("private"))
+        let original = largeSnapshot("PRESENT_LEGACY")
+        try FileManager.default.createDirectory(at: store.package(original.content.meta.id), withIntermediateDirectories: true)
+        let url = store.package(original.content.meta.id).appendingPathComponent("presentation.json")
+        try JSONEncoder().encode(original).write(to: url, options: .atomic)
+        let first = original.content.pages[0].id, last = original.content.pages[499].id
+        store.didChange(original.content.meta.id, head: nil, pages: [first: []])
+        store.flush(original.content.meta.id)
+        let fresh = PrivateLessonPersistence(base: base, root: store.root)
+        XCTAssertEqual(try fresh.loadItems(original.content.meta.id, page: first), [])
+        XCTAssertEqual(try fresh.loadItems(original.content.meta.id, page: last), original.items[last])
+        XCTAssertEqual(store.retainedPageCount, 0)
+    }
+
+    private func largeSnapshot(_ doc: DocumentID) -> LessonSnapshot {
+        let pages = (0..<500).map { PageRecord(id: PageID("PRIVATEPAGE\($0)"), order: "V", size: .a4) }
+        let item = Item.makeText(TextBoxItem(frame: Frame(x: 0, y: 0, w: 100, h: 30), text: RichText(plain: "Original")))
+        return LessonSnapshot(content: DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook), pages: pages),
+                              items: Dictionary(uniqueKeysWithValues: pages.map { ($0.id, [item]) }))
+    }
+
     func testOrdinaryDocumentMetadataProbesForwardWithoutLoadingPayloads() throws {
         let base = LessonMetadataPersistence()
         let wrapper = PrivateLessonPersistence(base: base, root: base.memory.root)
@@ -24,7 +112,7 @@ final class PrivateLessonPersistenceTests: XCTestCase {
         let base = LessonMetadataPersistence()
         let root = base.memory.root.appendingPathComponent("private")
         defer { try? FileManager.default.removeItem(at: base.memory.root) }
-        let wrapper = PrivateLessonPersistence(base: base, root: root, write: { _, _ in })
+        let wrapper = PrivateLessonPersistence(base: base, root: root)
         let doc: DocumentID = "PRESENT_TEST01", page: PageID = "PRIVATEPAGE01"
         var head = DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook),
                                    pages: [PageRecord(id: page, order: "V", size: .a4)])
@@ -103,4 +191,31 @@ private final class LessonMetadataPersistence: DocumentPersistence {
     func flush(_ doc: DocumentID) {}
     func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try memory.fileURL(doc, relativePath: relativePath) }
     func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { nil }
+}
+
+private final class CoalescingPrivateWriter {
+    private let started: XCTestExpectation
+    private let gate = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var saves: [(DocumentID, Int)] = []
+    init(started: XCTestExpectation) { self.started = started }
+    func release() { gate.signal() }
+    var savedDocuments: [DocumentID] {
+        lock.lock(); defer { lock.unlock() }
+        return saves.map { $0.0 }
+    }
+    func savedPages(for doc: DocumentID) -> [Int] {
+        lock.lock(); defer { lock.unlock() }
+        return saves.filter { $0.0 == doc }.map { $0.1 }
+    }
+    func write(_ snapshot: LessonSnapshot, to url: URL) throws {
+        if snapshot.content.meta.layers[0].name == "Blocked" {
+            started.fulfill()
+            guard gate.wait(timeout: .now() + 3) == .success else {
+                throw NibError.unavailable("private writer gate timed out")
+            }
+        }
+        try PrivateLessonFiles.write(snapshot, to: url)
+        lock.lock(); saves.append((snapshot.content.meta.id, snapshot.items.count)); lock.unlock()
+    }
 }

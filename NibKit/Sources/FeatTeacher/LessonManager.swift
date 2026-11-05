@@ -195,9 +195,87 @@ private struct PrivateLessonStatusBatch {
     let changes: [(DocumentID, String?)]
 }
 
-/// Accessed only on the persistence writer queue. A failed write never consumes its snapshot.
+/// Immutable page files plus an atomically replaced manifest: a failed save leaves the previous version readable.
+/// Old presentation.json snapshots are migrated on the first successful write, without discarding annotations.
+enum PrivateLessonFiles {
+    private static let manifestLock = NSLock()
+    private static func reading<T>(_ body: () throws -> T) rethrows -> T {
+        manifestLock.lock(); defer { manifestLock.unlock() }
+        return try body()
+    }
+    private struct Manifest: Codable {
+        var content: DocumentContent
+        var pageFiles: [PageID: String]
+    }
+
+    static func write(_ snapshot: LessonSnapshot, to url: URL) throws {
+        let folder = url.deletingLastPathComponent()
+        var files: [PageID: String] = [:]
+        var pages = snapshot.items
+        if FileManager.default.fileExists(atPath: url.path) {
+            let data = try Data(contentsOf: url)
+            if let old = try? JSONDecoder().decode(Manifest.self, from: data) {
+                files = old.pageFiles
+            } else {
+                let old = try JSONDecoder().decode(LessonSnapshot.self, from: data)
+                pages = old.items.merging(pages) { _, new in new }
+            }
+        }
+        let previous = Set(files.values)
+        let valid = Set(snapshot.content.pages.map(\.id))
+        files = files.filter { valid.contains($0.key) }
+        var created: [URL] = []
+        do {
+            for (page, items) in pages where valid.contains(page) {
+                let name = "page-" + UUID().uuidString + ".json"
+                let file = folder.appendingPathComponent(name)
+                try JSONEncoder().encode(items).write(to: file, options: .atomic)
+                created.append(file)
+                files[page] = name
+            }
+            let manifest = Manifest(content: snapshot.content, pageFiles: files)
+            let data = try JSONEncoder().encode(manifest)
+            try reading {
+                try data.write(to: url, options: .atomic)
+            }
+        } catch {
+            for file in created { try? FileManager.default.removeItem(at: file) }
+            throw error
+        }
+        // Taking the manifest lock waited for old readers to finish. New readers only see the new files.
+        for name in previous.subtracting(Set(files.values)) {
+            try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
+        }
+    }
+
+    static func head(at url: URL) throws -> DocumentContent {
+        try reading {
+            let data = try Data(contentsOf: url)
+            if let manifest = try? JSONDecoder().decode(Manifest.self, from: data) { return manifest.content }
+            return try JSONDecoder().decode(LessonSnapshot.self, from: data).content
+        }
+    }
+
+    static func items(_ page: PageID, at url: URL) throws -> [Item] {
+        try reading {
+            let data = try Data(contentsOf: url)
+            if let manifest = try? JSONDecoder().decode(Manifest.self, from: data) {
+                guard let name = manifest.pageFiles[page] else { return [] }
+                return try JSONDecoder().decode([Item].self,
+                    from: Data(contentsOf: url.deletingLastPathComponent().appendingPathComponent(name)))
+            }
+            return try JSONDecoder().decode(LessonSnapshot.self, from: data).items[page] ?? []
+        }
+    }
+}
+
+/// The mailbox retains only dirty pages: at most one pending version and one in-flight version per page.
+/// The serial writer owns status; the lock lets main enqueue/read without waiting for unrelated disk writes.
 private final class PrivateLessonWrites {
-    var pending: [DocumentID: LessonSnapshot] = [:]
+    private let lock = NSRecursiveLock()
+    private var pending: [DocumentID: LessonSnapshot] = [:]
+    private var inFlight: [DocumentID: LessonSnapshot] = [:]
+    private var scheduled: Set<DocumentID> = []
     var errors: [DocumentID: String] = [:]
     var statusChanges: [(DocumentID, String?)] = []
     private var reportedErrors: [DocumentID: String] = [:]
@@ -205,13 +283,52 @@ private final class PrivateLessonWrites {
     var undeliveredStatus: [PrivateLessonStatusBatch] = []
     let write: (LessonSnapshot, URL) throws -> Void
     init(write: @escaping (LessonSnapshot, URL) throws -> Void) { self.write = write }
+
+    func locked<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock(); defer { lock.unlock() }
+        return try body()
+    }
+    private func merged(_ older: LessonSnapshot?, _ newer: LessonSnapshot) -> LessonSnapshot {
+        LessonSnapshot(content: newer.content, items: (older?.items ?? [:]).merging(newer.items) { _, new in new })
+    }
+    func snapshot(_ doc: DocumentID) -> LessonSnapshot? {
+        locked {
+            guard let next = pending[doc] else { return inFlight[doc] }
+            return merged(inFlight[doc], next)
+        }
+    }
+    var retainedPageCount: Int {
+        locked { (Array(pending.values) + Array(inFlight.values)).reduce(0) { $0 + $1.items.count } }
+    }
+    func enqueue(_ snapshot: LessonSnapshot) -> Bool {
+        locked {
+            let doc = snapshot.content.meta.id
+            pending[doc] = merged(pending[doc], snapshot)
+            return scheduled.insert(doc).inserted
+        }
+    }
+    func clear(_ doc: DocumentID) {
+        locked { pending[doc] = nil; inFlight[doc] = nil; scheduled.remove(doc) }
+    }
     func retry(_ doc: DocumentID, at url: URL) {
-        guard let snapshot = pending[doc] else { return }
+        let value: LessonSnapshot? = locked {
+            scheduled.remove(doc)
+            let value = pending.removeValue(forKey: doc)
+            inFlight[doc] = value
+            return value
+        }
+        guard let value else { return }
         do {
-            try write(snapshot, url)
-            pending[doc] = nil
+            try write(value, url)
+            locked { inFlight[doc] = nil }
             errors[doc] = nil
-        } catch { errors[doc] = error.localizedDescription }
+        } catch {
+            locked {
+                pending[doc] = pending[doc].map { merged(value, $0) } ?? value
+                inFlight[doc] = nil
+            }
+            errors[doc] = error.localizedDescription
+        }
         recordStatus(doc, error: errors[doc])
     }
     func recordStatus(_ doc: DocumentID, error: String?) {
@@ -236,10 +353,8 @@ private final class PrivateLessonWrites {
 final class PrivateLessonPersistence: DocumentPersistence {
     let base: DocumentPersistence
     let root: URL
-    private var cache: [DocumentID: LessonSnapshot] = [:] {
-        didSet { snapshotGeneration &+= 1 }
-    }
-    private var snapshotGeneration: UInt64 = 0
+    // Metadata tokens only; saved heads and page payloads belong to the workspace, not this wrapper.
+    private var generations: [DocumentID: UInt64] = [:]
     private let writer = DispatchQueue(label: "app.nib.teacherlessons.private")
     private let log = Logger(subsystem: "app.nib", category: "teacherlessons")
 
@@ -250,12 +365,13 @@ final class PrivateLessonPersistence: DocumentPersistence {
 
     init(base: DocumentPersistence, root: URL,
          write: @escaping (LessonSnapshot, URL) throws -> Void = { snapshot, url in
-             try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+             try PrivateLessonFiles.write(snapshot, to: url)
          }, report: @escaping (DocumentID, String?) -> Void = { _, _ in }) {
         self.base = base; self.root = root
         self.writes = PrivateLessonWrites(write: write); self.report = report
     }
-    func pendingSnapshot(_ doc: DocumentID) -> LessonSnapshot? { writer.sync { writes.pending[doc] } }
+    func pendingSnapshot(_ doc: DocumentID) -> LessonSnapshot? { writes.snapshot(doc) }
+    var retainedPageCount: Int { writes.retainedPageCount }
     func saveError(_ doc: DocumentID) -> String? { writer.sync { writes.errors[doc] } }
     private func reportStatus() {
         let batches = writer.sync {
@@ -290,56 +406,62 @@ final class PrivateLessonPersistence: DocumentPersistence {
         try FileManager.default.createDirectory(at: package(doc), withIntermediateDirectories: true)
         let url = package(doc).appendingPathComponent("presentation.json")
         try writer.sync {
-            try writes.write(snapshot, url)
-            writes.pending[doc] = nil
+            var complete = snapshot
+            for page in snapshot.content.pages where complete.items[page.id] == nil { complete.items[page.id] = [] }
+            try writes.write(complete, url)
+            writes.clear(doc)
             writes.errors[doc] = nil
             writes.recordStatus(doc, error: nil)
         }
-        cache[doc] = snapshot
+        generations[doc, default: 0] &+= 1
         reportStatus()
     }
-    private func snapshot(_ doc: DocumentID) throws -> LessonSnapshot {
-        if let value = cache[doc] { return value }
-        writer.sync {}
-        let url = package(doc).appendingPathComponent("presentation.json")
-        guard FileManager.default.fileExists(atPath: url.path) else { throw NibError.notFound("private presentation \(doc.raw)") }
-        let value = try JSONDecoder().decode(LessonSnapshot.self, from: Data(contentsOf: url))
-        cache[doc] = value
-        return value
+    private func head(_ doc: DocumentID) throws -> DocumentContent {
+        try writes.locked {
+            if let value = writes.snapshot(doc) { return value.content }
+            let url = package(doc).appendingPathComponent("presentation.json")
+            guard FileManager.default.fileExists(atPath: url.path) else { throw NibError.notFound("private presentation \(doc.raw)") }
+            let content = try PrivateLessonFiles.head(at: url)
+            if generations[doc] == nil { generations[doc] = 0 }
+            return content
+        }
     }
     func loadHead(_ doc: DocumentID) throws -> DocumentContent {
-        if LessonManager.isPrivate(doc) { return try snapshot(doc).content }
+        if LessonManager.isPrivate(doc) { return try head(doc) }
         return try base.loadHead(doc)
     }
     func peekHead(_ doc: DocumentID) throws -> DocumentContent {
-        if LessonManager.isPrivate(doc) { return try snapshot(doc).content }
+        if LessonManager.isPrivate(doc) { return try head(doc) }
         return try base.peekHead(doc)
     }
     func headReadStamp(_ doc: DocumentID) -> String? {
         guard LessonManager.isPrivate(doc) else { return base.headReadStamp(doc) }
-        // Until the snapshot is loaded there is no cheap token. Once loaded, this instance owns its
-        // authoritative value, including unsaved edits; seed and didChange both advance the generation.
-        return cache[doc] == nil ? nil : String(snapshotGeneration)
+        return generations[doc].map { String($0) }
     }
     func contentFingerprint(_ doc: DocumentID, page: PageID) -> String? {
         guard LessonManager.isPrivate(doc) else { return base.contentFingerprint(doc, page: page) }
-        guard let value = try? snapshot(doc) else { return nil }
-        return LWW.fingerprint(value.items[page] ?? [])
+        guard let items = try? loadItems(doc, page: page) else { return nil }
+        return LWW.fingerprint(items)
     }
     func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
-        if LessonManager.isPrivate(doc) { return try snapshot(doc).items[page] ?? [] }
+        if LessonManager.isPrivate(doc) {
+            return try writes.locked {
+                if let items = writes.snapshot(doc)?.items[page] { return items }
+                return try PrivateLessonFiles.items(page, at: package(doc).appendingPathComponent("presentation.json"))
+            }
+        }
         return try base.loadItems(doc, page: page)
     }
     func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
         guard LessonManager.isPrivate(doc) else { base.didChange(doc, head: head, pages: pages); return }
         do {
-            var value = try snapshot(doc)
-            if let head { value.content = head }
-            for (page, items) in pages { value.items[page] = items }
-            cache[doc] = value
+            // Read only the head, even for a page-only edit; unchanged pages never enter the queue.
+            let content = try head ?? self.head(doc)
+            let value = LessonSnapshot(content: content, items: pages)
+            generations[doc, default: 0] &+= 1
             let url = package(doc).appendingPathComponent("presentation.json"), writes = self.writes
+            guard writes.enqueue(value) else { return }
             writer.async { [weak self] in
-                writes.pending[doc] = value
                 writes.retry(doc, at: url)
                 if writes.drainStatus() != nil {
                     let batches = writes.undeliveredStatus
@@ -361,7 +483,7 @@ final class PrivateLessonPersistence: DocumentPersistence {
         let url = package(doc).appendingPathComponent("presentation.json")
         writer.sync { writes.retry(doc, at: url) }
         reportStatus()
-        // A user retry (including tab close) must receive a synchronous failure even
+        // An explicit flush retry must receive a synchronous failure even
         // when background saves have already reported this same error.
         if let error = saveError(doc), error == previouslyReported { report(doc, error) }
     }
@@ -374,11 +496,11 @@ final class PrivateLessonPersistence: DocumentPersistence {
     }
     func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { LessonManager.isPrivate(doc) ? nil : try base.remoteChanges(doc) }
     func isReadOnly(_ doc: DocumentID) -> Bool {
-        if LessonManager.isPrivate(doc) { return (try? snapshot(doc).content.meta.ext?[LessonManager.returnReadOnlyKey]?.boolValue) == true }
+        if LessonManager.isPrivate(doc) { return (try? head(doc).meta.ext?[LessonManager.returnReadOnlyKey]?.boolValue) == true }
         return base.isReadOnly(doc)
     }
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
-        if LessonManager.isPrivate(doc) { return (try? snapshot(doc).items[page]?.map(\.rev).max()) ?? nil }
+        if LessonManager.isPrivate(doc) { return (try? loadItems(doc, page: page).map(\.rev).max()) ?? nil }
         return base.contentRevision(doc, page: page)
     }
 }
