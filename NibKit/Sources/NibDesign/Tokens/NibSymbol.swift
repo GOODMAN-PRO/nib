@@ -25,7 +25,9 @@ public struct NibSymbol: Hashable, Sendable {
 
     // Tools
     public static let pen = NibSymbol("pencil.tip")
-    public static let fountainPen = NibSymbol("fountainpen.tip")
+    /// The nib: SF Symbols has no fountain pen of its own.
+    public static let fountainPen = NibSymbol("pencil.tip")
+    public static let ballPen = NibSymbol("pencil.line")
     public static let brushPen = NibSymbol("paintbrush.pointed")
     public static let pencil = NibSymbol("pencil")
     public static let highlighter = NibSymbol("highlighter")
@@ -236,7 +238,7 @@ public struct NibSymbol: Hashable, Sendable {
 
     /// Every token, for the gallery and the test that each name resolves on this OS.
     static let all: [NibSymbol] = [
-        pen, fountainPen, brushPen, pencil, highlighter, eraser, eraserFilter, lasso, lassoRectangle, shapes, connectors, tape, text, pageTyping,
+        pen, fountainPen, ballPen, brushPen, pencil, highlighter, eraser, eraserFilter, lasso, lassoRectangle, shapes, connectors, tape, text, pageTyping,
         image, camera, scan, elements, sticky, comment, laser, zoomWindow, ruler, fingerDrawing, more, moreCircle,
         back, forward, chevronDown, undo, redo, search, clearText, bookmark, bookmarkFill, share, importFile, pages,
         outline, addPage, assistant, assistantOpen, record, microphone, stop, play, pause, present, externalDisplay,
