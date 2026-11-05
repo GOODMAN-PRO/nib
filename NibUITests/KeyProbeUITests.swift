@@ -16,8 +16,10 @@ final class KeyProbeUITests: XCTestCase {
     }
 
     private enum Route: String, CaseIterable {
-        case one = "1", two = "2", three = "3", app = "app.typeKey", field = "field.typeKey"
-        static let canvas: [Route] = [.one, .two, .three, .app]
+        case one = "1", two = "2", three = "3", app = "app.typeKey", field = "field.typeKey", hid = "hid"
+        // Run 41986732631: route 2 does not exist in this XCTest and route 3 delivers nothing, not even "a".
+        static let canvas: [Route] = [.one, .app, .hid]
+        static let text: [Route] = [.hid, .one, .app, .field]
     }
 
     private enum ProbeError: Error {
@@ -45,22 +47,25 @@ final class KeyProbeUITests: XCTestCase {
         let primed = waitForState { $0.keyLogTotal > initial.keyLogTotal }
         log("prime", "error=\(quoted(primeError ?? "nil")) delivered=\(primed) \(delta(initial, try state()))")
 
-        let keys: [(String, [String])] = [
+        // The last element is the keyboard-page HID usage of the key, for the device-event route.
+        let keys: [(String, [String], UInt)] = [
             // Establish the final assertion before an odd special key can move focus or consume the budget.
-            ("a", ["a"]),
-            ("Escape", [XCUIKeyboardKey.escape.rawValue, "\u{1B}"]),
-            ("Delete", [XCUIKeyboardKey.delete.rawValue, "\u{8}", "\u{7F}"]),
-            ("ForwardDelete", [XCUIKeyboardKey.forwardDelete.rawValue]),
-            ("Return", [XCUIKeyboardKey.return.rawValue, "\r", "\n"]),
-            ("Enter", [XCUIKeyboardKey.enter.rawValue, "\u{3}"]),
-            ("Tab", [XCUIKeyboardKey.tab.rawValue])
+            ("a", ["a"], 0x04),
+            ("Escape", [XCUIKeyboardKey.escape.rawValue, "\u{1B}"], 0x29),
+            ("Delete", [XCUIKeyboardKey.delete.rawValue, "\u{8}", "\u{7F}"], 0x2A),
+            ("ForwardDelete", [XCUIKeyboardKey.forwardDelete.rawValue], 0x4C),
+            ("Return", [XCUIKeyboardKey.return.rawValue, "\r", "\n"], 0x28),
+            ("Enter", [XCUIKeyboardKey.enter.rawValue, "\u{3}"], 0x58),
+            ("Tab", [XCUIKeyboardKey.tab.rawValue], 0x2B)
         ]
         var controlDelivered = false
         var firstEscape: (String, Route)?
-        canvasMatrix: for (name, candidates) in keys {
+        canvasMatrix: for (name, candidates, usage) in keys {
             var seen = Set<String>()
             for key in candidates where seen.insert(key).inserted {
                 for route in Route.canvas {
+                    // The device-event route ignores the string: sample it once per key.
+                    if route == .hid, key != candidates[0] { continue }
                     guard hasBudget(until: canvasDeadline, context: "canvas", reserve: 6) else { break canvasMatrix }
                     guard waitForState({ $0.keyResponderIsText == false && $0.openPanels.isEmpty }, timeout: 1) else {
                         let current = try? state()
@@ -71,7 +76,7 @@ final class KeyProbeUITests: XCTestCase {
                         continue
                     }
                     let before = try state()
-                    let error = send(key, route: route)
+                    let error = send(key, route: route, usage: usage)
                     _ = waitForState({ $0.keyLogTotal > before.keyLogTotal }, timeout: 1)
                     let after = try state()
                     let delivered = after.keyLogTotal > before.keyLogTotal
@@ -88,8 +93,8 @@ final class KeyProbeUITests: XCTestCase {
             let selectError = send("a", modifiers: .command)
             let selected = waitForState { $0.selectionCount > 0 && $0.keyResponderIsText == false }
             let beforeEscape = try state()
-            let (escapeKey, escapeRoute): (String, Route) = firstEscape ?? (XCUIKeyboardKey.escape.rawValue, Route.one)
-            let escapeError = send(escapeKey, route: escapeRoute)
+            let (escapeKey, escapeRoute): (String, Route) = firstEscape ?? (XCUIKeyboardKey.escape.rawValue, Route.hid)
+            let escapeError = send(escapeKey, route: escapeRoute, usage: 0x29)
             let cleared = waitForState { $0.selectionCount == 0 }
             let afterEscape = try state()
             log("effect", ["context=canvas key=Escape scalars=\(scalars(escapeKey)) route=\(escapeRoute.rawValue) ",
@@ -100,10 +105,12 @@ final class KeyProbeUITests: XCTestCase {
 
         // Canonical encodings once per route in native input. Return needs a valid page: "12" is out of range
         // in the four-page fixture, so it cannot be used to infer whether submission closes the panel.
-        textMatrix: for (name, key) in [("Delete", XCUIKeyboardKey.delete.rawValue),
-                            ("Return", XCUIKeyboardKey.return.rawValue),
-                            ("Escape", XCUIKeyboardKey.escape.rawValue)] {
-            for route in Route.allCases {
+        // Return is sent as a line feed here: run 41986732631 showed that only "\n" produces the Return key.
+        let textKeys: [(String, String, UInt)] = [("Delete", XCUIKeyboardKey.delete.rawValue, 0x2A),
+                                                  ("Return", "\n", 0x28),
+                                                  ("Escape", XCUIKeyboardKey.escape.rawValue, 0x29)]
+        textMatrix: for (name, key, usage) in textKeys {
+            for route in Route.text {
                 guard hasBudget(until: matrixDeadline, context: "text", reserve: 20) else { break textMatrix }
                 let field: XCUIElement
                 do {
@@ -125,7 +132,7 @@ final class KeyProbeUITests: XCTestCase {
                 guard hasBudget(until: matrixDeadline, context: "text.send", reserve: 5) else { break textMatrix }
                 let beforeValue = fieldValue(field)
                 let before = try state()
-                let error = send(key, route: route, field: field)
+                let error = send(key, route: route, field: field, usage: usage)
                 // Wait for the actual effect even if key logging happened first. A text-input edit can be
                 // delivered with no UIPress, and Return/Escape can close the panel with no logged key.
                 let effect = waitUntil({
@@ -178,7 +185,21 @@ final class KeyProbeUITests: XCTestCase {
 
     /// nil route uses the unmodified existing helper (priming and setup chords only).
     private func send(_ key: String, route: Route? = nil, modifiers: XCUIElement.KeyModifierFlags = [],
-                      field: XCUIElement? = nil) -> String? {
+                      field: XCUIElement? = nil, usage: UInt? = nil) -> String? {
+        if route == .hid {
+            guard let usage else { return "hid route has no usage" }
+            let performed = XCTestExpectation(description: "Key probe device event performed")
+            var deviceFailure: Error?
+            // Keyboard/keypad usage page 0x07; the helper presses, holds for the duration and releases.
+            NibTouchPaths.sendHIDUsage(usage, page: 0x07, duration: 0.05) { error in
+                deviceFailure = error
+                performed.fulfill()
+            }
+            guard XCTWaiter.wait(for: [performed], timeout: 5) == .completed else {
+                return "device event completion timed out after 5s"
+            }
+            return deviceFailure?.localizedDescription
+        }
         if route == .app {
             ui.app.typeKey(key, modifierFlags: modifiers)
             return nil
@@ -252,7 +273,7 @@ final class KeyProbeUITests: XCTestCase {
     }
 
     private func logSelectors() {
-        var names = ["XCPointerEventPath", "XCSynthesizedEventRecord"]
+        var names = ["XCPointerEventPath", "XCSynthesizedEventRecord", "XCDeviceEvent", "XCUIDevice"]
         let selector = NSSelectorFromString("eventSynthesizer")
         let device = XCUIDevice.shared
         if device.responds(to: selector), let synthesizer = device.perform(selector)?.takeUnretainedValue() {

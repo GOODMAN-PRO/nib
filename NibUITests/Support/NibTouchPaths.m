@@ -18,9 +18,47 @@
 - (void)addPointerEventPath:(id)path;
 - (id)eventSynthesizer;
 - (void)synthesizeEvent:(id)event completion:(void (^)(BOOL, NSError *))completion;
++ (id)deviceEventWithPage:(unsigned int)page usage:(unsigned int)usage duration:(NSTimeInterval)duration;
+- (BOOL)performDeviceEvent:(id)event error:(NSError **)error;
 @end
 
 @implementation NibTouchPaths
+// Probe only: one HID usage (press, hold for duration, release) through the device-event SPI that XCUIDevice
+// uses for hardware buttons. The text-input path maps characters through the keyboard layout and has no entry
+// for Escape or Delete; a raw keyboard-page usage does not depend on that map.
++ (void)sendHIDUsage:(NSUInteger)usage page:(NSUInteger)page duration:(NSTimeInterval)duration
+          completion:(void (^)(NSError *))completion {
+    Class eventClass = NSClassFromString(@"XCDeviceEvent");
+    XCUIDevice *device = XCUIDevice.sharedDevice;
+    BOOL makes = eventClass && [eventClass respondsToSelector:@selector(deviceEventWithPage:usage:duration:)];
+    BOOL performs = [device respondsToSelector:@selector(performDeviceEvent:error:)];
+    if (!makes || !performs) {
+        NSMutableArray<NSString *> *classSelectors = [NSMutableArray array];
+        if (eventClass) {
+            unsigned int count = 0;
+            Method *methods = class_copyMethodList(object_getClass(eventClass), &count);
+            for (unsigned int i = 0; i < count; i++) {
+                [classSelectors addObject:NSStringFromSelector(method_getName(methods[i]))];
+            }
+            free(methods);
+        }
+        completion([NSError errorWithDomain:@"NibUITests" code:7 userInfo:@{NSLocalizedDescriptionKey:
+            [NSString stringWithFormat:@"Device event SPI unavailable: XCDeviceEvent class %@, factory %@, performDeviceEvent %@, class selectors: %@",
+             eventClass ? @"present" : @"missing", makes ? @"present" : @"missing", performs ? @"present" : @"missing",
+             [classSelectors componentsJoinedByString:@", "]]}]);
+        return;
+    }
+    id event = [eventClass deviceEventWithPage:(unsigned int)page usage:(unsigned int)usage duration:duration];
+    if (!event) {
+        completion([NSError errorWithDomain:@"NibUITests" code:8 userInfo:@{NSLocalizedDescriptionKey: @"XCDeviceEvent factory returned nil"}]);
+        return;
+    }
+    NSError *error = nil;
+    BOOL performed = [device performDeviceEvent:event error:&error];
+    completion(error ?: (performed ? nil : [NSError errorWithDomain:@"NibUITests" code:9
+        userInfo:@{NSLocalizedDescriptionKey: @"Device event was not performed"}]));
+}
+
 + (NSArray<NSString *> *)selectorNamesForClassNamed:(NSString *)name {
     NSMutableArray<NSString *> *selectors = [NSMutableArray array];
     for (Class cls = NSClassFromString(name); cls && cls != [NSObject class]; cls = class_getSuperclass(cls)) {
