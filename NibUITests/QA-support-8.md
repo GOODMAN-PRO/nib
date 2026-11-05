@@ -158,3 +158,7 @@ D:controls-forms#10 correction confirms Show hidden is a Switch, Imported second
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Pages rotate selection | Pages Rotate submenu | Which children appear after opening Rotate? One tree and screenshot per test. |
+
+## C5 - dismiss thread menu before closing panel
+
+D:controls-forms#11 confirms the open thread menu and two cmd.panel.close buttons; the Edit Message absence predicate was vacuous. The resolve/filter/reopen test now taps outside and waits for its actual Show on Page row to disappear, then scopes close by both command ID and the observed thread-specific Close Comment label (excluding Close Comments). Escape transport remains untouched. CI must reach second-page navigation and Show on Page back to the original page.

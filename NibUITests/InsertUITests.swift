@@ -1202,10 +1202,13 @@ final class InsertUITests: XCTestCase {
         try toggle("Show Resolved", to: true)
         try message("Check the units").tap(); try tap("Reopen Thread")
         try message("Check the units").press(forDuration: 0.8)
-        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) {
-            try self.wait("Message context menu must dismiss before panel controls") { !self.ui.app.buttons["Edit Message"].exists }
-        }
-        try tap("cmd.panel.close"); try goToSecondPage(); try panel("Comments")
+        outside()
+        try wait("Thread context menu must dismiss before panel controls") { !self.ui.app.buttons["Show on Page"].exists }
+        let threadClose = ui.app.buttons.matching(NSPredicate(
+            format: "identifier == %@ AND label == %@", "cmd.panel.close", "Close Comment")).firstMatch
+        try wait("Thread panel close must be available") { threadClose.exists && threadClose.isHittable }
+        threadClose.tap()
+        try goToSecondPage(); try panel("Comments")
         try message("Check the units").press(forDuration: 0.8); try tap("Show on Page")
         _ = try ui.waitForState(timeout: 8) { $0.page == original.page }
         XCTAssertTrue(try message("Check the units").exists)
