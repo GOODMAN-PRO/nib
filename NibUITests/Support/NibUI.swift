@@ -235,16 +235,19 @@ final class NibUI {
 
     /// Waits for the actual microphone prompt (or an already-authorized Recording HUD), then for system alerts to disappear.
     /// Startup/teardown callers drain outstanding known authorization prompts without accepting unrelated dialogs.
-    func handleAuthorizationAlerts(waitForMicrophone: Bool = false) throws {
+    func handleAuthorizationAlerts(waitForMicrophone: Bool = false, waitForCountdown: (() -> Bool)? = nil) throws {
         let system = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let permission = NSPredicate(format: "label CONTAINS[c] 'microphone' OR label CONTAINS[c] 'calendar' OR label CONTAINS[c] 'photos'")
+        let permission = NSPredicate(format: "label CONTAINS[c] 'microphone' OR label CONTAINS[c] 'calendar' OR label CONTAINS[c] 'photos' OR label CONTAINS[c] 'notification'")
         /// Reads the currently visible authorization without waiting; the outer expectation handles asynchronous presentation.
         func alert(microphoneOnly: Bool = false) -> XCUIElement? {
             let filter = microphoneOnly ? NSPredicate(format: "label CONTAINS[c] 'microphone'") : permission
-            let title = system.alerts.matching(filter).firstMatch
-            if title.exists { return title }
-            let content = system.alerts.containing(filter).firstMatch
-            return content.exists ? content : nil
+            for host in [system, app] {
+                let title = host.alerts.matching(filter).firstMatch
+                if title.exists { return title }
+                let content = host.alerts.containing(filter).firstMatch
+                if content.exists { return content }
+            }
+            return nil
         }
         if waitForMicrophone {
             let recording = app.descendants(matching: .any).matching(NSPredicate(format: "label == 'Recording' AND value != nil")).firstMatch
@@ -255,9 +258,19 @@ final class NibUI {
                 throw Failure.message("Quick Record produced neither microphone authorization nor Recording HUD\n\(system.debugDescription)")
             }
         }
+        if let waitForCountdown {
+            let requested = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                alert() != nil || waitForCountdown()
+            }, object: nil)
+            guard XCTWaiter.wait(for: [requested], timeout: 12) == .completed else {
+                throw Failure.message("Start Timer produced neither authorization nor countdown")
+            }
+        }
         for _ in 0..<3 {
             guard let prompt = alert() else { return }
-            let allow = prompt.buttons.matching(NSPredicate(
+            let notification = prompt.label.localizedCaseInsensitiveContains("notification")
+                || prompt.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'notification'")).firstMatch.exists
+            let allow = notification ? prompt.buttons["Don't Allow"] : prompt.buttons.matching(NSPredicate(
                 format: "label IN {'Allow', 'OK', 'Allow Full Access', 'Allow Access to All Photos'}")).firstMatch
             guard allow.isHittable else { throw Failure.message("Authorization has no observed affirmative action\n\(system.debugDescription)") }
             allow.tap()
@@ -465,6 +478,7 @@ final class NibUI {
         }
         try establishFullScreen(allowFixtureRelaunch: true)
         _ = try waitForState { $0.screen == "library" }
+        try handleAuthorizationAlerts()
     }
 
     /// Activates this scene, waits for non-text focus without editing/navigating, and verifies the chord's action.

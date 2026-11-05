@@ -981,9 +981,9 @@ final class ChromeUITests: XCTestCase {
         // End field editing before a global canvas shortcut can be interpreted as text.
         try key(XCUIKeyboardKey.escape.rawValue)
         try tap("Start Timer")
-        let alert = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
-        if alert.waitForExistence(timeout: 2), alert.buttons["Don't Allow"].exists { alert.buttons["Don't Allow"].tap() }
+        try ui.handleAuthorizationAlerts(waitForCountdown: { self.clockValue.exists })
         try wait("Countdown must expose a running clock") { self.clockValue.exists }
+        try ui.handleAuthorizationAlerts()
     }
     func testTimeKeeperPaletteAndKeyboardToggleRetainActiveCountdown() throws {
         try open(); let before = try ui.state()
@@ -1000,6 +1000,7 @@ final class ChromeUITests: XCTestCase {
         try open(); try timeKeeper(); try tap("5 min")
         XCTAssertTrue(try require("5 min").isSelected)
         try replace("Timer name", "Preset countdown"); try tap("Start Timer")
+        try ui.handleAuthorizationAlerts(waitForCountdown: { self.clockValue.exists })
         try wait("Preset countdown must run") { self.clockValue.exists }
         let before = clockValue.label
         try wait("Countdown must decrease", timeout: 8) { self.clockValue.label != before }
