@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 import NibContracts
 import NibTesting
 @testable import FeatShapeRecognition
@@ -415,6 +416,31 @@ final class FeatShapeRecognitionTests: XCTestCase {
     }
 
     /// shape.create runs before anything is deleted: when it fails, the neighbours stay and the stroke stays as ink.
+    func testFailedShapeFallbackKeepsPreviewUntilInkCommitSucceeds() async throws {
+        for succeeds in [false, true] {
+            let h = Harness(features: [FeatShapeRecognitionFeature.self])
+            let host = ControlledInkHost(h)
+            let calls = Calls()
+            standIn(CommandIDs.shapeCreate, h, calls, fails: true)
+            let notice = expectation(description: "fallback failure")
+            notice.isInverted = succeeds
+            let token = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+                XCTAssertEqual(note.userInfo?["command"] as? String, CommandIDs.inkAddStrokes)
+                notice.fulfill()
+            }
+            DrawShapeTool().strokeFinished(rectangleStroke(h), page: page, host: host)
+            await settle { host.pending != nil }
+            XCTAssertEqual(host.overlayLayer.sublayers?.count, 1)
+            XCTAssertTrue(host.base.renderWaits.isEmpty)
+            host.finish(succeeds ? .success(nil) : .failure(NibError(.internalError, "Could not save ink")))
+            await fulfillment(of: [notice], timeout: 0.1)
+            NotificationCenter.default.removeObserver(token)
+            XCTAssertEqual(host.base.committed.count, 1)
+            XCTAssertEqual(host.overlayLayer.sublayers?.count ?? 0, succeeds ? 0 : 1)
+            XCTAssertEqual(host.base.renderWaits.count, succeeds ? 1 : 0)
+        }
+    }
+
     func testFailedCreateKeepsTheNeighboursAndTheInk() async throws {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 300), to: Point(400, 300), layer: 0)])
@@ -486,5 +512,40 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertEqual(arrowParams["points"], [[1, 2], [3, 4]])
         XCTAssertNil(arrowParams["frame"])
         XCTAssertEqual(arrowParams["shape"], "arrow")
+    }
+}
+
+/// A delayed ink commit with an immediate render fence, exposing premature preview retirement.
+@MainActor
+private final class ControlledInkHost: CanvasHost {
+    let base: FakeCanvasHost
+    var pending: (@MainActor (Result<ElementID?, NibError>) -> Void)?
+    init(_ h: Harness) { base = FakeCanvasHost(h) }
+    var app: NibApp { base.app }
+    var session: EditorSession { base.session }
+    var documentID: DocumentID { base.documentID }
+    var zoomScale: Double { base.zoomScale }
+    var canvasView: UIView { base.canvasView }
+    var overlayLayer: CALayer { base.overlayLayer }
+    func viewPoint(_ p: Point, page: PageID) -> CGPoint { base.viewPoint(p, page: page) }
+    func pagePoint(_ p: CGPoint) -> (page: PageID, point: Point)? { base.pagePoint(p) }
+    func pageFrame(_ page: PageID) -> CGRect? { base.pageFrame(page) }
+    func setHidden(_ ids: Set<ElementID>, page: PageID) { base.setHidden(ids, page: page) }
+    func invalidate(page: PageID, rect: Rect?) { base.invalidate(page: page, rect: rect) }
+    func cancelWetStroke() { base.cancelWetStroke() }
+    func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { base.attachLiveView(view, item: item, page: page) }
+    func commitStroke(_ stroke: Stroke, page: PageID) { commitStroke(stroke, page: page) { _ in } }
+    func commitStroke(_ stroke: Stroke, page: PageID,
+                      completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void) {
+        base.commitStroke(stroke, page: page)
+        pending = completion
+    }
+    func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) {
+        base.afterNextRender(page: page, body)
+    }
+    func finish(_ result: Result<ElementID?, NibError>) {
+        let completion = pending
+        pending = nil
+        completion?(result)
     }
 }

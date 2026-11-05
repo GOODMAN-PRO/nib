@@ -209,6 +209,9 @@ final class HighlighterTool: CanvasTool {
         host.commitStroke(stroke, page: page) { result in
             if case .failure(let error) = result {
                 HighlighterTool.log.error("keeping the stroke failed: \(String(describing: error), privacy: .public)")
+                NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
+                    userInfo: ["command": CommandIDs.inkAddStrokes, "error": error])
+                return
             }
             host.afterNextRender(page: page) { preview.removeFromSuperlayer() }
         }

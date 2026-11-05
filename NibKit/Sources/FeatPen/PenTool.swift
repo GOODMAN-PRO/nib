@@ -70,18 +70,32 @@ final class PenTool: CanvasTool {
         let outline = PenGeometry.thinned(stroke.polyline, limit: NibLimits.maxErasePathPoints)
         let app = host.app, session = host.session, doc = host.documentID
         if settings.get(PenSettings.scribbleErase), ScribbleDetector.isScribble(outline, scale: host.zoomScale) {
+            drawStroke(stroke, page: page, host: host)
+            let layer = preview; preview = nil
             host.cancelWetStroke()
-            Task { @MainActor [weak host] in
+            Task { @MainActor in
+                var erased = false
                 do {
                     let result = try await app.bus.execute(CommandIDs.inkScribbleErase,
                         ["page": .string(NodeRef.page(doc, page).description), "points": try JSONValue.from(outline)], session: session)
                     guard let removed = result["removed"]?.doubleValue else {
                         throw NibError.invalid("scribble erase must return a removed count")
                     }
-                    if removed == 0 { host?.commitStroke(stroke, page: page) }
+                    erased = removed > 0
                 } catch {
                     Self.report(error, command: CommandIDs.inkScribbleErase, app: app)
-                    host?.commitStroke(stroke, page: page)
+                }
+                if erased {
+                    host.afterNextRender(page: page) { layer?.removeFromSuperlayer() }
+                } else {
+                    host.commitStroke(stroke, page: page) { result in
+                        switch result {
+                        case .success:
+                            host.afterNextRender(page: page) { layer?.removeFromSuperlayer() }
+                        case .failure(let error):
+                            Self.report(error, command: CommandIDs.inkAddStrokes, app: app)
+                        }
+                    }
                 }
             }
             return
@@ -107,7 +121,6 @@ final class PenTool: CanvasTool {
                     return true
                 } catch {
                     Self.report(error, command: CommandIDs.inkAddStrokes, app: app)
-                    layer?.removeFromSuperlayer()
                     return false
                 }
             }

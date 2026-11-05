@@ -151,16 +151,23 @@ final class DrawShapeTool: CanvasTool {
         Task { @MainActor [weak host] in
             if let made = await ShapeCommit.create(result, plain: plain, doc: doc, page: page, app: app, session: session) {
                 UIAccessibility.post(notification: .announcement, argument: ShapeCommit.announcement(made))
+                if let host { host.afterNextRender(page: page) { layer?.removeFromSuperlayer() } }
+                else { layer?.removeFromSuperlayer() }
             } else if let host {
-                host.commitStroke(stroke, page: page)
+                host.commitStroke(stroke, page: page) { result in
+                    switch result {
+                    case .success:
+                        host.afterNextRender(page: page) { layer?.removeFromSuperlayer() }
+                    case .failure(let error):
+                        NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                            userInfo: ["command": CommandIDs.inkAddStrokes, "error": error])
+                    }
+                }
             } else {
-                await ShapeCommit.keepInk(stroke, doc: doc, page: page, app: app, session: session)
+                if await ShapeCommit.keepInk(stroke, doc: doc, page: page, app: app, session: session) {
+                    layer?.removeFromSuperlayer()
+                }
             }
-            guard let host else {
-                layer?.removeFromSuperlayer()
-                return
-            }
-            host.afterNextRender(page: page) { layer?.removeFromSuperlayer() }
         }
     }
 
@@ -263,15 +270,19 @@ enum ShapeCommit {
 
     /// Keeps a stroke as ink without a canvas (it closed before the shape could be made): `ink.addStrokes` directly.
     @MainActor
-    static func keepInk(_ stroke: Stroke, doc: DocumentID, page: PageID, app: NibApp, session: EditorSession) async {
+    static func keepInk(_ stroke: Stroke, doc: DocumentID, page: PageID, app: NibApp, session: EditorSession) async -> Bool {
         do {
             let json = try JSONValue.from(stroke)
             _ = try await app.bus.execute(Invocation(command: CommandIDs.inkAddStrokes,
                                                      params: ["page": .string(NodeRef.page(doc, page).description),
                                                               "strokes": .array([json])],
                                                      principal: .user, session: session)).value
+            return true
         } catch {
             DrawShapeTool.log.error("keeping the stroke as ink failed: \(String(describing: error), privacy: .public)")
+            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                userInfo: ["command": CommandIDs.inkAddStrokes, "error": NibError.wrap(error)])
+            return false
         }
     }
 

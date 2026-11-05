@@ -482,6 +482,30 @@ final class FeatHighlighterTests: XCTestCase {
         XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
     }
 
+    func testFailedHeldInkCommitKeepsPreviewAndReportsError() async throws {
+        let h = Harness(features: [FeatHighlighterFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeRecognize, title: "Recognise",
+            summary: "No match.", effect: .read)) { _, _ in .null }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeCreate, title: "Shape",
+            summary: "Shape stand-in.", effect: .edit)) { _, _ in .null }
+        let host = ControlledInkHost(h)
+        let tool = HighlighterTool()
+        let notice = expectation(description: "failed held ink")
+        let token = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+            XCTAssertEqual(note.userInfo?["command"] as? String, CommandIDs.inkAddStrokes)
+            notice.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+        XCTAssertTrue(tool.strokeHeld(Stroke(style: .defaultHighlighter, points: wobbly), page: Fixtures.page1, host: host))
+        tool.touchesCancelled(host: host)
+        XCTAssertNotNil(host.pending)
+        host.finish(.failure(NibError(.internalError, "Could not save ink")))
+        await fulfillment(of: [notice], timeout: 5)
+        XCTAssertEqual(host.base.committed.count, 1)
+        XCTAssertTrue(host.base.renderWaits.isEmpty)
+        XCTAssertEqual(host.overlayLayer.sublayers?.count, 1)
+    }
+
     func testCancellingAHoldKeepsTheStrokeAsDrawn() {
         let h = Harness(features: [FeatHighlighterFeature.self])
         h.app.commands.register(CommandDescriptor(id: "shape.recognize", title: "Recognise Shape", summary: "Stand-in.",
@@ -495,5 +519,40 @@ final class FeatHighlighterTests: XCTestCase {
         tool.touchesCancelled(host: host)
         XCTAssertEqual(host.committed.map(\.stroke), [stroke])
         XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
+    }
+}
+
+/// A delayed ink commit with an immediate render fence, exposing premature preview retirement.
+@MainActor
+private final class ControlledInkHost: CanvasHost {
+    let base: FakeCanvasHost
+    var pending: (@MainActor (Result<ElementID?, NibError>) -> Void)?
+    init(_ h: Harness) { base = FakeCanvasHost(h) }
+    var app: NibApp { base.app }
+    var session: EditorSession { base.session }
+    var documentID: DocumentID { base.documentID }
+    var zoomScale: Double { base.zoomScale }
+    var canvasView: UIView { base.canvasView }
+    var overlayLayer: CALayer { base.overlayLayer }
+    func viewPoint(_ p: Point, page: PageID) -> CGPoint { base.viewPoint(p, page: page) }
+    func pagePoint(_ p: CGPoint) -> (page: PageID, point: Point)? { base.pagePoint(p) }
+    func pageFrame(_ page: PageID) -> CGRect? { base.pageFrame(page) }
+    func setHidden(_ ids: Set<ElementID>, page: PageID) { base.setHidden(ids, page: page) }
+    func invalidate(page: PageID, rect: Rect?) { base.invalidate(page: page, rect: rect) }
+    func cancelWetStroke() { base.cancelWetStroke() }
+    func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { base.attachLiveView(view, item: item, page: page) }
+    func commitStroke(_ stroke: Stroke, page: PageID) { commitStroke(stroke, page: page) { _ in } }
+    func commitStroke(_ stroke: Stroke, page: PageID,
+                      completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void) {
+        base.commitStroke(stroke, page: page)
+        pending = completion
+    }
+    func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) {
+        base.afterNextRender(page: page, body)
+    }
+    func finish(_ result: Result<ElementID?, NibError>) {
+        let completion = pending
+        pending = nil
+        completion?(result)
     }
 }
