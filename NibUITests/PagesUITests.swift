@@ -486,7 +486,7 @@ final class PagesUITests: XCTestCase {
         try require(label("Second")).swipeLeft()
         try wait("Swipe Delete must remove only Second") { (try? self.outline().map { $0["title"] as? String }) == ["First", "Third"] }
         try count(4)
-        let third = try require(label("Third"))
+        let third = try require(ui.app.tables["Outline"].cells.matching(NSPredicate(format: "label == 'Third'")).firstMatch)
         try ui.dragWithoutIdle(from: third.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5)),
             to: third.coordinate(withNormalizedOffset: CGVector(dx: 0.55, dy: 0.5)), duration: 0.4)
         try require(button("Delete"), "Partial swipe must reveal Delete without deleting Third")

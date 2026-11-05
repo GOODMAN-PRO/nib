@@ -1272,7 +1272,7 @@ final class NibUI {
             // iOS 26 exposes "1 Photo, Location Included" as a Button, not static text.
             for kind in [XCUIElement.ElementType.button, .staticText] {
                 let count = selectionScope.descendants(matching: kind).matching(NSPredicate(
-                    format: "label MATCHES[c] '^[1-9][0-9]* Photos?([, ].*)?$'")).firstMatch
+                    format: "label MATCHES[c] '^1 Photo([, ].*)?$'")).firstMatch
                 if count.exists { outcome = "selection count: " + count.label; return true }
             }
             return false
@@ -1455,13 +1455,18 @@ final class NibUI {
             let identity = !identifier.isEmpty ? NSPredicate(format: "identifier == %@", identifier)
                 : NSPredicate(format: "label == %@", label)
             // Query the AX snapshot, never KVC-evaluate this SDK-dependent key on XCUIElement itself.
-            let focused = (container ?? nativeFormContainer()).descendants(matching: field.elementType).matching(identity)
-                .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-            if focused.exists && focused.frame == field.frame { return true }
+            let scope = container ?? nativeFormContainer()
+            func focused(in source: XCUIElement) -> Bool {
+                let match = source.descendants(matching: field.elementType).matching(identity)
+                    .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
+                return match.exists && match.frame == field.frame
+            }
+            if focused(in: scope) { return true }
+            if scope !== app, focused(in: app) { return true }
             // GIPHY and LaTeX expose focus in Attributes but not the predicate on this OS.
             // Only explicit native-editor callers opt in; ordinary discovery stays cheap.
-            if !allowingAttributeFallback { return false }
         }
+        guard allowingAttributeFallback else { return false }
         // debugDescription includes the whole application tree after the Attributes line.
         // A different focused field (Duration) must not qualify this field (Timer name).
         return field.debugDescription.components(separatedBy: "\n").first?.contains("Keyboard Focused") == true
@@ -1633,8 +1638,11 @@ final class NibUI {
         let container = nativeFormContainer()
         var field: XCUIElement?
         func locate() -> Bool {
-            for type in [XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField] {
-                if let found = findControl(name, type: type, actionable: false, in: container) { field = found; return true }
+            let scopes = container === app ? [app] : [container, app]
+            for scope in scopes {
+                for type in [XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField] {
+                    if let found = findControl(name, type: type, actionable: false, in: scope) { field = found; return true }
+                }
             }
             return false
         }
@@ -1663,12 +1671,13 @@ final class NibUI {
             throw Failure.message("Native field cannot receive focus: \(field)")
         }
         field.tap()
-        // The tap identifies the target. Do not query the whole AX tree or build debugDescription
-        // to rediscover it: keyboard presence plus one UIKit responder probe proves text focus.
+        // Cheap evidence establishes text focus, not the identity of the editor. Exact text
+        // postconditions remain with callers; remote editors retain the field-specific fallback.
         let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
             app.keyboards.firstMatch.exists && (try? readState())?.keyResponderIsText == true
         }, object: nil)
-        guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed else {
+        guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed
+                || isKeyboardFocused(field, allowingAttributeFallback: true, in: scope) else {
             throw Failure.message("Native field did not gain keyboard focus: \(field.debugDescription)")
         }
     }
@@ -2079,6 +2088,20 @@ final class NibUI {
     func nativeContextMenu(_ element: XCUIElement, path: [String]) throws {
         guard !path.isEmpty else { throw Failure.message("Context menu needs an action path") }
         let started = Date()
+        // Native menus may expose only buttons under Preview. Remember existing controls so
+        // an app-wide fallback cannot mistake persistent Delete/Move chrome for a new item.
+        var existingFrames: [String: [CGRect]] = [:]
+        for name in path {
+            var frames: [CGRect] = []
+            for kind in [XCUIElement.ElementType.button, .menuItem] {
+                let matches = app.descendants(matching: kind).matching(NSPredicate(
+                    format: "label == %@ OR identifier == %@", name, name))
+                for candidate in matches.allElementsBoundByIndex.prefix(16) {
+                    if hasVisibleFrame(candidate), candidate.isHittable { frames.append(candidate.frame) }
+                }
+            }
+            existingFrames[name] = frames
+        }
         var previous: CGRect?
         var settled: CGRect?
         let stable = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
@@ -2096,15 +2119,22 @@ final class NibUI {
         }
         logQA("Native menu opening", "path=\(path) frame=\(frame)")
         try pressWithoutIdle(at: CGPoint(x: frame.midX, y: frame.midY), duration: 0.8)
-        var activated: [(name: String, item: XCUIElement, frame: CGRect)] = []
+        var activated: [(item: XCUIElement, frame: CGRect)] = []
         for name in path {
             var item: XCUIElement?
             let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-                for kind in [XCUIElement.ElementType.button, .menuItem] {
-                    let candidate = app.descendants(matching: kind).matching(NSPredicate(
-                        format: "label == %@ OR identifier == %@", name, name)).firstMatch
-                    if hasVisibleFrame(candidate), candidate.isEnabled, candidate.isHittable {
-                        item = candidate; return true
+                let menus = Array(app.menus.allElementsBoundByIndex.prefix(8))
+                let preview = app.otherElements["Preview"].firstMatch
+                let scopes = menus + (preview.exists ? [preview] : []) + [app]
+                for scope in scopes {
+                    for kind in [XCUIElement.ElementType.button, .menuItem] {
+                        let matches = scope.descendants(matching: kind).matching(NSPredicate(
+                            format: "label == %@ OR identifier == %@", name, name))
+                        for candidate in matches.allElementsBoundByIndex.prefix(16) {
+                            guard hasVisibleFrame(candidate), candidate.isEnabled, candidate.isHittable else { continue }
+                            if scope === app, existingFrames[name, default: []].contains(candidate.frame) { continue }
+                            item = candidate; return true
+                        }
                     }
                 }
                 return false
@@ -2117,7 +2147,7 @@ final class NibUI {
                 recordDiagnostics("Native menu missing", includeHierarchy: true)
                 throw Failure.message(message)
             }
-            activated.append((name, item, item.frame))
+            activated.append((item, item.frame))
             logQA("Native menu item", "path=\(path) item=" + elementFacts(item))
             try tapWithoutIdle(item)
         }
@@ -2126,16 +2156,9 @@ final class NibUI {
             let menuVisible = app.menus.firstMatch.exists || app.otherElements["Preview"].firstMatch.exists
             let itemsGone = !menuVisible && activated.allSatisfy { action in
                 if !action.item.exists { return true }
-                let currentFrame = action.item.frame
-                guard currentFrame != action.frame else { return false }
-                // A frame change alone could be a menu animation. Accept a same-labelled successor
-                // only when it belongs to the Rename alert or Delete confirmation sheet.
-                for type in [XCUIElement.ElementType.alert, .sheet] {
-                    let successor = app.descendants(matching: type).buttons.matching(NSPredicate(
-                        format: "label == %@ OR identifier == %@", action.name, action.name)).firstMatch
-                    if successor.exists, successor.frame == currentFrame { return true }
-                }
-                return false
+                // Lazy queries may now resolve to a same-named confirmation anywhere in the
+                // app, including an iPad popover or a SwiftUI form with no Sheet AX ancestor.
+                return action.item.frame != action.frame
             }
             defer { previouslyGone = itemsGone }
             return previouslyGone && itemsGone
@@ -2257,10 +2280,12 @@ final class NibUI {
             guard window.exists, window.isHittable, window.frame.width > 24, window.frame.height > 24 else {
                 logQA("Window control hover", "source=\(name) no visible hittable window"); continue
             }
-            if XCUIDevice.shared.supportsPointerInteraction {
-                window.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 16, dy: 16)).hover()
+            let target = window.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 16, dy: 16))
+            let hover = NSSelectorFromString("hover")
+            if target.responds(to: hover) {
+                _ = target.perform(hover)
                 logQA("Window control hover", "source=\(name) top-leading +16pt")
-            } else { logQA("Window control hover", "pointer interaction unavailable") }
+            } else { logQA("Window control hover", "source=\(name) runtime hover selector unavailable") }
         }
         let appeared = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             found = candidate(); return found != nil
@@ -2268,7 +2293,12 @@ final class NibUI {
         _ = XCTWaiter.wait(for: [appeared], timeout: 3)
         inventory("after hover")
         recordDiagnostics("Window controls after hover", includeHierarchy: false)
-        return found ?? primary.buttons.matching(predicate).firstMatch
+        if let found { return found }
+        for source in [primary, springboard] {
+            let button = source.buttons.matching(predicate).firstMatch
+            if button.exists { return button }
+        }
+        return primary.buttons.matching(predicate).firstMatch
     }
 
     func diagnoseWindowControls() {
