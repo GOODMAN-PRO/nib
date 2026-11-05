@@ -5,6 +5,18 @@ import NibContracts
 
 /// Disk and archive work never runs on the UI actor. Temporary output is removed on every unsuccessful pass.
 enum BackupWriter {
+    struct ArchiveResult {
+        var url: URL
+        /// Library-relative paths, including missing files inside otherwise downloaded packages.
+        var notDownloaded: [String] = []
+    }
+
+    static func omissionWarning(_ paths: [String]) -> String? {
+        guard !paths.isEmpty else { return nil }
+        let names = paths.joined(separator: "\n")
+        return String(localized: "Backup incomplete. These items are not downloaded and were omitted:\n\(names)\nDownload them in Files and create another library backup.")
+    }
+
     static func components(_ path: String, allowEmpty: Bool = true) throws -> [String] {
         let value = path.trimmingCharacters(in: .whitespacesAndNewlines)
         if value.isEmpty && allowEmpty { return [] }
@@ -53,7 +65,7 @@ enum BackupWriter {
         return name == ".ds_store" || name.hasSuffix(".partial") || name.hasSuffix(".tmp")
     }
 
-    static func archive(root: URL, blocked: [URL], progress: Progress, unlockedDocuments: Set<DocumentID>? = nil, lockedDocuments: Set<DocumentID> = []) async throws -> URL {
+    static func archive(root: URL, blocked: [URL], progress: Progress, unlockedDocuments: Set<DocumentID>? = nil, lockedDocuments: Set<DocumentID> = []) async throws -> ArchiveResult {
         try await Task.detached(priority: .utility) {
             let fm = FileManager.default
             let output = fm.temporaryDirectory.appendingPathComponent("Nib-Backup-" + UUID().uuidString + ".zip")
@@ -66,6 +78,7 @@ enum BackupWriter {
             let archive = try Archive(url: output, accessMode: .create)
             progress.totalUnitCount = 1
             var count: Int64 = 0
+            var notDownloaded: [String] = []
             func relative(_ url: URL) -> String {
                 String(url.standardizedFileURL.path.dropFirst(root.standardizedFileURL.path.count + 1))
             }
@@ -98,7 +111,21 @@ enum BackupWriter {
                 for url in try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isSymbolicLinkKey, .isDirectoryKey]).sorted(by: { $0.path < $1.path }) {
                     if progress.isCancelled { throw CancellationError() }
                     guard try allowed(url) else { continue }
-                    let isDirectory = try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
+                    let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+                    let name = url.lastPathComponent
+                    if name.hasPrefix("."), name.hasSuffix(".icloud"), name.count > ".icloud".count + 1 {
+                        let original = url.deletingLastPathComponent().appendingPathComponent(String(name.dropFirst().dropLast(".icloud".count)))
+                        let resolved = original.standardizedFileURL.resolvingSymlinksInPath().path
+                        if !denied.contains(where: { resolved == $0 || resolved.hasPrefix($0 + "/") }) {
+                            notDownloaded.append(relative(original))
+                        }
+                        continue
+                    }
+                    if values.isUbiquitousItem == true, values.ubiquitousItemDownloadingStatus == .notDownloaded {
+                        notDownloaded.append(relative(url))
+                        continue
+                    }
+                    let isDirectory = values.isDirectory == true
                     let isPackage = isDirectory && [NibFormat.packageExtension, "nib"].contains(url.pathExtension.lowercased())
                     if isPackage && !insidePackage {
                         try coordinated(url) { source in
@@ -122,10 +149,21 @@ enum BackupWriter {
                 }
             }
             try walk(root, insidePackage: false)
+            if let warning = omissionWarning(notDownloaded) {
+                let report = output.appendingPathExtension("report.txt")
+                defer { try? fm.removeItem(at: report) }
+                try Data(warning.utf8).write(to: report, options: .atomic)
+                // Import skips hidden library metadata, so the report does not become a document on restore.
+                var reportName = NibFormat.libraryDirectory + "/Backup Report.txt", suffix = 2
+                while archive[reportName] != nil {
+                    reportName = NibFormat.libraryDirectory + "/Backup Report " + String(suffix) + ".txt"; suffix += 1
+                }
+                try archive.addEntry(with: reportName, fileURL: report, compressionMethod: .deflate, progress: Progress(totalUnitCount: 1))
+            }
             if progress.isCancelled { throw CancellationError() }
             progress.completedUnitCount += 1
             completed = true
-            return output
+            return ArchiveResult(url: output, notDownloaded: notDownloaded)
         }.value
     }
 

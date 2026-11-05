@@ -24,7 +24,7 @@ import NibDesign
 //   folder. Only what Nib made goes: other files in the folder stay, and folders are removed only when Nib's content
 //   was all they held.
 //
-// Without `includeLibrary` the library folder and the device id's Application Support mirror stay, so the library
+// Without `includeLibrary` the library folder, its write-ahead log and the device id's Application Support mirror stay, so the library
 // keeps syncing as this device. `app.deleteAllData` itself asks the person twice (it is `userPresence`), whoever
 // calls it; the gateway confirms it once more for the assistant, plugins and the bridge (`irreversible`). Afterwards a
 // full-screen notice asks the person to close Nib: features still hold state in memory (a running bridge keeps its
@@ -167,6 +167,7 @@ final class DataDeletionService {
         AboutLog.logger.notice("deleting all Nib data (library: \(includeLibrary ? "yes" : "no", privacy: .public))")
 
         if includeLibrary { await leaveDocuments(ctx) }
+        else { flushDocuments(ctx.workspace) }
         let settingsRemoved = DeviceSettingsEraser.clear(ctx.services.settings)
         let report = await erase(plan)
         let systemFailures = await system.wipe(appGroupIDs: place.appGroupIDs)
@@ -178,7 +179,7 @@ final class DataDeletionService {
         output.restartRequired = true
         let finish = DeletionFinish(subject: subject, failures: output.failures.count)
         prompter.showFinished(finish) { [weak self] in
-            await self?.finalPass(plan, appGroupIDs: place.appGroupIDs)
+            await self?.finalPass(plan, appGroupIDs: place.appGroupIDs, workspace: ctx.workspace)
         }
         return output
     }
@@ -190,10 +191,15 @@ final class DataDeletionService {
     }
 
     /// "Close Nib": whatever running features wrote since the first pass goes too, then Nib quits.
-    func finalPass(_ plan: DeletionPlan, appGroupIDs: [String]) async {
+    func finalPass(_ plan: DeletionPlan, appGroupIDs: [String], workspace: Workspace) async {
+        if !plan.includeLibrary { flushDocuments(workspace) }
         _ = await erase(plan)
         _ = await system.wipe(appGroupIDs: appGroupIDs)
         terminate()
+    }
+
+    private func flushDocuments(_ workspace: Workspace) {
+        for doc in workspace.loadedDocuments { workspace.persistence.flush(doc) }
     }
 
     /// With the library going, windows go back to the library and documents leave memory first, so nothing saves a
@@ -231,6 +237,11 @@ struct AppDataLocations: Equatable {
     /// per-device files stay this device's.
     var deviceIDFile: URL {
         applicationSupport.appendingPathComponent("Nib", isDirectory: true).appendingPathComponent("device-id")
+    }
+
+    /// Failed writes and crash recovery belong to the library, even when no library is currently connected.
+    var writeAheadLog: URL {
+        applicationSupport.appendingPathComponent("Nib/wal", isDirectory: true)
     }
 
     static func current(fileManager: FileManager = .default, bundle: Bundle = .main) -> AppDataLocations {
@@ -295,7 +306,7 @@ enum DeletionPlanner {
         let diagnostics = [l.documents.appendingPathComponent(diagnosticsFolder, isDirectory: true)]
         var keep: [URL] = []
         if let root = libraryRoot { keep.append(root) }
-        if !includeLibrary { keep.append(l.deviceIDFile) }
+        if !includeLibrary { keep += [l.deviceIDFile, l.writeAheadLog] }
         var roots: [URL] = []
         if includeLibrary {
             // The library Nib uses, and an earlier one in Nib's own Documents folder. A root inside another is
