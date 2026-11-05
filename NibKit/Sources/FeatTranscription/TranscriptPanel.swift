@@ -22,8 +22,11 @@ final class TranscriptPanelModel: ObservableObject {
     @Published var error: String?
     @Published var busy = false
     @Published var playback: AudioPlaybackPayload?
-    @Published var editIndex: Int?
+    @Published var editIndex: Int? {
+        didSet { if editIndex != oldValue { editLoaded = false } }
+    }
     @Published var editText = ""
+    private var editLoaded = false
     private(set) var editClip: String?
     private var recordingClip: String?
     private var subscription: EventSubscription?
@@ -80,7 +83,10 @@ final class TranscriptPanelModel: ObservableObject {
             guard ref == selectedClip else { return }
             transcript = try result.decode(TranscriptGet.Output.self)
             error = nil
-            if let editIndex, editText.isEmpty { editText = transcript?.segments.first { $0.index == editIndex }?.text ?? "" }
+            if let editIndex, !editLoaded,
+               let line = transcript?.segments.first(where: { $0.index == editIndex }) {
+                editText = line.text; editLoaded = true
+            }
         } catch {
             guard ref == selectedClip else { return }
             transcript = nil; self.error = NibError.wrap(error).message
@@ -93,7 +99,7 @@ final class TranscriptPanelModel: ObservableObject {
     }
 
     func beginEdit(_ line: TranscriptSegment) {
-        editClip = selectedClip; editIndex = line.index; editText = line.text
+        editClip = selectedClip; editIndex = line.index; editText = line.text; editLoaded = true
     }
 
     func seekSummaryWindow(_ window: TranscriptSummary.Window) {

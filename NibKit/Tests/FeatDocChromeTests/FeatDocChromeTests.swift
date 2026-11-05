@@ -8,6 +8,58 @@ import NibTesting
 
 @MainActor
 final class FeatDocChromeTests: XCTestCase {
+    func testModalBlocksCanvasAndPlainKeysButKeepsGlobalCommandKeys() {
+        let delete = KeyCommandDescriptor(id: "delete", title: "Delete", shortcut: KeyShortcut("delete", []),
+                                          command: "keyboard.delete", scope: .canvas, owner: "tests")
+        let select = KeyCommandDescriptor(id: "select", title: "Select", shortcut: KeyShortcut("a", [.command]),
+                                          command: "keyboard.selectAll", scope: .canvas, owner: "tests")
+        let plain = KeyCommandDescriptor(id: "plain", title: "Plain", shortcut: KeyShortcut("e", []),
+                                         command: "toolbar.key.e", scope: .global, owner: "tests")
+        let global = KeyCommandDescriptor(id: "global", title: "Search", shortcut: KeyShortcut("f", [.command]),
+                                          command: "search.open", scope: .global, owner: "tests")
+        for key in [delete, select, plain] {
+            XCTAssertFalse(ShellChromePolicy.permits(key, hasModal: true))
+            XCTAssertTrue(ShellChromePolicy.permits(key, hasModal: false))
+        }
+        XCTAssertTrue(ShellChromePolicy.permits(global, hasModal: true))
+        let root = UIViewController()
+        let child = ModalControllerProbe()
+        root.addChild(child)
+        XCTAssertFalse(ShellChromePolicy.hasModal(root))
+        child.modal = UIViewController()
+        XCTAssertTrue(ShellChromePolicy.hasModal(root))
+    }
+
+    func testTabBarIsRequestedForRemainingTabsBehindLibrary() {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        var documents: [DocumentID] = ["TAB_A", "TAB_B", "TAB_C"]
+        h.session.document = nil
+        documents.removeFirst()
+        let bar = UIView()
+        var requests = 0
+        let result = ShellChromePolicy.makeTabBar(openDocuments: documents) {
+            requests += 1
+            return bar
+        }
+        XCTAssertTrue(result === bar)
+        XCTAssertEqual(requests, 1)
+        XCTAssertNil(ShellChromePolicy.makeTabBar(openDocuments: []) { XCTFail("No tabs"); return bar })
+    }
+
+    func testLibraryPanelIDsSurviveAdoptionWhileRemovedChromePanelsClose() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let state = try chromeState(h)
+        state.open("test.chrome", at: .left, params: ["test": true])
+        h.session.document = nil
+        h.session.openPanels = ["lib.panel"]
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(h.session.openPanels, ["lib.panel"])
+        XCTAssertTrue(state.openPanels.isEmpty)
+        XCTAssertTrue(state.params.isEmpty)
+        XCTAssertFalse(state.close("lib.absent"))
+        XCTAssertEqual(h.session.openPanels, ["lib.panel"], "Closing a library panel must preserve other library ids")
+    }
+
     func testFeatureID() {
         XCTAssertEqual(FeatDocChromeFeature.id, "chrome")
     }
@@ -1663,4 +1715,10 @@ private final class TestNavigator: SceneNavigator {
     func showLibrary(folder: FolderID?) { shownLibrary.append(folder) }
     func showSettings(page: String?) {}
     func presentModal(_ viewController: UIViewController) {}
+}
+
+@MainActor
+private final class ModalControllerProbe: UIViewController {
+    var modal: UIViewController?
+    override var presentedViewController: UIViewController? { modal }
 }

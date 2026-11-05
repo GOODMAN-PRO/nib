@@ -431,6 +431,29 @@ final class FeatAudioTests: XCTestCase {
         }
     }
 
+    func testFailedResumeDoesNotFillTheSamePauseTwice() async throws {
+        let (h, audio) = try harness()
+        let source = SyntheticSource()
+        audio.makeSource = { source }
+        var now = 1_800_000_000.0
+        audio.clock = { now }
+        let started = try await h.run("audio.record", ["doc": "doc:FIXTUREDOC01", "action": "start"])
+        let ref = try XCTUnwrap(started["ref"]?.stringValue)
+        source.feed(seconds: 1)
+        now += 1
+        _ = try await h.run("audio.record", ["action": "pause"])
+        now += 30
+        source.onStart = { throw NibError.unavailable("Microphone busy") }
+        await assertThrows(.unavailable) { _ = try await h.run("audio.record", ["action": "resume"]) }
+        now += 30
+        source.onStart = nil
+        _ = try await h.run("audio.record", ["action": "resume"])
+        source.feed(seconds: 1)
+        now += 1
+        _ = try await h.run("audio.record", ["action": "stop"])
+        XCTAssertEqual(try clip(h, ref).duration, 62, accuracy: 0.001)
+    }
+
     func testPauseFillsTheGapSoTheRecordingMatchesTheWallClock() async throws {
         let (h, audio) = try harness()
         let source = SyntheticSource()

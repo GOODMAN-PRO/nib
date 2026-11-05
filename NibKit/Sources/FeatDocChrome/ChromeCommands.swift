@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import Combine
+import UIKit
 import NibContracts
 import NibDesign
 
@@ -91,6 +92,7 @@ final class ChromeState: ObservableObject {
     private(set) var lastTabs: [SidebarSide: String] = [:]
     private var animateUntil: TimeInterval = 0
     private weak var session: EditorSession?
+    private var mirroredPanels: Set<String> = []
 
     /// `session`: the window this state belongs to; nil keeps it to itself (layout tests).
     init(session: EditorSession? = nil) {
@@ -214,7 +216,13 @@ final class ChromeState: ObservableObject {
         if params.keys.contains(where: { !open.contains($0) }) {
             params = params.filter { open.contains($0.key) }
         }
-        if let session, session.openPanels != open { session.openPanels = open }
+        if let session {
+            // In the library only replace ids previously mirrored by this chrome. Library-owned ids survive
+            // every caller, including panel.close probing a panel that the chrome never opened.
+            let wanted = session.document == nil ? session.openPanels.subtracting(mirroredPanels).union(open) : open
+            if session.openPanels != wanted { session.openPanels = wanted }
+        }
+        mirroredPanels = open
     }
 
     private func detach(_ id: String) {
@@ -285,7 +293,8 @@ final class ChromeStateStore {
                 }
             }
         }
-        state.syncSession()
+        // The library owns the session's panel ids while no document is showing.
+        if session.document != nil { state.syncSession() }
     }
 }
 
@@ -616,5 +625,24 @@ struct DocSetScrollDirection: NibCommand {
             try tx.putMeta(meta)
         }
         return NoResult()
+    }
+}
+
+/// Shared with the app shell so its presentation decisions are covered by package tests.
+@MainActor
+public enum ShellChromePolicy {
+    public static func hasModal(_ controller: UIViewController) -> Bool {
+        controller.presentedViewController != nil || controller.children.contains { hasModal($0) }
+    }
+
+    public static func permits(_ descriptor: KeyCommandDescriptor, hasModal: Bool) -> Bool {
+        guard hasModal else { return true }
+        return descriptor.scope != .canvas
+            && !descriptor.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
+    }
+
+    public static func makeTabBar(openDocuments: [DocumentID], make: () -> UIView?) -> UIView? {
+        guard !openDocuments.isEmpty else { return nil }
+        return make()
     }
 }

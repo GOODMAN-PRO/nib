@@ -422,7 +422,13 @@ extension AudioController {
     func resumeRecording() throws {
         guard let r = recording, let recorder else { throw Self.notRecording }
         guard let paused = r.pausedAt else { return }
-        try recorder.resume(after: max(0, clock() - paused))
+        let resumedAt = clock()
+        do { try recorder.resume(after: max(0, resumedAt - paused)) }
+        catch {
+            // resume queues the gap before starting the microphone. A retry must only fill the remaining gap.
+            recording?.pausedAt = resumedAt
+            throw error
+        }
         recording?.pausedAt = nil
         resumeAfterInterruption = false
         chromeChanged()

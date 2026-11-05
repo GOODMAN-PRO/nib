@@ -546,6 +546,7 @@ final class Indexer {
     private var debounceTask: Task<Void, Never>?
     private var processing = false
     private var sweepTask: Task<Void, Never>?
+    private var rebuildGeneration: UInt64 = 0
     private var subscriptions: [EventSubscription] = []
     private var settingsToken: NSObjectProtocol?
     private var itemCache: [String: [InkLine]] = [:]
@@ -964,6 +965,7 @@ final class Indexer {
     /// Clears the index and re-indexes the library in the background. Returns the number of documents queued.
     func rebuildAll() async throws -> Int {
         guard let db = db else { throw NibError.unavailable("the search index") }
+        rebuildGeneration &+= 1
         sweepTask?.cancel()
         while let key = inFlight.keys.first { await waitForUnit(key) }
         try db.removeAll()
@@ -1112,10 +1114,16 @@ final class Indexer {
 
     private func refreshTitles() async {
         guard let library = app.services.library else { return }
+        var needsSweep = false
         for node in library.allNodes() + library.trashedNodes() where node.kind == .document {
             indexTitle(node.id, kind: node.documentKind)
+            if node.trashedAt == nil, let db, !db.keys(doc: node.id).contains(IndexKeys.docUnit) {
+                needsSweep = true
+            }
         }
         await prune()
+        // Copies and synced packages can arrive without a document transaction.
+        if needsSweep { startSweep(after: 2) }
     }
 
     /// Drops documents the library no longer knows (deleted permanently, or another library folder).
@@ -1162,6 +1170,7 @@ final class Indexer {
     /// is checked against its version, and the stamp is stored once that pass completes.
     private func sweepDocument(_ doc: DocumentID, db: SearchDatabase, pausable: Bool,
                                progress: SweepProgress) async -> DocumentPass {
+        let generation = rebuildGeneration
         guard let head = await loadHead(doc) else { return DocumentPass() }
         // Open documents can hold unsaved state; committed ones changed since their last pass.
         let checkPages = app.workspace.isLoaded(doc) || committedDocs.contains(doc)
@@ -1171,7 +1180,10 @@ final class Indexer {
             return DocumentPass()
         }
         let committed = committedDocs.remove(doc) != nil
-        let pass = await indexDocument(doc, head: head, force: false, pausable: pausable, progress: progress)
+        var pass = await indexDocument(doc, head: head, force: false, pausable: pausable, progress: progress)
+        // Cancellation can land during the final extraction or its trailing yield. Background sweeps can also
+        // outlive a rebuild without owning sweepTask, so reject their old generation as well.
+        if Task.isCancelled || generation != rebuildGeneration { pass.completed = false }
         if !pass.completed {
             if committed { committedDocs.insert(doc) }
         } else if let stamp = stamp {

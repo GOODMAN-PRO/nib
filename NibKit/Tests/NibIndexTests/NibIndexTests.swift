@@ -46,6 +46,80 @@ private final class SlowRecognizer: TextRecognizer {
 
 @MainActor
 final class NibIndexTests: XCTestCase {
+    func testCancelledFinalPageCannotStampAnIndexClearedForRebuild() async throws {
+        let (h, indexer) = harness()
+        var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+        head.pages = head.pages.filter { $0.id == Fixtures.page1 }
+        h.persistence.heads[Fixtures.docID] = head
+        let package = try XCTUnwrap(h.app.services.packages.url(Fixtures.docID))
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: package) }
+        try Data("{}".utf8).write(to: package.appendingPathComponent("doc.00000007.json"))
+        // Make the first progress notification occur after the document's final page extraction.
+        await indexer.indexDocUnit(Fixtures.docID, head: head)
+        let db = try XCTUnwrap(indexer.db)
+        var running: Task<Bool, Never>?
+        var cleared = false
+        let subscription = h.app.events.subscribe { event in
+            guard !cleared, event.decode(IndexProgressPayload.self)?.running == true,
+                  db.keys(doc: Fixtures.docID).contains(Fixtures.page1.raw) else { return }
+            cleared = true
+            // Exactly the cancellation + clear interleaving in rebuildAll, before the trailing page yield.
+            running?.cancel()
+            do { try db.removeAll() } catch { XCTFail("\(error)") }
+        }
+        running = Task { @MainActor in await indexer.sweep(foreground: false) }
+        let completed = await running?.value
+        subscription.cancel()
+        XCTAssertTrue(cleared)
+        XCTAssertEqual(completed, false)
+        XCTAssertNil(db.stamp(doc: Fixtures.docID), "An interrupted pass must not certify wiped rows")
+        _ = await indexer.sweep(foreground: false)
+        XCTAssertNotNil(db.stamp(doc: Fixtures.docID))
+        let found = results(try await h.run("search.text", ["query": "Remember"]))
+        XCTAssertFalse(found.isEmpty)
+    }
+
+    func testRebuildDuringExtractionRepopulatesDocumentContent() async throws {
+        let (h, indexer) = harness()
+        h.app.services.recognizer = SlowRecognizer()
+        var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+        head.pages = head.pages.filter { $0.id == Fixtures.page1 }
+        h.persistence.heads[Fixtures.docID] = head
+        await indexer.indexDocUnit(Fixtures.docID, head: head)
+        let running = Task { @MainActor in await indexer.sweep(foreground: false) }
+        let deadline = Date().addingTimeInterval(4)
+        while indexer.extractionsInFlight == 0 && Date() < deadline { await Task.yield() }
+        XCTAssertGreaterThan(indexer.extractionsInFlight, 0)
+        _ = try await indexer.rebuildAll()
+        _ = await running.value
+        // A background pass also completes the rebuild if foreground work is paused for thermal pressure.
+        _ = await indexer.sweep(foreground: false)
+        let found = results(try await h.run("search.text", ["query": "Remember"]))
+        XCTAssertFalse(found.isEmpty)
+        XCTAssertTrue(indexer.db?.keys(doc: Fixtures.docID).contains(Fixtures.page1.raw) == true)
+    }
+
+    func testLibraryChangeIndexesDuplicateContentWithoutACommit() async throws {
+        let (h, indexer) = harness()
+        _ = await indexer.sweep(foreground: false)
+        indexer.debounce = 0.01
+        indexer.start()
+        let copy = try h.library.duplicate(Fixtures.docID)
+        XCTAssertFalse(h.app.workspace.isLoaded(copy))
+        h.app.events.emit(NibEventType.libraryChanged, payload: ["refs": [.string(NodeRef.document(copy).description)]])
+        var found: [JSONValue] = []
+        let deadline = Date().addingTimeInterval(8)
+        repeat {
+            try await Task.sleep(nanoseconds: 50_000_000)
+            found = results(try await h.run("search.text", ["query": "Remember"]))
+                .filter { $0["doc"]?.stringValue == NodeRef.document(copy).description }
+        } while found.isEmpty && Date() < deadline
+        XCTAssertFalse(found.isEmpty)
+        XCTAssertTrue(indexer.db?.keys(doc: copy).contains(IndexKeys.docUnit) == true)
+        XCTAssertFalse(h.app.workspace.isLoaded(copy), "Background indexing must not open the copy")
+    }
+
     private var strokeRef: String { NodeRef.item(Fixtures.docID, Fixtures.page1, Fixtures.strokeID).description }
 
     private func harness(_ script: [TextRecognition] = []) -> (Harness, Indexer) {

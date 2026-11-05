@@ -7,6 +7,23 @@ import NibTesting
 final class TranscriptPanelTests: XCTestCase {
     private let clipRef = "audio:FIXTUREDOC01/FIXTUREAUD01"
 
+    func testRefreshPreservesIntentionallyEmptyDraftAndLoadsDeepLinkOnlyOnce() async throws {
+        let h = Harness(features: [FeatTranscriptionFeature.self])
+        for deepLink in [false, true] {
+            var context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+            context.params = deepLink ? ["clip": .string(clipRef), "index": 0] : [:]
+            let model = TranscriptPanelModel(context: context)
+            await model.reload()
+            if !deepLink { model.beginEdit(try XCTUnwrap(model.transcript?.segments.first)) }
+            XCTAssertFalse(model.editText.isEmpty)
+            model.editText = ""
+            await model.refresh()
+            await model.reload()
+            XCTAssertEqual(model.editText, "")
+            XCTAssertEqual(model.editIndex, 0)
+        }
+    }
+
     func testPanelLoadsF089SummaryAndSeeksWindowStart() async throws {
         let h = Harness(features: [FeatTranscriptionFeature.self])
         let stored = Self.summaryJSON

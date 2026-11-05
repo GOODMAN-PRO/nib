@@ -8,6 +8,81 @@ import NibTesting
 final class FeatTranscriptionTests: XCTestCase {
     private let ref = "audio:FIXTUREDOC01/FIXTUREAUD01"
 
+    func testSpeechFailureBeforeAudioIsReportedAndRetriesAreBounded() async throws {
+        let h = Harness(features: [FeatTranscriptionFeature.self])
+        try writeAudio(h, duration: 61)
+        let speech = TestSpeechBackend()
+        speech.completeImmediately = true
+        for index in 0..<10 { speech.failures[index] = NibError(.permissionDenied, "Speech disabled") }
+        let live = try XCTUnwrap(h.app.services.get(LiveTranscriber.serviceKey, as: LiveTranscriber.self))
+        live.speech = speech
+        _ = try await h.run(CommandIDs.settingsSet, ["name": "transcription.live", "value": true])
+        live.recording(AudioRecordingPayload(clip: ref, state: "recording", duration: 0))
+        live.recording(AudioRecordingPayload(clip: ref, state: "stopped", duration: 61))
+        let deadline = Date().addingTimeInterval(5)
+        while live.jobs[ref] != nil && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        XCTAssertNil(live.jobs[ref])
+        live.jobs[ref]?.cancel()
+        await live.waitForRecording(ref)
+        XCTAssertEqual(live.errors[ref]?.code, .permissionDenied)
+        XCTAssertEqual(speech.sessions.count, 3)
+        XCTAssertTrue(speech.sessions.allSatisfy { $0.frames == 0 && $0.cancelled })
+    }
+
+    func testFailedRegenerationPreservesExistingTranscript() async throws {
+        for timeout in [false, true] {
+            let h = Harness(features: [FeatTranscriptionFeature.self])
+            try writeAudio(h, duration: 61)
+            let before = try await h.run(CommandIDs.transcriptGet, ["clip": .string(ref)])
+            let speech = TestSpeechBackend()
+            if timeout {
+                speech.outcomes = Array(repeating: SpeechWindowResult(lines: [], complete: false), count: 2)
+            } else {
+                speech.failures = [0: NibError(.unavailable, "Recognition failed"), 1: NibError(.unavailable, "Recognition failed")]
+            }
+            let live = try XCTUnwrap(h.app.services.get(LiveTranscriber.serviceKey, as: LiveTranscriber.self))
+            live.speech = speech
+            do {
+                _ = try await h.run(CommandIDs.transcriptRegenerate, ["clip": .string(ref), "engine": "onDevice"])
+                XCTFail("Failed recognition must not replace existing lines")
+            } catch let error as NibError { XCTAssertEqual(error.code, timeout ? .timeout : .unavailable) }
+            let after = try await h.run(CommandIDs.transcriptGet, ["clip": .string(ref)])
+            XCTAssertEqual(try before.decode(TranscriptGet.Output.self).segments,
+                           try after.decode(TranscriptGet.Output.self).segments)
+        }
+    }
+
+    func testDeletingRecordingEndsLocalAndCloudJobs() async throws {
+        for cloud in [false, true] {
+            let h = Harness(features: [FeatTranscriptionFeature.self])
+            try writeAudio(h)
+            let live = try XCTUnwrap(h.app.services.get(LiveTranscriber.serviceKey, as: LiveTranscriber.self))
+            let speech = TestSpeechBackend()
+            live.speech = speech
+            _ = try await h.run(CommandIDs.settingsSet, ["name": "transcription.live", "value": true])
+            _ = try await h.run(CommandIDs.settingsSet, ["name": "security.transcription.cloud", "value": .bool(cloud)])
+            live.recording(AudioRecordingPayload(clip: ref, state: "recording", duration: 0))
+            try await Task.sleep(nanoseconds: 100_000_000)
+            h.app.commands.register(CommandDescriptor(id: "test.deleteRecording", title: "Delete", summary: "Tombstone recording", effect: .edit)) { _, ctx in
+                var clip = try XCTUnwrap(ctx.workspace.content(Fixtures.docID).liveAudio.first)
+                clip.deleted = true
+                try ctx.mutate { tx in _ = try tx.put(clip, doc: Fixtures.docID) }
+                return [:]
+            }
+            live.recording(AudioRecordingPayload(clip: ref, state: "stopped", duration: 1))
+            _ = try await h.run("test.deleteRecording")
+            let audio = try h.persistence.fileURL(Fixtures.docID, relativePath: "audio/FIXTUREAUD01.caf")
+            try FileManager.default.removeItem(at: audio)
+            let deadline = Date().addingTimeInterval(4)
+            while live.jobs[ref] != nil && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+            XCTAssertNil(live.jobs[ref])
+            // Cancel on failure too, so a regression never leaves the test runner with a retrying task.
+            live.jobs[ref]?.cancel()
+            await live.waitForRecording(ref)
+            XCTAssertTrue(speech.sessions.allSatisfy(\.cancelled))
+        }
+    }
+
     func testCommandConformanceAndExtensionPoints() async throws {
         let problems = await CommandConformance.check(features: [FeatTranscriptionFeature.self])
         XCTAssertEqual(problems, [])
@@ -448,12 +523,14 @@ private final class TestSpeechBackend: TranscriptSpeechBackend {
     var outcomes: [SpeechWindowResult] = []
     var failures: [Int: NibError] = [:]
     var completeDuringRead = false
+    var completeImmediately = false
     var onFinish: (() async throws -> Void)?
     func authorise() async throws {}
     func languages() throws -> [TranscriptLanguage] { [TranscriptLanguage(id: "en-GB", name: "English", onDevice: true, available: true)] }
     func session(language: String, update: @escaping ([TranscriptSegment]) -> Void) throws -> TranscriptSpeechSession {
         let number = sessions.count
         let session = TestSpeechSession(onFinish: onFinish)
+        session.isComplete = completeImmediately
         session.outcome = number < outcomes.count ? outcomes[number] : SpeechWindowResult(lines: [TranscriptSegment(start: 0, duration: 1, text: "Recognised")], complete: true)
         session.failure = failures[number]
         if completeDuringRead && number == 0 { Task { session.isComplete = true } }

@@ -369,7 +369,10 @@ struct DocUnlock: NibCommand {
         let service = try LockCommandSupport.service(ctx)
         try LockCommandSupport.requireDocument(doc, ctx)
         let ref = LockCommandSupport.ref(doc)
-        guard service.isLocked(doc) else { return Output(doc: ref, unlocked: true) }
+        guard service.isLocked(doc) else {
+            if !ctx.dryRun { service.presenter?.uncover(doc) }
+            return Output(doc: ref, unlocked: true)
+        }
         if ctx.dryRun { return Output(doc: ref, unlocked: false) }
         guard service.presenter != nil || service.biometricsEnabled else {
             throw LockCommandSupport.noWindow("Unlocking a document")

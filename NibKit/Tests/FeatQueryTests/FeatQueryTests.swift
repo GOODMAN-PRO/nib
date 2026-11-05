@@ -6,6 +6,27 @@ import FeatQuery
 
 @MainActor
 final class FeatQueryTests: XCTestCase {
+    func testNodeSetRejectsTombstonesWithoutWritingOrAddingUndo() async throws {
+        for ref in ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "block:FIXTUREDOC02/FIXTUREBLK02",
+                    "card:FIXTUREDOC03/FIXTURECRD01", "audio:FIXTUREDOC01/FIXTUREAUD01",
+                    "outline:FIXTUREDOC01/FIXTUREOUT01"] {
+            let h = harness()
+            _ = try await h.run("node.remove", ["ref": .string(ref)])
+            let before = try h.snapshot()
+            let depths = h.undoDepths()
+            let error = await nibError {
+                _ = try await h.run("node.set", ["ref": .string(ref), "fields": ["ext": ["test": "changed"]]])
+            }
+            XCTAssertEqual(error?.code, .notFound, ref)
+            XCTAssertEqual(try h.snapshot(), before, ref)
+            XCTAssertEqual(h.undoDepths(), depths, ref)
+        }
+        let h = harness()
+        _ = try await h.run("node.remove", ["ref": "page:FIXTUREDOC01/FIXTUREPG002"])
+        let result = try await h.run("node.set", ["ref": "page:FIXTUREDOC01/FIXTUREPG002", "fields": ["bookmarked": true]])
+        XCTAssertEqual(result["changed"], true, "Pages in the Trash remain editable")
+    }
+
     private func harness() -> Harness { Harness(features: [FeatQueryFeature.self]) }
 
     private func json(_ text: String) throws -> JSONValue { try JSONValue.parse(text) }
