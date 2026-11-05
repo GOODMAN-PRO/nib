@@ -290,7 +290,7 @@ final class FeatClipboardTests: XCTestCase {
             if replace {
                 board.write([UTType.utf8PlainText.identifier: "new copy"])
             } else {
-                try await Task.sleep(nanoseconds: 450_000_000)
+                try await Task.sleep(nanoseconds: UInt64((Clipboard.recognitionWindow + 0.1) * 1_000_000_000))
             }
             let revision = board.changeCount
             await recognizer.finish()
@@ -299,6 +299,26 @@ final class FeatClipboardTests: XCTestCase {
             XCTAssertEqual(board.strings, [replace ? "new copy" : "typed"])
             restoreBoard()
         }
+    }
+
+    func testRecognitionAfterTheOldWindowStillEnrichesTheUnchangedEntry() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let ink = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+        let export = ClipboardExport(fragment: NibFragment.make(items: [ink], assetData: { _ in nil }), png: Data([1, 2]), text: "")
+        board.write(export.representations)
+        let original = board.items[0][NibFragment.typeIdentifier] as? Data
+        let started = expectation(description: "recognition started")
+        let recognizer = SuspendedClipboardRecognizer(started: started)
+        let task = Clipboard.enrich(export, items: [ink], language: "en-US", recognizer: recognizer)
+        await fulfillment(of: [started], timeout: 1)
+        try await Task.sleep(nanoseconds: 800_000_000)
+        await recognizer.finish()
+        await task?.value
+        XCTAssertEqual(board.strings, ["recognised"])
+        XCTAssertEqual(board.items[0][NibFragment.typeIdentifier] as? Data, original)
+        XCTAssertEqual(board.items[0][UTType.png.identifier] as? Data, export.png)
     }
 
     func testCutRefusesLockedItems() async throws {

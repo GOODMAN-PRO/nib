@@ -127,10 +127,14 @@ final class VisionRecognizer: TextRecognizer {
         return supported.first { ($0.lowercased().split(separator: "-").first.map(String.init) ?? "") == base }
     }
 
-    private static let requests = RecognitionWaitPool(limit: 2)
+    // Full-page OCR and cold model loads need more time than interactive clipboard enrichment.
+    // Interactive callers cancel their own waits without shortening the indexer's budget.
+    static let recognitionTimeout: TimeInterval = 30
+    private static let requests = RecognitionWaitPool(limit: 4)
 
-    static func perform(_ image: CGImage, language: String, minimumTextPixels: Double) async throws -> [VNRecognizedTextObservation] {
-        try await requests.perform(timeout: 2) {
+    static func perform(_ image: CGImage, language: String, minimumTextPixels: Double,
+                        timeout: TimeInterval = recognitionTimeout) async throws -> [VNRecognizedTextObservation] {
+        try await requests.perform(timeout: timeout) {
             try performBlocking(image, languages: languages(for: language), minimumTextPixels: minimumTextPixels)
         }
     }
@@ -433,49 +437,67 @@ enum InkLayout {
 /// Blocking Vision calls never occupy Swift's cooperative executor. An abandoned call keeps its slot until the
 /// underlying operation returns: at most `limit` dispatch threads can be held, even if Vision never comes back.
 final class RecognitionWaitPool: @unchecked Sendable {
-    enum Failure: Error { case timedOut, saturated }
+    enum Failure: Error { case timedOut }
     private let lock = NSLock()
     private var outstanding = 0
     private let limit: Int
+    private var pending: [(id: UUID, start: @Sendable () -> Void)] = []
     private let queue = DispatchQueue(label: "app.nib.recognition", qos: .userInitiated, attributes: .concurrent)
     private let deadlines = DispatchQueue(label: "app.nib.recognition.deadlines", qos: .userInitiated)
 
     init(limit: Int) { self.limit = limit }
 
-    private func reserve() -> Bool {
+    private func submit<Value>(_ wait: RecognitionWait<Value>, id: UUID,
+                               operation: @escaping @Sendable () throws -> Value) {
+        let start: @Sendable () -> Void = {
+            defer { self.release() }
+            guard wait.isPending else { return }
+            wait.finish(Result { try operation() })
+        }
         lock.lock()
         defer { lock.unlock() }
-        guard outstanding < limit else { return false }
+        guard wait.isPending else { return }
+        guard outstanding < limit else {
+            pending.append((id: id, start: start))
+            return
+        }
         outstanding += 1
-        return true
+        queue.async(execute: start)
+    }
+
+    private func removePending(_ id: UUID) {
+        lock.lock()
+        pending.removeAll { $0.id == id }
+        lock.unlock()
     }
 
     private func release() {
         lock.lock()
-        outstanding -= 1
+        if pending.isEmpty {
+            outstanding -= 1
+        } else {
+            // Transfer the slot to the oldest waiter; its own deadline still includes time in this queue.
+            let next = pending.removeFirst()
+            queue.async(execute: next.start)
+        }
         lock.unlock()
     }
 
     func perform<Value>(timeout: TimeInterval, operation: @escaping @Sendable () throws -> Value) async throws -> Value {
         let wait = RecognitionWait<Value>()
+        let id = UUID()
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { continuation in
                 guard wait.install(continuation) else { return }
-                guard reserve() else {
-                    wait.finish(.failure(Failure.saturated), abandoned: true)
-                    return
-                }
                 deadlines.asyncAfter(deadline: .now() + timeout) {
                     wait.finish(.failure(Failure.timedOut), abandoned: true)
+                    self.removePending(id)
                 }
-                queue.async {
-                    defer { self.release() }
-                    guard wait.isPending else { return }
-                    wait.finish(Result { try operation() })
-                }
+                submit(wait, id: id, operation: operation)
             }
         }, onCancel: {
             wait.finish(.failure(CancellationError()), abandoned: true)
+            self.removePending(id)
         })
     }
 }

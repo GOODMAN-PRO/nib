@@ -621,25 +621,65 @@ final class NibIndexTests: XCTestCase {
                 return 2
             }
             XCTFail("capacity must remain capped until Vision returns")
-        } catch RecognitionWaitPool.Failure.saturated {
+        } catch RecognitionWaitPool.Failure.timedOut {
         } catch { XCTFail("unexpected error: \(error)") }
+    }
+
+    func testRecognitionWaitsForCapacityWithinItsOwnDeadline() async throws {
+        let pool = RecognitionWaitPool(limit: 1)
+        let blocked = DispatchSemaphore(value: 0)
+        defer { blocked.signal() }
+        let started = expectation(description: "first operation holds the only slot")
+        let first = Task {
+            try await pool.perform(timeout: 5) {
+                started.fulfill()
+                blocked.wait()
+                return 1
+            }
+        }
+        defer { first.cancel() }
+        await fulfillment(of: [started], timeout: 1)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { blocked.signal() }
+        let next = try await pool.perform(timeout: 5) { 2 }
+        XCTAssertEqual(next, 2, "a busy pool must wait for capacity instead of dropping legitimate OCR")
+        let previous = try await first.value
+        XCTAssertEqual(previous, 1)
+    }
+
+    func testRecognitionDefaultBudgetAllowsSlowBackgroundOCR() async throws {
+        let pool = RecognitionWaitPool(limit: 1)
+        let value = try await pool.perform(timeout: VisionRecognizer.recognitionTimeout) {
+            // A cold model or dense page can legitimately take longer than the old two-second budget.
+            let delay = DispatchSemaphore(value: 0)
+            _ = delay.wait(timeout: .now() + 2.2)
+            return "searchable page"
+        }
+        XCTAssertEqual(value, "searchable page")
     }
 
     func testRecognitionCancelledBeforeStartDoesNotRunBlockingOperation() async {
         let pool = RecognitionWaitPool(limit: 1)
         let ended = expectation(description: "pre-cancelled caller returned")
+        let gated = expectation(description: "caller suspended before recognition")
+        var gate: CheckedContinuation<Void, Never>?
         let task = Task {
-            // Suspend on the actor so cancellation precedes the recognition wait.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                gate = continuation
+                gated.fulfill()
+            }
             do {
                 let _: Int = try await pool.perform(timeout: 1) {
                     XCTFail("pre-cancelled work must not start")
                     return 1
                 }
+                XCTFail("pre-cancelled recognition must throw")
             } catch is CancellationError {
-                ended.fulfill()
             } catch { XCTFail("unexpected error: \(error)") }
+            ended.fulfill()
         }
+        await fulfillment(of: [gated], timeout: 1)
         task.cancel()
+        gate?.resume()
         await fulfillment(of: [ended], timeout: 1)
     }
 

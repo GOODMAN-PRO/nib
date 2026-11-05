@@ -64,8 +64,8 @@ enum Clipboard {
     static var board: ClipboardBoard = NibApp.isHostlessTest ? InMemoryClipboardBoard() : SystemClipboardBoard()
 
     static let log = Logger(subsystem: "app.nib", category: "clipboard")
-    /// Copy itself never waits for OCR. Only results arriving in this short window can enrich its entry.
-    static let recognitionWindow: TimeInterval = 0.35
+    /// Copy itself never waits for OCR. Late text is best-effort, while this is still the same clipboard entry.
+    static let recognitionWindow: TimeInterval = 5
     private static var recognitionTask: Task<Void, Never>?
     private static var recognitionDeadline: Task<Void, Never>?
 
@@ -83,10 +83,10 @@ enum Clipboard {
             guard let lines = try? await recognizer.recognize(strokes: ink, language: language),
                   !Task.isCancelled, ProcessInfo.processInfo.systemUptime <= deadline,
                   Clipboard.board === board, board.changeCount == revision else { return }
-            var blocks: [(bbox: Rect, text: String)] = items.compactMap { item in
+            var blocks: [(bbox: Rect, text: String)] = items.compactMap { item -> (bbox: Rect, text: String)? in
                 ClipboardText.typed(item).map { (bbox: item.bounds, text: $0) }
             }
-            blocks += lines.compactMap { line in
+            blocks += lines.compactMap { line -> (bbox: Rect, text: String)? in
                 let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 return text.isEmpty ? nil : (bbox: line.bbox, text: text)
             }
@@ -403,7 +403,7 @@ struct ClipboardCopy: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "clipboard.copy", title: "Copy",
-        summary: "Copy items to the clipboard (replacing what is on it) as a Nib fragment plus a PNG and their recognised text (attached content comes along).",
+        summary: "Replace the clipboard with items (including attachments) as Nib fragment, PNG and typed text. Recognised text is added when ready (up to 5 s); output.text is typed text only.",
         params: .obj(["refs": .arr(.ref, "items to copy, all on one page")], required: ["refs"]),
         examples: [example],
         effect: .read)
@@ -499,7 +499,7 @@ struct ClipboardCut: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "clipboard.cut", title: "Cut",
-        summary: "Cut items: copy them to the clipboard (Nib fragment, PNG, recognised text) and delete them; connectors to them keep a free end.",
+        summary: "Copy items as Nib fragment, PNG and typed text, then delete; connectors keep free ends. Recognised text is added when ready (up to 5 s); output.text is typed text only.",
         params: .obj(["refs": .arr(.ref, "items to cut, all on one page")], required: ["refs"]),
         examples: [example],
         effect: .edit, destructive: true)
