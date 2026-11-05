@@ -14,7 +14,10 @@ public enum NibStoreFeature: NibFeature {
         // `deviceHex` is DeviceIdentity.hex in the app and the Harness id in two-device tests, so file names and rev
         // tiebreakers stay in step.
         app.workspace.persistence = PackagePersistence(device: app.deviceHex, locator: app.services.packages,
-                                                       events: app.events, gate: gate)
+                                                       events: app.events, gate: gate,
+                                                       isDocumentOpen: { [weak workspace = app.workspace] doc in
+                                                           workspace?.isLoaded(doc) == true
+                                                       })
         app.services.assets = PackageAssetStore(locator: app.services.packages, gate: gate)
         // The legacy set (`ServiceKeys.storeReadOnly`), kept until every consumer asks `isReadOnly` instead.
         app.services.set(gate.published, for: ServiceKeys.storeReadOnly)

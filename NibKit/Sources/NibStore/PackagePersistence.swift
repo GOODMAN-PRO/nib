@@ -168,6 +168,12 @@ final class PackagePersistence: DocumentPersistence {
     private let readable = ReadableWrites()
     private let log = Logger(subsystem: "app.nib", category: "store")
     private var known: [DocumentID: Known] = [:]
+    /// Snapshot readers (indexing, library thumbnails) never open their documents. Retain only a small recent
+    /// working set for them; all open documents stay pinned for remote-change detection. Write recovery is separate.
+    static let closedReadCacheLimit = 8
+    private let isDocumentOpen: (DocumentID) -> Bool
+    private var readCacheOrder: [DocumentID] = []
+    var retainedReadDocuments: Set<DocumentID> { Set(known.keys).union(seen.keys).union(fileRevisions.keys) }
     /// Changes not handed to `io` yet.
     private var pending: [DocumentID: PendingWrite] = [:]
     private var timers: [DocumentID: Task<Void, Never>] = [:]
@@ -178,13 +184,15 @@ final class PackagePersistence: DocumentPersistence {
 
     /// `device` is this device's 8 lowercase hex characters (`DeviceIdentity.hex`); package URLs come from `locator`.
     init(device: String, locator: PackageLocator, events: EventBus?, gate: ReadOnlyGate,
-         walDirectory: URL = WriteAheadLog.defaultDirectory, debounce: TimeInterval = 1.5, maxDelay: TimeInterval = 10) {
+         walDirectory: URL = WriteAheadLog.defaultDirectory, debounce: TimeInterval = 1.5, maxDelay: TimeInterval = 10,
+         isDocumentOpen: @escaping (DocumentID) -> Bool = { _ in false }) {
         files = PackageFiles(device: device, locator: locator)
         wal = WriteAheadLog(directory: walDirectory)
         self.gate = gate
         self.events = events
         self.debounce = debounce
         self.maxDelay = maxDelay
+        self.isDocumentOpen = isDocumentOpen
     }
 
     // MARK: Loading
@@ -243,6 +251,7 @@ final class PackagePersistence: DocumentPersistence {
             pending[doc] = p
             scheduleWrite(doc)
         }
+        retainReadCache(doc)
         return head
     }
 
@@ -260,6 +269,7 @@ final class PackagePersistence: DocumentPersistence {
             pending[doc] = p
             scheduleWrite(doc)
         }
+        retainReadCache(doc)
         return items
     }
 
@@ -288,6 +298,7 @@ final class PackagePersistence: DocumentPersistence {
 
     func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
         guard head != nil || !pages.isEmpty else { return }
+        defer { retainReadCache(doc) }
         if let h = head {
             if known[doc] == nil { known[doc] = Known(head: h) } else { known[doc]?.head = h }
         }
@@ -411,6 +422,15 @@ final class PackagePersistence: DocumentPersistence {
     func forget(_ doc: DocumentID) {
         known[doc] = nil
         seen[doc] = nil
+        fileRevisions[doc] = nil
+        readCacheOrder.removeAll { $0 == doc }
+    }
+
+    private func retainReadCache(_ doc: DocumentID) {
+        readCacheOrder.removeAll { $0 == doc }
+        readCacheOrder.append(doc)
+        let closed = readCacheOrder.filter { !isDocumentOpen($0) }
+        for old in closed.prefix(max(0, closed.count - Self.closedReadCacheLimit)) { forget(old) }
     }
 
     // MARK: Read-only, content revision
@@ -429,6 +449,7 @@ final class PackagePersistence: DocumentPersistence {
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
         guard NibID.isValid(page.raw), let pkg = try? files.package(doc),
               FileManager.default.fileExists(atPath: pkg.path) else { return nil }
+        defer { retainReadCache(doc) }
         // Same read ordering as `mergedPage`, without waiting on file coordination.
         let queued = readable.snapshot(doc)
         let logged = wal.read(doc)

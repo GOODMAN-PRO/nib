@@ -91,6 +91,37 @@ final class NibStoreTests: XCTestCase {
         XCTAssertEqual(Set(saved.map(\.id)), Set((items[Fixtures.page1] ?? []).map(\.id) + [added.id]))
     }
 
+    func testIndexSweepDoesNotRetainClosedPackageSnapshots() throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        let writer = lib.store("0000000a")
+        var heads: [DocumentContent] = []
+        let (fixture, items) = Fixtures.sampleContent()
+        for index in 0..<24 {
+            var head = fixture
+            head.meta.id = NibID("INDEXED\(index)")
+            heads.append(head)
+            lib.package(head.meta.id)
+            writer.didChange(head.meta.id, head: head, pages: items)
+            writer.flush(head.meta.id)
+        }
+        let pinned = try XCTUnwrap(heads.first).meta.id
+        let reader = PackagePersistence(device: "0000000a", locator: lib.locator, events: nil, gate: ReadOnlyGate(),
+                                        walDirectory: writer.wal.directory, debounce: 3600,
+                                        isDocumentOpen: { $0 == pinned })
+        for head in heads {
+            XCTAssertEqual(try reader.loadHead(head.meta.id), head)
+            for (page, expected) in items {
+                XCTAssertEqual(try reader.loadItems(head.meta.id, page: page), expected)
+                _ = reader.contentRevision(head.meta.id, page: page)
+            }
+            XCTAssertLessThanOrEqual(reader.retainedReadDocuments.count, PackagePersistence.closedReadCacheLimit + 1)
+        }
+        XCTAssertTrue(reader.retainedReadDocuments.contains(pinned), "open documents retain remote-change baselines")
+        XCTAssertFalse(reader.retainedReadDocuments.contains(heads[1].meta.id))
+        XCTAssertEqual(try reader.loadHead(heads[1].meta.id), heads[1], "evicted snapshots remain readable")
+    }
+
     func testCompactPointsAreLossless() throws {
         var points: [StrokePoint] = []
         for i in 0..<50 {
