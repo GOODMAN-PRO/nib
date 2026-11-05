@@ -282,6 +282,36 @@ final class FeatTextBoxTests: XCTestCase {
 
     // MARK: Editing overlay
 
+    func testDetachSavesAfterLastEditorReferenceIsReleased() async throws {
+        for existing in [false, true] {
+            let h = Harness(features: [FeatTextBoxFeature.self])
+            let host = FakeCanvasHost(h)
+            var editor: TextBoxEditor? = TextBoxEditor(host: host)
+            editor?.attach(to: host)
+            if existing {
+                let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+                XCTAssertTrue(editor?.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil) == true)
+            } else {
+                editor?.beginNewBox(page: Fixtures.page2, at: Point(100, 100))
+            }
+            let ref = try XCTUnwrap(editor?.editingRef)
+            guard case let .item(doc, page, id)? = NodeRef(ref) else { return XCTFail("Expected item ref") }
+            let saved = expectation(description: "Detached draft saved")
+            let subscription = h.app.bus.observeCommits { changes in
+                if changes.mutations.contains(where: { mutation in
+                    guard case let .item(_, _, _, after) = mutation else { return false }
+                    return after.id == id && after.text?.text.plainText == "Final draft"
+                }) { saved.fulfill() }
+            }
+            editor?.editingTextView?.attributedText = NSAttributedString(string: "Final draft")
+            editor?.detach(from: host)
+            editor = nil
+            await fulfillment(of: [saved], timeout: 1)
+            subscription.cancel()
+            XCTAssertEqual(try h.app.workspace.item(doc, page: page, id: id).text?.text.plainText, "Final draft")
+        }
+    }
+
     func testTypingInANewBoxCreatesItOnTheFirstCommit() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         let host = FakeCanvasHost(h)

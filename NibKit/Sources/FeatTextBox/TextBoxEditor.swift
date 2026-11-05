@@ -364,7 +364,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         let textJSON = (try? JSONValue.from(text)) ?? .string(text.plainText)
         if st.exists {
             let params: JSONValue = ["ref": .string(st.ref), "text": textJSON]
-            enqueue { [weak self] in await self?.execute(CommandIDs.textSetText, params, group: st.group) }
+            enqueue { [self] in await execute(CommandIDs.textSetText, params, group: st.group) }
             return
         }
         st.exists = true
@@ -378,8 +378,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             "style": SavedTextStyle(box: st.box.style).json,
             "id": .string(st.id.raw)
         ]
-        enqueue { [weak self] in
-            guard let self = self else { return }
+        enqueue { [self] in
             if await self.execute(CommandIDs.textCreateBox, params, group: st.group) {
                 if self.state === st {
                     self.hide(st.id, page: st.page)
@@ -397,8 +396,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     private func deleteEmptyBox(_ st: EditState) {
         let ref = st.ref
         let canDelete = app.commands.descriptor(CommandIDs.itemDelete) != nil
-        enqueue { [weak self] in
-            guard let self = self else { return }
+        enqueue { [self] in
             if canDelete {
                 await self.execute(CommandIDs.itemDelete, ["refs": [.string(ref)]], group: st.group)
             } else {
