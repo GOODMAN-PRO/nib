@@ -191,6 +191,8 @@ final class FolderLibrary: LibraryService {
     private var started = false
     /// Bumped by every catalog change, so a background scan that raced a change is not applied over it.
     private var generation: UInt64 = 0
+    private var rootEpoch = UUID()
+    private(set) var lastRefreshRanOffMain = false
     private var scanning = false
     private var rebuilding = false
     private var rescanRequested = false
@@ -567,7 +569,7 @@ final class FolderLibrary: LibraryService {
     func duplicate(_ id: NibID) throws -> NibID {
         let job = try prepareDuplicate(id, as: nil)
         try job.run()
-        return finishDuplicate(job, top: job.topID ?? id)
+        return try finishDuplicate(job, top: job.topID ?? id)
     }
 
     /// Duplicates a document (new id in this device's head, other heads removed) or a folder (new ids for every folder
@@ -575,10 +577,10 @@ final class FolderLibrary: LibraryService {
     func duplicate(_ id: NibID, as newID: NibID?) async throws -> NibID {
         let job = try prepareDuplicate(id, as: newID)
         try await Task.detached(priority: .userInitiated) { try job.run() }.value
-        return finishDuplicate(job, top: job.topID ?? id)
+        return try finishDuplicate(job, top: job.topID ?? id)
     }
 
-    private func prepareDuplicate(_ id: NibID, as newID: NibID?) throws -> CopyJob {
+    func prepareDuplicate(_ id: NibID, as newID: NibID?) throws -> CopyJob {
         ensureLoaded()
         guard let e = catalog.entry(id: id) else { throw NibError.notFound("library item \(id.raw)") }
         guard !e.inTrash else {
@@ -589,7 +591,7 @@ final class FolderLibrary: LibraryService {
         guard catalog.entry(id: top) == nil else {
             throw NibError(.conflict, "the library already has an item with id \(top.raw)", hint: "omit ids to get fresh ones")
         }
-        flushDocuments(under: e)
+        try checkpointDocuments(under: e)
         let source = url(of: e)
         let dir = source.deletingLastPathComponent()
         let ext: String? = e.isDocument ? NibFormat.packageExtension : nil
@@ -597,10 +599,13 @@ final class FolderLibrary: LibraryService {
         let name = uniqueName(base, ext: ext, in: dir)
         let destination = dir.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
         return CopyJob(source: source, destination: destination, topID: top, device: device, clock: clock,
-                       taken: Set(catalog.entries.map { $0.node.id }), collapseHeads: true)
+                       taken: Set(catalog.entries.map { $0.node.id }), collapseHeads: true, rootEpoch: rootEpoch)
     }
 
-    private func finishDuplicate(_ job: CopyJob, top fallback: NibID) -> NibID {
+    func finishDuplicate(_ job: CopyJob, top fallback: NibID) throws -> NibID {
+        guard job.rootEpoch == rootEpoch else {
+            throw NibError(.conflict, String(localized: "The library changed while duplicating. The copy remains in the original library."))
+        }
         let added = scanner(previous: [:]).scanItem(at: job.destination, inTrash: false, trashTop: false,
                                                     existing: catalog.byPath)
         for entry in added {
@@ -862,6 +867,38 @@ final class FolderLibrary: LibraryService {
 
     // MARK: LibraryService — refresh and root
 
+    /// Awaitable incremental refresh for sync. Scanning and preference reads run off-main; catalogue publication
+    /// is retried after intervening edits and refused after a root switch (including switching away and back).
+    func refreshCatalog() async throws {
+        let epoch = rootEpoch
+        let prefs = self.prefs
+        while true {
+            try Task.checkCancellation()
+            let gen = generation
+            var job = scanner(previous: catalog.byPath)
+            job.reuse = FileManager.default.fileExists(atPath: cacheURL.path)
+            let scan = job
+            let (result, names, offMain) = try await Task.detached(priority: .utility) {
+                _ = try FileManager.default.contentsOfDirectory(at: scan.root, includingPropertiesForKeys: nil)
+                return (scan.scanAll(), prefs.reload(), !Thread.isMainThread)
+            }.value
+            guard rootEpoch == epoch else {
+                throw NibError(.conflict, String(localized: "The library changed while refreshing. Try syncing again."))
+            }
+            guard generation == gen else { continue }
+            try Task.checkCancellation()
+            loaded = true
+            lastRefreshRanOffMain = offMain
+            apply(result)
+            guard rootEpoch == epoch else {
+                throw NibError(.conflict, String(localized: "The library changed while refreshing. Try syncing again."))
+            }
+            scheduleCacheSave()
+            postSettingsChanges(names)
+            return
+        }
+    }
+
     /// A synchronous rescan (after sync, import or repair). Incremental while the cached catalog file exists; when it
     /// is gone (deleted by a repair, never written) every head and folder record is read again and the file is
     /// written anew. Either way ids stay with the paths that held them.
@@ -999,6 +1036,12 @@ final class FolderLibrary: LibraryService {
         overlayLoadedDocuments(&entries)
         let before = catalog.byPath
         install(entries)
+        // A remote Trash move has the same editor lifecycle as local trash. Install the new package URLs first
+        // so closing flushes pending edits to the moved package. Missing packages are left open for recovery.
+        let previouslyLive = Set(before.values.filter { $0.isDocument && !$0.inTrash }.map { $0.node.id })
+        for entry in entries where entry.isDocument && entry.inTrash && previouslyLive.contains(entry.node.id) {
+            workspace.close(entry.node.id)
+        }
         var refs: [String] = []
         for e in entries where before[e.node.path] != e { refs.append(e.ref) }
         let now = Set(entries.map { $0.node.path })
@@ -1092,6 +1135,7 @@ final class FolderLibrary: LibraryService {
         scopedRoot?.stopAccessingSecurityScopedResource()
         scopedRoot = scoped ? url : nil
         rootURL = target
+        rootEpoch = UUID()
         rootUnavailable = false
         LibrarySettings.saveRoot(bookmark, settings)
         try? FileOps.createDirectory(metadataURL)
@@ -1274,6 +1318,17 @@ final class FolderLibrary: LibraryService {
         return record
     }
 
+    /// Requires durable source bytes before copying, including failed writes retained after a document closed.
+    private func checkpointDocuments(under entry: CatalogEntry) throws {
+        // Matches NibStoreFeature.Checkpoint, like the optional catalogue-rebuild service: no feature import.
+        typealias Checkpoint = @MainActor (DocumentID) throws -> Bool
+        let checkpoint = services?.get("store.checkpoint", as: Checkpoint.self)
+        for e in catalog.subtree(path: entry.node.path) where e.isDocument {
+            if let checkpoint, try checkpoint(e.node.id) { continue }
+            workspace.persistence.flush(e.node.id)
+        }
+    }
+
     /// Writes pending changes of open documents at or under `entry` (before their package moves).
     private func flushDocuments(under entry: CatalogEntry) {
         for e in catalog.subtree(path: entry.node.path) where e.isDocument && workspace.isLoaded(e.node.id) {
@@ -1354,6 +1409,7 @@ struct CopyJob {
     let taken: Set<NibID>
     /// Duplicates: every document gets a new id and keeps only this device's head.
     let collapseHeads: Bool
+    var rootEpoch: UUID? = nil
 
     /// Copies, then re-identifies; a copy that cannot get its own identity is removed again.
     func run() throws {
