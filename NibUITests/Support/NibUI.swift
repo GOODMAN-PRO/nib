@@ -372,13 +372,28 @@ final class NibUI {
         return result
     }
 
-    /// Search real row gaps before considering the leading inset of a dense form.
+    /// Search real row gaps first, then a row of plain buttons, then the leading inset of a dense form.
     private func formDragStart(_ snapshot: XCUIElementSnapshot, viewport: CGRect, down: Bool) -> CGPoint? {
         let interactive: [XCUIElement.ElementType] = [.slider, .switch, .button, .textField, .textView,
             .secureTextField, .searchField, .stepper, .segmentedControl, .picker, .pickerWheel, .link]
         func controls(_ node: XCUIElementSnapshot) -> [(String, CGRect)] {
             let own = interactive.contains(node.elementType) ? [(node.label, node.frame)] : []
             return own + node.children.flatMap { controls($0) }
+        }
+        // Controls that keep a touch which starts on or near them. NibSlider takes the touch at touch down
+        // (DragGesture(minimumDistance: 0)) and its touch area is taller than its accessibility frame: in run
+        // 41985396100 a drag that began 23.5 pt away from a slider frame changed its value. Plain buttons and
+        // links do not keep a drag, the scroll view cancels their press, and menus made only of button rows
+        // (the More menu) offer no other place to start: the same run logged "Form no safe point" 28 times.
+        func frames(_ node: XCUIElementSnapshot, of types: [XCUIElement.ElementType]) -> [CGRect] {
+            let own = types.contains(node.elementType) ? [node.frame] : []
+            return own + node.children.flatMap { frames($0, of: types) }
+        }
+        let sliders = frames(snapshot, of: [.slider])
+        let holding = frames(snapshot, of: [.switch, .textField, .textView, .secureTextField, .searchField,
+                                            .stepper, .segmentedControl, .picker, .pickerWheel])
+        func verticalMargin(_ rects: [CGRect], _ y: CGFloat) -> CGFloat {
+            rects.map { max($0.minY - y, y - $0.maxY) }.min() ?? viewport.height
         }
         let blocked = controls(snapshot)
         let preferredY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
@@ -395,7 +410,18 @@ final class NibUI {
                 return point
             }
         }
-        // Second pass: only the leading inset, retaining the 4pt horizontal exclusion.
+        // Second pass: any row that is 40pt away from every slider and 12pt away from the other holding
+        // controls, which in practice is a row of plain buttons or captions.
+        for y in ys where abs(endY - y) >= 24 {
+            let sliderMargin = verticalMargin(sliders, y)
+            let holdingMargin = verticalMargin(holding, y)
+            if sliderMargin >= 40, holdingMargin >= 12 {
+                let point = CGPoint(x: viewport.midX, y: y)
+                logQA("Form drag point", "pass=plain-row point=\(point) sliderMargin=\(sliderMargin) holdingMargin=\(holdingMargin) viewport=\(viewport)")
+                return point
+            }
+        }
+        // Third pass: only the leading inset, retaining the 4pt horizontal exclusion.
         let x = viewport.minX + 6
         var best: (point: CGPoint, clearance: CGFloat)?
         for y in ys {
@@ -403,12 +429,13 @@ final class NibUI {
             let point = CGPoint(x: x, y: y)
             let relevant = blocked.filter { x >= $0.1.minX - 4 && x <= $0.1.maxX + 4 }
             let clearance = relevant.map { max($0.1.minY - y, y - $0.1.maxY) }.min() ?? viewport.height
-            if clearance >= 32 {
+            if clearance >= 32, verticalMargin(sliders, y) >= 40 {
                 logQA("Form drag point", "pass=leading-inset point=\(point) verticalMargin=\(clearance) horizontalMargin=4 viewport=\(viewport) controls=\(blocked)")
                 return point
             }
-            // Never start inside an interactive frame, even in the best-effort fallback.
-            if clearance > 0, clearance > (best?.clearance ?? 0) {
+            // Never start inside an interactive frame, and never within a slider's touch area, even in the
+            // best-effort fallback: failing to scroll is better than changing a setting.
+            if clearance > 0, verticalMargin(sliders, y) >= 40, clearance > (best?.clearance ?? 0) {
                 best = (point, clearance)
             }
         }
