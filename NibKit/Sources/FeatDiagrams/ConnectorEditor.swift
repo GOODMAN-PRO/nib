@@ -432,8 +432,12 @@ final class ConnectorEditor: CanvasAttachment {
 
     private func refresh() {
         guard let host = kit.host else { return }
-        target = ConnectorEditor.selectedConnector(in: host)
-        if target == nil { drag = nil }
+        let next = ConnectorEditor.selectedConnector(in: host)
+        if target?.item.id != next?.item.id || target?.page != next?.page {
+            if let previous = target, drag?.moved == true { host.setHidden([], page: previous.page) }
+            drag = nil
+        }
+        target = next
         render()
     }
 
