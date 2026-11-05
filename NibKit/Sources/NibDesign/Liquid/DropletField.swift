@@ -240,6 +240,8 @@ final class DropletField {
     private(set) var satellites: [Satellite] = []
     // Observed; each changes rarely.
     private(set) var hasOpenBud = false
+    /// Owners of modal buds, so palette chrome can react only to its own popovers.
+    private(set) var openBudOwners: Set<String> = []
     /// The Pencil is down: physics is parked.
     private(set) var isInking = false
     /// Backdrop sampling is frozen and droplets near the ink recede: from Pencil down until 450 ms after it lifts.
@@ -297,7 +299,12 @@ final class DropletField {
             if n.head != b.head.value { n.head = b.head.value }
             if n.tail != b.tail.value { n.tail = b.tail.value }
         }
-        let open = entries.values.contains { $0.bud?.presented == true && $0.style.modalWhenBudded }
+        let owners = Set(entries.values.compactMap { entry -> String? in
+            guard entry.style.modalWhenBudded, let bud = entry.bud, bud.presented else { return nil }
+            return bud.owner
+        })
+        if owners != openBudOwners { openBudOwners = owners }
+        let open = !owners.isEmpty
         if open != hasOpenBud { hasOpenBud = open }
         let next = buildClusters()
         if next != clusters { clusters = next }

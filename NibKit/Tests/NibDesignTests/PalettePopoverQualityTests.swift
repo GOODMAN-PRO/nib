@@ -100,13 +100,28 @@ final class PalettePopoverQualityTests: XCTestCase {
                 for modal in [false, true] {
                     for editor in [false, true] {
                         let visible = NibPalettePresentation.showsOptions(settings: settings, more: more,
-                                                                         modal: modal, optionsPopover: editor)
+                            paletteID: "palette", openBudOwners: modal ? ["palette"] : [], optionsPopover: editor)
                         if settings || more { XCTAssertFalse(visible) }
                         else if modal { XCTAssertEqual(visible, editor) }
                         else { XCTAssertTrue(visible) }
                     }
                 }
             }
+        }
+    }
+
+    func testNavigationBudsKeepOptionsButPaletteBudsHideThem() {
+        let navigationOwners: [Set<String>] = [[], ["chrome.share"], ["exportui.source"], ["another.palette"]]
+        for owners in navigationOwners {
+            XCTAssertTrue(NibPalettePresentation.showsOptions(settings: false, more: false,
+                paletteID: "palette", openBudOwners: owners, optionsPopover: false))
+        }
+        for owner in ["palette", "palette.options"] {
+            XCTAssertFalse(NibPalettePresentation.showsOptions(settings: false, more: false,
+                paletteID: "palette", openBudOwners: [owner], optionsPopover: false))
+            XCTAssertTrue(NibPalettePresentation.showsOptions(settings: false, more: false,
+                paletteID: "palette", openBudOwners: [owner], optionsPopover: true),
+                "The options editor must retain its source strip")
         }
     }
 
