@@ -228,6 +228,32 @@ final class NibIndexTests: XCTestCase {
         XCTAssertFalse(h.app.workspace.isLoaded(copy), "Background indexing must not open the copy")
     }
 
+    func testLibraryRefreshIndexesNewPagesOfAnAlreadyIndexedClosedDocument() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        await indexer.indexDocument(doc)
+        XCTAssertFalse(h.app.workspace.isLoaded(doc))
+        indexer.debounce = 0.01
+        indexer.start()
+        var head = try XCTUnwrap(h.persistence.heads[doc])
+        let page = PageRecord(id: "SYNCNEWPAGE1", order: "z", size: .a4)
+        head.pages.append(page)
+        h.persistence.heads[doc] = head
+        let text = Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 10, w: 100, h: 30),
+                                             text: RichText(plain: "Syncedplatypus")))
+        h.persistence.pageItems[doc, default: [:]][page.id] = [text]
+        h.app.events.emit(NibEventType.libraryChanged, payload: ["refresh": true, "refs": [.string(NodeRef.document(doc).description)]])
+        var found: [JSONValue] = []
+        let deadline = Date().addingTimeInterval(2)
+        repeat {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            found = results(try await h.run("search.text", ["query": "Syncedplatypus"]))
+        } while found.isEmpty && Date() < deadline
+        XCTAssertFalse(found.isEmpty)
+        XCTAssertEqual(found.first?["page"]?.stringValue, NodeRef.page(doc, page.id).description)
+        XCTAssertFalse(h.app.workspace.isLoaded(doc))
+    }
+
     private var strokeRef: String { NodeRef.item(Fixtures.docID, Fixtures.page1, Fixtures.strokeID).description }
 
     private func harness(_ script: [TextRecognition] = []) -> (Harness, Indexer) {

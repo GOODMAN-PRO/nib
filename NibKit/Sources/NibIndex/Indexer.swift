@@ -987,7 +987,7 @@ final class Indexer {
         subscriptions.append(app.bus.observeCommits { [weak self] cs in self?.noteChanges(cs) })
         subscriptions.append(app.events.subscribe { [weak self] e in
             guard e.type == NibEventType.libraryChanged, let indexer = self else { return }
-            Task { @MainActor in indexer.libraryChanged() }
+            Task { @MainActor in indexer.libraryChanged(e.payload) }
         })
         settingsToken = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings,
                                                                queue: nil) { [weak self] note in
@@ -1101,8 +1101,20 @@ final class Indexer {
         }
     }
 
-    private func libraryChanged() {
+    private func libraryChanged(_ payload: JSONValue?) {
         titlesDirty = true
+        let refs = payload?["refs"]?.arrayValue
+        // Refresh refs are capped at 500 by FolderLibrary. A root change or an unspecified/capped list must
+        // check the whole library, including documents that already have a document-unit row.
+        let docs: Set<DocumentID>
+        if let refs, !refs.isEmpty, refs.count < 500, payload?["root"]?.boolValue != true {
+            docs = Set(refs.compactMap { $0.stringValue.flatMap { NodeRef($0)?.documentID } })
+        } else {
+            docs = Set(libraryDocuments())
+        }
+        for doc in docs where app.services.library?.node(doc)?.trashedAt == nil {
+            wholeDocs.insert(doc)
+        }
         scheduleDebounce()
     }
 
