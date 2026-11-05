@@ -538,6 +538,33 @@ final class CollabMergeTests: XCTestCase {
         XCTAssertThrowsError(try CollabPackageIO.unzip(Data("not a zip".utf8)))
     }
 
+    func testPackageSnapshotSkipsDamagedConflictHeadAndKeepsAssets() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("collab-damaged-" + UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: root) }
+        let package = root.appendingPathComponent("Damaged.nibnote", isDirectory: true)
+        try fm.createDirectory(at: package.appendingPathComponent("assets", isDirectory: true), withIntermediateDirectories: true)
+        let head = Data(#"{"meta":{"id":"KINEMATICS01","sourceBookmark":"private"}}"#.utf8)
+        try head.write(to: package.appendingPathComponent("doc.00000007.json"))
+        let damagedName = "doc.00000007 (conflicted copy).json"
+        let damaged = Data(#"{"meta":{"sourceBookmark":"private""#.utf8)
+        try damaged.write(to: package.appendingPathComponent(damagedName))
+        let asset = Data(repeating: 19, count: 128_000)
+        try asset.write(to: package.appendingPathComponent("assets/photo.png"))
+        let unrelated = Data("not a document head".utf8)
+        try unrelated.write(to: package.appendingPathComponent("extra.json"))
+
+        let unpacked = try CollabPackageIO.unzip(CollabPackageIO.zip(package))
+        defer { try? fm.removeItem(at: CollabPackageIO.scratchFolder(of: unpacked)) }
+        let received = try JSONSerialization.jsonObject(with: Data(contentsOf: unpacked.appendingPathComponent("doc.00000007.json"))) as? [String: Any]
+        XCTAssertNil((received?["meta"] as? [String: Any])?["sourceBookmark"])
+        XCTAssertFalse(fm.fileExists(atPath: unpacked.appendingPathComponent(damagedName).path))
+        XCTAssertEqual(try Data(contentsOf: unpacked.appendingPathComponent("assets/photo.png")), asset)
+        XCTAssertEqual(try Data(contentsOf: unpacked.appendingPathComponent("extra.json")), unrelated)
+        XCTAssertEqual(try Data(contentsOf: package.appendingPathComponent(damagedName)), damaged)
+        XCTAssertEqual(try Data(contentsOf: package.appendingPathComponent("doc.00000007.json")), head)
+    }
+
     // MARK: Helpers
 
     private static func message(_ out: CollabFrames.Assembler.Output?) -> CollabMessage? {

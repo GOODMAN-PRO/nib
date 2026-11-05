@@ -933,16 +933,30 @@ enum CollabPackageIO {
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let zipURL = dir.appendingPathComponent("snapshot.zip")
         do {
-            let copy = dir.appendingPathComponent(package.lastPathComponent, isDirectory: true)
-            try fm.copyItem(at: package, to: copy)
-            // Sanitize the scratch copy before any bytes enter the transport; the host's package stays untouched.
-            for file in try fm.contentsOfDirectory(at: copy, includingPropertiesForKeys: nil) where file.pathExtension == "json" {
-                let data = try Data(contentsOf: file)
-                let clean = try CollabPrivacy.headData(data)
-                if clean != data { try clean.write(to: file, options: .atomic) }
+            let heads = dir.appendingPathComponent("heads", isDirectory: true)
+            try fm.createDirectory(at: heads, withIntermediateDirectories: true)
+            let archive = try Archive(url: zipURL, accessMode: .create)
+            func add(_ file: URL, path: String, topLevel: Bool = false) throws {
+                let values = try file.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                var source = file
+                if topLevel, file.pathExtension == "json",
+                   file.lastPathComponent.hasPrefix("doc.") || file.lastPathComponent == "document.json" {
+                    let data = try Data(contentsOf: file)
+                    // A damaged conflict head must neither block a valid snapshot nor leak unparsed private meta.
+                    guard let clean = try? CollabPrivacy.headData(data) else { return }
+                    source = heads.appendingPathComponent(file.lastPathComponent)
+                    try clean.write(to: source)
+                }
+                try archive.addEntry(with: path, fileURL: source, compressionMethod: .deflate)
+                if values.isDirectory == true, values.isSymbolicLink != true {
+                    for child in try fm.contentsOfDirectory(at: file, includingPropertiesForKeys: nil) {
+                        try add(child, path: path + "/" + child.lastPathComponent, topLevel: file == package)
+                    }
+                }
             }
-            try fm.zipItem(at: copy, to: zipURL, shouldKeepParent: true, compressionMethod: .deflate)
-            try fm.removeItem(at: copy)
+            // Only sanitized heads need scratch copies; stream assets and page files directly into the archive.
+            try add(package, path: package.lastPathComponent)
+            try fm.removeItem(at: heads)
         } catch {
             try? fm.removeItem(at: dir)
             throw error
@@ -1075,7 +1089,8 @@ final class CollabSession {
     enum Route: Hashable {
         case host
         case participant(String)
-        case peers([CollabPeer])
+        case peers([String])
+        case broadcast
     }
 
     /// `applyRemote` origin of merged collaborator changes ("collab:<participant>"), so they are never echoed back.
@@ -2228,16 +2243,31 @@ final class CollabSession {
 
     // MARK: Sending
 
-    /// Sends now, to explicit transport peers (hello, denials, ended); not ordered behind files.
+    /// Sends now unless this destination already has queued frames. A nil destination remains a broadcast.
     @discardableResult
     private func transmit(_ m: CollabMessage, to peers: [CollabPeer]?) -> Bool {
         do {
             let frames = try CollabFrames.frames(for: m)
-            let targets = peers ?? transport.peers
-            if outbox[.peers(targets)] != nil { return post(frames: frames, to: .peers(targets)) }
+            let route: Route
+            if let peers {
+                // A denial/revocation outlives the participant binding that its caller is about to remove.
+                let removesPeer = m.kind == .denied || m.kind == .revoked || m.kind == .ended || m.kind == .bye
+                if !removesPeer, peers.count == 1, side == .guest, peers[0].id == hostPeer?.id {
+                    route = .host
+                } else if !removesPeer, peers.count == 1, let pid = participantOf[peers[0].id] {
+                    route = .participant(pid)
+                } else {
+                    // Multi-peer and terminal control messages can interleave with individual routes.
+                    route = .peers(peers.map(\.id))
+                }
+            } else {
+                route = .broadcast
+            }
+            // End/bye must still go out immediately when end() has already marked the session closed.
+            if !isClosed, outbox[route] != nil { return post(frames: frames, to: route) }
             var next = 0
-            if try sendAvailable(frames, to: targets, next: &next) { return true }
-            return post(frames: Array(frames.dropFirst(next)), to: .peers(targets))
+            if try sendAvailable(frames, to: peers, next: &next) { return true }
+            return post(frames: Array(frames.dropFirst(next)), to: route)
         } catch {
             log.error("collab: send failed: \(NibError.wrap(error).message, privacy: .public)")
             return false
@@ -2270,7 +2300,10 @@ final class CollabSession {
         case .host: return hostPeer.map { [$0] }
         case .participant(let pid): return peerOf[pid].map { [$0] }
         case .peers(let targets):
-            return targets.allSatisfy { transport.peers.contains($0) } ? targets : nil
+            let current = transport.peers
+            let resolved = targets.compactMap { id in current.first { $0.id == id } }
+            return resolved.count == targets.count ? resolved : nil
+        case .broadcast: return [] // The transport resolves broadcast recipients, even before its roster is known.
         }
     }
 
@@ -2292,16 +2325,17 @@ final class CollabSession {
         var next = 0
         if previous == nil {
             do {
-                if try sendAvailable(frames, to: targets, next: &next) { return true }
+                if try sendAvailable(frames, to: route == .broadcast ? nil : targets, next: &next) { return true }
             } catch {
-                deliveryFailed(error)
+                log.error("collab: send failed: \(NibError.wrap(error).message, privacy: .public)")
+                hasUnsentChanges = true
                 return false
             }
         }
         let remaining = Array(frames.dropFirst(next))
         let task = Task { [weak self] in
             await previous?.value
-            guard let self = self, self.peers(for: route) == targets else { return }
+            guard let self = self, self.peers(for: route)?.map(\.id) == targets.map(\.id) else { return }
             _ = await self.deliver(remaining, to: route)
         }
         enqueue(task, on: route)
@@ -2310,7 +2344,6 @@ final class CollabSession {
 
     private func postBlob(_ header: CollabMessage, source: URL, copy: Bool, cleanup: URL?, to route: Route) {
         let previous = outbox[route]
-        let targets = peers(for: route)
         let task = Task { [weak self] in
             await previous?.value
             guard let self = self else {
@@ -2318,8 +2351,9 @@ final class CollabSession {
                 return
             }
             let sent = await self.streamBlob(header, source: source, copy: copy, cleanup: cleanup, to: route)
-            if !sent, !Task.isCancelled, !self.isClosed, let targets, self.peers(for: route) == targets {
-                self.deliveryFailed(NibError(.unavailable, String(localized: "The shared file couldn't be sent.")))
+            if !sent, !Task.isCancelled, !self.isClosed {
+                self.hasUnsentChanges = true
+                self.log.error("collab: the shared file couldn't be sent")
             }
         }
         enqueue(task, on: route)
@@ -2344,7 +2378,7 @@ final class CollabSession {
     }
 
     /// A busy relay has accepted every frame before `next`, and none from `next` onward.
-    private func sendAvailable(_ frames: [Data], to targets: [CollabPeer], next: inout Int) throws -> Bool {
+    private func sendAvailable(_ frames: [Data], to targets: [CollabPeer]?, next: inout Int) throws -> Bool {
         while next < frames.count {
             do {
                 try transport.send(frames[next], to: targets)
@@ -2356,23 +2390,19 @@ final class CollabSession {
         return true
     }
 
-    private func deliveryFailed(_ error: Error) {
-        hasUnsentChanges = true
-        let message = NibError.wrap(error).message
-        end(reason: String(localized: "The live session couldn't send changes: \(message) Your changes stay on this device. Share or join again to send them."),
-            notify: false)
-    }
-
     private func deliver(_ frames: [Data], to route: Route) async -> Bool {
         guard !isClosed, let targets = peers(for: route) else { return false }
         var next = 0
         do {
-            while !isClosed, !Task.isCancelled, peers(for: route) == targets {
-                if try sendAvailable(frames, to: targets, next: &next) { return true }
+            while !isClosed, !Task.isCancelled, peers(for: route)?.map(\.id) == targets.map(\.id) {
+                if try sendAvailable(frames, to: route == .broadcast ? nil : targets, next: &next) { return true }
                 try await Task.sleep(nanoseconds: 50_000_000)
             }
         } catch {
-            if !Task.isCancelled { deliveryFailed(error) }
+            if !Task.isCancelled {
+                log.error("collab: send failed: \(NibError.wrap(error).message, privacy: .public)")
+                hasUnsentChanges = true
+            }
         }
         return false
     }
@@ -2401,7 +2431,7 @@ final class CollabSession {
         } catch {
             return false
         }
-        guard !isClosed, peers(for: route) == first, await deliver(headerFrames, to: route) else { return false }
+        guard !isClosed, peers(for: route)?.map(\.id) == first.map(\.id), await deliver(headerFrames, to: route) else { return false }
         let count = CollabFrames.blobPartCount(prepared.bytes)
         var next = 0
         while next < count {
@@ -2417,7 +2447,7 @@ final class CollabSession {
                 log.error("collab: couldn't read a file to send: \(NibError.wrap(error).message, privacy: .public)")
                 return false
             }
-            guard !isClosed, !Task.isCancelled, peers(for: route) == first, await deliver(frames, to: route) else { return false }
+            guard !isClosed, !Task.isCancelled, peers(for: route)?.map(\.id) == first.map(\.id), await deliver(frames, to: route) else { return false }
             next = range.upperBound
         }
         return true

@@ -347,7 +347,7 @@ private struct LessonPanel: View {
     private var liveButtons: some View {
         Group {
             NibButton(String(localized: "Start Quick Lesson"), symbol: .share) {
-                run(CommandIDs.collabHost, ["doc": .string(doc)]) { _ in
+                run(CommandIDs.collabHost, ["doc": .string(doc)]) { value in
                     Task { await loadLiveSession() }
                     receipt = String(localized: "Quick Lesson started. Approve students in Manage Participants.")
                 }
