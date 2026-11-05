@@ -17,3 +17,11 @@ D:capture#1, L:#3 and D:ink-three#0: current Capture and Library tap the wide la
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Capture tabs; Library favourite/All folders; Chrome/Ink toggle callers | Switch before press / Switch value failed | Which row/thumb received the press, what overlaps it, and did the labelled value change? |
+
+## H3 - ancestor-clipped reveal viewport (C7 reorder)
+
+L:#0 and verifier confirm the 1032pt collection inside a 520pt panel, and the y961 drag outside that panel. Current reveal clips only to the window. Carry the selected container's intersection with every nonempty finite ancestor frame from the existing app snapshot (explicit forms obtain that ancestry too), then pass the clipped scroll frame to NibUITestScrollGeometry.viewport. The shared geometry source is outside NibUITests, so it remains unchanged. After a drag, disappearance or a type/frame change greater than 1pt records/fails immediately; requireControl and Library performTap propagate the failure without their later missing-row poll. Cached container/rebinding, ranking and control-value checks remain. Library Move earlier/later joins existing action diagnostics. CI must drag inside the panel, reach both rows and preserve all boundary/order assertions; a dismissed menu must instead report the container change.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Library AccessibleMoveEarlierLaterAndBoundaries; all reveal callers | Form container changed / Form drag point | Was the drag inside the ancestor clip, or did the original surface disappear/change? |

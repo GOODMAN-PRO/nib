@@ -74,7 +74,7 @@ final class LibraryUITests: XCTestCase {
         try ui.timedAction("Library tap \(label)") { try self.performTap(label, file: file, line: line) }
     }
     private func performTap(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
-        let diagnose = ["Move to Trash", "Save to Files"].contains(label)
+        let diagnose = ["Move to Trash", "Save to Files", "Move earlier", "Move later"].contains(label)
         var firstPoll = true
         func candidate() -> XCUIElement? {
             if diagnose && firstPoll {
@@ -90,6 +90,7 @@ final class LibraryUITests: XCTestCase {
         }
         if candidate() == nil {
             ui.revealFormElement { self.app.buttons.matching(self.matching(label)).firstMatch }
+            if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
         }
         do {
             try eventually("Action is not enabled and hittable: \(label)", file: file, line: line) { candidate() != nil }

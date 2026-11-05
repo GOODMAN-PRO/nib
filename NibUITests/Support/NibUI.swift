@@ -41,6 +41,7 @@ struct QAState: Decodable {
 final class NibUI {
     let app = XCUIApplication()
     var probe: XCUIElement { app.otherElements["nib.qa.state"].firstMatch }
+    private(set) var formRevealFailure: String?
     var canvas: XCUIElement { app.scrollViews["nib.canvas"].firstMatch }
 
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
@@ -122,6 +123,7 @@ final class NibUI {
                     ?? self.app.descendants(matching: type).matching(NSPredicate(
                         format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
             }
+            if let failure = formRevealFailure { throw Failure.message(failure) }
             if let found = findControl(name, type: type) { return found }
         }
         var found: XCUIElement?
@@ -167,12 +169,41 @@ final class NibUI {
 
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
     func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
+        formRevealFailure = nil
+        var ancestorClip: CGRect?
+        func clippedFrame(_ target: XCUIElementSnapshot, in root: XCUIElementSnapshot) -> CGRect? {
+            func visit(_ node: XCUIElementSnapshot, clip: CGRect) -> CGRect? {
+                let frame = node.frame
+                let clipped = frame.isNull || frame.isInfinite || frame.isEmpty ? clip : clip.intersection(frame)
+                if node.elementType == target.elementType && node.identifier == target.identifier
+                    && node.label == target.label && node.frame == target.frame { return clipped }
+                for child in node.children {
+                    if let match = visit(child, clip: clipped) { return match }
+                }
+                return nil
+            }
+            return visit(root, clip: app.windows.firstMatch.frame)
+        }
+        func containerLost(_ detail: String) {
+            let message = "Reveal drag dismissed or replaced its menu/popover/container: " + detail
+            formRevealFailure = message
+            recordDiagnostics("Form container changed", facts: message)
+            XCTFail(message)
+        }
         let initial = target()
         let initialSnapshot = initial.exists ? (try? initial.snapshot()) : nil
         // Unlabelled native thumbs are not unique identities; keep the caller's scoped query.
         let identity = initialSnapshot.flatMap { $0.identifier.isEmpty && $0.label.isEmpty ? nil : $0 }
         func liveList() -> XCUIElement? {
-            if let form, form.exists, hasVisibleFrame(form) { return form }
+            if let form, form.exists, hasVisibleFrame(form) {
+                guard let node = try? form.snapshot(), let root = try? app.snapshot(),
+                      let clip = clippedFrame(node, in: root) else {
+                    logQA("Form reveal unavailable", "Explicit container ancestry unavailable; no unbounded viewport drag")
+                    return nil
+                }
+                ancestorClip = clip
+                return form
+            }
             guard let root = try? app.snapshot() else {
                 logQA("Form reveal unavailable", "snapshotCandidates=0; app snapshot unavailable; candidates not collected")
                 return nil
@@ -240,6 +271,7 @@ final class NibUI {
             var fallback: (element: XCUIElement, rank: Int, frame: CGRect)?
             func chosen(_ element: XCUIElement, rank: Int, frame: CGRect, hittable: Bool) -> XCUIElement {
                 let node = ranked[rank].node
+                ancestorClip = clippedFrame(node, in: root)
                 logQA("Form reveal container", "type=\(node.elementType) label=\(node.label) frame=\(frame) rank=\(rank + 1)/\(ranked.count) hittable=\(hittable)")
                 return element
             }
@@ -313,7 +345,7 @@ final class NibUI {
         for _ in 0..<16 {
             let listFrame = snapshot.frame
             guard let viewport = NibUITestScrollGeometry.viewport(
-                scroll: listFrame, window: window, obstructions: obstructions) else { return }
+                scroll: listFrame.intersection(ancestorClip ?? window), window: window, obstructions: obstructions) else { return }
             let element: XCUIElement
             if let identity {
                 element = list.descendants(matching: identity.elementType).matching(NSPredicate(
@@ -351,7 +383,15 @@ final class NibUI {
                 nextSnapshot = try? replacement.snapshot()
             }
             guard let after = nextSnapshot else {
-                logQA("Form reveal unavailable", "Container disappeared after drag; caller retains its wait/fallback")
+                containerLost("container disappeared after drag; before=\(listFrame)")
+                return
+            }
+            let sameFrame = abs(after.frame.minX - listFrame.minX) <= 1
+                && abs(after.frame.minY - listFrame.minY) <= 1
+                && abs(after.frame.maxX - listFrame.maxX) <= 1
+                && abs(after.frame.maxY - listFrame.maxY) <= 1
+            guard after.elementType == snapshot.elementType, sameFrame else {
+                containerLost("before=\(snapshot.elementType) \(listFrame) after=\(after.elementType) \(after.frame)")
                 return
             }
             logQA("Form drag after", "point=\(start) container=\(after.frame) rows=\(formVisibleRange(after, viewport: viewport))")
@@ -1195,6 +1235,7 @@ final class NibUI {
             revealFormElement {
                 shareAction("Save to Files", actionable: false) ?? self.app.cells["Save to Files"].firstMatch
             }
+            if let failure = formRevealFailure { throw Failure.message(failure) }
         }
         var action: XCUIElement?
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
@@ -1426,7 +1467,10 @@ final class NibUI {
     /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.
     func focusField(_ field: XCUIElement) throws {
         if isKeyboardFocused(field) { return }
-        if !hasVisibleFrame(field) || !field.isHittable { revealFormElement(field) }
+        if !hasVisibleFrame(field) || !field.isHittable {
+            revealFormElement(field)
+            if let failure = formRevealFailure { throw Failure.message(failure) }
+        }
         guard hasVisibleFrame(field) && field.isHittable else {
             // Only a keyboard-occluded editor justifies the expensive Attributes-line check (GIPHY, LaTeX).
             if isKeyboardFocused(field, allowingAttributeFallback: true) { return }
@@ -1679,6 +1723,7 @@ final class NibUI {
         let target = app.buttons.matching(identifier: id).firstMatch
         if target.exists {
             revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
+            if let failure = formRevealFailure { throw Failure.message(failure) }
             if let control = candidate(id) { activate(control); return }
         }
         for identifier in overflow {
@@ -1691,6 +1736,7 @@ final class NibUI {
                 _ = XCTWaiter.wait(for: [ready], timeout: 3)
             }
             revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
+            if let failure = formRevealFailure { throw Failure.message(failure) }
             if let control = candidate(id) { activate(control); return }
             if menu.exists && menu.isHittable { menu.tap() }
         }
