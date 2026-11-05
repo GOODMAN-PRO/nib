@@ -65,17 +65,35 @@ public final class UndoHistory {
             let muts = cs.mutations.filter { $0.document == doc }
             var stack = undoStacks[doc] ?? []
             if var top = stack.last, top.group == cs.group {
-                top.mutations.append(contentsOf: muts)
+                UndoHistory.appendCompacting(muts, to: &top.mutations)
                 top.linked = top.linked || linked
                 stack[stack.count - 1] = top
             } else {
-                var entry = UndoEntry(group: cs.group, label: cs.label, principal: cs.principal, mutations: muts)
+                var compact: [Mutation] = []
+                UndoHistory.appendCompacting(muts, to: &compact)
+                var entry = UndoEntry(group: cs.group, label: cs.label, principal: cs.principal, mutations: compact)
                 entry.linked = linked
                 stack.append(entry)
                 if stack.count > limit { stack.removeFirst(stack.count - limit) }
             }
             undoStacks[doc] = stack
             redoStacks[doc] = []
+        }
+    }
+
+    /// Keep the first before-value and last after-value of a revision-linked run. A remote edit breaks the
+    /// chain, so its surrounding segments stay separate and selective undo still skips the conflicting segment.
+    private static func appendCompacting(_ writes: [Mutation], to stored: inout [Mutation]) {
+        var latest: [RecordKey: Int] = [:]
+        for (i, mutation) in stored.enumerated() { latest[mutation.recordKey] = i }
+        for write in writes {
+            let key = write.recordKey
+            if let i = latest[key], let merged = stored[i].followed(by: write) {
+                stored[i] = merged
+            } else {
+                latest[key] = stored.count
+                stored.append(write)
+            }
         }
     }
 
@@ -109,6 +127,22 @@ public final class UndoHistory {
     func removeEntry(id: String, doc: DocumentID) -> UndoEntry? {
         guard let i = undoStacks[doc]?.lastIndex(where: { $0.id == id }) else { return nil }
         return undoStacks[doc]?.remove(at: i)
+    }
+}
+
+private extension Mutation {
+    func followed(by next: Mutation) -> Mutation? {
+        guard recordKey == next.recordKey, afterRev == next.beforeRev else { return nil }
+        switch (self, next) {
+        case let (.item(d, p, b, _), .item(_, _, _, a)): return .item(d, p, before: b, after: a)
+        case let (.page(d, b, _), .page(_, _, a)): return .page(d, before: b, after: a)
+        case let (.meta(d, b, _), .meta(_, _, a)): return .meta(d, before: b, after: a)
+        case let (.block(d, b, _), .block(_, _, a)): return .block(d, before: b, after: a)
+        case let (.card(d, b, _), .card(_, _, a)): return .card(d, before: b, after: a)
+        case let (.audio(d, b, _), .audio(_, _, a)): return .audio(d, before: b, after: a)
+        case let (.outline(d, b, _), .outline(_, _, a)): return .outline(d, before: b, after: a)
+        default: return nil
+        }
     }
 }
 

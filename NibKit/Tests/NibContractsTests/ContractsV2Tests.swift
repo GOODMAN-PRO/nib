@@ -163,6 +163,53 @@ final class ContractsV2Tests: XCTestCase {
         XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).text?.text.plainText, "One two")
     }
 
+    func testLongTypingGroupCompactsRecordSnapshots() async throws {
+        let h = Harness()
+        let before = try h.snapshot(Fixtures.textDocID)
+        let ctx = try await probeContext(h, group: "LONGTYPING01")
+        for i in 0..<1_000 {
+            try ctx.mutate { tx in
+                var block = try XCTUnwrap(try tx.content(Fixtures.textDocID).blocks.first)
+                block.text = RichText(plain: String(repeating: "a", count: 1_000) + String(i))
+                try tx.put(block, doc: Fixtures.textDocID)
+            }
+        }
+        let entry = try XCTUnwrap(h.app.bus.history.entries(Fixtures.textDocID).last)
+        XCTAssertEqual(entry.mutations.count, 1)
+        XCTAssertEqual(h.undoDepth(Fixtures.textDocID), 1)
+        let after = try h.snapshot(Fixtures.textDocID)
+        XCTAssertNotEqual(after, before)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.textDocID))
+        XCTAssertEqual(try h.snapshot(Fixtures.textDocID), before)
+        XCTAssertTrue(h.app.bus.redo(Fixtures.textDocID))
+        XCTAssertEqual(try h.snapshot(Fixtures.textDocID), after)
+    }
+
+    func testGroupedCompactionKeepsSegmentsAcrossARemoteWrite() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h, group: "CONFLICTGROUP")
+        func write(_ text: String) throws {
+            try ctx.mutate { tx in
+                var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+                item.text?.text = RichText(plain: text)
+                try tx.put(item, doc: self.doc, page: self.page1)
+            }
+        }
+        try write("Local one")
+        try write("Local two")
+        var remote = try h.app.workspace.item(doc, page: page1, id: Fixtures.textID)
+        remote.rev = Rev(wallMs: remote.rev.wallMs, counter: remote.rev.counter + 1, device: 99)
+        remote.text?.text = RichText(plain: "Remote text")
+        _ = h.app.bus.applyRemote(DocumentPatch(doc: doc, items: [page1.raw: [remote]]), origin: "test")
+        try write("Local three")
+        try write("Local four")
+        XCTAssertEqual(h.app.bus.history.entries(doc).last?.mutations.count, 2)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).text?.text.plainText, "Remote text")
+        XCTAssertTrue(h.app.bus.redo(doc))
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).text?.text.plainText, "Local four")
+    }
+
     /// F026 / F029 / F034 / F036 / F049: consecutive undo entries on the SAME item all undo (each revert re-stamps the
     /// item, which used to make the next-older entry look "changed since" and be skipped), then all redo.
     func testConsecutiveUndosOnOneItem() async throws {
