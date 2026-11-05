@@ -48,19 +48,22 @@ final class GestureRouter {
         return .tool(tool)
     }
 
-    func begin(_ sample: CanvasSample, route: Route) {
-        guard let host = host else { return }
+    @discardableResult
+    func begin(_ sample: CanvasSample, route: Route) -> Route {
+        guard let host = host else { return .rejected }
         routes[sample.touchID] = route
         switch route {
         case .attachment(let attachment): attachment.touchesBegan(sample, host: host)
         case .tool(let tool) where tool.inputMode == .samples:
             guard sampleOwner == nil else {
-                routes[sample.touchID] = .rejected
-                return
+                // A second finger still participates in the controller's two-finger navigation.
+                let fallback: Route = sample.isPencil ? .rejected : .navigation
+                routes[sample.touchID] = fallback
+                return fallback
             }
             if sample.isPencil {
                 // Undelivered finger taps cannot later overwrite the Pencil gesture.
-                for id in buffered.keys { routes[id] = .rejected }
+                for id in buffered.keys where routes[id] != nil { routes[id] = .rejected }
                 buffered.removeAll()
                 sampleOwner = sample.touchID
                 tool.touchesBegan(sample, host: host)
@@ -68,6 +71,7 @@ final class GestureRouter {
             else { buffered[sample.touchID] = BufferedSamples(began: sample, tool: tool) }
         default: break
         }
+        return route
     }
 
     func move(_ samples: [CanvasSample]) {
@@ -109,6 +113,8 @@ final class GestureRouter {
         case .attachment(let attachment): attachment.touchesCancelled(host: host)
         case .tool(let tool) where sampleOwner == touchID:
             sampleOwner = nil
+            tool.touchesCancelled(host: host)
+        case .tool(let tool) where tool.inputMode != .samples:
             tool.touchesCancelled(host: host)
         default: break
         }
