@@ -850,6 +850,71 @@ final class FeatZoomWindowTests: XCTestCase {
         overlay.detach(from: host)
     }
 
+    func testWetInkCleanupWaitsForTheActiveToolAndKeepsLaterStrokes() {
+        let view = ZoomWritingView(frame: CGRect(x: 0, y: 0, width: 400, height: 100))
+        view.onStroke = { _ in true }
+        let first = PKBridge.pkStroke(stroke(120, 150))
+        let failed = PKBridge.pkStroke(stroke(160, 190))
+        let alsoFailed = PKBridge.pkStroke(stroke(180, 195))
+        let last = PKBridge.pkStroke(stroke(200, 230))
+        view.canvas.drawing = PKDrawing(strokes: [first, failed, alsoFailed])
+        view.canvasViewDrawingDidChange(view.canvas)
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        let before = view.canvas.drawing.dataRepresentation()
+        XCTAssertFalse(view.dropWet(1))
+        view.removeWet(at: 1)
+        view.removeWet(at: 1)
+        XCTAssertEqual(view.canvas.drawing.dataRepresentation(), before)
+        XCTAssertEqual(view.wetCount, 1, "failed strokes leave logical accounting immediately")
+        view.canvas.drawing = PKDrawing(strokes: [first, failed, alsoFailed, last])
+        view.canvasViewDrawingDidChange(view.canvas)
+        var ended = false
+        view.onToolEnded = { ended = true }
+        view.canvasViewDidEndUsingTool(view.canvas)
+        XCTAssertTrue(ended)
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 2)
+        XCTAssertTrue(view.dropWet(1))
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 1)
+        XCTAssertEqual(view.canvas.drawing.strokes[0].path[0].location, last.path[0].location)
+    }
+
+    func testRenderCompletionKeepsLandedInkUntilTheToolEnds() async throws {
+        let h = harness()
+        try await h.run("zoom.setBox", ["page": .string(page1), "rect": [100, 200, 200, 50]])
+        try await h.run("zoom.toggle", ["on": true])
+        let host = ScriptedCanvasHost(h)
+        let overlay = ZoomBoxOverlay(host: host)
+        overlay.attach(to: host)
+        let c = overlay.controller
+        let view = c.writingView()
+        let root = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        window.rootViewController = root
+        root.view.addSubview(view)
+        view.frame = root.view.bounds
+        window.makeKeyAndVisible()
+        c.paneAppeared()
+        defer {
+            c.paneDisappeared()
+            overlay.detach(from: host)
+            window.isHidden = true
+        }
+        view.onStroke = { _ in true }
+        showWet(c, [stroke(120, 150)])
+        view.canvasViewDrawingDidChange(view.canvas)
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        XCTAssertTrue(c.strokeFinished(stroke(120, 150)))
+        host.finish(.success(nil))
+        for _ in 0..<300 where view.paper.image == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNotNil(view.paper.image, "the render still updates dry ink")
+        XCTAssertEqual(c.landed, 1)
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 1)
+        view.canvasViewDidEndUsingTool(view.canvas)
+        for _ in 0..<300 where c.landed != 0 { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(c.landed, 0)
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 0)
+    }
+
     func testCommitOutcomesDecideWhenWetInkLeaves() async throws {
         let h = harness()
         registerAddStrokes(h)
