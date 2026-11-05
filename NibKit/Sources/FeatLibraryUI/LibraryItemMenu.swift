@@ -316,7 +316,7 @@ struct LibraryNewMenuPopover: View {
             let count = entries.filter { $0.submenu == nil }.count + Set(entries.compactMap(\.submenu)).count
             let header = titleHeight + NibSpacing.m + 2 * NibSpacing.l
             let layout = LibraryMenuViewport(available: max(above, below), count: count,
-                                             rowHeight: rowHeight, header: header)
+                                             rowHeight: rowHeight, header: header, maximumHeight: max(above, below))
             let width = min(NibMetrics.popoverWidth, max(0, proxy.size.width - 2 * inset))
             let y = layout.height <= below ? anchor.maxY + gap : max(top, anchor.minY - gap - layout.height)
             VStack(alignment: .leading, spacing: NibSpacing.m) {
@@ -402,8 +402,9 @@ struct LibraryMenuViewport {
     let viewportHeight: CGFloat
     let scrolls: Bool
     let height: CGFloat
-    init(available: CGFloat, count: Int, rowHeight: CGFloat, header: CGFloat) {
-        let limit = min(available, NibMetrics.popoverMaxHeight)
+    init(available: CGFloat, count: Int, rowHeight: CGFloat, header: CGFloat,
+         maximumHeight: CGFloat = NibMetrics.popoverMaxHeight) {
+        let limit = min(available, maximumHeight)
         let footer = NibSpacing.l + NibSpacing.m
         scrolls = header + CGFloat(count) * rowHeight > limit
         let capacity = max(1, Int(max(0, limit - header - (scrolls ? footer : 0)) / rowHeight))

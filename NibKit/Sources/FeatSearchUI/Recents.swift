@@ -177,7 +177,7 @@ enum SearchEmptyPresentation: Equatable {
         switch self {
         case .searching: return String(localized: "Results will appear here as the search finishes.")
         case .indexing: return String(localized: "Try typed text or check again when recognition finishes.")
-        case .noResults: return String(localized: "Try fewer words or choose All to search every source.")
+        case .noResults: return String(localized: "Try fewer words or check the spelling.")
         }
     }
 }
@@ -191,6 +191,7 @@ final class SearchState: ObservableObject {
     @Published var selectedID: String?
     @Published var recentRows: [RecentRow] = []
     @Published var loading = false
+    @Published var refreshPending = false
     @Published var error: String?
     @Published var progress: IndexProgressPayload?
     @Published var isPresented = false
@@ -219,7 +220,7 @@ final class SearchState: ObservableObject {
     var emptyPresentation: SearchEmptyPresentation? {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, error == nil, visibleMatches.isEmpty else { return nil }
-        if loading { return .searching }
+        if loading || refreshPending { return .searching }
         if isIndexing { return .indexing }
         return .noResults(trimmed)
     }
@@ -230,6 +231,7 @@ final class SearchState: ObservableObject {
         }
         return String(localized: "Handwriting is still being indexed.")
     }
+    var showsIndexingFooter: Bool { isIndexing && emptyPresentation != .indexing }
     /// Document navigation always has an active hit as soon as results arrive. Library search
     /// keeps its unselected count until a row is opened. Preserve selection across refreshes.
     func reconcileSelection() {
@@ -312,6 +314,7 @@ final class SearchRuntime {
     func cancelPending(_ session: EditorSession) {
         refreshTasks.removeValue(forKey: session.id)?.cancel()
         typingTasks.removeValue(forKey: session.id)?.cancel()
+        states[session.id]?.refreshPending = false
     }
     func type(_ query: String, session: EditorSession, state: SearchState) {
         cancelPending(session)
@@ -333,7 +336,16 @@ final class SearchRuntime {
     private func scheduleRefresh(_ session: EditorSession, state: SearchState, delay: UInt64 = 1_000_000_000) {
         refreshTasks.removeValue(forKey: session.id)?.cancel()
         state.generation += 1
+        // The old query may have completed before newly indexed titles reached the database.
+        // Do not announce a final empty result while its replacement is queued.
+        state.loading = false
+        state.refreshPending = true
         refreshTasks[session.id] = Task { @MainActor [weak self, weak session, weak state] in
+            defer {
+                // A cancelled task may have been replaced by a newer queued refresh.
+                // Its owner clears the flag in cancelPending or keeps it for the replacement.
+                if !Task.isCancelled { state?.refreshPending = false }
+            }
             do {
                 try await Task.sleep(nanoseconds: delay)
                 while session?.inking.isInking == true {
@@ -420,6 +432,7 @@ final class SearchRuntime {
 
     func load(_ state: SearchState, context ctx: CommandContext) async throws {
         state.generation += 1
+        state.refreshPending = false
         let generation = state.generation
         let query = state.query.trimmingCharacters(in: .whitespacesAndNewlines)
         state.loading = true

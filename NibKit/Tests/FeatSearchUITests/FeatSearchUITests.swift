@@ -132,6 +132,13 @@ final class FeatSearchUITests: XCTestCase {
         }
     }
 
+    func testSearchContinuationExplainsClippedRowsAndDisappearsAtTheEnd() {
+        XCTAssertFalse(SearchScrollContinuation.isVisible(contentBottom: 400, viewportHeight: 0))
+        XCTAssertTrue(SearchScrollContinuation.isVisible(contentBottom: 400, viewportHeight: 160))
+        XCTAssertFalse(SearchScrollContinuation.isVisible(contentBottom: 160, viewportHeight: 160))
+        XCTAssertFalse(SearchScrollContinuation.isVisible(contentBottom: 120, viewportHeight: 160))
+    }
+
     func testMatchControlsDisableForEmptyPendingFailedAndFilteredResults() {
         let state = SearchState()
         state.scope = NodeRef.document(Fixtures.docID).description
@@ -141,6 +148,9 @@ final class FeatSearchUITests: XCTestCase {
         state.matches = [hit()]
         state.reconcileSelection()
         XCTAssertTrue(state.canStepMatches, "A single result can still be revealed by the existing command")
+        state.refreshPending = true
+        XCTAssertTrue(state.canStepMatches, "A queued background refresh must not disable existing matches")
+        XCTAssertNil(state.emptyPresentation)
         state.loading = true
         XCTAssertFalse(state.canStepMatches)
         state.loading = false
@@ -983,6 +993,91 @@ final class FeatSearchUITests: XCTestCase {
             state.matches = []
             state.filter = .all
             state.progress = nil
+        }
+    }
+
+    func testEmptyAdviceDoesNotRecommendTheAlreadySelectedFilterAndIndexingAppearsOnce() {
+        let state = SearchState()
+        state.query = "Physics"
+        for filter in SearchFilter.allCases {
+            state.filter = filter
+            XCTAssertEqual(state.emptyPresentation?.message, "Try fewer words or check the spelling.")
+        }
+        state.filter = .all
+        state.progress = IndexProgressPayload(running: true, done: 0, total: 5, pending: 5)
+        XCTAssertEqual(state.emptyPresentation, .indexing)
+        XCTAssertFalse(state.showsIndexingFooter)
+        state.matches = [hit()]
+        XCTAssertTrue(state.showsIndexingFooter)
+        state.progress = nil
+        XCTAssertFalse(state.showsIndexingFooter)
+    }
+
+    func testIndexCompletionKeepsEmptySearchPendingUntilRefreshedTitlesArrive() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [])
+        let runtime = SearchRuntime.from(h.app)
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "query": "Physics"])
+        let state = runtime.state(h.session)
+        XCTAssertEqual(state.emptyPresentation, .noResults("Physics"))
+        installDependencies(h, hits: [hit(kind: "title")])
+        let completed = h.app.events.emit(IndexProgressPayload(running: false, done: 5, total: 5, pending: 0))
+        await runtime.receive(completed)
+        XCTAssertEqual(state.emptyPresentation, .searching)
+        XCTAssertTrue(state.refreshPending)
+        for _ in 0..<100 {
+            if !state.refreshPending && !state.loading { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(state.matches.count, 1)
+        XCTAssertFalse(state.loading)
+        XCTAssertFalse(state.refreshPending)
+    }
+
+    func testChangingFilterCancelsQueuedRefreshWithoutLeavingSearchLoading() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [hit()])
+        let runtime = SearchRuntime.from(h.app)
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "query": "Hello"])
+        let state = runtime.state(h.session)
+        let completed = h.app.events.emit(IndexProgressPayload(running: false, done: 1, total: 1, pending: 0))
+        await runtime.receive(completed)
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertTrue(state.refreshPending)
+        XCTAssertTrue(state.canStepMatches, "Keep available matches navigable while a refresh is queued")
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "filter": "all"])
+        XCTAssertFalse(state.refreshPending)
+        XCTAssertFalse(state.loading)
+        XCTAssertTrue(state.canStepMatches)
+    }
+
+    func testQueuedRefreshClearsPendingWhenHiddenOrCommandFailsBeforeLoading() async throws {
+        for failsBeforeLoad in [false, true] {
+            let h = Harness(features: [FeatSearchUIFeature.self])
+            installDependencies(h, hits: [])
+            let runtime = SearchRuntime.from(h.app)
+            try await h.run(CommandIDs.searchOpen, ["scope": "lib", "query": "Physics"])
+            let state = runtime.state(h.session)
+            var attempts = 0
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.searchOpen, title: "Search",
+                summary: "Fail before loading.", params: .anything(), effect: .session)) { _, _ in
+                    attempts += 1
+                    throw NibError(.unavailable, "Search unavailable")
+                }
+            // An isolated event bus avoids delivering the same event again via the runtime watcher.
+            let completed = EventBus().emit(IndexProgressPayload(running: false, done: 1, total: 1, pending: 0))
+            await runtime.receive(completed)
+            await runtime.receive(completed)
+            for _ in 0..<20 { await Task.yield() }
+            XCTAssertTrue(state.refreshPending, "The cancelled predecessor must not clear its replacement")
+            if !failsBeforeLoad { state.isPresented = false }
+            for _ in 0..<100 {
+                if !state.refreshPending { break }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            XCTAssertFalse(state.refreshPending)
+            XCTAssertFalse(state.loading)
+            XCTAssertEqual(attempts, failsBeforeLoad ? 1 : 0)
         }
     }
 

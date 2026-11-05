@@ -1288,6 +1288,17 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(shortMenu.viewportHeight, 132)
     }
 
+    func testNewMenuCanUseRoomBelowItsAnchorInsteadOfTheGenericPopoverCap() {
+        let full = LibraryMenuViewport(available: 800, count: 11, rowHeight: 44, header: 66, maximumHeight: 800)
+        XCTAssertFalse(full.scrolls)
+        XCTAssertEqual(full.viewportHeight, 484)
+        XCTAssertEqual(full.height, 550)
+        let short = LibraryMenuViewport(available: 310, count: 11, rowHeight: 44, header: 66, maximumHeight: 310)
+        XCTAssertTrue(short.scrolls)
+        XCTAssertLessThanOrEqual(short.height, 310)
+        XCTAssertEqual(short.viewportHeight.truncatingRemainder(dividingBy: 44), 0)
+    }
+
     func testFolderStyleResolvesSymbolEmojiAndDefaultForBothLayouts() throws {
         var row = LibraryRow(ref: "folder:STYLECHECK01", kind: "folder", title: "Semester Notes", color: "#0066E0", icon: "graduationcap.fill")
         XCTAssertEqual(row.folderGlyph, .symbol(try XCTUnwrap(NibSymbol(systemName: "graduationcap.fill"))))
@@ -1484,6 +1495,47 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertFalse(LibraryPresentation.usesInlineSidebar(size: CGSize(width: 899, height: 700), idiom: .pad))
         XCTAssertTrue(LibraryPresentation.usesInlineSidebar(size: CGSize(width: 900, height: 700), idiom: .pad))
         XCTAssertFalse(LibraryPresentation.usesInlineSidebar(size: CGSize(width: 932, height: 430), idiom: .phone))
+    }
+
+    func testContentWidthUsesCurrentViewportAndOnlyTheInlineSidebar() {
+        for width: CGFloat in [390, 834, 1032, 1194, 1376] {
+            XCTAssertEqual(LibraryPresentation.contentWidth(viewport: width, inlineSidebar: false), width)
+            XCTAssertEqual(LibraryPresentation.contentWidth(viewport: width, inlineSidebar: true),
+                max(0, width - NibMetrics.sidebarWidth))
+        }
+        XCTAssertEqual(LibraryPresentation.contentWidth(viewport: 0, inlineSidebar: true), 0)
+    }
+
+    func testEmptyStateUsesSpaceBelowHeaderAndAboveControls() {
+        XCTAssertEqual(LibraryPresentation.emptyContentHeight(viewport: 1000, header: 140, insets: 84), 776)
+        XCTAssertEqual(LibraryPresentation.emptyContentHeight(viewport: 400, header: 200, insets: 80), 120)
+        XCTAssertEqual(LibraryPresentation.emptyContentHeight(viewport: 200, header: 240, insets: 80), 0)
+    }
+
+    func testLibraryBannerAndTrailingChromeStayInsideViewport() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        model.sidebarVisible = false
+        model.liquidMode = .off
+        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(id: "test.cloud", owner: "test",
+            placement: .topTrailing, surface: .bar, isVisible: { !$0.isCompact }) { _ in
+                AnyView(Text("Cloud & Backup").padding(.horizontal, NibSpacing.l))
+            })
+        let banner: @MainActor (ChromeContext) -> AnyView? = { _ in
+            AnyView(NibBanner("Your library is stored inside Nib and may be lost if you reinstall the app. Move or copy it to a folder outside Nib.")
+                .libraryChromeFrame("test.banner"))
+        }
+        h.app.services.set(banner as AnyObject, for: "syncui.libraryBanner")
+        for size in [CGSize(width: 1032, height: 1376), CGSize(width: 1376, height: 1032)] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                var frames: [String: CGRect] = [:]
+                _ = try await hostlessLayoutImage(LibraryRootView(model: model, idiom: .pad)
+                    .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 }, size: size, variant: variant)
+                let bannerFrame = try XCTUnwrap(frames["test.banner"])
+                let chrome = try XCTUnwrap(frames["top.test.cloud"])
+                XCTAssertEqual(bannerFrame.maxX, size.width - NibMetrics.libraryGutter, accuracy: 1)
+                XCTAssertEqual(chrome.maxX, bannerFrame.maxX, accuracy: 1)
+            }
+        }
     }
 
     func testSyncCompletionDoesNotLeaveSidebarSyncing() async {
