@@ -154,7 +154,22 @@ final class CaptureUITests: XCTestCase {
         variants {
             _ = try self.require(self.notebook)
             try self.libraryCapture(1, "library-grid")
-            try self.tap("Sort and View")
+            let sort = try self.ui.requireControl("Sort and View", type: .button, timeout: 5)
+            let before = self.ui.elementFacts(sort)
+            self.ui.logQA("Capture Sort before tap", before)
+            guard sort.isEnabled else { throw NibUI.Failure.message("Sort and View must be enabled") }
+            sort.tap()
+            let menu = self.ui.app.windows.firstMatch.scrollViews["Sort and View"].firstMatch
+            do {
+                try self.wait("Sort and View must present its menu in the main window") {
+                    menu.exists && menu.isHittable
+                }
+            } catch {
+                let facts = "before: " + before + "\nafter: " + self.ui.elementFacts(sort)
+                    + "\nprobe: " + String(describing: self.ui.probe.value)
+                self.ui.recordDiagnostics("Capture Sort menu absent", facts: facts)
+                throw error
+            }
             try self.tap("List")
             self.ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.07, dy: 0.10)).tap()
             _ = try self.require(self.notebook)

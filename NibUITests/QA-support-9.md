@@ -66,3 +66,11 @@ D:ink-three#1 and correction confirm remote tree instability as well as the shor
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Ink CustomColourValidHex / HighlighterCustomColour | Colour picker controls / Colour picker dismissal | What controls and presentation type really exist, which dismissal route was used, and did the picker disappear? |
+
+## C6 - Sort menu postcondition
+
+D:capture#3 and verdict: a UIKit touch pair arrived but no library.setView/menu log followed; the 24pt layout shift is only a candidate cause. capture01Library resolves the labelled button, logs its facts immediately before the single tap, and waits for the actual Sort and View ScrollView in the main window. Failure records before/after button facts, raw probe, hierarchy and screenshot before propagating the error. No second tap or command workaround. CI must either reach the menu then original List/gallery captures, or provide evidence to pair with the new app library hit-test log.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Capture test01Library and variants | Capture Sort before tap / Capture Sort menu absent | Did the button frame change, which state followed the touch, and did the real menu appear? |
