@@ -548,5 +548,16 @@ enum PageDropKind: Equatable {
         return nil
     }
 
+    /// UIKit permits a move proposal only when the source session allows moving.
+    /// A same-document reorder must not silently become a copy when moving is refused.
+    @MainActor
+    static func proposal(for kind: PageDropKind?, canEdit: Bool, allowsMoveOperation: Bool) -> UICollectionViewDropProposal {
+        guard canEdit, let kind, kind != .reorder || allowsMoveOperation else {
+            return UICollectionViewDropProposal(operation: .forbidden)
+        }
+        return UICollectionViewDropProposal(operation: kind == .reorder ? .move : .copy,
+                                            intent: .insertAtDestinationIndexPath)
+    }
+
     static var acceptedTypes: [String] { [PagesPayload.typeIdentifier] + DroppedFiles.types.map { $0.identifier } }
 }

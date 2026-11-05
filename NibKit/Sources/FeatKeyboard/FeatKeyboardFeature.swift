@@ -204,6 +204,23 @@ final class LibraryCreationKeyboardResponder: UIView {
         return descriptors.contains { $0.id == command.propertyList as? String }
     }
 
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandled = presses
+        for press in presses {
+            guard let key = press.key,
+                  performUnhandledPress(CanvasKeyPress.shortcut(key, event: event)) else { continue }
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    @discardableResult
+    func performUnhandledPress(_ shortcut: KeyShortcut) -> Bool {
+        guard let context, let descriptor = descriptors.first(where: { $0.shortcut == shortcut }) else { return false }
+        LibraryCreationShortcuts.perform(descriptor.id, in: context)
+        return true
+    }
+
     @objc private func runCreationKey(_ command: UIKeyCommand) {
         NibUITestKeyLog.note("creation run \(String(describing: command.propertyList))")
         guard let context, let descriptor = descriptors.first(where: { $0.id == command.propertyList as? String }) else { return }

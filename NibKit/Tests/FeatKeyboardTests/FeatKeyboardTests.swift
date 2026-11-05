@@ -373,6 +373,33 @@ final class FeatKeyboardTests: XCTestCase {
                        ids.map { ["doc": .string(NodeRef.document(NibID($0)).description)] })
     }
 
+    func testLibraryCreationPressFallbackUsesTheLiveInvokingWindowRoute() async throws {
+        let h = await started()
+        h.session.document = nil
+        let root = KeyboardWindowController(session: h.session)
+        let keyboard = LibraryCreationKeyboardResponder(context: ChromeContext(app: h.app, session: h.session, navigator: root))
+        root.view.addSubview(keyboard)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        keyboard.restoreFocus()
+        let recorder = stand(in: h, for: [CommandIDs.panelOpen])
+        let ran = expectation(description: "Creation HID fallback dispatches once")
+        recorder.onCall = { if $0 == CommandIDs.panelOpen { ran.fulfill() } }
+        XCTAssertTrue(keyboard.performUnhandledPress(KeyShortcut("n", [.command, .option])))
+        await fulfillment(of: [ran], timeout: 3)
+        recorder.onCall = nil
+        XCTAssertEqual(recorder.params(CommandIDs.panelOpen).count, 1)
+        XCTAssertTrue(h.app.ui.activeNavigator === root)
+        XCTAssertFalse(keyboard.performUnhandledPress(KeyShortcut("escape")))
+        root.modal = UIViewController()
+        XCTAssertFalse(keyboard.performUnhandledPress(KeyShortcut("n", [.command, .option])))
+        root.modal = nil
+        h.session.document = Fixtures.docID
+        XCTAssertFalse(keyboard.performUnhandledPress(KeyShortcut("n", [.command, .option])))
+    }
+
     func testLibraryCreationNativeResponderRevalidatesAndPreservesTextAndModalFocus() async throws {
         let h = await started()
         h.session.document = nil
@@ -1064,6 +1091,21 @@ final class FeatKeyboardTests: XCTestCase {
                                                eventFlags: []), KeyShortcut("="), "Never infer modifiers from the action a key could perform")
     }
 
+    func testCanvasFocusYieldsToAnOptInOwnerInsideTheRoot() {
+        let root = UIViewController()
+        let owner = TestKeyboardFocusOwner()
+        root.addChild(owner)
+        root.view.addSubview(owner.view)
+        owner.didMove(toParent: root)
+        XCTAssertFalse(CanvasKeyboardFocus.mayReplace(owner, canvas: root.view))
+        owner.ownsFocus = false
+        XCTAssertTrue(CanvasKeyboardFocus.mayReplace(owner, canvas: root.view),
+                      "An inactive panel remains eligible for existing chrome focus recovery")
+        XCTAssertTrue(CanvasKeyboardFocus.mayReplace(nil, canvas: root.view))
+        XCTAssertTrue(CanvasKeyboardFocus.mayReplace(root, canvas: root.view))
+        XCTAssertFalse(CanvasKeyboardFocus.mayReplace(UITextField(), canvas: root.view))
+    }
+
     func testCanvasReclaimsSiblingHostingFocusForNavigationKeys() async throws {
         let h = await started()
         let host = FakeCanvasHost(h)
@@ -1745,5 +1787,15 @@ final class FeatKeyboardTests: XCTestCase {
                       "the feature maps other features' commands and owns none")
         let problems = await CommandConformance.check(features: [FeatKeyboardFeature.self])
         XCTAssertEqual(problems, [])
+    }
+}
+
+@MainActor
+private final class TestKeyboardFocusOwner: UIViewController {
+    var ownsFocus = true
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == NSSelectorFromString("nibOwnsKeyboardFocus:") { return ownsFocus }
+        return super.canPerformAction(action, withSender: sender)
     }
 }

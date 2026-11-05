@@ -326,6 +326,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     private var autoScroll: CADisplayLink?
     private var updateScheduled = false
     private var subscriptions = Set<AnyCancellable>()
+    #if DEBUG
+    private var lastDropDiagnostic: String?
+    #endif
 
     init(model: PagesPanelModel) {
         self.model = model
@@ -870,7 +873,19 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         true
     }
 
+    func collectionView(_ collectionView: UICollectionView, dragSessionWillBegin session: UIDragSession) {
+        #if DEBUG
+        lastDropDiagnostic = nil
+        let pages = session.items.compactMap { ($0.localObject as? PageDragItem)?.page.raw }
+        NSLog("%@", "[Nib QA pages] dragSessionWillBegin items=\(session.items.count) pages=\(pages)")
+        #endif
+    }
+
     func collectionView(_ collectionView: UICollectionView, dragSessionDidEnd session: UIDragSession) {
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] dragSessionDidEnd items=\(session.items.count)")
+        lastDropDiagnostic = nil
+        #endif
         highlightedPages.removeAll()
         flushDeferredUpdate()
     }
@@ -893,21 +908,35 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     func collectionView(_ collectionView: UICollectionView, dropSessionDidUpdate session: UIDropSession,
                         withDestinationIndexPath destinationIndexPath: IndexPath?) -> UICollectionViewDropProposal {
+        let kind = dropKind(session)
+        let proposal = PageDropKind.proposal(for: kind, canEdit: model.canEdit,
+                                             allowsMoveOperation: session.allowsMoveOperation)
         #if DEBUG
-        NSLog("%@", "[Nib QA pages] proposal destination=\(String(describing: destinationIndexPath)) canEdit=\(model.canEdit) kind=\(String(describing: dropKind(session)))")
-        #endif
-        guard model.canEdit, let kind = dropKind(session) else {
-            return UICollectionViewDropProposal(operation: .forbidden)
+        // UIKit asks on every movement tick; record only a changed decision or session state.
+        let state = [
+            "destination=\(String(describing: destinationIndexPath)) canEdit=\(model.canEdit)",
+            "kind=\(String(describing: kind)) allowsMoveOperation=\(session.allowsMoveOperation)",
+            "hasActiveDrag=\(collectionView.hasActiveDrag) local=\(session.localDragSession != nil)",
+            "items=\(session.items.count) operation=\(proposal.operation.rawValue) intent=\(proposal.intent.rawValue)"
+        ].joined(separator: " ")
+        if lastDropDiagnostic != state {
+            lastDropDiagnostic = state
+            NSLog("%@", "[Nib QA pages] proposal destination=\(String(describing: destinationIndexPath)) canEdit=\(model.canEdit) kind=\(String(describing: dropKind(session)))")
+            NSLog("%@", "[Nib QA pages] drop state \(state)")
         }
-        return UICollectionViewDropProposal(operation: kind == .reorder ? .move : .copy,
-                                            intent: .insertAtDestinationIndexPath)
+        #endif
+        return proposal
     }
 
     func collectionView(_ collectionView: UICollectionView, performDropWith coordinator: UICollectionViewDropCoordinator) {
         #if DEBUG
         NSLog("%@", "[Nib QA pages] performDrop items=\(coordinator.items.count) destination=\(String(describing: coordinator.destinationIndexPath)) canEdit=\(model.canEdit) kind=\(String(describing: dropKind(coordinator.session)))")
+        let droppedPages = coordinator.items.compactMap { ($0.dragItem.localObject as? PageDragItem)?.page.raw }
+        let sessionPages = coordinator.session.items.compactMap { ($0.localObject as? PageDragItem)?.page.raw }
+        NSLog("%@", "[Nib QA pages] performDrop pageIDs=\(droppedPages) sessionPageIDs=\(sessionPages)")
         #endif
-        guard let doc = model.doc, model.canEdit, let kind = dropKind(coordinator.session) else { return }
+        guard let doc = model.doc, model.canEdit, let kind = dropKind(coordinator.session),
+              kind != .reorder || coordinator.session.allowsMoveOperation else { return }
         let location = coordinator.session.location(in: collectionView)
         let model = self.model
         switch kind {
@@ -943,6 +972,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     }
 
     func collectionView(_ collectionView: UICollectionView, dropSessionDidEnd session: UIDropSession) {
+        #if DEBUG
+        lastDropDiagnostic = nil
+        #endif
         flushDeferredUpdate()
     }
 
@@ -1049,6 +1081,13 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     override var canBecomeFirstResponder: Bool { model.isSelecting }
 
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        // Canvas focus recovery queries this capability through UIKit's responder API.
+        // No feature-to-feature import or process-wide focus state is needed.
+        if action == NSSelectorFromString("nibOwnsKeyboardFocus:") { return model.isSelecting }
+        return super.canPerformAction(action, withSender: sender)
+    }
+
     override var keyCommands: [UIKeyCommand]? {
         guard model.isSelecting else { return nil }
         let selectAll = UIKeyCommand(title: String(localized: "Select All Pages"), action: #selector(selectAllPages),
@@ -1061,6 +1100,36 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
                                 input: UIKeyCommand.inputEscape)
         for command in [selectAll, copy, trash, done] { command.wantsPriorityOverSystemBehavior = true }
         return [selectAll, copy, trash, done]
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandled = presses
+        let held = event?.allPresses.filter { $0.phase != .ended && $0.phase != .cancelled }
+            .compactMap { $0.key?.keyCode } ?? []
+        for press in presses {
+            guard let key = press.key else { continue }
+            let shortcut = ThumbnailKeyPress.shortcut(code: key.keyCode, characters: key.charactersIgnoringModifiers,
+                                                       keyFlags: key.modifierFlags,
+                                                       eventFlags: event?.modifierFlags ?? [], heldKeys: held)
+            guard performUnhandledPress(shortcut) else { continue }
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    /// The HID route must stop here before the shell replays a canvas shortcut.
+    /// Use the same actions and menu availability/confirmation rules as UIKeyCommand.
+    @discardableResult
+    func performUnhandledPress(_ shortcut: KeyShortcut) -> Bool {
+        guard model.isSelecting else { return false }
+        switch shortcut {
+        case KeyShortcut("a", .command): selectAllPages()
+        case KeyShortcut("c", .command): copyPages()
+        case KeyShortcut("delete"): trashPages()
+        case KeyShortcut("escape"): endSelecting()
+        default: return false
+        }
+        return true
     }
 
     @objc private func selectAllPages() {
@@ -1107,5 +1176,36 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         #endif
         guard visible else { return }
         model.perform(item, context)
+    }
+}
+
+/// Keep event-level and held modifiers: HID chords need not repeat their flags on the letter.
+@MainActor
+enum ThumbnailKeyPress {
+    static func shortcut(code: UIKeyboardHIDUsage, characters: String,
+                         keyFlags: UIKeyModifierFlags, eventFlags: UIKeyModifierFlags,
+                         heldKeys: [UIKeyboardHIDUsage] = []) -> KeyShortcut {
+        let input: String
+        switch code {
+        case .keyboardEscape: input = "escape"
+        case .keyboardDeleteOrBackspace: input = "delete"
+        default: input = characters.lowercased()
+        }
+        var flags = keyFlags.union(eventFlags)
+        for held in heldKeys {
+            switch held {
+            case .keyboardLeftGUI, .keyboardRightGUI: flags.insert(.command)
+            case .keyboardLeftAlt, .keyboardRightAlt: flags.insert(.alternate)
+            case .keyboardLeftShift, .keyboardRightShift: flags.insert(.shift)
+            case .keyboardLeftControl, .keyboardRightControl: flags.insert(.control)
+            default: break
+            }
+        }
+        var modifiers: KeyModifiers = []
+        if flags.contains(.command) { modifiers.insert(.command) }
+        if flags.contains(.alternate) { modifiers.insert(.option) }
+        if flags.contains(.shift) { modifiers.insert(.shift) }
+        if flags.contains(.control) { modifiers.insert(.control) }
+        return KeyShortcut(input, modifiers)
     }
 }
