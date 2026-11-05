@@ -195,6 +195,33 @@ final class DropletField {
     @ObservationIgnored private var dismissers: [String: () -> Void] = [:]
     @ObservationIgnored private var pendingBuds: [String: (source: String, presented: Bool)] = [:]
     @ObservationIgnored private var driver: DisplayLinkDriver?
+    #if DEBUG
+    @ObservationIgnored private var idleDiagnostic: DispatchWorkItem?
+
+    /// Text input can leave a native animation running even when our field has parked.
+    /// Report both outcomes, once two seconds have passed since the last input.
+    func noteQAInput(in window: UIWindow?) {
+        idleDiagnostic?.cancel()
+        let work = DispatchWorkItem { [weak self, weak window] in
+            guard let self else { return }
+            let states = self.order.compactMap { id -> String? in
+                guard let e = self.entries[id] else { return nil }
+                return "\(id): drawn=\(self.isDrawn(e)) reshape=\(e.reshape) offset=\(e.dyn.offset.isResting) size=\(e.dyn.size.isResting) corner=\(e.dyn.corner.isResting) stretch=\(e.dyn.stretch.isResting) lift=\(e.dyn.lift.isResting) anchor=\(e.dyn.anchor.isResting) bud=\(String(describing: e.bud))"
+            }
+            NSLog("%@", "[Nib QA idle] field=\(ObjectIdentifier(self)) active=\(self.isActive) driver=\(self.driver?.isRunning ?? false) inking=\(self.isInking) beads=\(self.beads) bonds=\(self.bonds.count) meniscuses=\(self.meniscuses.count) satellites=\(self.satellites.count) entries=\(states)")
+            func inspect(_ layer: CALayer) {
+                for key in layer.animationKeys() ?? [] {
+                    guard let animation = layer.animation(forKey: key) else { continue }
+                    NSLog("%@", "[Nib QA idle] layer=\(type(of: layer)) delegate=\(String(describing: layer.delegate.map { type(of: $0) })) key=\(key) duration=\(animation.duration) repeats=\(animation.repeatCount) repeatDuration=\(animation.repeatDuration) speed=\(animation.speed) hidden=\(layer.isHidden)")
+                }
+                for child in layer.sublayers ?? [] { inspect(child) }
+            }
+            if let window { inspect(window.layer) }
+        }
+        idleDiagnostic = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+    }
+    #endif
     @ObservationIgnored private var isActive = true
     @ObservationIgnored private var restoreWork: DispatchWorkItem?
     @ObservationIgnored private var nextSatellite = 0
@@ -843,7 +870,12 @@ final class DropletField {
             let to = max(e.rest.width, e.rest.height)
             let p = 0.5 + 0.5 * (long - e.reshapeFrom) / max(1, to - e.reshapeFrom)
             e.contentAlpha = DropletPhysics.reshapeContentOpacity(progress: min(max(p, 0.5), 1))
-            if e.dyn.size.isResting && abs(long - to) < 1 && to > e.reshapeFrom {
+            // A square (or a resized destination smaller than the gathered body)
+            // cannot satisfy `to > reshapeFrom`. Once its actual layout target
+            // is reached there is no more spreading work. Do not park while the
+            // orientation's new layout is still pending.
+            if e.dyn.size.isResting && abs(long - to) < 1
+                && e.dyn.size.target == CGPoint(x: e.rest.width, y: e.rest.height) {
                 e.reshape = .idle
                 e.contentAlpha = 1
                 e.dyn.sizeSpring = NibMotion.budSize
