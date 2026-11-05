@@ -82,6 +82,14 @@ struct AttachedDroplet<Content: View>: View {
         return !p.hasBud || !p.hidden
     }
 
+    /// Read the binding at delivery time: a retracting bud must not swallow a
+    /// second Escape before SwiftUI has removed its cancellation bridge.
+    func cancelFromEscape() -> Bool {
+        guard style.modalWhenBudded, acceptsInteraction, let bud else { return false }
+        bud.isPresented.wrappedValue = false
+        return true
+    }
+
     var body: some View {
         let p = node.presentation
         let requestedHidden = bud.map { !$0.isPresented.wrappedValue } ?? false
@@ -132,6 +140,11 @@ struct AttachedDroplet<Content: View>: View {
                         .frame(width: 0, height: 0)
                         .opacity(0)
                         .accessibilityHidden(true)
+                }
+            }
+            .background {
+                if isOpenBud {
+                    Color.clear.nibEscapeHandler { cancelFromEscape() }
                 }
             }
             .background(RestReader(id: id, style: style, field: field))
