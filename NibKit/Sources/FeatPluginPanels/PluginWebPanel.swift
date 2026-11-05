@@ -194,8 +194,9 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
     /// When the page's web content process ended (PanelCrashRecovery).
     private var terminations: [Date] = []
     private lazy var ownRuleLists = PanelRuleListCache()
-    private var pageReady = false
-    private var outbox: [(String, JSONValue)] = []
+    private(set) var pageReady = false
+    private(set) var outbox: [(String, JSONValue)] = []
+    private(set) var reloadTask: Task<Void, Never>?
     private var started = false
     /// The network rules are compiling; the web view is made when they are ready.
     private var compiling = false
@@ -416,11 +417,15 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
     /// Reload from the menu or the stopped / failed states: reload the plugin (`plugin.reload`, so main.js picks up
     /// edits too), then the page.
     func reload() {
-        guard let app = app else { return }
+        guard let app = app, reloadTask == nil else { return }
+        // main.js can push its initial state while plugin.reload is still awaiting boot. Pause the old document
+        // first, and keep those messages until the replacement document says hello.
+        pageReady = false
         bridge.resetDialogBudget()
         let session = self.session ?? app.services.sessions.active
         let id = pluginID
-        Task { @MainActor [weak self] in
+        reloadTask = Task { @MainActor [weak self] in
+            defer { self?.reloadTask = nil }
             do {
                 _ = try await app.bus.execute(Invocation(command: CommandIDs.pluginReload, params: ["id": .string(id)],
                                                          session: session))
@@ -438,7 +443,8 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
     private func reloadPage() {
         guard let app = app else { return }
         pageReady = false
-        outbox.removeAll()
+        // Settings and tokens are refreshed on hello; undelivered main.js messages belong to the new page.
+        outbox.removeAll { $0.0 != "message" }
         bridge.resetPage()
         if webView != nil {
             phase = .loading
@@ -492,6 +498,8 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
     }
 
     private func pageDidStart() {
+        // An old document's delayed hello cannot drain messages during a plugin restart.
+        guard reloadTask == nil else { return }
         refreshNetworkRules()
         pageReady = true
         let queued = outbox

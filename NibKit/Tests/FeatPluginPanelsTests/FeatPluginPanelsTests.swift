@@ -548,6 +548,39 @@ final class FeatPluginPanelsTests: XCTestCase {
         XCTAssertEqual(fresh, true)
     }
 
+    func testReloadKeepsMessagesPostedDuringPluginBootForTheNewPage() async throws {
+        let h = Harness(features: [FeatPluginPanelsFeature.self])
+        let factory = try XCTUnwrap(h.app.services.get(ServiceKeys.pluginPanels, as: PluginPanelFactoryService.self))
+        let panel = PluginWebPanel(app: h.app, factory: factory, manifest: try manifest(), panelID: statsPanel,
+                                   folder: FileManager.default.temporaryDirectory, entry: "panels/stats.html",
+                                   context: PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {}))
+        panel.start()
+        panel.bridge.onHello?()
+        XCTAssertTrue(panel.pageReady)
+        let initial: JSONValue = ["words": 42]
+        var reloads = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.pluginReload, title: "Reload", summary: "Restart fixture.",
+                                                  effect: .session, target: .app)) { _, _ in
+            reloads += 1
+            XCTAssertFalse(panel.pageReady, "pause delivery before main.js restarts")
+            panel.bridge.onHello?() // A delayed hello from the old document must not reopen delivery.
+            XCTAssertFalse(panel.pageReady)
+            panel.deliverMessage(initial)
+            return [:]
+        }
+        panel.reload()
+        let task = try XCTUnwrap(panel.reloadTask)
+        panel.reload() // Repeated taps must not restart twice or discard the same queued state.
+        await task.value
+        XCTAssertEqual(reloads, 1)
+        XCTAssertFalse(panel.pageReady)
+        XCTAssertEqual(panel.outbox.filter { $0.0 == "message" }.map { $0.1 }, [initial])
+        panel.bridge.onHello?()
+        XCTAssertTrue(panel.pageReady)
+        // Hostless tests have no WKWebView: send requeues once, and the injected-script test covers delivery to JS.
+        XCTAssertEqual(panel.outbox.filter { $0.0 == "message" }.map { $0.1 }, [initial])
+    }
+
     /// The panel view in hostless tests: no WKWebView is made (NibApp.isHostlessTest), the chrome and its states
     /// still render in Light, Dark and AX3, floating (the 344 pt Deep panel frame) and full width (sheets, tabs).
     func testPanelViewRendersWithoutAWebViewInEveryVariant() throws {
