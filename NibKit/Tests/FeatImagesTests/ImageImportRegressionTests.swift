@@ -61,10 +61,13 @@ final class ImageImportRegressionTests: XCTestCase {
     func testCancelledRectanglePreviewCannotBecomeTheNextDragOrigin() {
         let committed = Rect(x: 0.2, y: 0.2, width: 0.5, height: 0.5)
         var draft = CropGestureDraft()
+        draft.activityChanged(true)
         draft.move(from: committed, handle: nil, dx: 0.2, dy: 0.1)
         XCTAssertNotEqual(draft.rectangle, committed)
-        draft = CropGestureDraft() // The GestureState lifetime reset discards the preview on cancellation.
+        // Cancellation skips onEnded and delivers this transition to the sheet's shared lifecycle handler.
+        draft.activityChanged(false)
         XCTAssertEqual(draft.rectangle ?? committed, committed)
+        draft.activityChanged(true)
         draft.move(from: committed, handle: .topLeft, dx: 0.1, dy: 0.1)
         XCTAssertEqual(draft.rectangle, CropEditing.drag(committed, handle: .topLeft, dx: 0.1, dy: 0.1))
     }
@@ -72,10 +75,15 @@ final class ImageImportRegressionTests: XCTestCase {
     func testCancelledFreehandPreviewCannotJoinTheNextOutline() {
         let committed = [Point(0, 0), Point(1, 0), Point(1, 1)]
         var draft = CropGestureDraft()
+        draft.activityChanged(true)
         draft.append(Point(0.9, 0.9))
         draft.append(Point(0.8, 0.9))
-        draft = CropGestureDraft()
+        draft.append(Point(0.8, 0.8))
+        XCTAssertNotEqual(draft.outline(or: committed), committed)
+        draft.activityChanged(false)
         XCTAssertEqual(draft.outline(or: committed), committed)
+        XCTAssertTrue(draft.points.isEmpty)
+        draft.activityChanged(true)
         let fresh = [Point(0.1, 0.1), Point(0.3, 0.1), Point(0.2, 0.3)]
         fresh.forEach { draft.append($0) }
         XCTAssertEqual(draft.outline(or: committed), fresh)
@@ -142,6 +150,83 @@ final class ImageImportRegressionTests: XCTestCase {
             XCTAssertEqual(selections, 0)
             XCTAssertEqual(h.session.selection, selection)
             XCTAssertEqual(h.session.tool, "image")
+        }
+    }
+
+    func testMenuImportTracksNavigationDuringLoadingStagingAndDismissal() async throws {
+        for phase in ["loading", "staging", "dismissal", "no navigation"] {
+            let h = Harness(features: [FeatImagesFeature.self])
+            h.session.page = Fixtures.page1
+            h.session.tool = "lasso"
+            h.session.tool = "image"
+            let paused = expectation(description: "Menu import paused at \(phase)")
+            let finished = expectation(description: "Menu import completed at \(phase)")
+            let gate = DispatchSemaphore(value: 0)
+            var dismiss: (() -> Void)?
+            defer { gate.signal(); dismiss?() }
+            let waitForRelease: () throws -> Void = {
+                paused.fulfill()
+                guard gate.wait(timeout: .now() + 5) == .success else { throw NibError.unavailable("test gate") }
+            }
+            if phase == "staging" {
+                h.app.services.assets = ImageAssetSpy(h.assets, onTemporary: waitForRelease)
+            }
+            var selected: [String] = []
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.selectionSet, title: "Select", summary: "Test selection.",
+                                                      effect: .session)) { params, _ in
+                selected = params["refs"]?.arrayValue?.compactMap { $0.stringValue } ?? []
+                return .null
+            }
+            let menu = ImageSourceMenu(app: h.app, session: h.session,
+                                       target: { ImageMenuTarget.current(h.session) }, close: { then in
+                if phase == "dismissal" {
+                    dismiss = then
+                    paused.fulfill()
+                } else { then() }
+            })
+            var refs: [String] = []
+            menu.insertImages({
+                if phase == "loading" || phase == "no navigation" {
+                    try await ImageIOWork.run { try waitForRelease() }
+                }
+                return [Fixtures.pngData]
+            }, completion: {
+                refs = $0
+                finished.fulfill()
+            })
+            await fulfillment(of: [paused], timeout: 2)
+            if phase != "no navigation" {
+                h.session.document = "FIXTUREDOC04"
+                h.session.page = "FIXTUREBRD01"
+                h.session.tool = "pen"
+                h.session.document = Fixtures.docID
+                h.session.page = Fixtures.page1
+                h.session.tool = "image" // A new image-tool use must not be finished by the old import.
+            }
+            let currentSelection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.imageID])
+            h.session.selection = currentSelection
+            gate.signal()
+            dismiss?()
+            dismiss = nil
+            await fulfillment(of: [finished], timeout: 2)
+            XCTAssertEqual(refs.count, 1, phase)
+            XCTAssertTrue(refs.first?.hasPrefix("item:FIXTUREDOC01/FIXTUREPG001/") == true, phase)
+            guard case let .item(doc, page, id)? = NodeRef(refs.first ?? "") else {
+                XCTFail("The menu import must return an inserted item reference")
+                continue
+            }
+            let item = try h.app.workspace.item(doc, page: page, id: id)
+            let asset = try XCTUnwrap(item.image?.asset)
+            XCTAssertEqual(try h.assets.data(asset, doc: doc), Fixtures.pngData)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "The import still succeeds in its captured document")
+            if phase == "no navigation" {
+                XCTAssertEqual(selected, refs)
+                XCTAssertEqual(h.session.tool, "lasso")
+            } else {
+                XCTAssertTrue(selected.isEmpty, phase)
+                XCTAssertEqual(h.session.selection, currentSelection, phase)
+                XCTAssertEqual(h.session.tool, "image", phase)
+            }
         }
     }
 

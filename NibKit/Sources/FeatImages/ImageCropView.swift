@@ -105,6 +105,14 @@ struct CropGestureDraft {
     var rectangle: Rect?
     var points: [Point] = []
 
+    /// Shared lifecycle handler for the sheet's GestureState, which becomes false even when onEnded is skipped.
+    mutating func activityChanged(_ active: Bool) {
+        if !active {
+            rectangle = nil
+            points = []
+        }
+    }
+
     mutating func move(from committed: Rect, handle: CropHandle?, dx: Double, dy: Double) {
         rectangle = CropEditing.drag(committed, handle: handle, dx: dx, dy: dy)
     }
@@ -210,7 +218,7 @@ struct ImageCropSheet: View {
         .padding(.bottom, NibSpacing.l)
         .background(NibColor.backgroundSecondary)
         .onChange(of: gestureActive) { _, active in
-            if !active { draft = CropGestureDraft() }
+            draft.activityChanged(active)
         }
     }
 
@@ -291,7 +299,7 @@ struct ImageCropSheet: View {
                 rect = CropEditing.drag(rect, handle: handle, dx: Double(g.translation.width / max(size.width, 1)),
                                         dy: Double(g.translation.height / max(size.height, 1)))
                 aspect = nil
-                draft = CropGestureDraft()
+                draft.activityChanged(false)
             }
     }
 
@@ -327,7 +335,7 @@ struct ImageCropSheet: View {
                     }
                     .onEnded { _ in
                         outline = draft.outline(or: outline)
-                        draft = CropGestureDraft()
+                        draft.activityChanged(false)
                     })
         }
         .frame(width: size.width, height: size.height)

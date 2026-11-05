@@ -59,27 +59,54 @@ struct ImageMenuTarget {
 
 // MARK: - Running commands from image UI
 
+/// Owned by one import from target capture through loading, staging, dismissal and command execution.
+/// Returning to the original page does not give an old import ownership of the new selection or tool.
+@MainActor
+final class ImageNavigationTracker {
+    private let document: DocumentID?
+    private let page: PageID?
+    private var navigated: Bool
+    private var watches: [AnyCancellable] = []
+
+    init(session: EditorSession?, target: ImageMenuTarget?) {
+        document = target?.doc ?? session?.document
+        page = target?.page ?? session?.page
+        navigated = session?.document != document || session?.page != page
+        if let session {
+            watches = [
+                session.$document.dropFirst().sink { [weak self] value in
+                    guard let self else { return }
+                    if value != self.document { self.navigated = true }
+                },
+                session.$page.dropFirst().sink { [weak self] value in
+                    guard let self else { return }
+                    if value != self.page { self.navigated = true }
+                }
+            ]
+        }
+    }
+
+    func canUpdate(_ session: EditorSession) -> Bool {
+        !navigated && session.document == document && session.page == page
+    }
+}
+
 @MainActor
 enum ImageUI {
     /// Runs commands as the user in one undo group, like `NibApp.perform` (failures reach the shell's toast). When items
     /// were created, the non-sticky image tool is finished and the new items are selected.
     static func run(_ app: NibApp, _ calls: [(command: String, params: JSONValue)], session: EditorSession?,
-                    target: ImageMenuTarget? = nil) {
+                    target: ImageMenuTarget? = nil, navigation: ImageNavigationTracker? = nil) {
         guard !calls.isEmpty else { return }
-        Task { @MainActor in await perform(app, calls, session: session, target: target) }
+        let navigation = navigation ?? ImageNavigationTracker(session: session, target: target)
+        Task { @MainActor in await perform(app, calls, session: session, target: target, navigation: navigation) }
     }
 
     /// `run`, awaited. Returns the created or replaced item refs ([] when a call failed).
     @discardableResult
     static func perform(_ app: NibApp, _ calls: [(command: String, params: JSONValue)], session: EditorSession?,
-                        target: ImageMenuTarget? = nil) async -> [String] {
-        let originDoc = target?.doc ?? session?.document
-        let originPage = target?.page ?? session?.page
-        var navigated = session?.document != originDoc || session?.page != originPage
-        // Remember navigation even if the user leaves and returns before loading completes.
-        let documentWatch = session?.$document.dropFirst().sink { if $0 != originDoc { navigated = true } }
-        let pageWatch = session?.$page.dropFirst().sink { if $0 != originPage { navigated = true } }
-        defer { documentWatch?.cancel(); pageWatch?.cancel() }
+                        target: ImageMenuTarget? = nil, navigation: ImageNavigationTracker? = nil) async -> [String] {
+        let navigation = navigation ?? ImageNavigationTracker(session: session, target: target)
         let group = NibID.make().raw
         var created: [String] = []
         for call in calls {
@@ -93,8 +120,7 @@ enum ImageUI {
                 return []
             }
         }
-        guard !created.isEmpty, let session = session, !navigated,
-              session.document == originDoc, session.page == originPage else { return created }
+        guard !created.isEmpty, let session = session, navigation.canUpdate(session) else { return created }
         finishToolUse(session, target: target)
         _ = try? await app.bus.execute(CommandIDs.selectionSet, ["refs": .array(created.map { .string($0) })],
                                        session: session)
@@ -250,34 +276,50 @@ struct ImageSourceMenu: View {
 
     private func choose(_ source: ImagePickSource) {
         guard let t = target() else { return }
+        let navigation = ImageNavigationTracker(session: session, target: t)
         var params: [String: JSONValue] = ["source": .string(source.rawValue), "page": .string(t.pageRef)]
         if let p = t.point { params["point"] = .array([.number(p.x), .number(p.y)]) }
         let app = self.app, session = self.session
-        close { ImageUI.run(app, [(command: "image.pick", params: .object(params))], session: session, target: t) }
-    }
-
-    private func insert(_ providers: [NSItemProvider]) {
-        guard let t = target() else { return }
-        let app = self.app, session = self.session, close = self.close
-        Task { @MainActor in
-            do {
-                let images = try await ImageProviders.load(providers)
-                let calls = try await ImageUI.insertCalls(images, target: t, app: app, session: session)
-                guard !calls.isEmpty else { return }
-                close { ImageUI.run(app, calls, session: session, target: t) }
-            } catch { ImageLoading.report(error, app: app) }
+        close {
+            ImageUI.run(app, [(command: "image.pick", params: .object(params))], session: session,
+                        target: t, navigation: navigation)
         }
     }
 
+    private func insert(_ providers: [NSItemProvider]) {
+        insertImages({ try await ImageProviders.load(providers) })
+    }
+
     private func insertRecent(_ asset: PHAsset) {
+        let recent = self.recent
+        insertImages({
+            guard let data = await recent.data(for: asset) else { throw ImageLoading.failure }
+            return [data]
+        })
+    }
+
+    /// All menu byte loaders share the same operation lifetime, including the dismissal continuation.
+    func insertImages(_ load: @escaping @MainActor () async throws -> [Data],
+                      completion: @escaping @MainActor ([String]) -> Void = { _ in }) {
         guard let t = target() else { return }
-        let app = self.app, session = self.session, close = self.close, recent = self.recent
+        let navigation = ImageNavigationTracker(session: session, target: t)
+        let app = self.app, session = self.session, close = self.close
         Task { @MainActor in
             do {
-                guard let data = await recent.data(for: asset) else { throw ImageLoading.failure }
-                let calls = try await ImageUI.insertCalls([data], target: t, app: app, session: session)
-                close { ImageUI.run(app, calls, session: session, target: t) }
-            } catch { ImageLoading.report(error, app: app) }
+                let images = try await load()
+                let calls = try await ImageUI.insertCalls(images, target: t, app: app, session: session)
+                guard !calls.isEmpty else { completion([]); return }
+                // A menu may suppress a duplicate dismissal callback; do not suspend a task waiting for it.
+                close {
+                    Task { @MainActor in
+                        let refs = await ImageUI.perform(app, calls, session: session, target: t, navigation: navigation)
+                        completion(refs)
+                    }
+                }
+            } catch {
+                ImageLoading.report(error, app: app)
+                completion([])
+            }
         }
     }
 }
