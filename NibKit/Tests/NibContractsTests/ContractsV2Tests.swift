@@ -261,6 +261,34 @@ final class ContractsV2Tests: XCTestCase {
         XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).layer, 3)
     }
 
+    func testEntirelySkippedSelectiveRevertKeepsItsPositionAndCanBeRetried() async throws {
+        let h = Harness()
+        let first = try await probeContext(h)
+        try first.mutate { tx in
+            var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+            item.locked = true
+            try tx.put(item, doc: self.doc, page: self.page1)
+        }
+        let later = try await probeContext(h)
+        try later.mutate { tx in
+            var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+            item.layer = 3
+            try tx.put(item, doc: self.doc, page: self.page1)
+        }
+        let groups = h.app.bus.history.entries(doc).map(\.group)
+        let params: JSONValue = ["doc": .string(NodeRef.document(doc).description), "group": .string(first.group)]
+        let skipped = try await h.run(CommandIDs.revertGroup, params)
+        XCTAssertEqual(skipped["reverted"]?.intValue, 0)
+        XCTAssertEqual(skipped["skipped"]?.intValue, 1)
+        XCTAssertNotNil(skipped["reason"]?.stringValue)
+        XCTAssertEqual(h.app.bus.history.entries(doc).map(\.group), groups)
+        XCTAssertTrue(h.app.bus.undo(doc), "the later step remains on top")
+        let retried = try await h.run(CommandIDs.revertGroup, params)
+        XCTAssertEqual(retried["reverted"]?.intValue, 1)
+        XCTAssertEqual(retried["skipped"]?.intValue, 0)
+        XCTAssertFalse(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).locked)
+    }
+
     func testLinkedUndoAcrossDocuments() async throws {
         let h = Harness()
         let beforeA = try h.snapshot(Fixtures.docID)

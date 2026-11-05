@@ -556,14 +556,17 @@ public final class CommandBus {
     }
 
     /// Reverts one undo group (e.g. an AI turn) even after later edits; records the revert as a new undo step.
-    /// Returns nil when the group is not in the history.
+    /// Returns nil when the group is not in the history. An entirely skipped entry stays in place for retry.
     public func revert(group: String, doc: DocumentID, principal: Principal = .user) -> (reverted: Int, skipped: Int)? {
-        guard let entry = history.removeEntry(group: group, doc: doc) else { return nil }
+        guard let entry = history.entries(doc).last(where: { $0.group == group }) else { return nil }
         let tx = DocTransaction(workspace: workspace, principal: principal, group: NibID.make().raw)
         let skipped = tx.revert(entry.mutations)
-        history.rebase(tx.rebase)
         let n = tx.mutations.count
-        if n > 0 { commit(tx, label: "Revert " + entry.label, command: CommandIDs.revertGroup, record: true) }
+        if n > 0 {
+            _ = history.removeEntry(group: group, doc: doc)
+            history.rebase(tx.rebase)
+            commit(tx, label: "Revert " + entry.label, command: CommandIDs.revertGroup, record: true)
+        }
         return (n, skipped)
     }
 

@@ -104,6 +104,7 @@ struct HistoryRevertGroup: NibCommand {
     struct Output: Codable {
         var reverted: Int
         var skipped: Int
+        var reason: String?
     }
     static let descriptor = CommandDescriptor(
         id: CommandIDs.revertGroup, title: "Revert Changes",
@@ -119,7 +120,10 @@ struct HistoryRevertGroup: NibCommand {
         guard let r = ctx.bus.revert(group: p.group, doc: doc, principal: ctx.principal) else {
             throw NibError.notFound("undo group '\(p.group)'")
         }
-        return Output(reverted: r.reverted, skipped: r.skipped)
+        let reason = r.reverted == 0 && r.skipped > 0
+            ? String(localized: "These records changed after this step. The history entry was kept; undo the later changes and try again.")
+            : nil
+        return Output(reverted: r.reverted, skipped: r.skipped, reason: reason)
     }
 }
 
