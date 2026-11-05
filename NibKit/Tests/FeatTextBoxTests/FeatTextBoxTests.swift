@@ -427,6 +427,43 @@ final class FeatTextBoxTests: XCTestCase {
         }
     }
 
+    func testFailedCloseReleasesEditorViewsButRestoresTextAndSelection() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        h.app.bus.hooks.register(.guarding(id: "test.reject", owner: "test", commands: [CommandIDs.textSetText]) { _, _, _ in
+            throw NibError(.permissionDenied, "Rejected save")
+        })
+        weak var releasedState: TextBoxEditor.EditState?
+        weak var releasedView: UITextView?
+        weak var releasedContainer: UIView?
+        do {
+            XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+            let state = try XCTUnwrap(editor.editingState)
+            state.textView.attributedText = NSAttributedString(string: "Recover without retaining views", attributes: state.textView.typingAttributes)
+            state.textView.selectedRange = NSRange(location: 3, length: 4)
+            releasedState = state
+            releasedView = state.textView
+            releasedContainer = state.container
+            editor.detach(from: host)
+            await editor.flush()
+        }
+        // Drain canceled observer removal, which is queued on the main actor.
+        await Task.yield()
+        XCTAssertNil(releasedState)
+        XCTAssertNil(releasedView)
+        XCTAssertNil(releasedContainer)
+        h.app.bus.hooks.unregister(id: "test.reject")
+        editor.attach(to: host)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        XCTAssertEqual(editor.editingTextView?.text, "Recover without retaining views")
+        XCTAssertEqual(editor.editingTextView?.selectedRange, NSRange(location: 3, length: 4))
+        editor.endEditing()
+        await editor.flush()
+        XCTAssertEqual(try box(h).text.plainText, "Recover without retaining views")
+        editor.detach(from: host)
+    }
+
     func testDeletedTextBoxDropsItsClosedDraft() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         h.app.commands.register(CommandDescriptor(id: CommandIDs.itemDelete, title: "Delete", summary: "Test deletion.",
@@ -1083,6 +1120,30 @@ final class FeatTextBoxTests: XCTestCase {
         XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID))
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertEqual(try box(h).text, item.text?.text)
+        editor.detach(from: host)
+    }
+
+    func testEmptyCloseIsSilentWhenAnotherWriterAlreadyRemovedTheBox() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let calls = Calls()
+        installDeleteStandIn(h, calls: calls)
+        try await h.run(CommandIDs.textCreateBox, ["page": .string(NodeRef.page(Fixtures.docID, Fixtures.page1).description), "frame": [40, 40, 200, 60],
+                                                  "text": "", "id": "EMPTYCLOSE"])
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "EMPTYCLOSE")
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        var failures = 0
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+            failures += 1
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        editor.endEditing()
+        // Undo is synchronous: removal lands before the queued empty-close lookup runs.
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        await editor.flush()
+        XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "EMPTYCLOSE"))
+        XCTAssertEqual(failures, 0)
+        XCTAssertTrue(calls.params.isEmpty)
         editor.detach(from: host)
     }
 

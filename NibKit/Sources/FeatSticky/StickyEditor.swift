@@ -356,7 +356,6 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
         var saved: RichText
         var persisted: RichText { didSet { conflictAnnounced = false } }
         var conflictAnnounced = false
-        var pending: RichText?
         var epoch = 0
         var recoveryKey = ""
         var recoverySubscription: EventSubscription?
@@ -400,11 +399,15 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
     /// Writes run one after another: a placed note's create, then its text saves, then closing the overlay.
     private var writes: Task<Void, Never>?
     private var pendingWrites = 0
+    private var commitSubscription: EventSubscription?
+
+    deinit { commitSubscription?.cancel() }
 
     private init(host: CanvasHost) {
         self.host = host
         super.init()
         keyboard.onChange = { [weak self] in self?.revealEditingNote() }
+        attach(to: host)
     }
 
     /// The note being edited.
@@ -412,9 +415,23 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
 
     // MARK: CanvasAttachment
 
-    func attach(to host: CanvasHost) { self.host = host }
+    func attach(to host: CanvasHost) {
+        self.host = host
+        commitSubscription?.cancel()
+        commitSubscription = host.app.bus.observeCommits { [weak self] changes in
+            guard let self, let current = self.editing, changes.mutations.contains(where: { mutation in
+                guard case let .item(doc, page, _, after) = mutation else { return false }
+                return doc == current.doc && page == current.page && after.id == current.id
+            }) else { return }
+            self.refresh(reconcileText: changes.group != current.group)
+        }
+    }
 
-    func detach(from host: CanvasHost) { endEditing(save: true) }
+    func detach(from host: CanvasHost) {
+        endEditing(save: true)
+        commitSubscription?.cancel()
+        commitSubscription = nil
+    }
 
     func canvasDidChange(_ host: CanvasHost) { refresh() }
 
@@ -480,8 +497,6 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
             // A note whose placing failed, or that was deleted meanwhile, has nothing left to save into.
             guard (try? app.workspace.item(e.doc, page: e.page, id: e.id)) != nil else { return }
             guard e.epoch == epoch, text != e.saved else { return }
-            e.pending = text
-            defer { e.pending = nil }
             if await StickyActions.setText(app, ref: e.ref, text: text, session: session, group: e.group,
                                            expectedText: e.persisted) {
                 e.saved = text
@@ -614,7 +629,9 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
 
     /// Follows the model (colour, author, resolved, frame, a delete, undo or collapse elsewhere) and the canvas
     /// (scroll, zoom). The typed text is the view's own; the document gets it through the saves.
-    private func refresh() {
+    // Canvas notifications carry no changeset and can precede our commit observer. Reconcile text
+    // only from that observer, using the undo group rather than raw/canonical text equality.
+    private func refresh(reconcileText: Bool = false) {
         guard let e = editing, let host = self.host else { return }
         if e.placed {
             guard let item = try? host.app.workspace.item(e.doc, page: e.page, id: e.id), let note = item.sticky else {
@@ -625,7 +642,7 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
                 endEditing(save: !item.locked)
                 return
             }
-            if note.text != e.persisted && note.text != e.pending {
+            if reconcileText && note.text != e.persisted {
                 let draft = StickyText.richText(e.view.textView.attributedText ?? NSAttributedString(), zoom: e.zoom)
                 if draft == e.saved {
                     e.epoch += 1

@@ -27,8 +27,35 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
     private struct WeakEditor { weak var editor: TextBoxEditor? }
     private static var live: [WeakEditor] = []
-    // Failed closes survive canvas/host teardown, including original attachment objects and their bytes.
-    private static var drafts: [String: EditState] = [:]
+    // Recovery holds text data, including unstaged attachment bytes, never editor views or sessions.
+    @MainActor
+    private final class Draft {
+        let doc: DocumentID
+        let page: PageID
+        let id: ElementID
+        var exists: Bool
+        let box: TextBoxItem
+        let base: TextAttributes
+        let text: NSAttributedString
+        let typingAttributes: [NSAttributedString.Key: Any]
+        let selection: NSRange
+        let recoveryKey: String
+        let group: String
+        var subscription: EventSubscription?
+
+        init(_ state: EditState) {
+            doc = state.doc; page = state.page; id = state.id; exists = state.exists
+            box = state.box; base = state.base
+            // RichText alone cannot represent an attachment whose asset staging failed.
+            text = NSAttributedString(attributedString: state.textView.attributedText ?? NSAttributedString())
+            typingAttributes = state.textView.typingAttributes
+            selection = state.textView.selectedRange
+            recoveryKey = state.recoveryKey; group = state.group
+        }
+
+        deinit { subscription?.cancel() }
+    }
+    private static var drafts: [String: Draft] = [:]
 
     /// The editor on the canvas showing `session`'s document.
     static func editor(for session: EditorSession) -> TextBoxEditor? {
@@ -60,9 +87,6 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         var stagingError: Error?
         var failedCloseAttempts = 0
         var recoveryKey = ""
-        var recoverySubscription: EventSubscription?
-
-        deinit { recoverySubscription?.cancel() }
         var session: EditorSession?
         var layer = 0
         /// The plain text when editing started: typed URLs are linked only when the text changed, so a link the user
@@ -300,9 +324,9 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         st.lastCommitted = exists ? currentRichText() : nil
         let draft = Self.drafts.removeValue(forKey: st.recoveryKey)
         if let draft {
-            st.textView.attributedText = draft.textView.attributedText
-            st.textView.typingAttributes = draft.textView.typingAttributes
-            st.textView.selectedRange = draft.textView.selectedRange
+            st.textView.attributedText = draft.text
+            st.textView.typingAttributes = draft.typingAttributes
+            st.textView.selectedRange = draft.selection
             // Keep the current stored baseline and geometry. Reopening explicitly retries the draft
             // against that version, including inherited formatting from its current style.
             rebase(st, from: draft.base)
@@ -357,8 +381,10 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             unhide(st.id, page: st.page)
         }
         enqueue { [self] in
+            // A queued create may have succeeded after the recovery snapshot was taken.
+            if Self.drafts[st.recoveryKey]?.group == st.group { Self.drafts[st.recoveryKey]?.exists = st.exists }
             if !commit || (st.stagingError == nil && ((!st.exists && text.isEmpty) || st.lastCommitted == text)) {
-                if Self.drafts[st.recoveryKey] === st { Self.drafts[st.recoveryKey] = nil }
+                if Self.drafts[st.recoveryKey]?.group == st.group { Self.drafts[st.recoveryKey] = nil }
             }
             st.container.removeFromSuperview()
             if !detaching, state?.ref != st.ref { unhide(st.id, page: st.page) }
@@ -381,16 +407,16 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     }
 
     private func retainDraft(_ st: EditState) {
-        Self.drafts[st.recoveryKey] = st
-        guard st.recoverySubscription == nil else { return }
-        st.recoverySubscription = app.bus.observeCommits { [weak st] changes in
-            guard let st else { return }
+        let draft = Draft(st)
+        Self.drafts[st.recoveryKey] = draft
+        draft.subscription = app.bus.observeCommits { [weak draft] changes in
+            guard let draft else { return }
             for mutation in changes.mutations {
                 guard case let .item(doc, page, _, after) = mutation,
-                      doc == st.doc, page == st.page, after.id == st.id, after.deleted else { continue }
-                if Self.drafts[st.recoveryKey] === st { Self.drafts[st.recoveryKey] = nil }
-                st.recoverySubscription?.cancel()
-                st.recoverySubscription = nil
+                      doc == draft.doc, page == draft.page, after.id == draft.id, after.deleted else { continue }
+                if Self.drafts[draft.recoveryKey] === draft { Self.drafts[draft.recoveryKey] = nil }
+                draft.subscription?.cancel()
+                draft.subscription = nil
             }
         }
     }
@@ -476,8 +502,17 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
     private func deleteEmptyBoxIfCurrent(_ st: EditState) async {
         guard app.commands.descriptor(CommandIDs.itemDelete) != nil else { return }
-        guard let stored = try? app.workspace.item(st.doc, page: st.page, id: st.id),
-              stored.text?.text == st.persisted, st.persisted.isEmpty else {
+        let stored: Item
+        do {
+            stored = try app.workspace.item(st.doc, page: st.page, id: st.id)
+        } catch let error as NibError where error.code == .notFound {
+            return // Another writer already removed the empty box; there is no draft to recover.
+        } catch {
+            report(error)
+            return
+        }
+        guard !stored.deleted else { return }
+        guard stored.text?.text == st.persisted, st.persisted.isEmpty else {
             report(NibError(.conflict, String(localized: "Text changed elsewhere. Your draft has been kept.")))
             return
         }

@@ -6,6 +6,33 @@ import NibDesign
 import NibTesting
 @testable import FeatShapes
 
+/// Uses document coordinates inside a real, window-attached scrolling canvas.
+@MainActor
+private final class ScrollingEditorHost: CanvasHost {
+    let base: FakeCanvasHost
+    let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 667, height: 375))
+    var app: NibApp { base.app }
+    var session: EditorSession { base.session }
+    var documentID: DocumentID { base.documentID }
+    var zoomScale: Double { base.zoomScale }
+    var canvasView: UIView { scroll }
+    var overlayLayer: CALayer { base.overlayLayer }
+    init(_ h: Harness) {
+        base = FakeCanvasHost(h)
+        scroll.contentSize = CGSize(width: 667, height: 2000)
+        scroll.contentInsetAdjustmentBehavior = .never
+    }
+    func viewPoint(_ p: Point, page: PageID) -> CGPoint { base.viewPoint(p, page: page) }
+    func pagePoint(_ v: CGPoint) -> (page: PageID, point: Point)? { base.pagePoint(v) }
+    func pageFrame(_ page: PageID) -> CGRect? { base.pageFrame(page) }
+    func setHidden(_ ids: Set<ElementID>, page: PageID) { base.setHidden(ids, page: page) }
+    func invalidate(page: PageID, rect: Rect?) { base.invalidate(page: page, rect: rect) }
+    func commitStroke(_ stroke: Stroke, page: PageID) { base.commitStroke(stroke, page: page) }
+    func cancelWetStroke() { base.cancelWetStroke() }
+    func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { base.attachLiveView(view, item: item, page: page) }
+    func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) { body() }
+}
+
 @MainActor
 final class FeatShapesTests: XCTestCase {
     private let shapeRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"
@@ -724,6 +751,134 @@ final class FeatShapesTests: XCTestCase {
         }
     }
 
+    func testKeyboardRevealsLowerCaretAndAccommodatesNilSelection() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        h.app.commands.register(CommandDescriptor(id: "test.tallEditor", title: "Tall editor", summary: "Layout fixture.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var item = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
+                item.shape?.frame = Frame(x: 40, y: 40, w: 300, h: 600)
+                try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
+            }
+            return .null
+        }
+        try await h.run("test.tallEditor")
+        let host = ScrollingEditorHost(h)
+        host.scroll.contentInset.bottom = 13
+        let window = UIWindow(frame: host.scroll.frame)
+        let controller = UIViewController()
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.addSubview(host.scroll)
+        controller.view.layoutIfNeeded()
+        let overlay = ShapeEditOverlay()
+        overlay.attach(to: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+        let tv = try XCTUnwrap(overlay.text?.textView)
+        defer {
+            overlay.endTextEditing(commit: false)
+            overlay.detach(from: host)
+            NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        tv.attributedText = NSAttributedString(string: Array(repeating: "A lower line", count: 18).joined(separator: "\n"),
+                                               attributes: [.font: UIFont.systemFont(ofSize: 18)])
+        tv.selectedRange = NSRange(location: tv.attributedText.length, length: 0)
+        overlay.textViewDidChangeSelection(tv)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        host.scroll.setContentOffset(.zero, animated: false)
+        tv.layoutIfNeeded()
+        let selection = try XCTUnwrap(tv.selectedTextRange)
+        let before = tv.convert(tv.caretRect(for: selection.end), to: window)
+        XCTAssertGreaterThan(before.maxY, 160, "The lower caret starts behind the keyboard")
+        XCTAssertGreaterThan(tv.bounds.height, 160, "Whole-object reveal cannot fit this editor")
+        let frame = window.convert(CGRect(x: 0, y: 160, width: 667, height: 215), to: window.screen.coordinateSpace)
+        let info = [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: frame)]
+        NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil, userInfo: info)
+        overlay.textViewDidChangeSelection(tv)
+        let after = tv.convert(tv.caretRect(for: selection.end), to: window)
+        XCTAssertGreaterThanOrEqual(after.minY, window.safeAreaInsets.top)
+        XCTAssertLessThan(after.maxY, 160, "Reveal the caret, not the oversized object's top")
+        XCTAssertGreaterThan(host.scroll.contentOffset.y, 0)
+        let accommodatedInset = host.scroll.contentInset.bottom
+        XCTAssertGreaterThan(accommodatedInset, 13)
+
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        XCTAssertEqual(host.scroll.contentInset.bottom, 13, accuracy: 0.1)
+        tv.selectedTextRange = nil
+        XCTAssertNil(tv.selectedTextRange)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil, userInfo: info)
+        XCTAssertEqual(host.scroll.contentInset.bottom, accommodatedInset, accuracy: 0.1, "Nil selection must still accommodate the keyboard")
+    }
+
+    func testNormalisedCommitPreservesTypingAndUndoDuringSuspendedSave() async throws {
+        for undoPaste in [false, true] {
+            let h = Harness(features: [FeatShapesFeature.self])
+            Self.registerTextStandIn(h.app)
+            let host = FakeCanvasHost(h)
+            let overlay = ShapeEditOverlay()
+            overlay.attach(to: host)
+            h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+            XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+            let tv = try XCTUnwrap(overlay.text?.textView)
+            let original = NSAttributedString(attributedString: tv.attributedText)
+            let commits = h.app.bus.observeCommits { _ in overlay.canvasDidChange(host) }
+            defer { commits.cancel() }
+            var failures = 0
+            let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+                failures += 1
+            }
+            defer { NotificationCenter.default.removeObserver(observer) }
+            let entered = expectation(description: "Save suspended")
+            let release = expectation(description: "Resume save")
+            var suspended = false
+            h.app.bus.hooks.register(.guarding(id: "test.normalised", owner: "test", commands: [CommandIDs.textSetText]) { _, _, _ in
+                if !suspended {
+                    suspended = true
+                    entered.fulfill()
+                    await self.fulfillment(of: [release], timeout: 2)
+                }
+                return nil
+            })
+            // Use a real undo operation to restore the exact clean comparison baseline while saving.
+            let undo = UndoManager()
+            undo.groupsByEvent = false
+            undo.beginUndoGrouping()
+            undo.registerUndo(withTarget: tv) { target in target.attributedText = original }
+            undo.endUndoGrouping()
+            tv.attributedText = NSAttributedString(string: "Pasted", attributes: [.font: UIFont.systemFont(ofSize: 500)])
+            overlay.saveTextNow()
+            await fulfillment(of: [entered], timeout: 2)
+            if undoPaste {
+                undo.undo()
+            } else {
+                tv.attributedText = NSAttributedString(string: "Newer typing", attributes: [.font: UIFont.systemFont(ofSize: 500)])
+            }
+            let draft = NSAttributedString(attributedString: tv.attributedText)
+            overlay.textViewDidChange(tv) // schedule the real debounce, not an explicit second save
+            release.fulfill()
+            await overlay.pendingFlush?.value
+            XCTAssertEqual(tv.attributedText, draft, "The synchronous commit callback must preserve the newer draft")
+            XCTAssertEqual((try shape(h, Fixtures.shapeID).text ?? .empty).plainText, "Pasted")
+            XCTAssertEqual((try shape(h, Fixtures.shapeID).text ?? .empty).paragraphs.first?.runs.first?.attrs.size, 400)
+            let autosaved = expectation(description: "Newer draft autosaved")
+            let saved = h.app.bus.observeCommits { _ in
+                let stored = try? h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
+                if stored?.shape?.text?.plainText == draft.string { autosaved.fulfill() }
+            }
+            await fulfillment(of: [autosaved], timeout: 2)
+            saved.cancel()
+            await overlay.pendingFlush?.value
+            XCTAssertEqual((try shape(h, Fixtures.shapeID).text ?? .empty).plainText, draft.string)
+            XCTAssertEqual(failures, 0)
+            h.app.bus.hooks.unregister(id: "test.normalised")
+            overlay.endTextEditing(commit: false)
+            await overlay.pendingFlush?.value
+            overlay.detach(from: host)
+        }
+    }
+
     func testNormalisedLabelSaveUsesStoredBaselineForNextSaveAndClose() async throws {
         let h = Harness(features: [FeatShapesFeature.self])
         Self.registerTextStandIn(h.app)
@@ -733,6 +888,13 @@ final class FeatShapesTests: XCTestCase {
         h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
         XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
         let tv = try XCTUnwrap(overlay.text?.textView)
+        let commits = h.app.bus.observeCommits { _ in overlay.canvasDidChange(host) }
+        defer { commits.cancel() }
+        var failures = 0
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+            failures += 1
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
         for value in ["Pasted", "Edited again", "Closed"] {
             tv.attributedText = NSAttributedString(string: value, attributes: [.font: UIFont.systemFont(ofSize: 500)])
             let rich = ShapeTextStyle.richText(tv.attributedText, shape: try shape(h, Fixtures.shapeID), scale: 1)
@@ -743,6 +905,7 @@ final class FeatShapesTests: XCTestCase {
             XCTAssertEqual(try shape(h, Fixtures.shapeID).text?.paragraphs.first?.runs.first?.attrs.size, 400)
         }
         XCTAssertNil(overlay.text)
+        XCTAssertEqual(failures, 0)
         overlay.detach(from: host)
     }
 
@@ -759,11 +922,11 @@ final class FeatShapesTests: XCTestCase {
         overlay.canvasDidChange(host)
         XCTAssertEqual(tv.text, "External clean")
         tv.attributedText = NSAttributedString(string: "Local label", attributes: tv.typingAttributes)
-        try await h.run(CommandIDs.textSetText, ["ref": .string(shapeRef), "text": "External dirty"])
         var conflicts = 0
         let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
             conflicts += 1
         }
+        try await h.run(CommandIDs.textSetText, ["ref": .string(shapeRef), "text": "External dirty"])
         for _ in 0..<3 { overlay.canvasDidChange(host) }
         NotificationCenter.default.removeObserver(observer)
         XCTAssertEqual(conflicts, 1, "Unrelated canvas refreshes must not repeat the conflict toast")
@@ -820,6 +983,8 @@ final class FeatShapesTests: XCTestCase {
         XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
         let tv = try XCTUnwrap(overlay.text?.textView)
         tv.attributedText = NSAttributedString(string: "Queued label", attributes: tv.typingAttributes)
+        let commits = h.app.bus.observeCommits { _ in overlay.canvasDidChange(host) }
+        defer { commits.cancel() }
         let entered = expectation(description: "Save suspended")
         let release = expectation(description: "Resume save")
         h.app.bus.hooks.register(.guarding(id: "test.suspend", owner: "test", commands: [CommandIDs.textSetText]) { _, params, _ in

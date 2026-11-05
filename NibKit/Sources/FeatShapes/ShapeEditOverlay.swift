@@ -170,7 +170,6 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         var committed: RichText
         var persisted: RichText { didSet { conflictAnnounced = false } }
         var conflictAnnounced = false
-        var pending: RichText?
         var epoch = 0
         var recoveryKey = ""
         var recoverySubscription: EventSubscription?
@@ -196,6 +195,9 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     private weak var host: CanvasHost?
     private let keyboard = NibKeyboardAvoidance()
     private var sessionID: NibID?
+    private var commitSubscription: EventSubscription?
+
+    deinit { commitSubscription?.cancel() }
     private let container = CALayer()
     private let guides = CAShapeLayer()
     private let preview = ShapePreviewLayer()
@@ -227,6 +229,14 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
 
     func attach(to host: CanvasHost) {
         self.host = host
+        commitSubscription?.cancel()
+        commitSubscription = host.app.bus.observeCommits { [weak self] changes in
+            guard let self, let current = self.text, changes.mutations.contains(where: { mutation in
+                guard case let .item(doc, page, _, after) = mutation else { return false }
+                return doc == current.doc && page == current.page && after.id == current.id
+            }) else { return }
+            self.refresh(reconcileText: changes.group != current.group)
+        }
         keyboard.onChange = { [weak self] in self?.revealText() }
         sessionID = host.session.id
         Self.live[host.session.id] = WeakOverlay(self)
@@ -251,6 +261,8 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
 
     func detach(from host: CanvasHost) {
         endTextEditing(commit: true)
+        commitSubscription?.cancel()
+        commitSubscription = nil
         cancelDrag()
         container.removeFromSuperlayer()
         accessView.removeFromSuperview()
@@ -337,7 +349,9 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
 
     // MARK: Model → layers
 
-    private func refresh() {
+    // Only commit observations carry the identity needed to distinguish our canonical save from
+    // another writer. Canvas callbacks can run first, so they update geometry without reconciling text.
+    private func refresh(reconcileText: Bool = false) {
         guard let host else { return }
         if let t = text {
             guard (try? host.app.workspace.item(t.doc, page: t.page, id: t.id)) != nil else {
@@ -350,7 +364,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
             }
             if let shape = (try? host.app.workspace.item(t.doc, page: t.page, id: t.id))?.shape {
                 let incoming = shape.text ?? .empty
-                if incoming != t.persisted && incoming != t.pending {
+                if reconcileText && incoming != t.persisted {
                     let draft = ShapeTextStyle.richText(t.textView.attributedText ?? NSAttributedString(), shape: shape, scale: t.scale)
                     if draft == t.committed {
                         t.epoch += 1
@@ -738,8 +752,6 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
             guard t.epoch == epoch, rich != t.committed else { return }
             let params: JSONValue = ["ref": .string(Self.ref(t)), "text": value,
                 "expectedText": (try? JSONValue.from(t.persisted)) ?? .string(t.persisted.plainText)]
-            t.pending = rich
-            defer { t.pending = nil }
             if await ShapesUI.run(app, ShapeTapAt.textCommand, params, session: session, group: group) != nil {
                 t.committed = rich
                 // Keep the dirty comparison separate from text.setText's canonical stored value.
