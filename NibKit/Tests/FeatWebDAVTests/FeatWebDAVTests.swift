@@ -589,6 +589,20 @@ final class FeatWebDAVTests: XCTestCase {
         XCTAssertThrowsError(try WebDAVConfiguration.normalizeFolder("Nib/../etc"))
     }
 
+    func testSettingsSaveShowsLocalisedValidationWithoutChangingConfiguration() async throws {
+        let h = Harness(features: [FeatWebDAVFeature.self])
+        let model = WebDAVSettingsModel(app: h.app)
+        let before = WebDAVSettings.read(h.app.settings)
+        let address = "nas.local"
+        model.url = address
+        let saved = await model.save()
+        XCTAssertFalse(saved)
+        XCTAssertEqual(model.errorMessage, String(localized: "'\(address)' is not an http or https URL"))
+        XCTAssertEqual(WebDAVSettings.read(h.app.settings), before)
+        XCTAssertTrue(model.isDirty)
+        XCTAssertFalse(model.isWorking)
+    }
+
     // MARK: Client against the fake server
 
     func testClientListsUploadsDownloadsAndDeletes() async throws {
