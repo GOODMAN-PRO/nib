@@ -1412,6 +1412,87 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertTrue(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).isEmpty)
     }
 
+    func testFailedInkOwnerTracksViewportAndSurvivesCanvasRecycling() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let host = FakeCanvasHost(h)
+        let store = FailedInkStore.shared(h.app)
+        let attachment = FailedInkAttachment(store: store)
+        attachment.attach(to: host)
+        let saved = stroke()
+        let result = try await h.run("canvas.retainFailedInk",
+            ["page": "page:FIXTUREDOC01/FIXTUREPG002", "stroke": try JSONValue.from(saved), "id": "UNSAVED01"])
+        XCTAssertEqual(result["id"], "UNSAVED01")
+        let layer = try XCTUnwrap(attachment.layers["UNSAVED01"])
+        XCTAssertTrue(layer.superlayer === host.canvasView.layer)
+        XCTAssertEqual(layer.affineTransform(), try XCTUnwrap(host.pageTransform(Fixtures.page2)))
+        host.zoomScale = 2
+        host.gap = 100
+        attachment.canvasDidChange(host)
+        XCTAssertEqual(layer.affineTransform(), try XCTUnwrap(host.pageTransform(Fixtures.page2)))
+        attachment.detach(from: host)
+        XCTAssertNil(layer.superlayer)
+        XCTAssertEqual(store.entries["UNSAVED01"]?.stroke, saved, "Recycling retires the layer, not the unsaved data")
+        attachment.attach(to: host)
+        XCTAssertEqual(attachment.layers.count, 1)
+        _ = try await h.run("canvas.recoverInk", ["doc": "doc:FIXTUREDOC01", "discard": true])
+        XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertTrue(attachment.layers.isEmpty)
+        attachment.detach(from: host)
+    }
+
+    func testFailedInkRetryRetainsFailureProcessesOnceAndDoesNotDuplicate() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let host = FakeCanvasHost(h)
+        let store = FailedInkStore.shared(h.app)
+        let attachment = FailedInkAttachment(store: store)
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        let shift = ShiftProcessor()
+        h.app.content.strokeProcessors.register(StrokeProcessorEntry(id: "test.shift", order: 1, owner: "test", processor: shift))
+        var shouldFail = true
+        var attempts = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.inkAddStrokes, title: "Ink",
+            summary: "Recovery stand-in.", params: .anything(), effect: .edit)) { params, ctx in
+            attempts += 1
+            if shouldFail { throw NibError(.internalError, "Disk unavailable") }
+            let strokes = try XCTUnwrap(params["strokes"]).decode([Stroke].self)
+            let id = ElementID(try XCTUnwrap(params["ids"]?[0]?.stringValue))
+            let items = try ctx.mutate { tx in
+                try tx.put([Item(id: id, kind: .stroke, stroke: strokes[0])], doc: Fixtures.docID, page: Fixtures.page2)
+            }
+            return ["refs": .array(items.map { .string(NodeRef.item(Fixtures.docID, Fixtures.page2, $0.id).description) })]
+        }
+        _ = try await h.run("canvas.retainFailedInk",
+            ["page": "page:FIXTUREDOC01/FIXTUREPG002", "stroke": try JSONValue.from(stroke()), "id": "UNSAVED02"])
+        _ = try await h.app.bus.execute(Invocation(command: "canvas.recoverInk",
+            params: ["doc": "doc:FIXTUREDOC01"], session: h.session, dryRun: true))
+        XCTAssertEqual(store.entries.count, 1, "A dry run must not retire unsaved ink")
+        XCTAssertEqual(attempts, 0)
+        do {
+            _ = try await h.run("canvas.recoverInk", ["doc": "doc:FIXTUREDOC01"])
+            XCTFail("The retry must report its failure")
+        } catch { XCTAssertEqual(NibError.wrap(error).message, "Disk unavailable") }
+        XCTAssertEqual(store.entries.count, 1)
+        XCTAssertEqual(attachment.layers.count, 1)
+        shouldFail = false
+        _ = try await h.run("canvas.recoverInk", ["doc": "doc:FIXTUREDOC01"])
+        _ = try await h.run("canvas.recoverInk", ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(shift.pages, [Fixtures.page2])
+        XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertTrue(attachment.layers.isEmpty)
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+        XCTAssertEqual(items.map(\.id), [ElementID("UNSAVED02")])
+        XCTAssertEqual(items.first?.stroke?.points.first?.y, 210)
+        // Undo also retires unsaved previews belonging to the document.
+        _ = try await h.run("canvas.retainFailedInk",
+            ["page": "page:FIXTUREDOC01/FIXTUREPG002", "stroke": try JSONValue.from(stroke()), "id": "UNSAVED03"])
+        _ = try await h.run(CommandIDs.undo, ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertTrue(attachment.layers.isEmpty)
+        XCTAssertTrue(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).isEmpty)
+    }
+
     func testFailingCommitReportsTheError() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h)

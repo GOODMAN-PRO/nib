@@ -217,6 +217,18 @@ final class HighlighterTool: CanvasTool {
                 HighlighterTool.log.error("keeping the stroke failed: \(String(describing: error), privacy: .public)")
                 NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
                     userInfo: ["command": CommandIDs.inkAddStrokes, "error": error])
+                Task { @MainActor in
+                    guard host.app.commands.entry("canvas.retainFailedInk") != nil else { return }
+                    do {
+                        _ = try await host.app.bus.execute("canvas.retainFailedInk",
+                            ["page": .string(NodeRef.page(host.documentID, page).description),
+                             "stroke": try JSONValue.from(stroke)], session: host.session)
+                        preview.removeFromSuperlayer()
+                    } catch {
+                        NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
+                            userInfo: ["command": "canvas.retainFailedInk", "error": NibError.wrap(error)])
+                    }
+                }
                 return
             }
             host.afterNextRender(page: page) { preview.removeFromSuperlayer() }

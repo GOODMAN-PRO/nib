@@ -455,7 +455,7 @@ final class FeatHighlighterTests: XCTestCase {
         for i in 10_000..<10_100 {
             samples.append(StrokePoint(x: Float(i), y: 20))
             let path = preview.extend(samples, transform: .identity, view: view)
-            XCTAssertEqual(path.currentPoint, CGPoint(x: i, y: 20))
+            XCTAssertEqual(path.currentPoint, CGPoint(x: CGFloat(i), y: 20))
         }
         XCTAssertEqual(visits, 10_100, "Each move must process only the appended samples")
         let zoom = CGAffineTransform(scaleX: 2, y: 2)
@@ -576,6 +576,32 @@ final class FeatHighlighterTests: XCTestCase {
         XCTAssertEqual(host.base.committed.count, 1)
         XCTAssertTrue(host.base.renderWaits.isEmpty)
         XCTAssertEqual(host.overlayLayer.sublayers?.count, 1)
+    }
+
+    func testFailedHeldInkTransfersDataBeforeRetiringItsPreview() async throws {
+        let h = Harness(features: [FeatHighlighterFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeRecognize, title: "Recognise",
+            summary: "No match.", effect: .read)) { _, _ in .null }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeCreate, title: "Shape",
+            summary: "Shape stand-in.", effect: .edit)) { _, _ in .null }
+        var retained: JSONValue?
+        h.app.commands.register(CommandDescriptor(id: "canvas.retainFailedInk", title: "Keep",
+            summary: "Canvas recovery stand-in.", effect: .session)) { params, _ in
+            retained = params
+            return [:]
+        }
+        let host = ControlledInkHost(h)
+        let tool = HighlighterTool()
+        let stroke = Stroke(style: .defaultHighlighter, points: wobbly)
+        XCTAssertTrue(tool.strokeHeld(stroke, page: Fixtures.page1, host: host))
+        tool.touchesCancelled(host: host)
+        host.finish(.failure(NibError(.internalError, "Could not save ink")))
+        for _ in 0..<200 where retained == nil || !(host.overlayLayer.sublayers?.isEmpty ?? true) {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(try XCTUnwrap(retained?["stroke"]).decode(Stroke.self), stroke)
+        XCTAssertEqual(retained?["page"], "page:FIXTUREDOC01/FIXTUREPG001")
+        XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
     }
 
     func testCancellingAHoldKeepsTheStrokeAsDrawn() {
