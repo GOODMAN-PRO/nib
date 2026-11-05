@@ -637,11 +637,10 @@ struct ZoomPane: View {
     let writing: ZoomWritingView
 
     var body: some View {
-        VStack(spacing: ZoomWindowController.rowGap) {
+        ZoomPaneLayout(writingHeight: controller.writingSize.height) {
             controls
             ZoomWritingSurface(view: writing)
                 .frame(maxWidth: .infinity)
-                .frame(height: controller.writingSize.height)
                 .background {
                     GeometryReader { g in
                         Color.clear
@@ -695,6 +694,24 @@ struct ZoomPane: View {
             controller.toggleOptions()
         }
         .nibBudAnchor(ZoomWindowController.optionsAnchor)
+    }
+}
+
+/// Accept the chrome's actual height proposal instead of overflowing with a fixed writing surface.
+struct ZoomPaneLayout: Layout {
+    let writingHeight: CGFloat
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let natural = NibMetrics.hitTarget + NibSpacing.xs + writingHeight
+        return CGSize(width: proposal.width ?? 600, height: min(natural, proposal.height ?? natural))
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard subviews.count == 2 else { return }
+        let row = min(NibMetrics.hitTarget, bounds.height)
+        subviews[0].place(at: bounds.origin, anchor: .topLeading,
+            proposal: ProposedViewSize(width: bounds.width, height: row))
+        let top = row + NibSpacing.xs
+        subviews[1].place(at: CGPoint(x: bounds.minX, y: bounds.minY + top), anchor: .topLeading,
+            proposal: ProposedViewSize(width: bounds.width, height: max(0, bounds.height - top)))
     }
 }
 
