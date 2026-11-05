@@ -44,7 +44,7 @@ D:idle-stalls#2 verdict rejects query shape as the proven root cause: unchanged 
 
 ## C3 - decimal keyboard dismissal
 
-D:escape-and-keyboard#2 and verdict: the inert-header contact removes the floating pad while the docked keyboard and Width focus remain. Only the two existing inertHeader custom-size callers now re-check keyboard existence, re-resolve the visible system Hide key and send at most one additional coordinate tap. Retain the five-second keyboard-gone wait and all dimension/validation assertions. Other dismissal callers are unchanged. CI must show pad removal, the conditional docked-Hide contact, keyboard disappearance, then the exact custom-size results. The second contact's effect on decimal input is inferred from the working Title keyboard route and remains runtime-unverified.
+D:escape-and-keyboard#2 and verdict: the inert-header contact removes the floating pad while the docked keyboard and Width focus remain. Only the four existing inertHeader calls in the two custom-size tests now re-check keyboard existence, re-resolve the visible system Hide key and send at most one additional coordinate tap. Retain the five-second keyboard-gone wait and all dimension/validation assertions. Other dismissal callers are unchanged. CI must show pad removal, the conditional docked-Hide contact, keyboard disappearance, then the exact custom-size results. The second contact's effect on decimal input is inferred from the working Title keyboard route and remains runtime-unverified.
 
 | Test | Log prefix | Question |
 | --- | --- | --- |
@@ -74,3 +74,23 @@ D:capture#3 and verdict: a UIKit touch pair arrived but no library.setView/menu 
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Capture test01Library and variants | Capture Sort before tap / Capture Sort menu absent | Did the button frame change, which state followed the touch, and did the real menu appear? |
+
+## C7 - Library failure boundaries
+
+L:#0 is implemented with H3 and the original reorder/boundary assertions remain. L:#1: the observed card context menu after drag is now recorded with a screenshot and reported immediately as lift losing to the native menu, rather than missing Combine. No repeat gesture or outside-tap workaround; the app job owns the arbitration fix. L:#2 correction refutes the expiry explanation: an earlier run also failed with several seconds left. Remove the two-frame loop and snapshot, require Undo hittability in the existing toast/moved-document predicate, log that toast query's message/button/first frame and tap immediately. Retain restoration and destination-removal assertions. This saves queries, not a claimed fix of the action/hit-test defect. L:#4 correction leaves capability/selector unknown: before the unchanged multitasking lookup, log Files buttons/windows, its full tree, SpringBoard tree and retain a screenshot. No selector change, seam or skip. CI must show Combine confirmation/pages/trash, real Undo action and root restoration (compare app hit-test/action logs), and what iOS 26 actually exposes for external drag setup.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Library CombineNotebooksRequiresConfirmationAndPreservesPages | Combine context menu after drag | Did the native card menu survive the drag instead of arming Combine? |
+| Library DragDocumentIntoFolderAndToastUndo | Toast Undo before tap | Which toast/button frame received the immediate hittable tap? Pair with app library tap/hit-test and toast action logs. |
+| Library ExternalFilesDropImportsIntoCurrentFolder | Files window controls / Files hierarchy before multitasking / SpringBoard before Files multitasking | Is a differently labelled window control available, or is the expected flow absent? |
+
+## Final source review and validation
+
+Reviewed all changed Swift blocks and the unchanged NibTouchPaths.h/.m perform implementation: XCTest queries/snapshots and coordinate APIs, optional decoding, closure captures/throws, predicate placeholders, helper access/signatures and string expression sizes. All ordinary canvas paths retain the same screen conversion and completion/error handling. Re-read shared-helper callers across every class, including Insert/Pages/Selection: signatures/defaults are compatible; those classes are not edited. Explicit form ancestry failure returns without an unsafe drag; a detected post-drag container change fails and is propagated by requireControl, command taps, native focus and PNG-save wrappers. Existing nonthrowing direct callers stop via their continueAfterFailure=false setting. Capture's continueAfterFailure=true paths use the throwing wrappers.
+
+A Python source audit against 6df0cbf preserves all **586 test declarations**, every existing XCTAssert line, all executionTimeAllowance assignments and the skip/sleep inventory. Removed only the explicitly requested toast stability wait; colour dismissal now checks the actual presented route and still requires disappearance. Eight files changed, all under NibUITests. Eleven commits, one for each H1-H4/C1-C7 cluster, with the exact requested attribution body; review corrections folded into their owning clusters. No push.
+
+`python Scripts/lint.py`: **0 errors, 25 existing warnings**. `git diff --check 6df0cbf` and `git diff --check`: clean. These checks do not compile Swift/Objective-C or run XCUITest. CI must particularly validate native-menu screen coordinates, ancestry clipping and frame-change detection, native switch presses, remote colour-picker surface containment, late Calendar permission timing, and foreign-app AX availability. No Objective-C source/header changes were necessary. H4's missing authoritative key-window probe fields are explicitly explained above; no other cluster remains unaddressed.
+
+Estimated, unmeasured runtime saving: nine observed 60-second idle waits (seven Canvas, two Create), about **540 seconds** across those paths; the additional duplicate-menu wait interrupted by the baseline allowance makes the potential avoided total about **600 seconds**. Pencil and toast query reductions are unquantified and do not establish a latency or toast-action fix. New diagnostics and state waits add AX overhead, so net runtime and test passes require the next macOS CI run. App-owned Escape, toast action and lift/menu defects retain their original expected behavior and receive no test workaround.
