@@ -1472,6 +1472,7 @@ final class InsertUITests: XCTestCase {
             try documentMenu("Replay Options"); try tap(mode)
             XCTAssertTrue(try control(mode).isSelected, "Replay mode must reflect the applied setting")
             try ui.dismissSheets()
+            try ui.waitForMenuClosed(ui.app.buttons["Replay in Full Screen"].firstMatch, named: "Replay Options " + mode)
             rendered[mode] = try canvasPixels()
         }
         XCTAssertGreaterThan(changedPixels(try XCTUnwrap(rendered["Static"]), try XCTUnwrap(rendered["Reveal"])), 20,

@@ -207,3 +207,7 @@ For #2 correction, the 27 ms run with Skip Silence/Reduce Noise is proven; an em
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | AudioPlayPauseSeekSkipSettingsAndClose | Audio enabled-settings playback / State step (Audio before Play with Skip Silence and Reduce Noise) | Which settings and exposed state preceded the potentially immediate end? SilenceMap itself is unavailable to the runner. |
+
+### I8 - Replay Options closure
+
+Confirmed insert-pickers-audio#6 and current 10a H4: dismissSheets already closes identified native popovers and requires the dismissal region to disappear. Reused it, adding the Replay in Full Screen content sentinel through 10a waitForMenuClosed before pixels or the next More action. No second dismissal implementation. ReplayModesAndSeek must reach Spotlight/Reveal/Static and retain both pixel-difference and stroke/seek/zoom assertions. Existing Menu remained open and State step diagnostics identify a surviving surface.
