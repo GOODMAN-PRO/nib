@@ -98,10 +98,11 @@ final class InkUITests: XCTestCase {
         element.tap()
     }
 
-    private func settings(_ tool: String) throws {
-        try ui.selectTool(tool)
+    private func settings(_ tool: String, alreadySelected: Bool = false, revealTop: Bool = true) throws {
+        if !alreadySelected { try ui.selectTool(tool) }
         // Tapping the active tool opens its settings even when navigation has folded the options bar.
         try tap("tool." + tool)
+        if !revealTop { return }
         // Popover ScrollViews keep their offset when closed. Start at the type/mode grid each time.
         let topLabel: String
         switch tool {
@@ -110,13 +111,8 @@ final class InkUITests: XCTestCase {
         case "drawShape": topLabel = "Draw and Hold"
         default: topLabel = "Fountain Pen"
         }
-        for _ in 0..<8 {
-            if ui.findControl(topLabel) != nil { return }
-            guard let panel = ui.app.scrollViews.allElementsBoundByIndex.first(where: {
-                $0.identifier != "nib.canvas" && $0.isHittable && $0.frame.width > 200 && $0.frame.width < 600 && $0.frame.height > 180
-            }) else { break }
-            scrollPanel(panel, down: true)
-        }
+        _ = try control(topLabel, scroll: true)
+
     }
 
     private var scrollPanels: [XCUIElement] {
@@ -129,17 +125,6 @@ final class InkUITests: XCTestCase {
             return [.collectionView, .table].contains(panel.elementType)
                 && panel.buttons.allElementsBoundByIndex.contains { $0.isHittable }
         }
-    }
-
-    private func scrollPanel(_ panel: XCUIElement, down: Bool) {
-        // The centre of a pen popover contains custom sliders which consume drag gestures.
-        // Scroll from the panel's 16-point content padding, clear of every slider and toggle.
-        // Native Settings lists inset their cells farther than that padding; their empty margin
-        // does not scroll. Use a row's centre for those lists, away from the trailing switches.
-        let x: CGFloat = [.collectionView, .table].contains(panel.elementType) ? 0.5 : 0.025
-        let start = panel.coordinate(withNormalizedOffset: CGVector(dx: x, dy: down ? 0.2 : 0.8))
-        let end = panel.coordinate(withNormalizedOffset: CGVector(dx: x, dy: down ? 0.8 : 0.2))
-        start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0)
     }
 
     private func closePopover() {
@@ -173,7 +158,7 @@ final class InkUITests: XCTestCase {
                 // Scroll the actual tap point into view before exercising the switch.
                 let centre = CGPoint(x: target.frame.midX, y: target.frame.midY)
                 if target.isHittable && panel.frame.insetBy(dx: 2, dy: 2).contains(centre) { break }
-                scrollPanel(panel, down: centre.y < panel.frame.minY)
+                ui.revealFormElement(in: panel) { target }
             }
             XCTAssertTrue(target.isHittable, "\(label) switch thumb must be visible")
             target.coordinate(withNormalizedOffset: CGVector(dx: native.exists ? 0.5 : 0.92, dy: 0.5)).tap()
@@ -623,23 +608,24 @@ final class InkUITests: XCTestCase {
     func testHighlighterStabilisationAndCustomWidthChangeRenderedInk() throws {
         let zigzag = (0...12).map { i in CGPoint(x: 0.40 + Double(i) / 60, y: i % 2 == 0 ? 0.61 : 0.64) }
         var smoothed: [Raster] = []
+        try ui.selectTool("highlighter")
         for position: CGFloat in [0.01, 0.99] {
-            try settings("highlighter")
+            try settings("highlighter", alreadySelected: true, revealTop: false)
             _ = try slider("Stabilisation", to: position); closePopover()
             let before = try ui.state(), blank = try raster()
             try draw(zigzag); smoothed.append(try visibleInk(after: blank)); try undo(to: before)
         }
         XCTAssertGreaterThan(smoothed[0].changed(from: smoothed[1]), 20, "Highlighter smoothing must change the drawn path")
         var areas: [Int] = []
+        try settings("highlighter", alreadySelected: true, revealTop: false)
         for position: CGFloat in [0.15, 0.85] {
-            try settings("highlighter")
             let widthValue = try slider("Thickness", to: position); closePopover()
-            try settings("highlighter")
-            XCTAssertEqual(String(describing: try control("Thickness", type: .slider, scroll: true).value), widthValue)
-            closePopover()
             let before = try ui.state(), blank = try raster()
             try draw(); areas.append(try visibleInk(after: blank).changed(from: blank)); try undo(to: before)
+            try settings("highlighter", alreadySelected: true, revealTop: false)
+            XCTAssertEqual(String(describing: try control("Thickness", type: .slider, scroll: true).value), widthValue)
         }
+        closePopover()
         XCTAssertGreaterThan(areas[1], areas[0], "Larger custom highlighter width must cover more paper")
     }
 
@@ -982,13 +968,15 @@ final class InkUITests: XCTestCase {
         }
         let mixed = try ui.state()
         XCTAssertEqual(mixed.itemCountOnPage, initial.itemCountOnPage + 4)
-        for enabled in labels {
-            try settings("eraser"); try tap("Whole stroke")
+        try settings("eraser"); try tap("Whole stroke")
+        let chips = try labels.map { try control($0, type: .button, scroll: true) }
+        for (index, enabled) in labels.enumerated() {
+            if index > 0 { try settings("eraser", alreadySelected: true, revealTop: false) }
             // Enable target first, so the last-enabled-filter guard is respected.
-            let target = try control(enabled, type: .button, scroll: true)
+            let target = chips[index]
             if !target.isSelected { target.tap() }
-            for label in labels where label != enabled {
-                let chip = try control(label, type: .button, scroll: true)
+            for (chipIndex, label) in labels.enumerated() where label != enabled {
+                let chip = chips[chipIndex]
                 if chip.isSelected { chip.tap() }
                 XCTAssertFalse(chip.isSelected)
             }

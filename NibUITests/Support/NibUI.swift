@@ -178,16 +178,17 @@ final class NibUI {
                 return $0.node.frame.width * $0.node.frame.height > $1.node.frame.width * $1.node.frame.height
             }.first?.element
         }
+        guard let list = liveList(), let firstSnapshot = try? list.snapshot() else { return }
+        let window = app.windows.firstMatch.frame
+        let obstructions = app.keyboards.allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
+            + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
+        var snapshot = firstSnapshot
         var visited = Set<String>()
         var direction: Bool?
         var reversed = false
         var endSignatures: [String] = []
         for _ in 0..<16 {
-            guard let list = liveList(), list.exists else { return }
-            let listFrame = list.frame
-            let window = app.windows.firstMatch.frame
-            let obstructions = app.keyboards.allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
-                + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
+            let listFrame = snapshot.frame
             guard let viewport = NibUITestScrollGeometry.viewport(
                 scroll: listFrame, window: window, obstructions: obstructions) else { return }
             let element: XCUIElement
@@ -198,7 +199,6 @@ final class NibUI {
             let targetFrame = element.exists ? element.frame : nil
             if let targetFrame, viewport.contains(CGPoint(x: targetFrame.midX, y: targetFrame.midY)),
                element.isHittable { return }
-            guard list.exists, let snapshot = try? list.snapshot() else { return }
             let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
             if !visited.insert(signature).inserted {
                 endSignatures.append(signature)
@@ -224,6 +224,7 @@ final class NibUI {
                 XCTFail("Form disappeared after reveal drag"); return
             }
             logQA("Form drag after", "point=\(start) container=\(after.frame) rows=\(formVisibleRange(after, viewport: viewport))")
+            snapshot = after // Reuse this post-drag snapshot as the next iteration's before state.
             let afterValues = formControlValues(after)
             let changed = values.keys.filter { afterValues[$0] != nil && afterValues[$0] != values[$0] }
             guard changed.isEmpty else {
@@ -918,7 +919,7 @@ final class NibUI {
     /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.
     func focusField(_ field: XCUIElement) throws {
         if isKeyboardFocused(field) { return }
-        revealFormElement(field)
+        if !hasVisibleFrame(field) || !field.isHittable { revealFormElement(field) }
         guard hasVisibleFrame(field) && field.isHittable else {
             // Only a keyboard-occluded editor justifies the expensive Attributes-line check (GIPHY, LaTeX).
             if isKeyboardFocused(field, allowingAttributeFallback: true) { return }

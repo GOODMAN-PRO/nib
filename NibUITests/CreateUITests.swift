@@ -800,6 +800,10 @@ final class CreateUITests: XCTestCase {
             let exists = element.exists
             if exists && element.elementType != .textField && element.isHittable { return }
             let target = exists ? element.frame : nil
+            let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
+            if exists, element.elementType == .textField, element.isHittable, let target,
+               let usable = NibUITestScrollGeometry.viewport(scroll: app.windows.firstMatch.frame,
+                   window: app.windows.firstMatch.frame, obstructions: keyboards), usable.contains(target) { return }
             let candidates = (app.collectionViews.allElementsBoundByIndex + app.scrollViews.allElementsBoundByIndex)
                 .filter { $0.isHittable && $0.frame.height > 40 }
             // Scroll the target's own container, not an unrelated card editor or paper grid.
@@ -817,7 +821,6 @@ final class CreateUITests: XCTestCase {
             }
             // DESIGN uses the native keyboard. Its covered area cannot receive form gestures,
             // even when accessibility reports a scroll frame extending underneath it.
-            let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
             guard let visible = NibUITestScrollGeometry.viewport(
                 scroll: scroll.frame, window: app.frame, obstructions: keyboards) else { break }
             if exists && element.isHittable, let target {
@@ -834,6 +837,9 @@ final class CreateUITests: XCTestCase {
                 .press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(
                     dx: drag.end.x - app.frame.minX, dy: drag.end.y - app.frame.minY)),
                     withVelocity: XCUIGestureVelocity(rawValue: 80), thenHoldForDuration: 0.3)
+            let after = element.exists ? element.frame : nil
+            ui.logQA("Creation scroll", "name=\(name) target=\(String(describing: target)) after=\(String(describing: after)) viewport=\(visible)")
+            if after == target { break }
         }
         try require(element, "Missing required creation control: \(name)")
         XCTAssertTrue(element.isHittable, "Creation control is unreachable after scrolling")
