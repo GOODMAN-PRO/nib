@@ -51,7 +51,7 @@ public enum NibUITestStorage {
 
 /// Extra prerequisites are explicit so ordinary canvas tests retain their four-page notebook and one board.
 public enum NibUITestScenario: String, CaseIterable {
-    case standard, failedRender, largeDocument, unseenBoards
+    case standard, failedRender, largeDocument, unseenBoards, tabsOverflow
 
     public static func parse(_ arguments: [String]) -> Self {
         guard arguments.contains("-NibUITestFixture"),

@@ -99,6 +99,10 @@ enum UITestFixture {
         for (front, back) in [("Velocity", "Displacement per unit time"), ("Acceleration", "Change in velocity per unit time"), ("Force", "Mass times acceleration")] {
             try await run("card.add", ["doc": study["ref"] ?? .null, "front": .string(front), "back": .string(back)])
         }
+        if scenario == .tabsOverflow {
+            // Prerequisites only. The UI test opens each persisted document through the library.
+            for index in 2...9 { _ = try await create("notebook", "Chrome tab \(index)") }
+        }
         let listing = try await run("library.list", [:])
         guard listing["nodes"]?.arrayValue?.contains(where: { $0["title"]?.stringValue == "Physics — Motion" }) == true else {
             throw NibError.invalid("Fixture is missing from library.list: " + listing.jsonString())

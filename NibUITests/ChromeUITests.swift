@@ -23,7 +23,9 @@ final class ChromeUITests: XCTestCase {
             self?.ui.logQA("Chrome interruption", self?.ui.elementFacts(element) ?? "test released")
             return false
         }
-        try ui.launchFixture()
+        let scenario: NibUI.FixtureScenario = name.contains("testTabsOverflowAndKeyboardOneThroughEightAndNineLast")
+            ? .tabsOverflow : .standard
+        try ui.launchFixture(scenario: scenario)
         ui.logQA("Typed probe estimate", "Chrome toolbar/More rows use buttons; baseline Any probes ~0.99s vs present typed ~0.16s. Potential 50-70s/layout test, unmeasured; modal typed queries may remain slow.")
     }
 
@@ -790,10 +792,20 @@ final class ChromeUITests: XCTestCase {
         return (first, try ui.state())
     }
     func testTabsOverflowAndKeyboardOneThroughEightAndNineLast() throws {
-        try open(); try showTabs(true)
+        func openFixtureTab(_ title: String) throws {
+            let card = ui.app.buttons.matching(identifier: "cmd.doc.open").matching(NSPredicate(
+                format: "label == %@ OR label BEGINSWITH %@", title, title + ",")).firstMatch
+            if !card.exists || !card.isHittable {
+                ui.revealFormElement { card }
+                if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
+            }
+            try open(title)
+        }
+        try openFixtureTab(notebook); try showTabs(true)
         var documents = [try XCTUnwrap(ui.state().document)]
         for index in 2...9 {
-            try newNotebook("Chrome tab \(index)")
+            try ui.tapCommand("window.showLibrary")
+            try openFixtureTab("Chrome tab \(index)")
             documents.append(try XCTUnwrap(ui.state().document))
         }
         try tap("Tabs"); try tap(notebook)

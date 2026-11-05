@@ -56,3 +56,7 @@ Confirmed chrome-timeouts#3/#4, create#3 and insert-timeouts-state#1 corrections
 | Rename Layer / Create SuggestedTitle / native text callers | Stall boundary (focus / typeKey / Delete) | Which exact XCTest action was about to enter the stall? |
 | Insert CopyTextUsesActualSelectedText | Stall boundary (Finish Editing) | Did the stall begin at the finish tap after paste? |
 | Rotated More | Stall boundary / Rotated More failed | Did the tap fail, without paying post-tap facts on success? |
+
+### C1 - tabs fixture prerequisites
+
+Confirmed chrome-timeouts#5: eight New Notebook UI creations at 26–46 seconds each structurally exceed the allowance. Added explicit tabsOverflow cases to the runner and app scenario enums; only this test selects the scenario in setup, matching Canvas's existing launch pattern. The fixture creates eight extra persisted notebooks. Offscreen fixture cards are revealed through the bounded shared list helper before the existing clipped card tap. The test opens all nine through actual library cards, retaining overflow selection, all Command-1…8/9 assertions and hidden/restored-tabs checks. No tab state is injected. Grepped all scenario references: no exhaustive switch over either enum exists; notebookPageCount remains unchanged. CI must show eight library opens, no New Notebook loop, all nine distinct switches, and completion under the original allowance (diagnosis target <120 seconds is unmeasured).
