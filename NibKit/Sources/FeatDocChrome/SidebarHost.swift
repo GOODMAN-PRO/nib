@@ -41,6 +41,7 @@ struct SidebarPanelView: View {
 
     private var header: some View {
         NibPanelHeader(title: selected.title, symbol: NibSymbol(systemName: selected.icon) ?? .puzzle,
+                       handlesEscape: presentation == .sheet || presentation == .fullScreen,
                        onClose: { chrome.closePanel(selected.id) }) {
             placementMenu
         }

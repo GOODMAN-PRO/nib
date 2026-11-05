@@ -1709,6 +1709,36 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertFalse(h.app.bus.undo(Fixtures.docID), "Cancelling must not add document history")
     }
 
+    func testPresentedPanelHeadersCloseThroughEscapeButDockedHeadersDecline() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let descriptor = panel("test.escape", .floating)
+        h.app.ui.panels.register(descriptor)
+        for presentation in [PanelPresentation.sidebar, .window, .sheet, .fullScreen] {
+            try await h.run(CommandIDs.panelOpen, ["id": .string(descriptor.id)])
+            let host = UIHostingController(rootView: SidebarPanelView(chrome: chrome, side: .left,
+                tabs: [descriptor], selected: descriptor, mode: .sidebar, presentation: presentation))
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 600))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            let modal = presentation == .sheet || presentation == .fullScreen
+            XCTAssertEqual(NibEscapeRouting.cancel(in: host.view), modal)
+            if modal { try await waitUntil { !h.session.openPanels.contains(descriptor.id) } }
+            else { XCTAssertTrue(h.session.openPanels.contains(descriptor.id)) }
+        }
+        try await h.run(CommandIDs.panelOpen, ["id": .string(descriptor.id)])
+        let host = UIHostingController(rootView: PanelSheetView(chrome: chrome, panel: descriptor))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 600))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertTrue(NibEscapeRouting.cancel(in: host.view))
+        try await waitUntil { !h.session.openPanels.contains(descriptor.id) }
+    }
+
     func testContainerFollowsTheStatusBarSettingAndBackGoesToTheLibrary() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         let navigator = TestNavigator(session: h.session)
