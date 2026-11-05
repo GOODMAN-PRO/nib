@@ -794,6 +794,21 @@ final class PluginRuntimeTests: XCTestCase {
         }
     }
 
+    func testReloadedBridgeIsReleasedAfterStop() async throws {
+        let s = try await start("")
+        s.plugin.stop()
+        var instance: PluginInstance? = try await s.runtime.startInstance(s.plugin.manifest, folder: s.plugin.folder)
+        weak var bridge = instance?.bridge
+        let stored = await instance?.evaluate("nib.storage.set('payload', 'retained state').then(() => 'saved')")
+        XCTAssertEqual(stored, "saved")
+        instance?.stop()
+        // Shutdown is queued; release the external handle and bound the wait for deallocation.
+        instance = nil
+        for _ in 0..<500 where bridge != nil { await sleep(0.001) }
+        XCTAssertNil(bridge)
+        XCTAssertNotNil(s.runtime.storage(for: Self.pluginID), "Storage intentionally survives a reload")
+    }
+
     func testStopRejectsLaterCallsAndMissingHandlersAreNotFound() async throws {
         let s = try await start("nib.commands.register('dev.test.plugin.one', () => 1);")
         map(s, "dev.test.plugin.one", effect: .read)
