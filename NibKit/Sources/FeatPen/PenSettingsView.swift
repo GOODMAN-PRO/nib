@@ -157,11 +157,11 @@ final class PenOptions: ObservableObject {
                     presets.selectedSwatch = presets.swatches.count - 1
                     if session == customSession { customSwatch = (presets.selectedSwatch, rgba) }
                 case .full:
-                    customDraft = nil
-                    NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                        userInfo: ["command": CommandIDs.settingsSet,
-                                   "error": NibError(.invalidParams, String(localized: "The colour palette is full. Remove a swatch before adding a custom colour."))])
-                    return
+                    // Match preset selection when there is no room for another swatch.
+                    let index = max(0, min(presets.selectedSwatch, presets.swatches.count - 1))
+                    presets.swatches[index] = PresetSwatch(color: rgba)
+                    presets.selectedSwatch = index
+                    if session == customSession { customSwatch = (index, rgba) }
                 }
                 set(NibSettings.presets(tool), presets)
                 customDraft = nil

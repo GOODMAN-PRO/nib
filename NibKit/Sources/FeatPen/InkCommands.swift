@@ -620,11 +620,8 @@ struct InkSetStyle: NibCommand {
                 throw NibError(.invalidParams, "item \(id.raw) is locked", path: "$.refs[\(i)]", hint: "unlock it first")
             }
             if patch.ignoresColor(on: stroke) {
-                guard !patch.changesOnlyColor else {
-                    throw NibError(.invalidParams, String(localized: "Patterned tape cannot be recoloured."), path: "$.style.color",
-                                   hint: String(localized: "Change width or another style field, or use solid tape to change colour."))
-                }
                 ignoredColorRefs.append(ref)
+                if patch.changesOnlyColor { continue }
             }
             var updated = item
             updated.stroke = patch.applied(to: stroke)
@@ -634,6 +631,10 @@ struct InkSetStyle: NibCommand {
                 try InkParse.checkWritable(doc, ctx)
             }
             changes[key, default: []].append(updated)
+        }
+        if patch.changesOnlyColor && ignoredColorRefs.count == seen.count {
+            throw NibError(.invalidParams, String(localized: "Patterned tape cannot be recoloured."), path: "$.style.color",
+                           hint: String(localized: "Change width or another style field, or use solid tape to change colour."))
         }
         try ctx.mutate { tx in
             for key in order {

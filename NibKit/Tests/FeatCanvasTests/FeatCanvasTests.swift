@@ -1418,7 +1418,12 @@ final class FeatCanvasTests: XCTestCase {
         let store = FailedInkStore.shared(h.app)
         let attachment = FailedInkAttachment(store: store)
         attachment.attach(to: host)
-        let saved = stroke()
+        var saved = stroke()
+        // Keep whole-stroke equality meaningful across the three-decimal JSON wire format.
+        for i in saved.points.indices {
+            saved.points[i].altitude = 1.571
+            saved.points[i].t = Float(i) * 0.25
+        }
         let result = try await h.run("canvas.retainFailedInk",
             ["page": "page:FIXTUREDOC01/FIXTUREPG002", "stroke": try JSONValue.from(saved), "id": "UNSAVED01"])
         XCTAssertEqual(result["id"], "UNSAVED01")
@@ -1484,13 +1489,36 @@ final class FeatCanvasTests: XCTestCase {
         let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
         XCTAssertEqual(items.map(\.id), [ElementID("UNSAVED02")])
         XCTAssertEqual(items.first?.stroke?.points.first?.y, 210)
-        // Undo also retires unsaved previews belonging to the document.
+        // Undo an earlier, unrelated commit: retire the preview but retain the unsaved data.
         _ = try await h.run("canvas.retainFailedInk",
             ["page": "page:FIXTUREDOC01/FIXTUREPG002", "stroke": try JSONValue.from(stroke()), "id": "UNSAVED03"])
         _ = try await h.run(CommandIDs.undo, ["doc": "doc:FIXTUREDOC01"])
-        XCTAssertTrue(store.entries.isEmpty)
+        XCTAssertNotNil(store.entries["UNSAVED03"])
         XCTAssertTrue(attachment.layers.isEmpty)
         XCTAssertTrue(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).isEmpty)
+        attachment.detach(from: host)
+        attachment.attach(to: host)
+        XCTAssertTrue(attachment.layers.isEmpty, "Recycling must not restore a retired preview")
+        _ = try await h.run("canvas.recoverInk", ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertTrue(store.entries.isEmpty)
+        let recovered = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+        XCTAssertEqual(recovered.map(\.id), [ElementID("UNSAVED03")])
+        XCTAssertEqual(recovered.first?.stroke?.points.first?.y, 210)
+    }
+
+    func testDiscardingUnsavedInkRequiresDestructiveConfirmation() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        _ = try await h.run("canvas.retainFailedInk",
+            ["page": "page:FIXTUREDOC01/FIXTUREPG002", "stroke": try JSONValue.from(stroke()), "id": "UNSAVED04"])
+        XCTAssertTrue(CanvasRecoverInk.descriptor.destructive)
+        XCTAssertTrue(CanvasRecoverInk.descriptor.scopes.contains(.destructive))
+        h.confirmer.decision = .deny
+        do {
+            _ = try await h.run("canvas.recoverInk", ["doc": "doc:FIXTUREDOC01", "discard": true], as: .ai("chat1"))
+            XCTFail("Discard must require confirmation")
+        } catch { XCTAssertEqual(NibError.wrap(error).code, .userDenied) }
+        XCTAssertEqual(h.confirmer.requests.count, 1)
+        XCTAssertNotNil(FailedInkStore.shared(h.app).entries["UNSAVED04"])
     }
 
     func testFailingCommitReportsTheError() async throws {
@@ -2380,7 +2408,7 @@ final class FeatCanvasTests: XCTestCase {
         let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.boardID])
         await waitUntil("failed renders to settle") { page.isSettled }
         XCTAssertFalse(vc.errorView.isHidden, "Settling alone is not recovery")
-        XCTAssertEqual(vc.errorView.reason, "the tile could not be drawn")
+        XCTAssertEqual(vc.errorView.reason, String(localized: "This page could not be displayed. Try again."))
         h.app.services.renderer = RecordingRenderer()
         page.invalidate(nil)
         await waitUntil("successful rerender") { page.isSettled && !vc.failedPages.contains(Fixtures.boardID) }
@@ -2406,13 +2434,13 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertTrue(vc.errorView.isHidden)
     }
 
-    func testRenderFailureReasonReachesTheBanner() throws {
+    func testRenderFailureBannerDoesNotExposeRendererDiagnostics() throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h)
         defer { vc.closeCanvas() }
         let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
-        vc.host.pageTileView(page, didFailWith: NibError(.notFound, "Missing page image"))
-        XCTAssertEqual(vc.errorView.reason, "Missing page image")
+        vc.host.pageTileView(page, didFailWith: NibError(.internalError, "CGContext nil at tile 3,4"))
+        XCTAssertEqual(vc.errorView.reason, String(localized: "This page could not be displayed. Try again."))
         XCTAssertFalse(vc.errorView.isHidden)
     }
 

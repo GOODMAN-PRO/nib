@@ -384,10 +384,8 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
         // No renderer installed (a stripped-down build): the pages show their paper, which is not a failure.
         guard let page = view.pageID, NibError.wrap(error).code != .unavailable else { return }
         CanvasHostImpl.log.error("page \(page.raw, privacy: .public) failed to render: \(NibError.wrap(error).description, privacy: .public)")
-        let message = NibError.wrap(error).message.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
-        let reason = message.isEmpty
-            ? String(localized: "The page renderer could not finish drawing this page.")
-            : String(message.prefix(240))
+        // Renderer diagnostics belong in the log, never in user-facing copy.
+        let reason = String(localized: "This page could not be displayed. Try again.")
         controller?.pageDidFail(page, reason: reason)
     }
 
@@ -518,6 +516,7 @@ final class FailedInkStore {
         let stroke: Stroke
         var processed: Stroke?
         var retrying = false
+        var previewHidden = false
         var sequence = 0
         init(id: ElementID, doc: DocumentID, page: PageID, stroke: Stroke, processed: Bool) {
             self.id = id; self.doc = doc; self.page = page; self.stroke = stroke
@@ -535,7 +534,8 @@ final class FailedInkStore {
         commits = app.bus.observeCommits { [weak self] changes in
             guard changes.command == CommandIDs.undo, let self else { return }
             for entry in self.entries.values where changes.documents.contains(entry.doc) && !entry.retrying {
-                self.entries[entry.id] = nil
+                // An unrelated undo must not discard ink that never reached the document.
+                entry.previewHidden = true
             }
             self.changed()
         }
@@ -596,7 +596,7 @@ final class FailedInkAttachment: CanvasAttachment {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
-        let entries = store.entries.values.filter { $0.doc == host.documentID }.sorted { $0.sequence < $1.sequence }
+        let entries = store.entries.values.filter { $0.doc == host.documentID && !$0.previewHidden }.sorted { $0.sequence < $1.sequence }
         let live = Set(entries.map(\.id))
         for (id, layer) in layers where !live.contains(id) && !retiring.contains(id) {
             guard let page = pages[id] else { continue }
@@ -604,7 +604,7 @@ final class FailedInkAttachment: CanvasAttachment {
             host.afterNextRender(page: page) { [weak self] in
                 guard let self, self.layers[id] === layer else { layer.removeFromSuperlayer(); return }
                 self.retiring.remove(id)
-                guard self.store.entries[id] == nil else { return }
+                guard self.store.entries[id]?.previewHidden != false else { return }
                 layer.removeFromSuperlayer()
                 self.layers[id] = nil
                 self.pages[id] = nil
@@ -659,7 +659,7 @@ struct CanvasRecoverInk: NibCommand {
     struct Output: Codable { var recovered: Int }
     static let descriptor = CommandDescriptor(id: "canvas.recoverInk", title: String(localized: "Recover Unsaved Ink"),
         summary: "Retry the document's unsaved ink, or discard it explicitly. Retried strokes use stable ids.",
-        params: .obj(["doc": .ref, "discard": .bool()], required: ["doc"]), examples: [["doc": "doc:FIXTUREDOC01"], ["doc": "doc:FIXTUREDOC01", "discard": true]], effect: .edit)
+        params: .obj(["doc": .ref, "discard": .bool()], required: ["doc"]), examples: [["doc": "doc:FIXTUREDOC01"], ["doc": "doc:FIXTUREDOC01", "discard": true]], effect: .edit, destructive: true)
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         guard let app = ctx.app else { throw NibError.unavailable("canvas") }
         let doc = try ctx.documentOrSession(p.doc)

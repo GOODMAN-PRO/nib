@@ -467,6 +467,20 @@ final class FeatHighlighterTests: XCTestCase {
         XCTAssertEqual(path.currentPoint, CGPoint(x: 20_198, y: 40))
     }
 
+    func testHeldPreviewWithoutTransformRebuildsForViewportChanges() {
+        let preview = HighlighterPreviewPath()
+        let samples = [StrokePoint(x: 10, y: 20), StrokePoint(x: 30, y: 40)]
+        _ = preview.extend(samples, transform: nil) { $0.cg }
+        var visits = 0
+        let viewport = CGAffineTransform(a: 2, b: 0, c: 0, d: 2, tx: 50, ty: 100)
+        let path = preview.extend(samples, transform: nil) { point in
+            visits += 1
+            return point.cg.applying(viewport)
+        }
+        XCTAssertEqual(visits, samples.count)
+        XCTAssertEqual(path.boundingBoxOfPath, CGRect(x: 70, y: 140, width: 40, height: 40))
+    }
+
     func testAHoldThatSnapsToNothingKeepsTheStroke() async throws {
         let h = Harness(features: [FeatHighlighterFeature.self])
         h.app.commands.register(CommandDescriptor(id: "shape.recognize", title: "Recognise Shape", summary: "Stand-in.",
@@ -592,7 +606,12 @@ final class FeatHighlighterTests: XCTestCase {
         }
         let host = ControlledInkHost(h)
         let tool = HighlighterTool()
-        let stroke = Stroke(style: .defaultHighlighter, points: wobbly)
+        var stroke = Stroke(style: .defaultHighlighter, points: wobbly)
+        // Use points exactly representable in the three-decimal JSON wire format.
+        for i in stroke.points.indices {
+            stroke.points[i].altitude = 1.571
+            stroke.points[i].t = Float(i) * 0.25
+        }
         XCTAssertTrue(tool.strokeHeld(stroke, page: Fixtures.page1, host: host))
         tool.touchesCancelled(host: host)
         host.finish(.failure(NibError(.internalError, "Could not save ink")))

@@ -271,7 +271,8 @@ final class HighlighterPreviewPath {
     private var transform: CGAffineTransform?
 
     func extend(_ points: [StrokePoint], transform: CGAffineTransform?, view: (Point) -> CGPoint) -> CGPath {
-        if self.transform != transform || points.count < count {
+        // Without a transform, viewPoint can change with scrolling or zooming.
+        if transform == nil || self.transform != transform || points.count < count {
             path = CGMutablePath()
             count = 0
         }
