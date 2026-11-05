@@ -135,6 +135,48 @@ final class NibContractsTests: XCTestCase {
         XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID).layer, 2)
     }
 
+    func testHistoryPreviewsDoNotChangeDocumentsOrConsumeHistory() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h)
+        try ctx.mutate("Lock text") { tx in
+            var item = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+            item.locked = true
+            try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
+        }
+        let edited = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        let undo = try await h.app.bus.execute(Invocation(command: CommandIDs.undo,
+            params: ["doc": "doc:FIXTUREDOC01"], dryRun: true))
+        XCTAssertEqual(undo.value["done"], true)
+        XCTAssertEqual(undo.value["label"], "Lock text")
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID), edited)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        XCTAssertFalse(h.app.bus.history.canRedo(Fixtures.docID))
+
+        do {
+            _ = try await h.app.bus.execute(Invocation(command: CommandIDs.revertGroup,
+                params: ["doc": "doc:FIXTUREDOC01", "group": .string(ctx.group)], dryRun: true))
+            XCTFail("Selective revert previews must be refused")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .unsupported)
+        }
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID), edited)
+        XCTAssertEqual(h.app.bus.history.entries(Fixtures.docID).map { $0.group }, [ctx.group])
+        XCTAssertFalse(h.app.bus.history.canRedo(Fixtures.docID))
+
+        _ = try await h.run(CommandIDs.undo, ["doc": "doc:FIXTUREDOC01"])
+        let undone = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        let redo = try await h.app.bus.execute(Invocation(command: CommandIDs.redo,
+            params: ["doc": "doc:FIXTUREDOC01"], dryRun: true))
+        XCTAssertEqual(redo.value["done"], true)
+        XCTAssertEqual(redo.value["label"], "Lock text")
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID), undone)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        XCTAssertTrue(h.app.bus.history.canRedo(Fixtures.docID))
+        _ = try await h.run(CommandIDs.redo, ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertTrue(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID).locked)
+        XCTAssertFalse(h.app.bus.history.canRedo(Fixtures.docID))
+    }
+
     func testRemoteMergeIsLastWriterWins() throws {
         let h = Harness()
         var item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)

@@ -40,6 +40,7 @@ struct EditUndo: NibCommand {
     static func run(_ p: DocParams, _ ctx: CommandContext) async throws -> Output {
         let doc = try ctx.documentOrSession(p.doc)
         let label = ctx.bus.history.undoLabel(doc)
+        if ctx.dryRun { return Output(done: ctx.bus.history.canUndo(doc), label: label) }
         return Output(done: ctx.bus.undo(doc), label: label)
     }
 }
@@ -58,6 +59,7 @@ struct EditRedo: NibCommand {
     static func run(_ p: DocParams, _ ctx: CommandContext) async throws -> Output {
         let doc = try ctx.documentOrSession(p.doc)
         let label = ctx.bus.history.redoLabel(doc)
+        if ctx.dryRun { return Output(done: ctx.bus.history.canRedo(doc), label: label) }
         return Output(done: ctx.bus.redo(doc), label: label)
     }
 }
@@ -110,6 +112,9 @@ struct HistoryRevertGroup: NibCommand {
         examples: [["doc": "doc:FIXTUREDOC01", "group": "G0"]], effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        guard !ctx.dryRun else {
+            throw NibError(.unsupported, String(localized: "Selective undo cannot be previewed. Run Revert Changes to apply it."))
+        }
         let doc = NodeRef.documentID(from: p.doc)
         guard let r = ctx.bus.revert(group: p.group, doc: doc, principal: ctx.principal) else {
             throw NibError.notFound("undo group '\(p.group)'")
