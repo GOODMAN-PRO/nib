@@ -304,17 +304,14 @@ final class PresetMenuModel {
         guard let app, let session else { return }
         let tool = self.tool, slot = colourSlot
         let initial = editedSwatch.color
+        let writes = PickerWrites(app: app, session: session, tool: tool, slot: slot, swatches: presets.swatches)
         // Release the menu's modal input catcher before handing input to UIKit. Keep the
         // edited target and initial colour even as the menu's presentation changes.
         close()
         SystemColourPicker.present(title: String(localized: "\(PresetText.toolName(tool)) Colour"),
                                    initial: initial, supportsAlpha: tool != "highlighter",
                                    commitsOnFinishOnly: slot == nil, app: app, session: session) { colour in
-            let hex = tool == "highlighter" ? PresetColour.rgbHex(colour) : colour.hex
-            let call = slot.map { i in
-                PresetActions.call("preset.setSwatch", tool, ["index": .number(Double(i)), "color": .string(hex)])
-            } ?? PresetActions.call("preset.addSwatch", tool, ["color": .string(hex)])
-            PresetActions.run(app, session: session, [call])
+            writes.submit(colour)
         }
     }
 
@@ -871,5 +868,45 @@ final class PresetReorderButton: UIButton, UIDragInteractionDelegate, UIDropInte
     func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
         guard let move = move(in: session), let model else { return }
         move.commit(model, at: index)
+    }
+}
+
+/// One picker owns a baseline and a serial command queue, even after its popover closes.
+@MainActor
+final class PickerWrites {
+    let app: NibApp
+    let session: EditorSession
+    let tool: String
+    let slot: Int?
+    private var swatches: [PresetSwatch]
+    private var failed = false
+    private(set) var pending: Task<Void, Never>?
+
+    init(app: NibApp, session: EditorSession, tool: String, slot: Int?, swatches: [PresetSwatch]) {
+        self.app = app; self.session = session; self.tool = tool; self.slot = slot; self.swatches = swatches
+    }
+
+    func submit(_ colour: RGBA) {
+        let previous = pending
+        pending = Task { @MainActor in
+            await previous?.value
+            guard !self.failed else { return }
+            let hex = self.tool == "highlighter" ? PresetColour.rgbHex(colour) : colour.hex
+            let command = self.slot == nil ? "preset.addSwatch" : "preset.setSwatch"
+            do {
+                var params: [String: JSONValue] = ["tool": .string(self.tool), "color": .string(hex)]
+                if let slot = self.slot {
+                    params["index"] = .number(Double(slot))
+                    params["expectedSwatches"] = try JSONValue.from(self.swatches)
+                }
+                let result = try await self.app.bus.execute(command, .object(params), session: self.session)
+                let output = try result.decode(PresetOutput.self)
+                if let presets = output.presets { self.swatches = presets.swatches }
+            } catch {
+                self.failed = true
+                NotificationCenter.default.post(name: .nibCommandFailed, object: self.app,
+                    userInfo: ["command": command, "error": NibError.wrap(error)])
+            }
+        }
     }
 }

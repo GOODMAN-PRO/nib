@@ -880,6 +880,21 @@ final class FeatPresetsTests: XCTestCase {
         XCTAssertTrue(scroll.isScrollEnabled)
     }
 
+    func testOpenPickerRejectsReorderedTargetAndSerialisesOwnWrites() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let original = presets(h, "pen")
+        let writes = PickerWrites(app: h.app, session: h.session, tool: "pen", slot: 1, swatches: original.swatches)
+        writes.submit(RGBA(0, 0, 255))
+        writes.submit(RGBA(0, 255, 0))
+        await writes.pending?.value
+        XCTAssertEqual(presets(h, "pen").swatches[1].color, RGBA(0, 255, 0))
+        try await h.run("preset.moveSwatch", ["tool": "pen", "from": 0, "to": 2])
+        let reordered = presets(h, "pen")
+        writes.submit(RGBA(255, 0, 0))
+        await writes.pending?.value
+        XCTAssertEqual(presets(h, "pen"), reordered)
+    }
+
     func testCustomPickerClosesPopoverBeforePresentationAndRetainsEachWindowDelegate() async throws {
         let h = Harness(features: [FeatPresetsFeature.self])
         let navigator = PresetTestNavigator(session: h.session)
