@@ -41,6 +41,35 @@ final class ImageAssetSpy: AssetStore {
 
 @MainActor
 final class ImageImportRegressionTests: XCTestCase {
+    func testCropRejectsImageReplacedOrFlippedWhileSheetOpen() async throws {
+        for command in ["image.replace", "image.flip"] {
+            let h = Harness(features: [FeatImagesFeature.self])
+            let ref = "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREIMG01"
+            var intervening: Item?
+            h.app.commands.register(CommandDescriptor(id: "test.crop", title: "Crop", summary: "Interactive crop regression.",
+                                                      effect: .edit)) { _, ctx in
+                _ = try await ImageCrop.run(ImageCrop.Params(ref: ref), ctx, ask: { doc, page, id, context in
+                    let previewed = try context.workspace.item(doc, page: page, id: id)
+                    let params: JSONValue = command == "image.replace"
+                        ? ["ref": .string(ref), "asset": "fixture-image.png"]
+                        : ["ref": .string(ref), "axis": "horizontal"]
+                    _ = try await context.execute(command, params)
+                    intervening = try context.workspace.item(doc, page: page, id: id)
+                    return ImageCrop.Preview(request: .rect(Rect(x: 0.1, y: 0.2, width: 0.5, height: 0.5)),
+                                             revision: previewed.rev)
+                })
+                return .null
+            }
+            do {
+                try await h.run("test.crop")
+                XCTFail("A stale crop must not change the edited image")
+            } catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+            let actual = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID)
+            XCTAssertEqual(actual, try XCTUnwrap(intervening))
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "only the intervening edit is undoable")
+        }
+    }
+
     func testLateImportPreservesSelectionAndToolAfterNavigation() async throws {
         for returnToOrigin in [false, true] {
             let h = Harness(features: [FeatImagesFeature.self])

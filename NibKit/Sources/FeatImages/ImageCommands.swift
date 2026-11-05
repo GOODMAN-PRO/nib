@@ -266,6 +266,11 @@ struct ImageInsert: NibCommand {
 // MARK: - image.crop
 
 struct ImageCrop: NibCommand {
+    struct Preview {
+        var request: CropRequest
+        var revision: Rev
+    }
+
     struct Params: Codable {
         var ref: String
         var rect: Rect?
@@ -287,8 +292,14 @@ struct ImageCrop: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
+        try await run(p, ctx, ask: ImageCropPresenter.ask)
+    }
+
+    static func run(_ p: Params, _ ctx: CommandContext,
+                    ask: @MainActor (DocumentID, PageID, ElementID, CommandContext) async throws -> Preview?) async throws -> NoResult {
         let (doc, page, id) = try ImageRefs.item(p.ref)
         let request: CropRequest
+        var revision: Rev?
         switch (p.rect, p.mask) {
         case (let r?, nil):
             request = .rect(r)
@@ -300,16 +311,18 @@ struct ImageCrop: NibCommand {
                 throw NibError(.invalidParams, "pass rect or mask", path: "$.rect",
                                hint: "rect [x, y, w, h] or mask [[x, y], …], normalised 0–1 in image space")
             }
-            guard let chosen = try await ImageCropPresenter.ask(doc: doc, page: page, id: id, ctx: ctx) else { return NoResult() }
-            request = chosen
+            guard let chosen = try await ask(doc, page, id, ctx) else { return NoResult() }
+            request = chosen.request
+            revision = chosen.revision
         default:
             throw NibError(.invalidParams, "pass rect or mask, not both", path: "$.mask")
         }
-        try apply(request, doc: doc, page: page, id: id, ctx: ctx)
+        try apply(request, doc: doc, page: page, id: id, ctx: ctx, expectedRevision: revision)
         return NoResult()
     }
 
-    static func apply(_ request: CropRequest, doc: DocumentID, page: PageID, id: ElementID, ctx: CommandContext) throws {
+    static func apply(_ request: CropRequest, doc: DocumentID, page: PageID, id: ElementID, ctx: CommandContext,
+                      expectedRevision: Rev? = nil) throws {
         let crop: Rect?
         let mask: [Point]?
         switch request {
@@ -323,6 +336,9 @@ struct ImageCrop: NibCommand {
         }
         try ctx.mutate { tx in
             var (item, image) = try ImageRefs.image(tx, doc, page, id)
+            if let expectedRevision, item.rev != expectedRevision {
+                throw NibError(.conflict, String(localized: "The image changed while Crop was open. Reopen Crop and try again."))
+            }
             image.frame = ImageGeometry.recrop(image.frame, from: image.crop ?? ImageGeometry.unit,
                                                to: crop ?? ImageGeometry.unit, flip: ImageFlip(item))
             image.crop = crop

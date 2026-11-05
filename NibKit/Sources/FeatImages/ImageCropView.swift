@@ -297,7 +297,7 @@ struct ImageCropSheet: View {
 /// Presents the crop sheet for `image.crop` called by the user without rect or mask (the object menu's Crop).
 @MainActor
 enum ImageCropPresenter {
-    static func ask(doc: DocumentID, page: PageID, id: ElementID, ctx: CommandContext) async throws -> CropRequest? {
+    static func ask(doc: DocumentID, page: PageID, id: ElementID, ctx: CommandContext) async throws -> ImageCrop.Preview? {
         let item = try ctx.workspace.item(doc, page: page, id: id)
         // Refused before the sheet opens, so nobody draws a crop that cannot be applied.
         let image = try ImageRefs.editable(item)
@@ -313,8 +313,8 @@ enum ImageCropPresenter {
         let result = await present(UIImage(cgImage: whole), rect: flip.mirror(image.crop ?? ImageGeometry.unit),
                                    mask: image.mask.map { flip.mirror($0) }, from: presenter)
         switch result {
-        case .rect(let r)?: return .rect(flip.mirror(r))
-        case .mask(let m)?: return .mask(flip.mirror(m))
+        case .rect(let r)?: return ImageCrop.Preview(request: .rect(flip.mirror(r)), revision: item.rev)
+        case .mask(let m)?: return ImageCrop.Preview(request: .mask(flip.mirror(m)), revision: item.rev)
         case nil: return nil
         }
     }
