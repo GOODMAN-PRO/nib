@@ -858,7 +858,8 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         inFlight = (task, text, group)
         let ok = await task.value
         inFlight = nil
-        commitFailing = !ok
+        // An outside commit may already have reported a conflict for the new typing group.
+        if self.group == group { commitFailing = !ok }
         if ok {
             if dirty { scheduleCommit() }
             return
@@ -881,8 +882,8 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
     private static func send(_ text: RichText, baseline: RichText, ref: String, group: String, session: EditorSession?, app: NibApp,
                              quiet: Bool = false) async -> Bool {
         do {
-            // item.update still needs a transactional expected-text guard in F003. This preflight also
-            // protects final saves and reopened failed drafts from changes already in the workspace.
+            // item.update checks expectedText transactionally. This preflight also protects final saves
+            // and reopened failed drafts from changes already in the workspace.
             guard case let .item(doc, page, id)? = NodeRef(ref),
                   try app.workspace.item(doc, page: page, id: id).text?.text == baseline else {
                 throw textConflict
@@ -922,7 +923,9 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
                     editing?.baseline = box.text
                     return
                 }
-                let saving = inFlight?.group == group
+                // The commit observer advances the baseline before the async send returns. A task still
+                // awaiting its result owns unsaved text only until that text becomes the baseline.
+                let saving = inFlight.map { $0.group == group && $0.text != e.baseline } ?? false
                 group = NibID.make().raw                            // typing after an outside change is a new step
                 if saving { dirty = true }                         // an awaiting save still owns a local draft
                 if cs.command == CommandIDs.undo || cs.command == CommandIDs.redo || cs.command == CommandIDs.revertGroup {
