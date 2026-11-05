@@ -152,7 +152,8 @@ final class CollabCatchUpTests: XCTestCase {
     }
 
     func testHostReadFailureWithLiveTrafficFailsPromptlyAndCanRetry() async throws {
-        // With the failure reply dropped, the idle deadline must still fire despite continuous traffic.
+        // An explicit failure wins even on a busy link. If it is lost, ANY host frame keeps
+        // the link alive; the idle deadline fires once that traffic actually stops.
         for dropFailureReply in [false, true] {
             let pair = CollabPair()
             let hostDisk = try CatchUpDiskPersistence(count: 2), guestDisk = try CatchUpDiskPersistence(count: 2)
@@ -184,6 +185,7 @@ final class CollabCatchUpTests: XCTestCase {
                                              origin: "failure-test-live-edit")
             }
             pair.guestService.timing.syncIdleTimeout = dropFailureReply ? 0.08 : 5
+            pair.hostService.timing.syncProgressInterval = 0.02
             let receive = pair.guestTransport.onMessage
             let assembler = CollabFrames.Assembler()
             var failureReplies = 0, presenceMessages = 0, livePatches = 0
@@ -198,14 +200,16 @@ final class CollabCatchUpTests: XCTestCase {
                 }
                 receive?(peer, data)
             }
+            var trafficFinished = false
             let traffic = Task { @MainActor in
-                for tick in 0..<200 {
+                for tick in 0..<40 {
                     guard !Task.isCancelled, !session.isClosed else { return }
                     _ = pair.hostService.session?.sendPresence(["tick": .number(Double(tick))], to: nil)
                     _ = session.sendPresence(["tick": .number(Double(tick))], to: nil)
                     try await pair.host.insert([CollabPair.stroke("DURINGFAIL001", x: Float(tick))])
                     try await Task.sleep(nanoseconds: 5_000_000)
                 }
+                trafficFinished = true
             }
             var watchdogFired = false
             let watchdog = Task { @MainActor in
@@ -221,10 +225,13 @@ final class CollabCatchUpTests: XCTestCase {
             } catch {
                 XCTAssertEqual((error as? NibError)?.code, dropFailureReply ? .timeout : .unavailable)
             }
+            if dropFailureReply {
+                XCTAssertTrue(trafficFinished, "every host frame, even live traffic, resets the idle clock")
+            }
             traffic.cancel()
             _ = await traffic.result
             watchdog.cancel()
-            XCTAssertFalse(watchdogFired, "ordinary traffic must not keep the waiter alive")
+            XCTAssertFalse(watchdogFired, "silence after the bounded traffic must release the waiter")
             XCTAssertEqual(hostDisk.failedLoads, 1)
             XCTAssertEqual(failureReplies, 1)
             XCTAssertGreaterThan(presenceMessages, 0)
@@ -233,6 +240,10 @@ final class CollabCatchUpTests: XCTestCase {
             XCTAssertTrue(session.synchronizationPending)
             XCTAssertTrue(session.hasUnsentChanges)
             XCTAssertFalse(session.isClosed)
+            let failedAt = pair.hostTransport.sent.count
+            try await Task.sleep(nanoseconds: 60_000_000)
+            let afterFailure = try CollabPair.kinds(Array(pair.hostTransport.sent.dropFirst(failedAt)))
+            XCTAssertFalse(afterFailure.contains(.syncProgress), "failed work must stop its heartbeat")
             pair.guestService.timing.syncIdleTimeout = 2
             _ = try await pair.guestService.join(code: code, transportKey: nil)
             XCTAssertTrue(pair.guestService.session === session)
@@ -379,6 +390,203 @@ final class CollabCatchUpTests: XCTestCase {
         XCTAssertTrue(CollabPair.hasItem(pair.guest, "IDLEHOSTEDIT1"))
     }
 
+    func testMultipartReplyKeepsAliveOnFragmentsAlone() async throws {
+        let pair = CollabPair()
+        let transport = InterruptedCollabTransport(pair.hostTransport)
+        pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+        defer { pair.guestService.leave(); pair.hostService.leave() }
+        let code = try await pair.share()
+        try await pair.join(code)
+        let session = try XCTUnwrap(pair.guestService.session)
+        pair.guestService.didEnterBackground()
+        pair.guestTransport.leave()
+        var text = try pair.host.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        // Incompressible text forces a real multi-frame JSON page patch, unlike many small pages.
+        let contents = (0..<60_000).map { _ in UUID().uuidString }.joined()
+        text.text?.text = RichText(plain: contents)
+        try await pair.host.insert([text])
+        let receive = pair.guestTransport.onMessage
+        let inspector = CollabFrames.Assembler()
+        var fragments = 0
+        var patchFragments = 0
+        var firstFragment: Date?
+        var lastFragment: Date?
+        pair.guestTransport.onMessage = { peer, data in
+            if data.count >= 3, data[data.startIndex + 2] & CollabFrames.partFlag != 0 {
+                fragments += 1
+                if firstFragment == nil { firstFragment = Date() }
+                lastFragment = Date()
+            }
+            if case .message(let message)? = try? inspector.feed(data, from: peer.id, trusted: true) {
+                // No heartbeat may mask missing fragment accounting in this regression.
+                if message.kind == .syncProgress { return }
+                if message.kind == .syncReply, message.patch != nil { patchFragments = fragments }
+            }
+            receive?(peer, data)
+        }
+        pair.guestService.timing.syncIdleTimeout = 0.3
+        transport.minimumSendInterval = 0.06
+        transport.shouldThrottle = { [weak session] in session?.synchronizationPending == true }
+        let watchdog = catchUpWatchdog(session)
+        defer { watchdog.cancel() }
+        _ = try await pair.guestService.join(code: code, transportKey: nil)
+        XCTAssertGreaterThan(patchFragments, 10)
+        let duration = try XCTUnwrap(lastFragment).timeIntervalSince(try XCTUnwrap(firstFragment))
+        XCTAssertGreaterThan(duration, 0.9, "one patch spans several idle periods")
+        XCTAssertFalse(session.synchronizationPending)
+        let received = try pair.guest.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertEqual(received.text, text.text)
+    }
+
+    func testEmptyDeltaSlowHostScanAndValidationSendBoundedProgress() async throws {
+        let pair = CollabPair()
+        let hostDisk = try CatchUpDiskPersistence(count: 24), guestDisk = try CatchUpDiskPersistence(count: 24)
+        defer {
+            hostDisk.onLoad = nil
+            pair.guestService.leave(); pair.hostService.leave()
+            try? FileManager.default.removeItem(at: hostDisk.root)
+            try? FileManager.default.removeItem(at: guestDisk.root)
+        }
+        pair.host.app.workspace.close(Fixtures.docID)
+        pair.guest.app.workspace.close(Fixtures.docID)
+        pair.host.app.workspace.persistence = hostDisk
+        pair.guest.app.workspace.persistence = guestDisk
+        let code = try await pair.share()
+        try await pair.join(code)
+        let session = try XCTUnwrap(pair.guestService.session)
+        pair.guestService.didEnterBackground()
+        pair.guestTransport.leave()
+        pair.host.app.workspace.evictPages(Fixtures.docID, keeping: [])
+        pair.hostService.timing.syncProgressInterval = 0.03
+        pair.guestService.timing.syncIdleTimeout = 0.2
+        // The actual synchronous persistence contract is slow one page at a time; scan/validate
+        // must send between reads instead of relying solely on a separately scheduled timer.
+        hostDisk.onLoad = { _ in Thread.sleep(forTimeInterval: 0.025) }
+        let before = hostDisk.loads
+        let start = Date()
+        let sentBefore = pair.hostTransport.sent.count
+        let watchdog = catchUpWatchdog(session)
+        defer { watchdog.cancel() }
+        _ = try await pair.guestService.join(code: code, transportKey: nil)
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertGreaterThan(elapsed, 0.6)
+        XCTAssertGreaterThanOrEqual(hostDisk.loads - before, 48, "both scan and validation read the unchanged pages")
+        let frames = Array(pair.hostTransport.sent.dropFirst(sentBefore))
+        let assembler = CollabFrames.Assembler()
+        var progress = 0, replies = 0, patches = 0
+        for frame in frames {
+            if case .message(let message)? = try assembler.feed(frame, from: "host", trusted: true) {
+                if message.kind == .syncProgress { progress += 1 }
+                if message.kind == .syncReply {
+                    replies += 1
+                    if message.patch != nil { patches += 1 }
+                }
+            }
+        }
+        XCTAssertGreaterThan(progress, 3)
+        XCTAssertLessThanOrEqual(progress, Int(elapsed / 0.03) + 1)
+        XCTAssertEqual(replies, 1)
+        XCTAssertEqual(patches, 0, "an already-current notebook needs no page patch")
+        XCTAssertFalse(session.synchronizationPending)
+        let stoppedAt = pair.hostTransport.sent.count
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let after = try CollabPair.kinds(Array(pair.hostTransport.sent.dropFirst(stoppedAt)))
+        XCTAssertFalse(after.contains(.syncProgress), "completed work must stop its heartbeat")
+    }
+
+    func testSilenceExpiresOnceAndLateReplyDoesNotApply() async throws {
+        let pair = CollabPair()
+        defer { pair.guestService.leave(); pair.hostService.leave() }
+        let code = try await pair.share()
+        try await pair.join(code)
+        let session = try XCTUnwrap(pair.guestService.session)
+        pair.guestService.didEnterBackground()
+        pair.guestTransport.leave()
+        try await pair.host.insert([CollabPair.stroke("LATEREPLY001", x: 90)])
+        pair.guestService.timing.syncIdleTimeout = 0.2
+        let receive = pair.guestTransport.onMessage
+        let inspector = CollabFrames.Assembler()
+        var welcomed = false
+        var lastReceived = Date()
+        var withheld: [(CollabPeer, Data)] = []
+        pair.guestTransport.onMessage = { peer, frame in
+            if welcomed { withheld.append((peer, frame)); return }
+            if case .message(let message)? = try? inspector.feed(frame, from: peer.id, trusted: true),
+               message.kind == .welcome { welcomed = true }
+            lastReceived = Date()
+            receive?(peer, frame)
+        }
+        let watchdog = catchUpWatchdog(session)
+        defer { watchdog.cancel() }
+        // Incoming traffic from another peer and outgoing work are not frames FROM the host.
+        let stranger = CollabPeer(id: "unrelated-peer", name: "Other")
+        let unknown = try XCTUnwrap(CollabFrames.frames(for: CollabMessage(kind: .presence, session: session.id,
+                                                                         from: "other", payload: [:])).first)
+        let noise = Task { @MainActor in
+            for _ in 0..<40 {
+                guard !Task.isCancelled else { return }
+                receive?(stranger, unknown)
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+        }
+        defer { noise.cancel() }
+        do {
+            _ = try await pair.guestService.join(code: code, transportKey: nil)
+            XCTFail("a silent peer must fail")
+        } catch { XCTAssertEqual((error as? NibError)?.code, .timeout) }
+        let idle = Date().timeIntervalSince(lastReceived)
+        XCTAssertGreaterThanOrEqual(idle, 0.2)
+        XCTAssertLessThan(idle, 0.4, "expires after one idle period, not two polling periods")
+        XCTAssertFalse(withheld.isEmpty)
+        for (peer, frame) in withheld { receive?(peer, frame) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(CollabPair.hasItem(pair.guest, "LATEREPLY001"))
+        XCTAssertFalse(session.joinInProgress)
+        XCTAssertTrue(session.synchronizationPending)
+        XCTAssertTrue(session.hasUnsentChanges)
+    }
+
+    private func catchUpWatchdog(_ session: CollabSession) -> Task<Void, Never> {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard !Task.isCancelled else { return }
+            XCTFail("catch-up exceeded its bounded test wait")
+            session.end(reason: "test watchdog", notify: false)
+        }
+    }
+
+    func testOldPeerIgnoresProgressFrameAndStillSynchronizes() async throws {
+        let pair = CollabPair()
+        defer { pair.guestService.leave(); pair.hostService.leave() }
+        let code = try await pair.share()
+        try await pair.join(code)
+        let session = try XCTUnwrap(pair.guestService.session)
+        pair.guestService.didEnterBackground()
+        pair.guestTransport.leave()
+        try await pair.host.insert([CollabPair.stroke("OLDPEEREDIT1", x: 40)])
+        let receive = pair.guestTransport.onMessage
+        var ignored = 0
+        pair.guestTransport.onMessage = { peer, frame in
+            // Freeze the version-1 kind decoder, rather than letting the current enum recognize
+            // the new kind. These small control frames use the unchanged whole-JSON framing.
+            if frame.count >= 3, frame[frame.startIndex + 2] == 0 {
+                do {
+                    let old = try JSONDecoder().decode(LegacyCollabEnvelope.self, from: Data(frame.dropFirst(3)))
+                    if old.kind == .unknown { ignored += 1; return }
+                } catch { XCTFail("old peer could not decode control frame: \(error)") }
+            }
+            receive?(peer, frame)
+        }
+        let watchdog = catchUpWatchdog(session)
+        defer { watchdog.cancel() }
+        _ = try await pair.guestService.join(code: code, transportKey: nil)
+        XCTAssertGreaterThan(ignored, 0)
+        XCTAssertEqual(CollabMessage.protocolVersion, 1)
+        XCTAssertEqual(CollabFrames.formatVersion, 2)
+        XCTAssertFalse(session.synchronizationPending)
+        XCTAssertTrue(CollabPair.hasItem(pair.guest, "OLDPEEREDIT1"))
+    }
+
     func testTransientCatchUpFailureRetriesAutomaticallyAndExplicitlyWithoutLeaving() async throws {
         for automatic in [true, false] {
             let pair = CollabPair()
@@ -459,6 +667,19 @@ final class CollabCatchUpTests: XCTestCase {
         XCTAssertEqual(try pair.host.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "MIDSCANEDIT1"),
                        try pair.guest.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "MIDSCANEDIT1"))
     }
+}
+
+/// The pre-progress decoder and its unknown-kind fallback, preserved for wire compatibility.
+private struct LegacyCollabEnvelope: Decodable {
+    enum Kind: String, Decodable {
+        case hello, pending, welcome, denied, roster, patch, sync, syncReply, needSnapshot, snapshot, asset, revoked,
+             ended, bye, status, presence, unknown
+        init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = Kind(rawValue: raw) ?? .unknown
+        }
+    }
+    var kind: Kind
 }
 
 /// Real JSON page reads with no persistence payload cache; avoids substituting memory for the audited disk path.
