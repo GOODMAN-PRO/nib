@@ -32,8 +32,13 @@ public enum NibEscapeRouting {
             if let owner = responder as? NibEscapeHandling, owner.handleEscape() { return true }
             for command in responder.keyCommands ?? [] {
                 guard command.input == UIKeyCommand.inputEscape, command.modifierFlags.isEmpty,
-                      let action = command.action, responder.canPerformAction(action, withSender: command) else { continue }
-                if UIApplication.shared.sendAction(action, to: responder, from: command, for: nil) { return true }
+                      let action = command.action, responder.responds(to: action),
+                      responder.canPerformAction(action, withSender: command) else { continue }
+                // The responder and its command have already been resolved in this window.
+                // UIApplication dispatch may reject a key command outside its active key-event
+                // route (including the HID fallback). Invoke that verified owner directly.
+                _ = responder.perform(action, with: command)
+                return true
             }
         }
         return false
