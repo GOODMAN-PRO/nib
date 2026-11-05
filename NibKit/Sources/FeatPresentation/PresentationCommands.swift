@@ -48,7 +48,7 @@ struct PresentSetMode: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "present.setMode", title: "Presentation Mode",
+        id: "present.setMode", title: String(localized: "Presentation Mode"),
         summary: "External display: mirror (whole screen), presenter (page follows zoom/scroll) or fullPage (whole page); blank true/false blacks out/shows; omitted keeps it.",
         params: .obj(["mode": .str("mirror | presenter | fullPage", choices: ExternalDisplayMode.allCases.map { $0.rawValue }),
                       "blank": .bool("true blacks out the connected display, false shows it again; omit to keep the current state"),

@@ -63,7 +63,7 @@ struct PageAdd: NibCommand {
     ]
 
     static let descriptor = CommandDescriptor(
-        id: "page.add", title: "Add Page",
+        id: "page.add", title: String(localized: "Add Page"),
         summary: "Add pages before/after a page or at the start/end: current template, blank, a template, a PDF or image asset, or the page clipboard. Returns the new page refs.",
         params: .obj([
             "doc": .ref,
@@ -277,7 +277,7 @@ struct PageDuplicate: NibCommand {
     static let example: JSONValue = ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"]]
 
     static let descriptor = CommandDescriptor(
-        id: "page.duplicate", title: "Duplicate Page",
+        id: "page.duplicate", title: String(localized: "Duplicate Page"),
         summary: "Duplicate pages with all their items; each copy goes right after its original. Returns the new page refs.",
         params: .obj(["pages": PageCommands.pagesSchema, "ids": PageCommands.idsSchema], required: ["pages"]),
         examples: [PageDuplicate.example], effect: .edit)
@@ -337,7 +337,7 @@ struct PageCopy: NibCommand {
     static let example: JSONValue = ["pages": ["page:FIXTUREDOC01/FIXTUREPG001", "page:FIXTUREDOC01/FIXTUREPG002"]]
 
     static let descriptor = CommandDescriptor(
-        id: "page.copy", title: "Copy Pages",
+        id: "page.copy", title: String(localized: "Copy Pages"),
         summary: "Copy pages with their items and images to the page clipboard (UTI app.nib.pages), ready for page.paste in any document.",
         params: .obj(["pages": PageCommands.pagesSchema], required: ["pages"]),
         examples: [PageCopy.example], effect: .read)
@@ -379,7 +379,7 @@ struct PagePaste: NibCommand {
     ]
 
     static let descriptor = CommandDescriptor(
-        id: "page.paste", title: "Paste Pages",
+        id: "page.paste", title: String(localized: "Paste Pages"),
         summary: "Paste pages from the page clipboard (or an app.nib.pages payload) before/after a page or at the start/end of a document. Returns the new page refs.",
         params: .obj([
             "doc": .ref,
@@ -426,7 +426,7 @@ struct PageMoveTo: NibCommand {
     static let example: JSONValue = ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "doc": "doc:FIXTUREDOC04"]
 
     static let descriptor = CommandDescriptor(
-        id: "page.moveTo", title: "Move Pages",
+        id: "page.moveTo", title: String(localized: "Move Pages"),
         summary: "Move pages with their items, images and outline entries to the end of another notebook or whiteboard; one undo in either document restores both. Returns the new page refs.",
         params: .obj(["pages": PageCommands.pagesSchema, "doc": .ref, "ids": PageCommands.idsSchema], required: ["pages", "doc"]),
         examples: [PageMoveTo.example], effect: .edit)
@@ -574,7 +574,7 @@ struct PageReorder: NibCommand {
     static let example: JSONValue = ["pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "before": "page:FIXTUREDOC01/FIXTUREPG001"]
 
     static let descriptor = CommandDescriptor(
-        id: "page.reorder", title: "Reorder Pages",
+        id: "page.reorder", title: String(localized: "Reorder Pages"),
         summary: "Move pages (kept in the given order) before or after another page of the same document, or to the end when neither is given.",
         params: .obj(["pages": PageCommands.pagesSchema, "before": .ref, "after": .ref], required: ["pages"]),
         examples: [PageReorder.example], effect: .edit)
@@ -642,7 +642,7 @@ struct PageRotate: NibCommand {
     ]
 
     static let descriptor = CommandDescriptor(
-        id: "page.rotate", title: "Rotate Pages",
+        id: "page.rotate", title: String(localized: "Rotate Pages"),
         summary: "Rotate pages 90° clockwise, or by degrees (180, 270, -90): the page turns with its items and PDF or image background; all: doc ref rotates every page.",
         params: .obj([
             "pages": PageCommands.pagesSchema,
@@ -704,7 +704,7 @@ struct PageTrash: NibCommand {
     static let example: JSONValue = ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"]]
 
     static let descriptor = CommandDescriptor(
-        id: "page.trash", title: "Move to Trash",
+        id: "page.trash", title: String(localized: "Move to Trash"),
         summary: "Move pages to the Trash (recoverable with page.restore). A document always keeps at least one page.",
         params: .obj(["pages": PageCommands.pagesSchema], required: ["pages"]),
         examples: [PageTrash.example], effect: .edit, destructive: true)
@@ -741,7 +741,7 @@ struct PageRestore: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "page.restore", title: "Restore Pages",
+        id: "page.restore", title: String(localized: "Restore Pages"),
         summary: "Restore pages from the Trash (put there by page.trash first) to their places in their documents; pages not in the Trash are left alone.",
         params: .obj(["pages": PageCommands.pagesSchema], required: ["pages"]),
         examples: [PageTrash.example], effect: .edit)
@@ -793,7 +793,7 @@ struct PagePurge: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "page.purge", title: "Delete Permanently",
+        id: "page.purge", title: String(localized: "Delete Permanently"),
         summary: "Delete trashed pages and their items permanently. Cannot be undone; the pages must be in the Trash (page.trash).",
         params: .obj(["pages": PageCommands.pagesSchema], required: ["pages"]),
         examples: [PageTrash.example], effect: .irreversible, undoable: false)

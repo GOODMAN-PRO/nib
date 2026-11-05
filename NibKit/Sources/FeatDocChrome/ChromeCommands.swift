@@ -442,7 +442,7 @@ struct PanelOpen: NibCommand {
         var placement: String
     }
     static let descriptor = CommandDescriptor(
-        id: "panel.open", title: "Open Panel",
+        id: "panel.open", title: String(localized: "Open Panel"),
         summary: "Open a registered panel by id where the placement settings say; other keys and params reach the panel; edge docks a floating panel. With no document open the library shows it.",
         params: .obj(["id": .str("panel id, e.g. 'chrome.editingSettings', PanelIDs.assistant or a plugin panel id"),
                       "edge": .str("floating panels only: the side edge it rests on",
@@ -522,7 +522,7 @@ struct PanelClose: NibCommand {
         var closed: Bool
     }
     static let descriptor = CommandDescriptor(
-        id: "panel.close", title: "Close Panel",
+        id: "panel.close", title: String(localized: "Close Panel"),
         summary: "Close an open panel by id (closing a sidebar's tab hides that sidebar); closed=false if it was not open. With no document open the library closes it.",
         params: .obj(["id": .str("panel id")], required: ["id"]),
         examples: [["id": "chrome.editingSettings"]], effect: .session, target: .app)
@@ -555,7 +555,7 @@ struct SidebarToggle: NibCommand {
         var panel: String?
     }
     static let descriptor = CommandDescriptor(
-        id: "sidebar.toggle", title: "Show or Hide Sidebar",
+        id: "sidebar.toggle", title: String(localized: "Show or Hide Sidebar"),
         summary: "Show or hide the document sidebar (Pages, Outline… tabs); mode 'sidebar' docks it beside the page, 'window' fills the window.",
         params: .obj(["mode": .str("sidebar (a column beside the page) or window (full-window thumbnails)",
                                    choices: SidebarMode.allCases.map { $0.rawValue })]),
@@ -602,7 +602,7 @@ struct DocSetScrollDirection: NibCommand {
         var direction: String
     }
     static let descriptor = CommandDescriptor(
-        id: "doc.setScrollDirection", title: "Set Scrolling Direction",
+        id: "doc.setScrollDirection", title: String(localized: "Set Scrolling Direction"),
         summary: "Make a notebook's pages scroll vertically (continuous) or horizontally (page by page). Undoable.",
         params: .obj(["doc": .ref,
                       "direction": .str("page scrolling", choices: ScrollDirection.allCases.map { $0.rawValue })],
