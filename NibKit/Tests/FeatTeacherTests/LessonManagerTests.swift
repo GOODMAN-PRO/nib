@@ -436,6 +436,22 @@ final class LessonManagerTests: XCTestCase {
         XCTAssertEqual(h.session.document, Fixtures.docID)
     }
 
+    func testQuickLessonInviteFollowsCurrentSessionInsteadOfLastHostResult() {
+        let active: JSONValue = ["active": true, "side": "host", "code": "K7M2QX"]
+        var state = LessonLiveSessionState(active)
+        XCTAssertTrue(state.hosted)
+        XCTAssertEqual(state.code, "K7M2QX", "reopening an active lesson restores its invite")
+        XCTAssertEqual(state.url, "nib://collab/join?code=K7M2QX")
+        let endedStates: [JSONValue?] = [["active": false, "phase": "idle"],
+                                       ["active": true, "side": "guest", "code": "K7M2QX"], nil]
+        for value in endedStates {
+            state = LessonLiveSessionState(value)
+            XCTAssertFalse(state.hosted)
+            XCTAssertNil(state.code, "the code also controls Manage Participants visibility")
+            XCTAssertNil(state.url, "a dead session must not leave a scannable QR")
+        }
+    }
+
     func testRosterEmailsAreNotSavedAndTrashedRosterIsIgnored() async throws {
         let h = harness()
         let (doc, _, _, _) = try source(h)
