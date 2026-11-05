@@ -446,6 +446,34 @@ final class NibTemplatesTests: XCTestCase {
         XCTAssertThrowsError(try TemplateCommands.pageSize([10, 10]))
     }
 
+    func testAllPagesPreservesCustomCoverAndUpdatesDefaultInOneUndoStep() async throws {
+        for background in [Background.ofPDF(AssetRef("fixture-page.pdf"), page: 0),
+                           Background.ofImage(AssetRef("fixture-image.png"))] {
+            let h = harness()
+            var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+            let index = try XCTUnwrap(head.pages.firstIndex { $0.id == Fixtures.page1 })
+            head.pages[index].background = background
+            head.pages[index].ext = ["templateui.customCover": "customCover01"]
+            head.meta.coverEnabled = true
+            h.persistence.heads[Fixtures.docID] = head
+            let before = try h.snapshot()
+            let cover = try page(h, Fixtures.page1)
+            let depth = h.undoDepth(Fixtures.docID)
+            _ = try await h.run("page.setTemplate", ["pages": ["doc:FIXTUREDOC01"], "template": "builtin.grid"])
+            let content = try h.app.workspace.content(Fixtures.docID)
+            XCTAssertEqual(try page(h, Fixtures.page1), cover)
+            XCTAssertTrue(content.meta.coverEnabled)
+            XCTAssertTrue(content.livePages.dropFirst().allSatisfy { $0.background.template?.id == "builtin.grid" })
+            XCTAssertEqual(content.meta.defaultTemplate?.id, "builtin.grid")
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
+            let after = try h.snapshot()
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), before)
+            XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), after)
+        }
+    }
+
     func testCoversGoOnPageOneAndAllPagesLeavesTheCoverAlone() async throws {
         let h = harness()
         await assertFails(h, "page.setTemplate", #"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "template": "cover.solid"}"#,

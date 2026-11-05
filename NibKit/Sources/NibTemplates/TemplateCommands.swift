@@ -170,11 +170,14 @@ enum TemplateCommands {
                 if firstPages[doc] == nil { firstPages[doc] = content.livePages.first?.id }
                 add(doc, page, first: firstPages[doc] == pid)
             case let .document(doc)?:
-                let live = try workspace.content(doc).livePages
+                let content = try workspace.content(doc)
+                let live = content.livePages
                 for (n, page) in live.enumerated() {
+                    // coverEnabled historically defaults to true even for notebooks whose first page is paper.
+                    let customCover = content.meta.coverEnabled && (page.background.kind == .pdf || page.background.kind == .image)
                     if cover {
                         if n == 0 { add(doc, page, first: true) }
-                    } else if n > 0 || !isCover(page.background, registry) {
+                    } else if n > 0 || !(customCover || isCover(page.background, registry)) {
                         add(doc, page, first: n == 0)
                     }
                 }
