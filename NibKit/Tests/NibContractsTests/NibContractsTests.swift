@@ -49,6 +49,18 @@ final class NibContractsTests: XCTestCase {
         XCTAssertLessThan(first, "1")
     }
 
+    func testReadOnlyPageOrderKeySkipsToTheNextDistinctBound() {
+        let content = DocumentContent(meta: DocumentMeta(kind: .notebook), pages: [
+            PageRecord(id: "A", order: "V"), PageRecord(id: "B", order: "V"), PageRecord(id: "C", order: "V1")
+        ])
+        let requests: [(PagePosition, PageID)] = [(.after, "A"), (.before, "B")]
+        for request in requests {
+            let key = content.orderKey(request.0, relativeTo: request.1)
+            XCTAssertGreaterThan(key, "V")
+            XCTAssertLessThan(key, "V1", "The old equal-bound midpoint jumped past the next distinct page too")
+        }
+    }
+
     func testRevCodingAndOrder() throws {
         let a = Rev(wallMs: 10, counter: 1, device: 2)
         let b = Rev(wallMs: 10, counter: 2, device: 1)

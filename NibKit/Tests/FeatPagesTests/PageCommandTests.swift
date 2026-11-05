@@ -68,6 +68,69 @@ final class PageCommandTests: XCTestCase {
 
     // MARK: page.add
 
+    private func makeTiedNotebook(_ h: Harness) throws {
+        let content = DocumentContent(meta: DocumentMeta(id: "TIES", kind: .notebook), pages: [
+            PageRecord(id: "A", order: "A"), PageRecord(id: "B", order: "V"),
+            PageRecord(id: "C", order: "V"), PageRecord(id: "D", order: "V1")
+        ])
+        _ = try h.library.createDocument(content, title: "Tied pages", in: nil)
+    }
+
+    func testAddInsideTiedPagesHonoursTheAnchorAndUndoesTheRekeying() async throws {
+        for position in ["before", "after"] {
+            for count in [1, 3] {
+                let h = harness()
+                try makeTiedNotebook(h)
+                let before = try h.snapshot("TIES")
+                let originalPages = try h.app.workspace.content("TIES").pages
+                let ids = (0..<count).map { "NEW\($0)" }
+                let params: JSONValue = ["doc": "doc:TIES", "position": .string(position),
+                    "anchor": .string(position == "before" ? "page:TIES/C" : "page:TIES/B"),
+                    "ids": .array(ids.map { .string($0) })]
+                _ = try await h.app.bus.execute(Invocation(command: "page.add", params: params, dryRun: true))
+                XCTAssertEqual(try h.app.workspace.content("TIES").pages, originalPages)
+                XCTAssertEqual(h.undoDepth("TIES"), 0)
+                _ = try await h.run("page.add", params)
+                XCTAssertEqual(try livePageIDs(h, "TIES"), ["A", "B"] + ids + ["C", "D"])
+                let pages = try h.app.workspace.content("TIES").livePages
+                XCTAssertEqual(Set(pages.map { $0.order }).count, pages.count)
+                XCTAssertEqual(pages.first?.order, "A", "Unrelated neighbours keep their keys")
+                XCTAssertEqual(pages.last?.order, "V1")
+                XCTAssertEqual(h.undoDepth("TIES"), 1)
+                XCTAssertTrue(h.app.bus.undo("TIES"))
+                XCTAssertEqual(try h.snapshot("TIES"), before)
+                XCTAssertTrue(h.app.bus.redo("TIES"))
+                XCTAssertEqual(try livePageIDs(h, "TIES"), ["A", "B"] + ids + ["C", "D"])
+            }
+        }
+    }
+
+    func testDuplicatePasteAndReorderAlsoSplitTiedNeighbours() async throws {
+        for command in ["page.duplicate", "page.paste", "page.reorder"] {
+            let h = harness()
+            try makeTiedNotebook(h)
+            let before = try h.snapshot("TIES")
+            let params: JSONValue
+            let expected: [String]
+            switch command {
+            case "page.duplicate":
+                params = ["pages": ["page:TIES/B"], "ids": ["NEW"]]
+                expected = ["A", "B", "NEW", "C", "D"]
+            case "page.paste":
+                _ = try await h.run("page.copy", ["pages": ["page:TIES/A"]])
+                params = ["doc": "doc:TIES", "position": "before", "anchor": "page:TIES/C", "ids": ["NEW"]]
+                expected = ["A", "B", "NEW", "C", "D"]
+            default:
+                params = ["pages": ["page:TIES/A"], "after": "page:TIES/B"]
+                expected = ["B", "A", "C", "D"]
+            }
+            _ = try await h.run(command, params)
+            XCTAssertEqual(try livePageIDs(h, "TIES"), expected, command)
+            XCTAssertTrue(h.app.bus.undo("TIES"))
+            XCTAssertEqual(try h.snapshot("TIES"), before, command)
+        }
+    }
+
     func testCreationDistributionSurvivesAlternatingPagesAndBatchAdds() async throws {
         for pattern in ["allPages", "everyOther"] {
             let h = harness()
@@ -554,6 +617,50 @@ final class PageCommandTests: XCTestCase {
     }
 
     // MARK: page.trash / page.restore / page.purge
+
+    func testRestoreAfterReusingATrashedOrderKeepsPagesDistinct() async throws {
+        let h = harness()
+        let add: JSONValue = ["doc": "doc:FIXTUREDOC01", "position": "after", "anchor": "page:FIXTUREDOC01/FIXTUREPG001"]
+        _ = try await h.run("page.add", add.merging(["id": "TRASHED"]))
+        let oldOrder = try pageRecord(h, "page:FIXTUREDOC01/TRASHED").order
+        _ = try await h.run("page.trash", ["pages": ["page:FIXTUREDOC01/TRASHED"]])
+        _ = try await h.run("page.add", add.merging(["id": "REPLACEMENT"]))
+        XCTAssertEqual(try pageRecord(h, "page:FIXTUREDOC01/REPLACEMENT").order, oldOrder)
+        let beforeRestore = try h.snapshot()
+        _ = try await h.run("page.restore", ["pages": ["page:FIXTUREDOC01/TRASHED"]])
+        let pages = try h.app.workspace.content(Fixtures.docID).livePages
+        XCTAssertEqual(Set(pages.map { $0.order }).count, pages.count)
+        XCTAssertEqual(try livePageIDs(h), ["FIXTUREPG001", "REPLACEMENT", "TRASHED", "FIXTUREPG002", "FIXTUREPG003"])
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), beforeRestore)
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        _ = try await h.run("page.add", ["doc": "doc:FIXTUREDOC01", "position": "after",
+            "anchor": "page:FIXTUREDOC01/REPLACEMENT", "id": "BETWEEN"])
+        XCTAssertEqual(try livePageIDs(h), ["FIXTUREPG001", "REPLACEMENT", "BETWEEN", "TRASHED", "FIXTUREPG002", "FIXTUREPG003"])
+    }
+
+    func testBatchRestoreReservesEachReusedKeyAndDryRunRollsBack() async throws {
+        let h = harness()
+        for id in ["FIRST", "SECOND"] {
+            _ = try await h.run("page.add", ["doc": "doc:FIXTUREDOC01", "position": "after",
+                "anchor": "page:FIXTUREDOC01/FIXTUREPG001", "id": .string(id)])
+            _ = try await h.run("page.trash", ["pages": [.string("page:FIXTUREDOC01/" + id)]])
+        }
+        _ = try await h.run("page.add", ["doc": "doc:FIXTUREDOC01", "position": "after",
+            "anchor": "page:FIXTUREDOC01/FIXTUREPG001", "id": "LIVE"])
+        let before = try h.app.workspace.content(Fixtures.docID).pages
+        let depth = h.undoDepth(Fixtures.docID)
+        let params: JSONValue = ["pages": ["page:FIXTUREDOC01/FIRST", "page:FIXTUREDOC01/SECOND"]]
+        _ = try await h.app.bus.execute(Invocation(command: "page.restore", params: params, dryRun: true))
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).pages, before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        let restored = try await h.run("page.restore", params)
+        XCTAssertEqual(restored["restored"], 2)
+        let pages = try h.app.workspace.content(Fixtures.docID).livePages
+        XCTAssertEqual(pages.count, 6)
+        XCTAssertEqual(Set(pages.map { $0.order }).count, pages.count)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
+    }
 
     func testTrashRestoreAndPurge() async throws {
         let h = harness()

@@ -220,6 +220,20 @@ final class FeatPagesTests: XCTestCase {
         XCTAssertEqual(OrderKeys.bounds(.before, anchor: "missing", in: content.livePages).lo, "k", "an unknown anchor means the end")
     }
 
+    func testReadOnlyOrderKeysUseADistinctUpperBoundForTies() {
+        let content = notebook(["V", "V", "V1"])
+        let requests: [(PagePosition, PageID)] = [(.after, "P1"), (.before, "P2")]
+        for (position, anchor) in requests {
+            let gap = OrderKeys.bounds(position, anchor: anchor, in: content.livePages)
+            XCTAssertEqual(gap.lo, "V")
+            XCTAssertEqual(gap.hi, "V1")
+            for count in [1, 5] {
+                let keys = OrderKeys.keys(position, anchor: anchor, count: count, in: content)
+                XCTAssertTrue(keys.allSatisfy { "V" < $0 && $0 < "V1" })
+            }
+        }
+    }
+
     func testBulkOrderKeysStayShortAndIncreasing() {
         // A 2000-page PDF imported at the end, between neighbours, and between keys sharing a prefix
         // (FractionalIndex.balanced, contracts-v2 G23, instead of a key chain that grows every few pages).
