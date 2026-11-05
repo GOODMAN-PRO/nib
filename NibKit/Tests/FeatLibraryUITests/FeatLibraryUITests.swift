@@ -528,6 +528,36 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(model.menu, "app")
     }
 
+    func testMenuBatchReportsFailedFavouriteAndKeepsSuccessfulChange() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        var succeeded = false
+        h.app.commands.register(CommandDescriptor(id: "test.failFavourite", title: "Favourite",
+            summary: "Fail a folder write.", effect: .session)) { _, _ in
+            throw NibError(.unavailable, "Folder provider offline")
+        }
+        h.app.commands.register(CommandDescriptor(id: "test.goodFavourite", title: "Favourite",
+            summary: "Record a successful document change.", effect: .session)) { _, _ in
+            succeeded = true
+            return .null
+        }
+        let reported = expectation(description: "partial batch error surfaced")
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+            let error = note.userInfo?["error"] as? NibError
+            XCTAssertTrue(error?.message.contains("folder:FIXTUREFLD01") == true)
+            XCTAssertTrue(error?.message.contains("Folder provider offline") == true)
+            reported.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        model.menu = "app"
+        model.activateMenu(command: CommandIDs.batch, params: ["stopOnError": false, "calls": [
+            ["command": "test.failFavourite", "params": ["folder": "folder:FIXTUREFLD01"]],
+            ["command": "test.goodFavourite", "params": ["doc": "doc:FIXTUREDOC01"]]
+        ]])
+        await fulfillment(of: [reported], timeout: 2)
+        XCTAssertTrue(succeeded)
+        XCTAssertNil(model.menu)
+    }
+
     func testMenuActivationClosesBudBeforeOpeningInlineRename() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         model.menu = "new"
