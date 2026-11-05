@@ -10,6 +10,25 @@ import NibTesting
 final class FeatLinksTests: XCTestCase {
     private let textRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"
 
+    func testAudioLinkFallsBackFromTrashedPage() async throws {
+        let h = harness()
+        let calls = stubAudioPlay(h)
+        h.app.commands.register(CommandDescriptor(id: "test.trashPage", title: "Trash", summary: "Trash clip page", effect: .edit)) { _, ctx in
+            var page = try XCTUnwrap(ctx.workspace.content(Fixtures.docID).page(Fixtures.page1))
+            page.deleted = true
+            try ctx.mutate { tx in _ = try tx.put(page, doc: Fixtures.docID) }
+            return [:]
+        }
+        _ = try await h.run("test.trashPage")
+        h.session.document = Fixtures.textDocID
+        h.session.page = nil
+        _ = try await h.run("link.follow", ["clip": "audio:FIXTUREDOC01/FIXTUREAUD01"])
+        XCTAssertEqual(h.session.document, Fixtures.docID)
+        XCTAssertEqual(h.session.page, Fixtures.page2)
+        XCTAssertEqual(calls.params.count, 1)
+        XCTAssertEqual(try navigator(h).pendingReturn(h.session), LinkStop(doc: Fixtures.textDocID, page: nil))
+    }
+
     private func harness() -> Harness { Harness(features: [FeatLinksFeature.self]) }
 
     private func navigator(_ h: Harness) throws -> LinkNavigator {

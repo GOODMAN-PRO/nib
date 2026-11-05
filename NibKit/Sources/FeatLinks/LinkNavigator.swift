@@ -90,7 +90,8 @@ final class LinkNavigator: ObservableObject {
             let ref = NodeRef.audio(doc, clipID).description
             guard !dryRun else { return LinkFollowResult(kind: "audio", target: ref) }
             if let session = ctx.activeSession, session.document != doc {
-                go(to: doc, page: clip.page, from: from, session: session, content: content, navigator: ctx.navigator)
+                let page = clip.page.flatMap { id in content.page(id).flatMap { $0.deleted ? nil : id } }
+                go(to: doc, page: page, from: from, session: session, content: content, navigator: ctx.navigator)
             }
             // §6.1: media time is seconds, the clip an audio ref.
             var params: [String: JSONValue] = ["clip": .string(ref)]
