@@ -45,7 +45,8 @@ struct EventPlannerParams: Equatable {
     init(_ params: [String: JSONValue]) {
         func int(_ name: String, _ fallback: Int) -> Int {
             guard let v = params[name]?.doubleValue, v.isFinite else { return fallback }
-            return Int(v.rounded())
+            // Imported/synced params bypass the command schema. Never trap converting a finite Double.
+            return Int(exactly: v.rounded()) ?? fallback
         }
         self.init(layout: params["layout"]?.stringValue.flatMap(Layout.init(rawValue:)) ?? .daily,
                   weekStart: params["weekStart"]?.stringValue.flatMap(WeekStart.init(rawValue:)) ?? .monday,

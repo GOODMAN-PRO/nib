@@ -438,6 +438,24 @@ final class FeatCalendarTests: XCTestCase {
         XCTAssertEqual(pinned.first?.rect.height, 12)
     }
 
+    func testPlannerParamsAndRenderingSurviveOutOfRangeNumbers() {
+        let cache = CalendarEventCache(fileURL: nil)
+        for value in [1e19, -1e19, 1e300, -1e300, Double.greatestFiniteMagnitude,
+                      Double(Int.max), Double.infinity, -Double.infinity, Double.nan] {
+            let raw: [String: JSONValue] = ["year": .number(value), "month": .number(value),
+                "day": .number(value), "startHour": .number(value), "endHour": .number(value)]
+            let params = EventPlannerParams(raw)
+            XCTAssertEqual(params.year, 0)
+            XCTAssertEqual(params.month, 0)
+            XCTAssertEqual(params.day, 0)
+            XCTAssertEqual(params.startHour, EventPlannerParams.defaultStartHour)
+            XCTAssertEqual(params.endHour, EventPlannerParams.defaultEndHour)
+            XCTAssertNil(params.interval(in: params.calendar()))
+            let render = EventPlannerTemplate.render(raw, size: .a4, scale: 1, cache: cache)
+            XCTAssertFalse(render.display.ops.isEmpty)
+        }
+    }
+
     func testPlannerDatesForDailyAndWeeklyPages() {
         let monday = EventPlannerParams(layout: .weekly, weekStart: .monday, year: 2026, month: 9, day: 30)
         let calM = monday.calendar(timeZone: TimeZone(secondsFromGMT: 0)!)
