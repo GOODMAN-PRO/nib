@@ -471,6 +471,32 @@ final class FeatCanvasTests: XCTestCase {
 
     // MARK: view.goToPage
 
+    func testRemovingTheViewedMiddlePageShowsItsNeighbourOnCommitAndReload() async throws {
+        for reopen in [false, true] {
+            let h = Harness(features: [FeatCanvasFeature.self])
+            h.app.commands.register(CommandDescriptor(id: "test.removePage", title: "Remove Page",
+                summary: "Test page removal.", effect: .edit)) { _, ctx in
+                try ctx.mutate { tx in
+                    guard var page = try tx.content(Fixtures.docID).page(Fixtures.page2) else {
+                        throw NibError.notFound("page")
+                    }
+                    page.deleted = true
+                    _ = try tx.put(page, doc: Fixtures.docID)
+                }
+                return .null
+            }
+            let vc = try makeCanvas(h, page: Fixtures.page2)
+            XCTAssertEqual(h.session.page, Fixtures.page2)
+            if reopen { vc.closeCanvas() }
+            _ = try await h.run("test.removePage")
+            if reopen { vc.viewWillAppear(false) }
+            XCTAssertEqual(h.session.page, Fixtures.pdfPage)
+            let neighbour = try XCTUnwrap(vc.host.pageFrame(Fixtures.pdfPage))
+            XCTAssertTrue(neighbour.intersects(unobscured(vc)))
+            vc.closeCanvas()
+        }
+    }
+
     func testGoToPageScrollsThePageToTheTop() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h)

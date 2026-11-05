@@ -776,15 +776,18 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     func reloadAll() {
+        let oldPages = livePages
+        let anchor = didInitialLayout ? centreAnchor() : nil
         loadModel()
+        selectNeighbourIfNeeded(oldPages: oldPages)
         boardContentStale = true
         boardBoundsPage = nil
         paperCache.removeAll()
         failedPages.removeAll()
         guard isViewLoaded, didInitialLayout else { return }
-        let anchor = centreAnchor()
         scrollView.recycleAll()
-        relayout(anchor: anchor, initial: false)
+        let survivingAnchor = anchor.flatMap { a in livePages.contains { $0.id == a.page } ? a : nil }
+        relayout(anchor: survivingAnchor, initial: survivingAnchor == nil)
     }
 
     /// Pans by page points (or fractions of the window). A paged window turns the page for a window-sized step.
@@ -914,6 +917,12 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     // MARK: Commits
 
+    private func selectNeighbourIfNeeded(oldPages: [PageRecord]) {
+        guard let page = session.page, !livePages.contains(where: { $0.id == page }), !livePages.isEmpty else { return }
+        let old = oldPages.firstIndex { $0.id == page } ?? 0
+        setSessionPage(livePages[min(old, livePages.count - 1)].id)
+    }
+
     private func committed(_ cs: Changeset) {
         guard !isClosed, cs.documents.contains(documentID) else { return }
         updateBoardBounds(cs)
@@ -925,14 +934,11 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             let geometry = livePages.map { $0.id } != oldPages.map { $0.id } || livePages.map { $0.size } != oldPages.map { $0.size }
                 || direction != oldDirection
             if geometry || !livePages.contains(where: { $0.id == session.page }) {
-                if let p = session.page, !livePages.contains(where: { $0.id == p }), !livePages.isEmpty {
-                    // The current page went away: show its neighbour.
-                    let old = oldPages.firstIndex { $0.id == p } ?? 0
-                    setSessionPage(livePages[min(old, livePages.count - 1)].id)
-                }
+                selectNeighbourIfNeeded(oldPages: oldPages)
                 if isViewLoaded && didInitialLayout {
                     let switched = mode(for: currentPage) != mode
-                    relayout(anchor: switched ? nil : anchor, initial: switched)
+                    let survivingAnchor = anchor.flatMap { a in livePages.contains { $0.id == a.page } ? a : nil }
+                    relayout(anchor: switched ? nil : survivingAnchor, initial: switched || survivingAnchor == nil)
                 }
             } else {
                 var redrawn: [PageID] = []
