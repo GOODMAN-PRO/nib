@@ -25,6 +25,7 @@ final class GestureRouter {
         var ended: CanvasSample?
     }
     private var buffered: [Int: BufferedSamples] = [:]
+    private var sampleOwner: Int?
     private static let log = Logger(subsystem: "app.nib", category: "canvasinput")
 
     init(host: CanvasHost, attachments: @escaping () -> [CanvasAttachment],
@@ -47,16 +48,30 @@ final class GestureRouter {
         return .tool(tool)
     }
 
-    func begin(_ sample: CanvasSample, route: Route) {
-        guard let host = host else { return }
+    @discardableResult
+    func begin(_ sample: CanvasSample, route: Route) -> Route {
+        guard let host = host else { return .rejected }
         routes[sample.touchID] = route
         switch route {
         case .attachment(let attachment): attachment.touchesBegan(sample, host: host)
         case .tool(let tool) where tool.inputMode == .samples:
-            if sample.isPencil { tool.touchesBegan(sample, host: host) }
+            guard sampleOwner == nil else {
+                // A second finger still participates in the controller's two-finger navigation.
+                let fallback: Route = sample.isPencil ? .rejected : .navigation
+                routes[sample.touchID] = fallback
+                return fallback
+            }
+            if sample.isPencil {
+                // Undelivered finger taps cannot later overwrite the Pencil gesture.
+                for id in buffered.keys where routes[id] != nil { routes[id] = .rejected }
+                buffered.removeAll()
+                sampleOwner = sample.touchID
+                tool.touchesBegan(sample, host: host)
+            }
             else { buffered[sample.touchID] = BufferedSamples(began: sample, tool: tool) }
         default: break
         }
+        return route
     }
 
     func move(_ samples: [CanvasSample]) {
@@ -67,7 +82,7 @@ final class GestureRouter {
         }
         switch routes[id] {
         case .attachment(let attachment): attachment.touchesMoved(samples, host: host)
-        case .tool(let tool) where tool.inputMode == .samples: tool.touchesMoved(samples, host: host)
+        case .tool(let tool) where sampleOwner == id: tool.touchesMoved(samples, host: host)
         default: break
         }
     }
@@ -82,7 +97,9 @@ final class GestureRouter {
         }
         switch route {
         case .attachment(let attachment): attachment.touchesEnded(sample, host: host)
-        case .tool(let tool) where tool.inputMode == .samples: tool.touchesEnded(sample, host: host)
+        case .tool(let tool) where sampleOwner == sample.touchID:
+            sampleOwner = nil
+            tool.touchesEnded(sample, host: host)
         default: break
         }
         return route
@@ -94,7 +111,11 @@ final class GestureRouter {
         guard let host = host else { return }
         switch route {
         case .attachment(let attachment): attachment.touchesCancelled(host: host)
-        case .tool(let tool): tool.touchesCancelled(host: host)
+        case .tool(let tool) where sampleOwner == touchID:
+            sampleOwner = nil
+            tool.touchesCancelled(host: host)
+        case .tool(let tool) where tool.inputMode != .samples:
+            tool.touchesCancelled(host: host)
         default: break
         }
     }
@@ -102,12 +123,18 @@ final class GestureRouter {
     func cancelAll() {
         for id in Array(routes.keys) { cancel(id) }
         buffered.removeAll()
+        sampleOwner = nil
     }
     func releaseBufferedSamples(_ touchID: Int) {
         guard let buffer = buffered.removeValue(forKey: touchID), let host = host else { return }
+        guard sampleOwner == nil else { routes[touchID] = .rejected; return }
+        sampleOwner = touchID
         buffer.tool.touchesBegan(buffer.began, host: host)
         if !buffer.moved.isEmpty { buffer.tool.touchesMoved(buffer.moved, host: host) }
-        if let ended = buffer.ended { buffer.tool.touchesEnded(ended, host: host) }
+        if let ended = buffer.ended {
+            sampleOwner = nil
+            buffer.tool.touchesEnded(ended, host: host)
+        }
     }
     func resolveBufferedTap(_ touchID: Int, handled: Bool) {
         if handled { buffered[touchID] = nil }

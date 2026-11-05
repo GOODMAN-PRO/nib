@@ -4,7 +4,7 @@ import SwiftUI
 import PencilKit
 import Combine
 import NibContracts
-import NibDesign
+@testable import NibDesign
 import NibTesting
 @testable import FeatZoomWindow
 
@@ -964,6 +964,79 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertFalse(view.isUsingTool, "an ink type change must finish capture")
     }
 
+    func testLayerVisibilityRerendersStationaryPane() async throws {
+        let h = harness(), renderer = FakeRenderer()
+        h.app.services.renderer = renderer
+        let (host, overlay) = try await openWindow(h)
+        let controller = overlay.controller
+        let view = controller.writingView()
+        let root = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        window.rootViewController = root
+        root.view.addSubview(view)
+        view.frame = root.view.bounds
+        window.makeKeyAndVisible()
+        controller.paneAppeared()
+        defer { controller.paneDisappeared(); overlay.detach(from: host); window.isHidden = true }
+        for _ in 0..<100 where renderer.requests.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
+        XCTAssertFalse(renderer.requests.isEmpty)
+        h.session.hiddenLayers = [0]
+        for _ in 0..<100 where renderer.requests.last?.layers?.contains(0) != false {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(renderer.requests.last?.layers?.contains(0), false)
+        h.session.hiddenLayers = []
+        for _ in 0..<100 where renderer.requests.last?.layers?.contains(0) != true {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(renderer.requests.last?.layers?.contains(0), true)
+        h.session.replay = ReplayState(time: 123, mode: .reveal)
+        for _ in 0..<100 where renderer.requests.last?.replay?.time != 123 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(renderer.requests.last?.replay, h.session.replay)
+        h.session.replay = nil
+        for _ in 0..<100 where renderer.requests.last?.replay != nil {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertNil(renderer.requests.last?.replay)
+    }
+
+    func testContinuousReplayCompletesRendersBeforePublishingStops() async throws {
+        let h = harness(), renderer = ReplayCadenceRenderer()
+        h.app.services.renderer = renderer
+        let (host, overlay) = try await openWindow(h)
+        let controller = overlay.controller, view = controller.writingView()
+        let root = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        window.rootViewController = root
+        root.view.addSubview(view)
+        view.frame = root.view.bounds
+        window.makeKeyAndVisible()
+        controller.paneAppeared()
+        defer { controller.paneDisappeared(); overlay.detach(from: host); window.isHidden = true }
+        // Every tick is faster than the 40 ms render cadence. Check displayed images while
+        // publishing, not just renderer requests or a final frame after the publisher stops.
+        var previous: UIImage?
+        var displayedFrames = 0
+        for tick in 1...40 {
+            h.session.replay = ReplayState(time: Double(tick), mode: .reveal)
+            try await Task.sleep(nanoseconds: 10_000_000)
+            if let image = view.paper.image, image !== previous {
+                displayedFrames += 1
+                previous = image
+            }
+            if tick == 20 {
+                XCTAssertGreaterThan(displayedFrames, 0, "continuous replay must render before publishing stops")
+            }
+        }
+        XCTAssertGreaterThan(displayedFrames, 1, "the pane must keep rendering throughout playback")
+        for _ in 0..<100 where renderer.requests.last?.replay?.time != 40 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(renderer.requests.last?.replay, h.session.replay, "the final dirty state must also render")
+    }
+
     func testHidingPaneFinishesCaptureBeforeClearingWetInk() async throws {
         let h = harness()
         let (host, overlay) = try await openWindow(h)
@@ -1189,6 +1262,61 @@ final class FeatZoomWindowTests: XCTestCase {
         overlay.detach(from: host)
     }
 
+    func testHostedPaneShrinksWritingContentToTheRemainingChromeHeight() async throws {
+        let h = harness()
+        let (host, overlay) = try await openWindow(h)
+        let c = overlay.controller, writing = c.writingView()
+        let pane = UIHostingController(rootView: ZoomPane(controller: c, state: state(h), writing: writing))
+        pane.safeAreaRegions = []
+        let root = UIViewController()
+        root.addChild(pane)
+        root.view.addSubview(pane.view)
+        pane.didMove(toParent: root)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 667, height: 375))
+        window.rootViewController = root
+        window.isHidden = false
+        defer { overlay.detach(from: host); window.isHidden = true; window.rootViewController = nil }
+        func taps(_ view: UIView) -> [NibActionTapRecognizer] {
+            (view.gestureRecognizers ?? []).compactMap { $0 as? NibActionTapRecognizer }
+                + view.subviews.flatMap(taps)
+        }
+        // The full chrome budget, then the smaller space after reserving the page HUD.
+        for budget in [CGFloat(184), CGFloat(128)] {
+            pane.view.frame = CGRect(x: 16, y: 68, width: 635, height: budget)
+            pane.view.setNeedsLayout()
+            for _ in 0..<50 {
+                root.view.layoutIfNeeded(); pane.view.layoutIfNeeded(); writing.layoutIfNeeded()
+                if taps(pane.view).count == 2,
+                   abs(writing.bounds.height - (budget - ZoomWindowController.paneChrome)) < 1 { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTAssertGreaterThan(c.writingSize.height, budget - ZoomWindowController.paneChrome,
+                                 "The natural writing height must exceed the actual proposal")
+            XCTAssertEqual(writing.bounds.height, budget - ZoomWindowController.paneChrome, accuracy: 0.5)
+            XCTAssertEqual(writing.canvas.frame, writing.bounds, "Constrain the actual input surface, not just the outer frame")
+            let writingFrame = writing.convert(writing.bounds, to: root.view)
+            XCTAssertTrue(pane.view.frame.insetBy(dx: -1, dy: -1).contains(writingFrame))
+            let controls = taps(pane.view).sorted { a, b in
+                (a.view?.convert(CGPoint.zero, to: root.view).x ?? 0)
+                    < (b.view?.convert(CGPoint.zero, to: root.view).x ?? 0)
+            }
+            XCTAssertEqual(controls.count, 2, "Close and New Line must both be hosted")
+            for tap in controls {
+                let target = try XCTUnwrap(tap.view)
+                let frame = target.convert(target.bounds, to: root.view)
+                XCTAssertGreaterThanOrEqual(frame.minY, 68)
+                XCTAssertLessThanOrEqual(frame.maxY, writingFrame.minY)
+                XCTAssertTrue(pane.view.frame.contains(frame))
+                let hit = try XCTUnwrap(root.view.hitTest(CGPoint(x: frame.midX, y: frame.midY), with: nil))
+                XCTAssertTrue(hit === target || hit.isDescendant(of: target))
+            }
+            let before = state(h).rect
+            try XCTUnwrap(controls.last).activate()
+            await c.pending?.value
+            XCTAssertGreaterThan(state(h).rect.y, before.y, "The reachable New Line control must still work")
+        }
+    }
+
     func testDeletingTheBoxPageHidesTheWindowAndRefusesItsStrokes() async throws {
         let h = harness()
         let descriptor = CommandDescriptor(id: "test.deletePage", title: "Delete Page",
@@ -1261,4 +1389,24 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertEqual(erased.params.count, 1)
         overlay.detach(from: host)
     }
+}
+
+/// A small delayed renderer makes replay ticks arrive during rendering as well as during its
+/// cadence delay. It records completed renders, and honours cancellation like a real renderer.
+private final class ReplayCadenceRenderer: PageRenderer {
+    private let lock = NSLock()
+    private var completed: [RenderRequest] = []
+    private let image = FakeRenderer.blank(CGSize(width: 2, height: 2))
+    var requests: [RenderRequest] { lock.withLock { completed } }
+
+    func render(_ request: RenderRequest) async throws -> RenderResult {
+        try await Task.sleep(nanoseconds: 15_000_000)
+        try Task.checkCancellation()
+        lock.withLock { completed.append(request) }
+        return RenderResult(image: image, region: request.region ?? .zero, scale: request.scale)
+    }
+
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { image }
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
+    func purgeCaches() {}
 }

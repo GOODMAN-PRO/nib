@@ -8,12 +8,15 @@ struct SnapNeighbor {
     var shape: ShapeItem
     /// False for locked items and items on another layer: they are snap targets but are never merged away.
     var mergeable: Bool = true
+    /// Revision of the item whose geometry was read; inline shapes have no stored revision.
+    var revision: Rev? = nil
 }
 
 struct SnapResult {
     var shape: ShapeItem
     /// Refs of the neighbours joined into `shape`; the caller deletes them in the same undo step.
     var mergeWith: [String]
+    var mergeRevisions: [String: Rev] = [:]
 }
 
 /// "Snap to Other Shapes" (T-014). A new line or polyline whose end lands within `radius` (12 pt) of an end of an open
@@ -39,7 +42,7 @@ enum ShapeSnapper {
             guard let s = item.shape, !hiddenLayers.contains(item.layer) else { return nil }
             let mergeable = !item.locked && item.layer == (activeLayer ?? item.layer)
             guard (mergeable && joins(s)) || item.bounds.intersects(near) else { return nil }
-            return SnapNeighbor(ref: NodeRef.item(doc, page, item.id).description, shape: s, mergeable: mergeable)
+            return SnapNeighbor(ref: NodeRef.item(doc, page, item.id).description, shape: s, mergeable: mergeable, revision: item.rev)
         }
     }
 
@@ -50,6 +53,11 @@ enum ShapeSnapper {
         var out = shape
         var merged: [String] = []
         var used = Set<Int>()
+        func result(_ shape: ShapeItem) -> SnapResult {
+            var revisions: [String: Rev] = [:]
+            for index in used { revisions[neighbors[index].ref] = neighbors[index].revision }
+            return SnapResult(shape: shape, mergeWith: merged, mergeRevisions: revisions)
+        }
         var startIsNew = true, endIsNew = true
         if joins(shape) {
             var chain = shape.points
@@ -89,7 +97,7 @@ enum ShapeSnapper {
                 // the new stroke's own end.
                 if startIsNew && !endIsNew { chain[0] = chain[chain.count - 1] }
                 chain.removeLast()
-                return SnapResult(shape: ShapeRecognizer.pointShape(.polygon, chain, style: shape.style), mergeWith: merged)
+                return result(ShapeRecognizer.pointShape(.polygon, chain, style: shape.style))
             }
             if !merged.isEmpty { out = ShapeRecognizer.pointShape(.polyline, chain, style: shape.style) }
         }
@@ -105,7 +113,7 @@ enum ShapeSnapper {
             moved = true
         }
         if moved { out.frame = Frame(ShapeGeometry.bounds(out)) }
-        return SnapResult(shape: out, mergeWith: merged)
+        return result(out)
     }
 
     private static func nearest(to p: Point, in anchors: [Point], within r: Double) -> Point? {

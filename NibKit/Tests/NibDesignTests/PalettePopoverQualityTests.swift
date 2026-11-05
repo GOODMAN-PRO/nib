@@ -3,6 +3,31 @@ import SwiftUI
 @testable import NibDesign
 
 final class PalettePopoverQualityTests: XCTestCase {
+    func testSelectedToolDecisionForEveryStripFoldAndSettingsCombination() {
+        for hasStrip in [false, true] {
+            for userFold in [false, true] {
+                for scrollFold in [false, true] {
+                    for hasSettings in [false, true] {
+                        for settingsOpen in [false, true] {
+                            let state = NibToolOptionsState(hasStrip: hasStrip, foldedByUser: userFold,
+                                                            foldedByScroll: scrollFold)
+                            let expected: NibToolOptionsState.Reselection
+                            if hasStrip {
+                                expected = userFold || scrollFold ? .showOptions : .hideOptions
+                            } else if hasSettings {
+                                expected = .settings(!settingsOpen)
+                            } else {
+                                expected = .none
+                            }
+                            XCTAssertEqual(state.reselect(hasSettings: hasSettings, settingsOpen: settingsOpen), expected,
+                                           "strip=\(hasStrip), user=\(userFold), scroll=\(scrollFold), settings=\(hasSettings)/\(settingsOpen)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func testExplicitRegisteredAndFallbackBudSourcesHaveStablePrecedence() {
         let explicit = CGRect(x: 900, y: 32, width: 44, height: 44)
         let registered = CGRect(x: 800, y: 40, width: 44, height: 44)

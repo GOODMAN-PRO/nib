@@ -789,6 +789,25 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertEqual(h.session.page, Fixtures.boardID)
     }
 
+    func testExternalRenamePreservedByUntouchedDraft() async throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let model = BoardsModel(app: h.app, session: h.session)
+        model.beginRename(try XCTUnwrap(model.boards.first))
+        try await h.run(CommandIDs.boardRename, ["page": "page:FIXTUREDOC04/FIXTUREBRD01", "title": "External"])
+        XCTAssertEqual(model.renameText, "External")
+        model.commitRename()
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.whiteboardID).page(Fixtures.boardID)?.title, "External")
+        do {
+            try await h.run(CommandIDs.boardRename, ["page": "page:FIXTUREDOC04/FIXTUREBRD01",
+                "title": "Stale draft", "expectedTitle": "Old"])
+            XCTFail("A stale dirty draft must not replace the external name")
+        } catch {}
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.whiteboardID).page(Fixtures.boardID)?.title, "External")
+    }
+
     func testRenameCommandAReplacesWholeNameAndPersists() async throws {
         let h = harness()
         h.session.document = Fixtures.whiteboardID

@@ -305,6 +305,7 @@ struct LibraryCell: View {
                 identifier: row.isFolder ? "cmd.library.setView" : "cmd.doc.open",
                 value: accessibilityValue(subtitle: visibleSubtitle),
                 selected: model.selection.isSelecting && model.selection.refs.contains(row.ref),
+                dragEnabled: LibraryItemReflow.acceptsDrag(model),
                 earlier: model.collection == .documents ? { step(-1) } : nil,
                 later: model.collection == .documents ? { step(1) } : nil, action: {
                 guard !LibraryCarrierVisibility.hides(row.ref, in: reflow) else { return }
@@ -348,7 +349,9 @@ struct LibraryCell: View {
         } }
         .libraryDropTarget(row.isFolder ? row.ref : nil)
         .task(id: row.ref + String(row.modified ?? 0) + ":" + String(cache.revisions[row.nodeID] ?? 0) + ":" + String(isLocked)) {
-            subtitle = cache.subtitle(row, app: model.app)
+            let value = await cache.subtitle(row, app: model.app)
+            guard !Task.isCancelled else { return }
+            subtitle = value
         }
     }
 }
@@ -360,6 +363,7 @@ struct LibraryItemTapTarget: UIViewRepresentable {
     var identifier: String
     var value: String
     var selected: Bool
+    var dragEnabled: Bool
     var earlier: (() -> Void)?
     var later: (() -> Void)?
     var action: () -> Void
@@ -380,6 +384,9 @@ struct LibraryItemTapTarget: UIViewRepresentable {
         return view
     }
     func updateUIView(_ view: LibraryItemTouchView, context: Context) {
+        // A reused card may stop receiving lift touches after a drop or collection change.
+        // Retire the old sequence so its queued menu completion cannot affect the next hold.
+        if !dragEnabled && view.liftRecognized { view.reflowTouchBegan() }
         view.menu = menu
         view.preview = preview
         view.isAccessibilityElement = true
@@ -404,11 +411,25 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibR
     var menu: (() -> UIMenu)?
     var preview: (() -> UIViewController)?
     var activate: (() -> Void)?
+    var dismissContextMenu: (UIContextMenuInteraction) -> Void = { $0.dismissMenu() }
     private(set) var liftRecognized = false
-    func reflowTouchBegan() { liftRecognized = false }
+    private var touchSequence = 0
+    func reflowTouchBegan() {
+        touchSequence += 1
+        liftRecognized = false
+    }
     func reflowLiftBegan() {
         liftRecognized = true
-        for interaction in interactions.compactMap({ $0 as? UIContextMenuInteraction }) { interaction.dismissMenu() }
+        for interaction in interactions.compactMap({ $0 as? UIContextMenuInteraction }) {
+            dismissMenuForLift(interaction, phase: "lift began")
+        }
+    }
+    private func dismissMenuForLift(_ interaction: UIContextMenuInteraction, phase: String) {
+        guard liftRecognized else { return }
+        #if DEBUG
+        NSLog("%@", "[Nib QA reflow] menu dismissal requested phase=\(phase) view=\(ObjectIdentifier(self)) sequence=\(touchSequence)")
+        #endif
+        dismissContextMenu(interaction)
     }
     override func accessibilityActivate() -> Bool { activate?(); return activate != nil }
     override init(frame: CGRect) {
@@ -430,7 +451,17 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibR
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                 willDisplayMenuFor configuration: UIContextMenuConfiguration,
                                 animator: UIContextMenuInteractionAnimating?) {
-        if !NibReflowArbitration.permitsContextMenu(liftRecognized: liftRecognized) { interaction.dismissMenu() }
+        #if DEBUG
+        NSLog("%@", "[Nib QA reflow] menu will present view=\(ObjectIdentifier(self)) lifted=\(liftRecognized) sequence=\(touchSequence)")
+        #endif
+        dismissMenuForLift(interaction, phase: "menu will present")
+        let sequence = touchSequence
+        // UIKit may already have queued presentation when the lift wins. Dismissing before
+        // that animation starts can be a no-op; retire it again at its completion boundary.
+        animator?.addCompletion { [weak self, weak interaction] in
+            guard let self, let interaction, self.touchSequence == sequence else { return }
+            self.dismissMenuForLift(interaction, phase: "menu presentation completed")
+        }
         #if DEBUG
         NibQAIdleDiagnostics.schedule(reason: "library-context-menu")
         #endif
@@ -441,8 +472,10 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibR
                                 willEndFor configuration: UIContextMenuConfiguration,
                                 animator: UIContextMenuInteractionAnimating?) {
         NSLog("%@", "[Nib QA reflow] native-menu willEnd view=\(ObjectIdentifier(self))")
+        if animator == nil { NSLog("%@", "[Nib QA reflow] menu dismissed lifted=\(liftRecognized) animated=false") }
         animator?.addCompletion { [weak self] in
             NSLog("%@", "[Nib QA reflow] native-menu ended view=\(String(describing: self.map { ObjectIdentifier($0) }))")
+            NSLog("%@", "[Nib QA reflow] menu dismissed lifted=\(self?.liftRecognized ?? false)")
         }
     }
     #endif
@@ -583,18 +616,31 @@ struct LibraryListRow: View {
     var body: some View {
         HStack(spacing: NibSpacing.l) {
             if row.isFolder {
-                NibFolderGlyphView(glyph: row.folderGlyph, color: row.folderColor, size: NibMetrics.rowThumbnailWidth)
-                    .frame(width: NibMetrics.rowThumbnailWidth)
+                Group {
+                    switch row.folderGlyph {
+                    case .symbol(let symbol):
+                        Image(nib: symbol).resizable().scaledToFit()
+                            .foregroundStyle(row.folderColor)
+                    case .emoji(let emoji):
+                        NibFolderGlyphView(glyph: .emoji(emoji), color: row.folderColor,
+                                           size: NibMetrics.rowThumbnailWidth - NibSpacing.s)
+                    }
+                }
+                .frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
+                .libraryLayoutFrame("row.thumbnail." + row.ref, space: .global)
+                .accessibilityHidden(true)
             }
             else { LibraryCover(row: row, model: model).frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
                 .clipShape(RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous))
-                .nibElevation(.paper)
-                .libraryCoverFrame(row.ref) }
+                .libraryCoverFrame(row.ref)
+                .libraryLayoutFrame("row.thumbnail." + row.ref, space: .global) }
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
                 Text(row.name).font(NibFont.body).foregroundStyle(NibColor.label).lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
-                if !row.isFolder { Text(subtitle ?? row.subtitle()).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
-                    .lineLimit(nil).fixedSize(horizontal: false, vertical: true) }
+                    .libraryLayoutFrame("row.title." + row.ref, space: .global)
+                Text(row.isFolder ? LibraryRow.itemCount(row.items ?? 0) : subtitle ?? row.subtitle())
+                    .font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
+                    .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                 Text(Date(timeIntervalSince1970: row.modified ?? 0), style: .date).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
             }
             Spacer()

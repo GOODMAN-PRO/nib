@@ -168,6 +168,13 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         /// The page is dark paper: the editor shows near-black text as chalk, as the tiles will.
         let darkPaper: Bool
         var committed: RichText
+        var persisted: RichText { didSet { conflictAnnounced = false } }
+        var conflictAnnounced = false
+        var epoch = 0
+        var recoveryKey = ""
+        var recoverySubscription: EventSubscription?
+
+        deinit { recoverySubscription?.cancel() }
         var debounce: Task<Void, Never>?
 
         init(doc: DocumentID, page: PageID, id: ElementID, textView: ShapeTextView, scale: Double, darkPaper: Bool,
@@ -179,12 +186,18 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
             self.scale = scale
             self.darkPaper = darkPaper
             self.committed = committed
+            self.persisted = committed
         }
     }
+
+    private static var drafts: [String: TextSession] = [:]
 
     private weak var host: CanvasHost?
     private let keyboard = NibKeyboardAvoidance()
     private var sessionID: NibID?
+    private var commitSubscription: EventSubscription?
+
+    deinit { commitSubscription?.cancel() }
     private let container = CALayer()
     private let guides = CAShapeLayer()
     private let preview = ShapePreviewLayer()
@@ -216,6 +229,14 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
 
     func attach(to host: CanvasHost) {
         self.host = host
+        commitSubscription?.cancel()
+        commitSubscription = host.app.bus.observeCommits { [weak self] changes in
+            guard let self, let current = self.text, changes.mutations.contains(where: { mutation in
+                guard case let .item(doc, page, _, after) = mutation else { return false }
+                return doc == current.doc && page == current.page && after.id == current.id
+            }) else { return }
+            self.refresh(reconcileText: changes.group != current.group)
+        }
         keyboard.onChange = { [weak self] in self?.revealText() }
         sessionID = host.session.id
         Self.live[host.session.id] = WeakOverlay(self)
@@ -240,6 +261,8 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
 
     func detach(from host: CanvasHost) {
         endTextEditing(commit: true)
+        commitSubscription?.cancel()
+        commitSubscription = nil
         cancelDrag()
         container.removeFromSuperlayer()
         accessView.removeFromSuperview()
@@ -326,7 +349,9 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
 
     // MARK: Model → layers
 
-    private func refresh() {
+    // Only commit observations carry the identity needed to distinguish our canonical save from
+    // another writer. Canvas callbacks can run first, so they update geometry without reconciling text.
+    private func refresh(reconcileText: Bool = false) {
         guard let host else { return }
         if let t = text {
             guard (try? host.app.workspace.item(t.doc, page: t.page, id: t.id)) != nil else {
@@ -336,6 +361,29 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
             if host.session.selection.items != [t.id] {
                 endTextEditing(commit: true)
                 return
+            }
+            if let shape = (try? host.app.workspace.item(t.doc, page: t.page, id: t.id))?.shape {
+                let incoming = shape.text ?? .empty
+                if reconcileText && incoming != t.persisted {
+                    let draft = ShapeTextStyle.richText(t.textView.attributedText ?? NSAttributedString(), shape: shape, scale: t.scale)
+                    if draft == t.committed {
+                        t.epoch += 1
+                        let selection = t.textView.selectedRange
+                        let attributed = ShapeTextStyle.attributed(incoming, shape: shape, darkPaper: t.darkPaper, scale: t.scale)
+                        t.textView.attributedText = attributed
+                        t.textView.selectedRange = NSRange(location: min(selection.location, attributed.length), length: 0)
+                        t.persisted = incoming
+                        t.committed = ShapeTextStyle.richText(attributed, shape: shape, scale: t.scale)
+                    } else {
+                        t.debounce?.cancel()
+                        if !t.conflictAnnounced {
+                            t.conflictAnnounced = true
+                            NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
+                                userInfo: ["command": CommandIDs.textSetText, "error": NibError(.conflict,
+                                    String(localized: "Text changed elsewhere. Your draft has been kept."))])
+                        }
+                    }
+                }
             }
             layoutText(t, host: host)
             hideKnobs()
@@ -603,6 +651,13 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
 
         let session = TextSession(doc: doc, page: page, id: id, textView: tv, scale: scale, darkPaper: dark,
                                   committed: ShapeTextStyle.richText(attributed, shape: shape, scale: scale))
+        session.recoveryKey = "\(host.session.id.raw):\(Self.ref(session))"
+        session.persisted = shape.text ?? .empty
+        if let draft = Self.drafts.removeValue(forKey: session.recoveryKey) {
+            let rich = ShapeTextStyle.richText(draft.textView.attributedText ?? NSAttributedString(), shape: shape, scale: draft.scale)
+            tv.attributedText = ShapeTextStyle.attributed(rich, shape: shape, darkPaper: dark, scale: scale)
+            tv.selectedRange = draft.textView.selectedRange
+        }
         text = session
         var bare = shape
         bare.text = nil
@@ -612,7 +667,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         host.setHidden([id], page: page)
         host.session.isEditingText = true
         host.session.editingTextRef = Self.ref(session)
-        host.session.editingTextRange = ShapeTextStyle.plainRange(tv.selectedRange, in: attributed)
+        host.session.editingTextRange = ShapeTextStyle.plainRange(tv.selectedRange, in: tv.attributedText)
         hideKnobs()
         layoutText(session, host: host)
         tv.becomeFirstResponder()
@@ -623,9 +678,14 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     /// Ends editing; the shape reappears once the last commit has landed, so the text never blinks.
     func endTextEditing(commit: Bool) {
         guard let t = text else { return }
+        if commit { retainDraft(t) }
         text = nil
         keyboard.reset()
         t.debounce?.cancel()
+        let closingShape = (try? host?.app.workspace.item(t.doc, page: t.page, id: t.id))?.shape
+        let closingRich = closingShape.map {
+            ShapeTextStyle.richText(t.textView.attributedText ?? NSAttributedString(), shape: $0, scale: t.scale)
+        }
         let flushed = commit ? flush(t) : nil
         t.textView.delegate = nil
         t.textView.onEscape = nil
@@ -641,6 +701,9 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         let page = t.page
         Task { @MainActor [weak self] in
             await flushed?.value
+            if (!commit || closingRich == t.committed), Self.drafts[t.recoveryKey] === t {
+                Self.drafts[t.recoveryKey] = nil
+            }
             let reveal: @MainActor () -> Void = { [weak self] in
                 self?.host?.setHidden([], page: page)
                 t.textView.removeFromSuperview()
@@ -651,19 +714,53 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         }
     }
 
+    /// Flush immediately for lifecycle callers and deterministic save/retry checks.
+    func saveTextNow() {
+        guard let t = text else { return }
+        t.debounce?.cancel()
+        flush(t)
+    }
+
+    private func retainDraft(_ t: TextSession) {
+        Self.drafts[t.recoveryKey] = t
+        guard t.recoverySubscription == nil, let app = host?.app else { return }
+        t.recoverySubscription = app.bus.observeCommits { [weak t] changes in
+            guard let t else { return }
+            for mutation in changes.mutations {
+                guard case let .item(doc, page, _, after) = mutation,
+                      doc == t.doc, page == t.page, after.id == t.id, after.deleted else { continue }
+                if Self.drafts[t.recoveryKey] === t { Self.drafts[t.recoveryKey] = nil }
+                t.recoverySubscription?.cancel()
+                t.recoverySubscription = nil
+            }
+        }
+    }
+
     /// Commits the text through `text.setText` when it changed since the last commit.
     @discardableResult
     private func flush(_ t: TextSession) -> Task<Void, Never>? {
         guard let host, let item = try? host.app.workspace.item(t.doc, page: t.page, id: t.id),
               let shape = item.shape else { return nil }
         let rich = ShapeTextStyle.richText(t.textView.attributedText ?? NSAttributedString(), shape: shape, scale: t.scale)
-        guard rich != t.committed else { return nil }
-        t.committed = rich
+        guard rich != t.committed || pendingFlush != nil else { return nil }
         let value: JSONValue = (try? JSONValue.from(rich)) ?? .string(rich.plainText)
-        let params: JSONValue = ["ref": .string(Self.ref(t)), "text": value]
         let app = host.app, session = host.session, group = t.group
+        let previous = pendingFlush
+        let epoch = t.epoch
         let task = Task { @MainActor in
-            _ = await ShapesUI.run(app, ShapeTapAt.textCommand, params, session: session, group: group)
+            await previous?.value
+            guard t.epoch == epoch, rich != t.committed else { return }
+            let params: JSONValue = ["ref": .string(Self.ref(t)), "text": value,
+                "expectedText": (try? JSONValue.from(t.persisted)) ?? .string(t.persisted.plainText)]
+            if await ShapesUI.run(app, ShapeTapAt.textCommand, params, session: session, group: group) != nil {
+                t.committed = rich
+                // Keep the dirty comparison separate from text.setText's canonical stored value.
+                if let stored = try? app.workspace.item(t.doc, page: t.page, id: t.id).shape {
+                    t.persisted = stored.text ?? .empty
+                }
+                let current = ShapeTextStyle.richText(t.textView.attributedText ?? NSAttributedString(), shape: shape, scale: t.scale)
+                if current == rich, Self.drafts[t.recoveryKey] === t { Self.drafts[t.recoveryKey] = nil }
+            }
         }
         pendingFlush = task
         return task
@@ -702,7 +799,8 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
             }
             return
         }
-        keyboard.reveal(t.textView.bounds, in: t.textView, scrolling: scroll)
+        let rect = t.textView.selectedTextRange.map { t.textView.caretRect(for: $0.end) } ?? t.textView.bounds
+        keyboard.reveal(rect, in: t.textView, scrolling: scroll)
     }
 
     /// The shape without its text, drawn by the shape drawer itself, shown while the item is hidden for editing.

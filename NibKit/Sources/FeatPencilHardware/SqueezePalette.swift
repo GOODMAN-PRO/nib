@@ -136,8 +136,8 @@ enum PaletteNames {
     }
 
     /// Preset widths are page points; people read millimetres.
-    static func thickness(_ points: Double) -> String {
-        let mm = String(format: "%.1f", points * 25.4 / 72)
+    static func thickness(_ points: Double, locale: Locale = .current) -> String {
+        let mm = String(format: "%.1f", locale: locale, points * 25.4 / 72)
         return String(localized: "\(mm) millimetres")
     }
 
@@ -272,10 +272,29 @@ final class PaletteModel: ObservableObject {
 struct SqueezePaletteView: View {
     @ObservedObject var model: PaletteModel
     let dismiss: () -> Void
+    var maximumHeight: CGFloat? = nil
 
     var body: some View {
+        ViewThatFits(in: .vertical) {
+            rows
+            ScrollView(.vertical) {
+                rows.fixedSize(horizontal: true, vertical: false)
+            }
+        }
+        .frame(maxHeight: maximumHeight)
+        .fixedSize(horizontal: true, vertical: false)
+        .nibGlass(.deep, cornerRadius: NibRadius.popover)
+        .nibChromeTypeCap()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(model.plan.kind.title)
+        .accessibilityAddTraits(.isModal)
+        .accessibilityAction(.escape) { dismiss() }
+        // Escape on a hardware keyboard: `PaletteHostingController` (first responder while the palette is open).
+    }
+
+    private var rows: some View {
         let plan = model.plan
-        VStack(alignment: .leading, spacing: 0) {
+        return VStack(alignment: .leading, spacing: 0) {
             if plan.showsTools {
                 toolRows(plan)
             }
@@ -293,14 +312,8 @@ struct SqueezePaletteView: View {
             }
         }
         .padding(NibMetrics.paletteEndPadding)
-        .fixedSize()
-        .nibGlass(.deep, cornerRadius: NibRadius.popover)
-        .nibChromeTypeCap()
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(plan.kind.title)
-        .accessibilityAddTraits(.isModal)
-        .accessibilityAction(.escape) { dismiss() }
-        // Escape on a hardware keyboard: `PaletteHostingController` (first responder while the palette is open).
+        .fixedSize(horizontal: true, vertical: true)
+
     }
 
     /// The system hairline in the `separator` token (DESIGN.md §3: 0.5 pt hairlines inside droplets).
@@ -397,7 +410,8 @@ struct PaletteOverlay: View {
                     .contentShape(Rectangle())
                     .gesture(DragGesture(minimumDistance: 0).onEnded { _ in dismiss() })
                     .accessibilityHidden(true)
-                SqueezePaletteView(model: model, dismiss: dismiss)
+                SqueezePaletteView(model: model, dismiss: dismiss,
+                    maximumHeight: max(0, proxy.size.height - insets.top - insets.bottom - 2 * NibMetrics.chromeInset))
                     .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
                     .opacity(size == .zero ? 0 : 1)
                     .position(PalettePlacement.centre(size: size, anchor: anchor,

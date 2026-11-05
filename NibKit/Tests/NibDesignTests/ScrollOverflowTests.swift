@@ -34,7 +34,7 @@ final class ScrollOverflowTests: XCTestCase {
     func testCueReservesSpaceOutsideControlsAndKeepsTheScrollHost() async throws {
         let host = UIHostingController(rootView: NibScrollView {
             Color.clear.frame(height: 600)
-        }.frame(width: 300, height: 240))
+        }.frame(width: 300, height: 240).ignoresSafeArea())
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 300, height: 240))
         window.rootViewController = host
         window.isHidden = false
@@ -45,7 +45,9 @@ final class ScrollOverflowTests: XCTestCase {
         }
         for _ in 0..<10 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
         let scroll = try XCTUnwrap(findScroll(host.view))
-        XCTAssertEqual(scroll.bounds.height, 240 - NibSpacing.l, accuracy: 1)
+        // The window may carry a safe area (status bar): the root ignores it so the 240 pt frame is the window.
+        XCTAssertEqual(scroll.bounds.height, 240 - NibSpacing.l, accuracy: 1,
+                       "scroll frame \(scroll.frame), safe area \(host.view.safeAreaInsets), host \(host.view.bounds)")
         XCTAssertTrue(scroll.showsVerticalScrollIndicator)
         let bottom = scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom
         scroll.setContentOffset(CGPoint(x: 0, y: bottom), animated: false)

@@ -182,11 +182,13 @@ enum StickyActions {
     /// Stores a note's rich text with `text.setText` (the text feature, F026), or with `item.update` on the note's
     /// `sticky.text` when that command is missing or refuses the note. Only a failure of both is reported (and toasted).
     @discardableResult
-    static func setText(_ app: NibApp, ref: String, text: RichText, session: EditorSession?, group: String?) async -> Bool {
+    static func setText(_ app: NibApp, ref: String, text: RichText, session: EditorSession?, group: String?, expectedText: RichText? = nil) async -> Bool {
         guard let json = try? JSONValue.from(text) else { return false }
+        var params: [String: JSONValue] = ["ref": .string(ref), "text": json]
+        if let expectedText { params["expectedText"] = try? JSONValue.from(expectedText) }
         if app.commands.entry(CommandIDs.textSetText) != nil {
             do {
-                _ = try await execute(app, CommandIDs.textSetText, ["ref": .string(ref), "text": json], session: session,
+                _ = try await execute(app, CommandIDs.textSetText, .object(params), session: session,
                                       group: group)
                 return true
             } catch {
@@ -198,8 +200,19 @@ enum StickyActions {
                 log.info("text.setText declined \(ref, privacy: .public) (\(e.code.rawValue, privacy: .public)); saving with item.update")
             }
         }
-        return await run(app, CommandIDs.itemUpdate, ["ref": .string(ref), "patch": ["sticky": ["text": json]]],
-                         session: session, group: group) != nil
+        var fallback: [String: JSONValue] = ["ref": .string(ref), "patch": ["sticky": ["text": json]]]
+        if let expectedText {
+            // Older item.update implementations silently ignore unknown fields. Never send a guarded
+            // replacement to one: its owner must implement expectedText inside its mutation first.
+            guard let descriptor = app.commands.descriptor(CommandIDs.itemUpdate),
+                  case let .object(fields, _, _) = descriptor.params, fields["expectedText"] != nil else {
+                report(app, CommandIDs.itemUpdate, NibError(.unavailable,
+                    String(localized: "Safe text saving is unavailable. Your draft has been kept.")))
+                return false
+            }
+            fallback["expectedText"] = try? JSONValue.from(expectedText)
+        }
+        return await run(app, CommandIDs.itemUpdate, .object(fallback), session: session, group: group) != nil
     }
 
     /// Whole-note formatting (the inspector): applies `change` to each note's text as it is when the action runs, not
@@ -331,20 +344,36 @@ final class StickyNoteView: UIView {
 /// `editingTextRef` and `editingTextRange` follow the text view.
 @MainActor
 final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
-    private struct Editing {
+    @MainActor
+    private final class Editing {
         let doc: DocumentID
         let page: PageID
         let id: ElementID
         /// The undo group every write of this editing session joins.
         let group: String
         let view: StickyNoteView
-        /// The text last saved (or on its way to the document), in the editor's normal form.
+        /// The last successfully saved text, in the editor's normal form.
         var saved: RichText
+        var persisted: RichText { didSet { conflictAnnounced = false } }
+        var conflictAnnounced = false
+        var epoch = 0
+        var recoveryKey = ""
+        var recoverySubscription: EventSubscription?
+
+        deinit { recoverySubscription?.cancel() }
         var zoom: CGFloat
         /// False while the tool's `sticky.create` has not landed yet.
         var placed: Bool
         var ref: String { NodeRef.item(doc, page, id).description }
+
+        init(doc: DocumentID, page: PageID, id: ElementID, group: String, view: StickyNoteView,
+             saved: RichText, zoom: CGFloat, placed: Bool) {
+            self.doc = doc; self.page = page; self.id = id; self.group = group; self.view = view
+            self.saved = saved; self.persisted = view.note.text; self.zoom = zoom; self.placed = placed
+        }
     }
+
+    private static var drafts: [String: Editing] = [:]
 
     /// Time after the last keystroke before typing is saved.
     static let autosaveDelay: UInt64 = 500_000_000
@@ -370,11 +399,15 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
     /// Writes run one after another: a placed note's create, then its text saves, then closing the overlay.
     private var writes: Task<Void, Never>?
     private var pendingWrites = 0
+    private var commitSubscription: EventSubscription?
+
+    deinit { commitSubscription?.cancel() }
 
     private init(host: CanvasHost) {
         self.host = host
         super.init()
         keyboard.onChange = { [weak self] in self?.revealEditingNote() }
+        attach(to: host)
     }
 
     /// The note being edited.
@@ -382,9 +415,23 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
 
     // MARK: CanvasAttachment
 
-    func attach(to host: CanvasHost) { self.host = host }
+    func attach(to host: CanvasHost) {
+        self.host = host
+        commitSubscription?.cancel()
+        commitSubscription = host.app.bus.observeCommits { [weak self] changes in
+            guard let self, let current = self.editing, changes.mutations.contains(where: { mutation in
+                guard case let .item(doc, page, _, after) = mutation else { return false }
+                return doc == current.doc && page == current.page && after.id == current.id
+            }) else { return }
+            self.refresh(reconcileText: changes.group != current.group)
+        }
+    }
 
-    func detach(from host: CanvasHost) { endEditing(save: true) }
+    func detach(from host: CanvasHost) {
+        endEditing(save: true)
+        commitSubscription?.cancel()
+        commitSubscription = nil
+    }
 
     func canvasDidChange(_ host: CanvasHost) { refresh() }
 
@@ -443,13 +490,22 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
         autosave = nil
         guard let e = editing, let app = host?.app else { return }
         let text = StickyText.richText(e.view.textView.attributedText ?? NSAttributedString(), zoom: e.zoom)
-        guard text != e.saved else { return }
-        editing?.saved = text
+        guard text != e.saved || pendingWrites > 0 else { return }
+        let epoch = e.epoch
         let session = host?.session
         write {
             // A note whose placing failed, or that was deleted meanwhile, has nothing left to save into.
             guard (try? app.workspace.item(e.doc, page: e.page, id: e.id)) != nil else { return }
-            await StickyActions.setText(app, ref: e.ref, text: text, session: session, group: e.group)
+            guard e.epoch == epoch, text != e.saved else { return }
+            if await StickyActions.setText(app, ref: e.ref, text: text, session: session, group: e.group,
+                                           expectedText: e.persisted) {
+                e.saved = text
+                // text.setText may normalise the submitted font sizes and paragraph attributes.
+                // Read its stored baseline in this actor turn; saved still describes the text view.
+                if let stored = try? app.workspace.item(e.doc, page: e.page, id: e.id).sticky {
+                    e.persisted = stored.text
+                }
+            }
         }
     }
 
@@ -466,19 +522,28 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
             return
         }
         position(e.view, zoom: e.zoom, page: e.page, host: host)
-        keyboard.reveal(e.view.bounds, in: e.view, scrolling: scroll)
+        let textView = e.view.textView
+        e.view.layoutIfNeeded()
+        let rect = textView.selectedTextRange.map { textView.caretRect(for: $0.end) } ?? textView.bounds
+        keyboard.reveal(rect, in: textView, scrolling: scroll)
     }
 
     private func open(doc: DocumentID, page: PageID, id: ElementID, note: StickyItem, placed: Bool, host: CanvasHost) {
         let zoom = CGFloat(max(host.zoomScale, 0.01))
         let view = StickyNoteView(note: note)
         view.textView.attributedText = StickyText.attributed(note.text, zoom: zoom)
+        view.textView.selectedRange = NSRange(location: view.textView.attributedText.length, length: 0)
         if note.text.isEmpty { view.textView.typingAttributes = StickyText.typingAttributes(zoom: zoom) }
         view.textView.delegate = self
         view.textView.onDone = { [weak self] in self?.endEditing(save: true) }
         host.canvasView.addSubview(view)
         editing = Editing(doc: doc, page: page, id: id, group: NibID.make().raw, view: view,
                           saved: StickyText.normalised(note.text), zoom: zoom, placed: placed)
+        editing?.recoveryKey = "\(host.session.id.raw):\(editing?.ref ?? "")"
+        if let e = editing, let draft = Self.drafts.removeValue(forKey: e.recoveryKey) {
+            view.textView.attributedText = StickyText.scaled(draft.view.textView.attributedText, by: zoom / draft.zoom)
+            view.textView.selectedRange = draft.view.textView.selectedRange
+        }
         position(view, zoom: zoom, page: page, host: host)
         host.setHidden([id], page: page)                       // the overlay stands in for the note meanwhile
 
@@ -494,7 +559,6 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
             .sink { _ in finish() }.store(in: &observers)
 
         view.textView.becomeFirstResponder()
-        view.textView.selectedRange = NSRange(location: view.textView.attributedText.length, length: 0)
         publishRange(view.textView)
         reveal(note, page: page, host: host)
         UIAccessibility.post(notification: .layoutChanged, argument: view.textView)
@@ -510,6 +574,7 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
             autosave?.cancel()
             autosave = nil
         }
+        if save { retainDraft(e) }
         editing = nil
         keyboard.reset()
         observers.removeAll()
@@ -524,12 +589,31 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
             }
         }
         let finish: () -> Void = { [weak self, weak host = self.host] in
+            let draft = StickyText.richText(e.view.textView.attributedText ?? NSAttributedString(), zoom: e.zoom)
+            if (!save || draft == e.saved), Self.drafts[e.recoveryKey] === e { Self.drafts[e.recoveryKey] = nil }
             e.view.removeFromSuperview()
             guard let host = host else { return }
             let still: ElementID? = self?.editing.flatMap { $0.page == e.page ? $0.id : nil }
             host.setHidden(still.map { Set([$0]) } ?? [], page: e.page)
         }
         if pendingWrites == 0 { finish() } else { write { finish() } }
+    }
+
+    func flush() async { await writes?.value }
+
+    private func retainDraft(_ e: Editing) {
+        Self.drafts[e.recoveryKey] = e
+        guard e.recoverySubscription == nil, let app = host?.app else { return }
+        e.recoverySubscription = app.bus.observeCommits { [weak e] changes in
+            guard let e else { return }
+            for mutation in changes.mutations {
+                guard case let .item(doc, page, _, after) = mutation,
+                      doc == e.doc, page == e.page, after.id == e.id, after.deleted else { continue }
+                if Self.drafts[e.recoveryKey] === e { Self.drafts[e.recoveryKey] = nil }
+                e.recoverySubscription?.cancel()
+                e.recoverySubscription = nil
+            }
+        }
     }
 
     /// Runs `work` after every write queued before it.
@@ -545,10 +629,12 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
 
     /// Follows the model (colour, author, resolved, frame, a delete, undo or collapse elsewhere) and the canvas
     /// (scroll, zoom). The typed text is the view's own; the document gets it through the saves.
-    private func refresh() {
+    // Canvas notifications carry no changeset and can precede our commit observer. Reconcile text
+    // only from that observer, using the undo group rather than raw/canonical text equality.
+    private func refresh(reconcileText: Bool = false) {
         guard let e = editing, let host = self.host else { return }
         if e.placed {
-            guard let item = try? host.app.workspace.item(e.doc, page: e.page, id: e.id), var note = item.sticky else {
+            guard let item = try? host.app.workspace.item(e.doc, page: e.page, id: e.id), let note = item.sticky else {
                 endEditing(save: false)                        // deleted here, undone, or deleted by a collaborator
                 return
             }
@@ -556,7 +642,26 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
                 endEditing(save: !item.locked)
                 return
             }
-            note.text = e.view.note.text
+            if reconcileText && note.text != e.persisted {
+                let draft = StickyText.richText(e.view.textView.attributedText ?? NSAttributedString(), zoom: e.zoom)
+                if draft == e.saved {
+                    e.epoch += 1
+                    let selection = e.view.textView.selectedRange
+                    e.view.textView.attributedText = StickyText.attributed(note.text, zoom: e.zoom)
+                    let length = e.view.textView.attributedText.length
+                    e.view.textView.selectedRange = NSRange(location: min(selection.location, length), length: 0)
+                    e.persisted = note.text
+                    e.saved = StickyText.normalised(note.text)
+                } else {
+                    autosave?.cancel()
+                    if !e.conflictAnnounced {
+                        e.conflictAnnounced = true
+                        NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
+                            userInfo: ["command": CommandIDs.textSetText, "error": NibError(.conflict,
+                                String(localized: "Text changed elsewhere. Your draft has been kept."))])
+                    }
+                }
+            }
             if note != e.view.note { e.view.note = note }
         }
         let zoom = CGFloat(max(host.zoomScale, 0.01))

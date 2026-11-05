@@ -59,6 +59,7 @@ final class ZoomWindowController: ObservableObject {
 
     private var writing: ZoomWritingView?
     private var renderTask: Task<Void, Never>?
+    private var renderDirty = false
     private var shownDoc: DocumentID?
     private var shownPage: PageID?
     private var shownRect: Rect?
@@ -93,6 +94,12 @@ final class ZoomWindowController: ObservableObject {
         session.$tool.removeDuplicates().receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.configureWriting() }
             .store(in: &subscriptions)
+        session.$hiddenLayers.removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.scheduleRender() }
+            .store(in: &subscriptions)
+        session.$replay.receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.scheduleRender() }
+            .store(in: &subscriptions)
         canvasResized(host.canvasView.bounds.size)
         updateActive()
     }
@@ -103,7 +110,7 @@ final class ZoomWindowController: ObservableObject {
         commits?.cancel()
         commits = nil
         subscriptions.removeAll()
-        renderTask?.cancel()
+        cancelRender()
         clearWet()
         if state.pane === self { state.pane = nil }
         host = nil
@@ -131,7 +138,7 @@ final class ZoomWindowController: ObservableObject {
         } else {
             writing?.finishToolUse()
             removeOptions()
-            renderTask?.cancel()
+            cancelRender()
             // A hidden pane renders nothing, so its wet ink would go stale; its commits land on the page regardless,
             // and the render when the pane shows again draws them.
             clearWet()
@@ -170,7 +177,7 @@ final class ZoomWindowController: ObservableObject {
         guard paneAppearances == 0 else { return }
         writing?.finishToolUse()
         removeOptions()
-        renderTask?.cancel()
+        cancelRender()
         clearWet()
     }
 
@@ -449,30 +456,56 @@ final class ZoomWindowController: ObservableObject {
         scheduleRender()
     }
 
-    /// Renders the visible region at the pane's pixel density while the pane shows; coalesces bursts (slider drags,
-    /// commits).
-    private func scheduleRender() {
+    private func cancelRender() {
         renderTask?.cancel()
-        guard isPaneShowing, let writing, let renderer = app.services.renderer, let doc = state.doc,
+        renderTask = nil
+        renderDirty = false
+    }
+
+    /// One worker samples the latest state at a bounded cadence. Updates during a render mark it dirty
+    /// for another pass instead of cancelling it (continuous replay must not starve the pane).
+    private func scheduleRender() {
+        guard isPaneShowing else { return }
+        renderDirty = true
+        guard renderTask == nil else { return }
+        renderTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 40_000_000)
+                guard !Task.isCancelled, let self else { return }
+                guard self.renderDirty, self.isPaneShowing else {
+                    self.renderTask = nil
+                    return
+                }
+                self.renderDirty = false
+                await self.renderLatest()
+                guard !Task.isCancelled else { return }
+                if !self.renderDirty {
+                    self.renderTask = nil
+                    return
+                }
+            }
+        }
+    }
+
+    private func renderLatest() async {
+        guard let writing, let renderer = app.services.renderer, let doc = state.doc,
               let pid = state.page, pageSize != nil else { return }
         let region = visibleRegion
         let screen = Double(writing.traitCollection.displayScale > 0 ? writing.traitCollection.displayScale : 2)
         let scale = min(magnification * screen, 4096 / max(region.width, 1))
+        let layers = Set(0..<NibLimits.layerCount).subtracting(session.hiddenLayers)
         let request = RenderRequest(doc: doc, page: pid, region: region, scale: scale,
-                                    layers: Set(0..<NibLimits.layerCount).subtracting(session.hiddenLayers),
-                                    replay: session.replay)
-        let drop = landed
-        renderTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 40_000_000)
-            guard !Task.isCancelled else { return }
-            do {
-                let result = try await renderer.render(request)
-                guard !Task.isCancelled, let self else { return }
-                self.writing?.show(UIImage(cgImage: result.image, scale: CGFloat(screen), orientation: .up), region: result.region)
-                if self.writing?.dropWet(drop) == true {
-                    self.landed = max(0, self.landed - drop)
-                }
-            } catch {
+                                    layers: layers, replay: session.replay)
+        let drop = landed, generation = wetGeneration
+        do {
+            let result = try await renderer.render(request)
+            guard !Task.isCancelled, isPaneShowing, state.doc == doc, state.page == pid,
+                  visibleRegion == region, wetGeneration == generation,
+                  layers == Set(0..<NibLimits.layerCount).subtracting(session.hiddenLayers) else { return }
+            writing.show(UIImage(cgImage: result.image, scale: CGFloat(screen), orientation: .up), region: result.region)
+            if writing.dropWet(drop) { landed = max(0, landed - drop) }
+        } catch {
+            if !Task.isCancelled {
                 ZoomWindowController.log.error("zoom pane render failed: \(String(describing: error), privacy: .public)")
             }
         }
@@ -631,11 +664,10 @@ struct ZoomPane: View {
     let writing: ZoomWritingView
 
     var body: some View {
-        VStack(spacing: ZoomWindowController.rowGap) {
+        ZoomPaneLayout(writingHeight: controller.writingSize.height) {
             controls
             ZoomWritingSurface(view: writing)
                 .frame(maxWidth: .infinity)
-                .frame(height: controller.writingSize.height)
                 .background {
                     GeometryReader { g in
                         Color.clear
@@ -689,6 +721,24 @@ struct ZoomPane: View {
             controller.toggleOptions()
         }
         .nibBudAnchor(ZoomWindowController.optionsAnchor)
+    }
+}
+
+/// Accept the chrome's actual height proposal instead of overflowing with a fixed writing surface.
+struct ZoomPaneLayout: Layout {
+    let writingHeight: CGFloat
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let natural = NibMetrics.hitTarget + NibSpacing.xs + writingHeight
+        return CGSize(width: proposal.width ?? 600, height: min(natural, proposal.height ?? natural))
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard subviews.count == 2 else { return }
+        let row = min(NibMetrics.hitTarget, bounds.height)
+        subviews[0].place(at: bounds.origin, anchor: .topLeading,
+            proposal: ProposedViewSize(width: bounds.width, height: row))
+        let top = row + NibSpacing.xs
+        subviews[1].place(at: CGPoint(x: bounds.minX, y: bounds.minY + top), anchor: .topLeading,
+            proposal: ProposedViewSize(width: bounds.width, height: max(0, bounds.height - top)))
     }
 }
 

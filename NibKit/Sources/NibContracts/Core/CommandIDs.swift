@@ -152,6 +152,8 @@ public enum CommandIDs {
     public static let calendarOpenNote = "calendar.openNote"  // F075
 
     public static let canvasClearDecorations = "canvas.clearDecorations"  // F006
+    public static let canvasRetainFailedInk = "canvas.retainFailedInk"  // F006
+    public static let canvasRecoverInk = "canvas.recoverInk"  // F006
 
     public static let cardAdd = "card.add"  // F049
     public static let cardUpdate = "card.update"  // F049

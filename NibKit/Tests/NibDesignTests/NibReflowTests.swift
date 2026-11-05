@@ -1,6 +1,7 @@
 import XCTest
 import CoreGraphics
 import SwiftUI
+import UIKit
 @testable import NibDesign
 
 /// The library's live reorder (DESIGN.md §10.12, §14.1): the gap follows the finger with hysteresis, neighbours move
@@ -216,6 +217,42 @@ final class NibReflowTests: XCTestCase {
         XCTAssertEqual(reflow.carrierFrame, layout.slot(1))
     }
 
+    @MainActor
+    func testRenderingWarmupExercisesTheMovingCarrierBeforeAnyUserLift() async throws {
+        var field: DropletField?
+        let warmup = NibReflowRenderingWarmup(size: CGSize(width: 140, height: 182)) {
+            Color.blue.overlay(WarmupFieldProbe { field = $0 })
+        }
+        let host = UIHostingController(rootView: warmup
+            .environment(\.scenePhase, .active).nibLiquidMode(.full))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 220, height: 280))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        for _ in 0..<40 {
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(20))
+            if field?.isDragging("reflow.warmup") == true,
+               field?.node("reflow.warmup").presentation.isDrawn == true { break }
+        }
+        let rendered = try XCTUnwrap(field, "The probe is inside the production carrier content")
+        XCTAssertTrue(warmup.reflow.isDragging)
+        XCTAssertEqual(warmup.reflow.carried, 0)
+        XCTAssertEqual(warmup.reflow.carrierFrame?.size, CGSize(width: 140, height: 182))
+        XCTAssertNotEqual(warmup.reflow.lift?.start, warmup.reflow.lift?.location)
+        XCTAssertTrue(warmup.reflow.hasCarrier)
+        XCTAssertNotNil(rendered.visualFrame("reflow.warmup"))
+        XCTAssertTrue(rendered.isDragging("reflow.warmup"), "CarrierDriver must enter the moving foreground")
+        XCTAssertTrue(rendered.node("reflow.warmup").presentation.isDrawn)
+        host.view.layer.displayIfNeeded()
+        let image = UIGraphicsImageRenderer(size: window.bounds.size).image {
+            host.view.layer.render(in: $0.cgContext)
+        }
+        XCTAssertNotNil(image.cgImage)
+    }
+
     func testRecognizedLiftKeepsMenuOwnershipEvenAfterMovementStops() {
         XCTAssertTrue(NibReflowArbitration.permitsContextMenu(liftRecognized: false))
         XCTAssertFalse(NibReflowArbitration.permitsContextMenu(liftRecognized: true))
@@ -280,5 +317,13 @@ final class NibReflowTests: XCTestCase {
         XCTAssertEqual(reflow.offset(for: "c"), CGSize(width: -164, height: 0))   // …then makes room
         XCTAssertNil(reflow.armed)
         XCTAssertEqual(reflow.end(), .reorder(NibReflowMove(id: "b", from: 1, to: 2, in: ids)))
+    }
+}
+
+private struct WarmupFieldProbe: View {
+    @Environment(DropletField.self) private var field: DropletField?
+    let receive: (DropletField) -> Void
+    var body: some View {
+        Color.clear.onAppear { if let field { receive(field) } }
     }
 }

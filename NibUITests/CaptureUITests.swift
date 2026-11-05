@@ -1,8 +1,8 @@
 import XCTest
 import UIKit
 
-/// Real-app review captures. Reachability is the only assertion: no pixel, colour,
-/// spacing or typography expectations. Each test launches one disposable fixture for
+/// Real-app review captures. Reachability and rendered-content readiness are the only assertions;
+/// there are no styling, colour, spacing or typography expectations. Each test launches one disposable fixture for
 /// one group/appearance/orientation: 24 groups x 4 variants = 96 independent tests.
 /// UITestFixture pins appearance at launch (including new windows); FeatAppearance
 /// follows the system and has no live light/dark command, so variants require relaunches.
@@ -140,6 +140,64 @@ final class CaptureUITests: XCTestCase {
         _ = try require("nib.canvas")
     }
 
+    /// Accessibility state can precede the canvas bitmaps and palette foreground. See QA-ui-app15-strip.md
+    /// for the rendering paths and the unresolved diagnosis. A timeout fails the test and preserves the capture.
+    private func settledNotebookWithAssistant() {
+        let pen = ui.app.buttons["tool.pen"]
+        let note = ui.app.staticTexts.matching(NSPredicate(
+            format: "label == %@ AND value == %@", "Sticky note", "Remember F = ma")).firstMatch
+        var readiness = CaptureReadiness()
+        Self.checkAssistantReadiness(waitUntilRendered: {
+            try wait("Page note and palette glyph must finish presenting", timeout: 20) {
+                let time = ProcessInfo.processInfo.systemUptime
+                guard pen.exists, note.exists, pen.isHittable else {
+                    return readiness.observe([], canvas: .zero, window: .zero, at: time)
+                }
+                let elements = [pen, note].map {
+                    CaptureReadiness.Element(frame: $0.frame, isAvailable: true,
+                                             pixels: self.grayscalePixels($0))
+                }
+                return readiness.observe(elements, canvas: self.ui.canvas.frame,
+                                         window: self.ui.app.windows.firstMatch.frame, at: time)
+            }
+        }, diagnose: { error in
+            let stem = "assistant-readiness-timeout-\(appearance)-\(orientation)"
+            attach(XCTAttachment(string: "Rendering readiness unconfirmed: \(error)"), name: stem + "-reason")
+            attach(XCTAttachment(screenshot: XCUIScreen.main.screenshot()), name: stem)
+            attach(XCTAttachment(string: ui.app.debugDescription), name: stem + "-hierarchy")
+        })
+    }
+
+    /// Shared by the real assistant wait and its regression tests. Keep gathering evidence after a timeout,
+    /// but never allow document/item-count assertions to turn an unrendered capture into a passing test.
+    static func checkAssistantReadiness(waitUntilRendered: () throws -> Void,
+                                        diagnose: (Error) -> Void) {
+        do {
+            try waitUntilRendered()
+        } catch {
+            diagnose(error)
+            XCTFail("Assistant rendering readiness failed: \(error)")
+        }
+    }
+
+    /// A blank paper tile or empty glass capsule has no foreground detail. This deliberately loose contrast
+    /// gate checks presence only, in either appearance, rather than comparing a screenshot to a golden image.
+    private func grayscalePixels(_ element: XCUIElement) -> [UInt8] {
+        let image = element.screenshot().image
+        let width = 128, height = 32
+        var pixels = [UInt8](repeating: 0, count: width * height)
+        guard let cgImage = image.cgImage else { return [] }
+        let drawn = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: width, height: height,
+                                          bitsPerComponent: 8, bytesPerRow: width,
+                                          space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)
+            else { return false }
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+            return true
+        }
+        return drawn ? pixels : []
+    }
+
     private func folder(_ title: String) throws {
         let row = ui.app.descendants(matching: .any).matching(identifier: "cmd.library.setView")
             .matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", title, title + ",")).firstMatch
@@ -241,8 +299,7 @@ final class CaptureUITests: XCTestCase {
     private func toolOptions(_ id: String, title: String, number: Int) {
         variants {
             try self.openNotebook()
-            try self.ui.selectTool(id)
-            try self.tap("menu.toolSettings")
+            try self.ui.openToolSettings(id)
             _ = try self.ui.requireControl(title, type: .staticText, timeout: 12)
             try self.capture(number, id == "shape" ? "shapes-options" : id + "-options") {
                 $0.screen == "document" && $0.tool == id
@@ -313,7 +370,12 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook()
             try self.tap("Assistant")
-            try self.capture(21, "ai-assistant") { $0.openPanels.contains("aichat.panel") }
+            _ = try self.ui.waitForState { $0.openPanels.contains("aichat.panel") }
+            self.settledNotebookWithAssistant()
+            try self.capture(21, "ai-assistant") {
+                $0.screen == "document" && $0.document != nil && $0.itemCountOnPage > 0
+                    && $0.openPanels.contains("aichat.panel")
+            }
         }
     }
 

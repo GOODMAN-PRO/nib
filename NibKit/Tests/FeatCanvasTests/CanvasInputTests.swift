@@ -10,6 +10,8 @@ final class CanvasInputTests: XCTestCase {
     private final class Tool: CanvasTool {
         let id = "test.input"
         var inputMode: CanvasInputMode = .samples
+        var cancellations = 0
+        func touchesCancelled(host: CanvasHost) { cancellations += 1 }
         var taps = 0
         var longPresses = 0
         var beganIDs: [Int] = []
@@ -66,6 +68,55 @@ final class CanvasInputTests: XCTestCase {
         harness.app.content.tapHandlers.register(TapHandlerDescriptor(id: id, owner: "test", gesture: gesture, command: id,
                                                                       order: order, itemKinds: kinds, drawKeys: keys,
                                                                       worksInReadOnly: readOnly))
+    }
+
+    func testMixedContactsKeepOneSampleToolOwner() {
+        XCTAssertFalse(TouchTap().requiresExclusiveTouchType)
+        let harness = Harness(), tool = Tool()
+        let host = FakeCanvasHost(harness)
+        let router = router(host, tool: tool)
+        let finger = sample(id: 1), pencil = sample(pencil: true, id: 2)
+        router.begin(finger, route: .rejected)
+        router.begin(pencil, route: .tool(tool))
+        router.begin(sample(id: 3), route: .tool(tool))
+        router.move([sample(id: 3)])
+        router.cancel(1)
+        router.cancel(3)
+        router.move([pencil])
+        _ = router.end(pencil)
+        XCTAssertEqual(tool.beganIDs, [2])
+        XCTAssertEqual(tool.moved.map(\.touchID), [2])
+        XCTAssertEqual(tool.endedIDs, [2])
+        XCTAssertEqual(tool.cancellations, 0)
+    }
+
+    func testBufferedFingerCannotOverwritePencilOrCancelItsGesture() {
+        let harness = Harness(), tool = Tool()
+        let host = FakeCanvasHost(harness)
+        let router = router(host, tool: tool)
+        let finger = sample(id: 1), pencil = sample(pencil: true, id: 2)
+        router.begin(finger, route: .tool(tool))
+        _ = router.end(finger)
+        router.begin(pencil, route: .tool(tool))
+        router.releaseBufferedSamples(1)
+        router.cancel(1)
+        _ = router.end(pencil)
+        router.begin(sample(id: 3), route: .tool(tool))
+        router.releaseBufferedSamples(3)
+        _ = router.end(sample(id: 3))
+        XCTAssertEqual(tool.beganIDs, [2, 3])
+        XCTAssertEqual(tool.endedIDs, [2, 3])
+        XCTAssertEqual(tool.cancellations, 0)
+    }
+
+    func testNativeToolCancellationStillReachesHeldStroke() {
+        let harness = Harness(), tool = Tool()
+        tool.inputMode = .pencilKit
+        let host = FakeCanvasHost(harness), contact = sample(pencil: true)
+        let router = router(host, tool: tool)
+        router.begin(contact, route: .tool(tool))
+        router.cancel(contact.touchID)
+        XCTAssertEqual(tool.cancellations, 1)
     }
 
     func testAttachmentClaimWinsBeforeHandlersAndToolAndKeepsTouchID() async {
@@ -1051,6 +1102,24 @@ final class CanvasInputTests: XCTestCase {
         input.end(second)
         XCTAssertFalse(harness.session.inking.isInking)
         XCTAssertEqual(tool.taps, 0)
+    }
+
+    func testSecondFingerStillCancelsAnOwnedSampleGestureForNavigation() throws {
+        let tool = Tool()
+        let (_, editor, input) = try installed(tool, stylusMode: .anyInput)
+        defer { editor.closeCanvas() }
+        let first = event(editor.host, id: 501, pencil: false)
+        input.begin(first, screenPoint: first.location, route: .tool(tool))
+        let moved = event(editor.host, id: 501, pencil: false, point: Point(180, 220))
+        input.move([moved], screenPoint: moved.location, id: 501)
+        XCTAssertEqual(tool.beganIDs, [501])
+        let second = event(editor.host, id: 502, pencil: false)
+        input.begin(second, screenPoint: second.location, route: .tool(tool))
+        XCTAssertEqual(tool.cancellations, 1)
+        input.end(moved)
+        input.end(second)
+        XCTAssertTrue(tool.endedIDs.isEmpty)
+        XCTAssertEqual(tool.beganIDs, [501])
     }
 
     func testControllerRejectedPalmBeforePencilDoesNotBlockOrCancelWriting() throws {

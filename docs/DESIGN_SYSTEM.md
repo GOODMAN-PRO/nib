@@ -9594,7 +9594,8 @@ extension View { func nibTooltip(_ text: String) -> some View }   // Components/
 extension NibToolPalette {
     init(id:tools:moreTools:selection:swatches:swatch:dock:allowedEdges:reservedTrailing:
          toolOptions: @escaping (String) -> NibToolOptions?, settingsPresented: Binding<Bool>? = nil,
-         morePresented: Binding<Bool>? = nil, onReselect: ((String) -> Void)? = nil,
+         morePresented: Binding<Bool>? = nil, optionsState: ((String) -> NibToolOptionsState)? = nil,
+         onReselect: ((String) -> Void)? = nil,
          @ViewBuilder settings: @escaping (String) -> Settings)
 }
 // Components/NibToolOptions.swift

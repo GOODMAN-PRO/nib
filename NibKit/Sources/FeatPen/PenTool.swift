@@ -261,32 +261,52 @@ final class PenTool: CanvasTool {
                 await state.recognition?.value
                 if let result = state.result {
                     let shape = PenShapeAdjustment.adjust(result.shape, grab: state.grab, current: state.current)
+                    let group = NibID.make().raw
+                    var command = CommandIDs.shapeRecognize
                     do {
-                        let group = NibID.make().raw
-                        // Create first so a failed creation preserves both the stroke and every neighbour.
-                        let created = try await app.bus.execute(Invocation(command: CommandIDs.shapeCreate,
-                            params: try PenShapeResult.createParams(shape, doc: doc, page: state.page), session: session, group: group))
-                        if !result.mergeWith.isEmpty {
-                            do {
-                                _ = try await app.bus.execute(Invocation(command: CommandIDs.itemDelete,
-                                    params: ["refs": .array(result.mergeWith.map(JSONValue.string))], session: session, group: group))
-                            } catch {
-                                Self.report(error, command: CommandIDs.itemDelete, app: app)
-                                if app.bus.history.entries(doc).last?.group == group {
-                                    _ = try await app.bus.execute(CommandIDs.undo,
-                                        ["doc": .string(NodeRef.document(doc).description)], session: session)
-                                } else if let ref = created.value["ref"]?.stringValue {
-                                    _ = try await app.bus.execute(CommandIDs.itemDelete,
-                                        ["refs": .array([.string(ref)])], session: session)
-                                }
-                                await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session, host: host)
+                        // Avoid creating obsolete geometry at all when the hold's snapshot is already stale.
+                        // The atomic replacement checks again after any suspending command hooks.
+                        guard result.mergeWith.allSatisfy({ ref in
+                            guard let expected = result.mergeRevisions[ref],
+                                  case let .item(d, p, id)? = NodeRef(ref),
+                                  let item = try? app.workspace.item(d, page: p, id: id) else { return false }
+                            return item.rev == expected
+                        }) else {
+                            throw NibError(.conflict, String(localized: "A nearby shape changed. Your original stroke was kept."))
+                        }
+                        if !result.mergeWith.isEmpty, app.commands.entry(CommandIDs.itemDelete) == nil {
+                            throw NibError(.unavailable, String(localized: "Could not join nearby shapes. Your original stroke was kept."))
+                        }
+                        if result.mergeWith.isEmpty {
+                            command = CommandIDs.shapeCreate
+                            _ = try await app.bus.execute(Invocation(command: command,
+                                params: try PenShapeResult.createParams(shape, doc: doc, page: state.page), session: session, group: group))
+                        } else {
+                            command = CommandIDs.itemDelete
+                            let joined = try await app.bus.execute(Invocation(command: command,
+                                params: ["refs": .array(result.mergeWith.map(JSONValue.string)),
+                                         "expectedRevisions": try JSONValue.from(result.mergeRevisions),
+                                         "replacementShape": try JSONValue.from(shape)],
+                                session: session, group: group))
+                            let deleted = Set((joined.value["deleted"]?.arrayValue ?? []).compactMap(\.stringValue))
+                            guard Set(result.mergeWith).isSubset(of: deleted), joined.value["replacementRef"]?.stringValue != nil else {
+                                throw NibError(.conflict, String(localized: "Could not join nearby shapes. Your original stroke was kept."))
                             }
                         }
                     } catch {
-                        Self.report(error, command: CommandIDs.shapeCreate, app: app)
-                        await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session, host: host)
+                        let failure = NibError.wrap(error)
+                        Self.report(failure.code == .conflict
+                            ? NibError(.conflict, String(localized: "A nearby shape changed. Your original stroke was kept."))
+                            : failure, command: command, app: app)
+                        await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session,
+                                            host: host, preview: layer)
+                        return
                     }
-                } else { await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session, host: host) }
+                } else {
+                    await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session,
+                                        host: host, preview: layer)
+                    return
+                }
                 if let host { host.afterNextRender(page: state.page) { layer?.removeFromSuperlayer() } }
                 else { layer?.removeFromSuperlayer() }
             }
@@ -397,22 +417,43 @@ final class PenTool: CanvasTool {
     }
 
     private static func preserve(_ stroke: Stroke, page: PageID, doc: DocumentID, app: NibApp,
-                                 session: EditorSession, host: CanvasHost?) async {
-        if let host { host.commitStroke(stroke, page: page); return }
+                                 session: EditorSession, host: CanvasHost?, preview: CALayer?) async {
+        if let host {
+            let outcome = await withCheckedContinuation { (continuation: CheckedContinuation<Result<ElementID?, NibError>, Never>) in
+                host.commitStroke(stroke, page: page) { continuation.resume(returning: $0) }
+            }
+            switch outcome {
+            case .success:
+                host.afterNextRender(page: page) { preview?.removeFromSuperlayer() }
+            case .failure(let error):
+                report(error, command: CommandIDs.inkAddStrokes, app: app)
+                await retainFailed(stroke, page: page, doc: doc, app: app, session: session, preview: preview)
+            }
+            return
+        }
         var processed = stroke
         for entry in app.content.strokeProcessors.all {
-            guard entry.processor.process(&processed, page: page, session: session) else { return }
+            guard entry.processor.process(&processed, page: page, session: session) else {
+                preview?.removeFromSuperlayer()
+                return
+            }
         }
         do {
             _ = try await app.bus.execute(CommandIDs.inkAddStrokes,
                 ["page": .string(NodeRef.page(doc, page).description), "strokes": .array([try JSONValue.from(processed)])], session: session)
-        } catch { report(error, command: CommandIDs.inkAddStrokes, app: app) }
+            preview?.removeFromSuperlayer()
+        } catch {
+            report(error, command: CommandIDs.inkAddStrokes, app: app)
+            await retainFailed(processed, page: page, doc: doc, app: app, session: session,
+                               preview: preview, processed: true)
+        }
     }
 }
 
 struct PenShapeResult {
     var shape: ShapeItem
     var mergeWith: [String]
+    var mergeRevisions: [String: Rev]
     var confidence: Double?
 
     static func parse(_ json: JSONValue, ink: InkStyle, doc: DocumentID, page: PageID) throws -> PenShapeResult? {
@@ -431,7 +472,8 @@ struct PenShapeResult {
             if case let .item(d, p, _)? = NodeRef(ref) { return d == doc && p == page }
             return false
         }) else { throw NibError.invalid("merged shapes must be item refs on the drawing page", path: "$.mergeWith") }
-        return PenShapeResult(shape: shape, mergeWith: Array(Set(refs)).sorted(), confidence: confidence)
+        let revisions = try json["mergeRevisions"]?.decode([String: Rev].self) ?? [:]
+        return PenShapeResult(shape: shape, mergeWith: Array(Set(refs)).sorted(), mergeRevisions: revisions, confidence: confidence)
     }
 
     static func createParams(_ shape: ShapeItem, doc: DocumentID, page: PageID) throws -> JSONValue {

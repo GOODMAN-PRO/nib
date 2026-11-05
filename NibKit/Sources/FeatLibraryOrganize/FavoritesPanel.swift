@@ -54,6 +54,7 @@ struct FavoritesPanel: View {
     let window: OrganizeWindow
     @StateObject private var library: LibraryWatch
     @ObservedObject private var index: PageIndex
+    @State private var indexConsumer = UUID()
     @State private var customising: FolderID? = nil
     @Environment(\.horizontalSizeClass) private var sizeClass
 
@@ -93,7 +94,8 @@ struct FavoritesPanel: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(NibColor.background)
-        .onAppear { library.reload() }
+        .onAppear { library.reload(); index.attach(indexConsumer) }
+        .onDisappear { index.detach(indexConsumer) }
         .nibSheet(isPresented: Binding(get: { customising != nil }, set: { if !$0 { customising = nil } })) {
             if let folder = customising {
                 FolderStyleSheet(window: window, mode: .edit(folder), onDone: { customising = nil })

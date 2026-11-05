@@ -1887,6 +1887,145 @@ final class FeatCreateTests: XCTestCase {
         }
     }
 
+    func testProductionNotebookSheetShowsPaperAndCueAndClearsFinalCoverLabel() async throws {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                let h = harness()
+                for index in 0..<8 {
+                    h.app.content.templates.register(TemplateDefinition(id: "cover.review.\(index)",
+                        title: index == 7 ? "Oxblood" : "Cover \(index)", category: "Covers", isCover: true,
+                        owner: "builtin") { _, _, _ in TemplateRender(paper: .white) })
+                }
+                let options = NewNotebookModel(app: h.app, folder: nil, kind: .notebook,
+                                               session: h.session, navigator: nil)
+                let lastCover = try XCTUnwrap(options.covers.last)
+                let firstPaper = try XCTUnwrap(options.papersInGroup.first)
+                var frames: [String: CGRect] = [:]
+                let sheet = NewNotebookSheet(app: h.app, folder: nil, kind: .notebook,
+                    session: h.session, navigator: nil, idiom: .pad, onDone: {})
+                    .onPreferenceChange(NotebookLayoutFrames.self) { frames = $0 }
+                    .environment(\.notebookLayoutDiagnostics, true)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .environment(\.colorScheme, variant.colorScheme)
+                    .environment(\.dynamicTypeSize, .large)
+                    .ignoresSafeArea()
+                let host = UIHostingController(rootView: sheet)
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                func settle() async throws {
+                    for _ in 0..<10 {
+                        host.view.setNeedsLayout()
+                        host.view.layoutIfNeeded()
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
+                }
+                func scrollViews(_ view: UIView) -> [UIScrollView] {
+                    ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap(scrollViews)
+                }
+                try await settle()
+                let sheetFrame = try XCTUnwrap(frames["sheet"])
+                let viewport = try XCTUnwrap(frames["viewport"])
+                let paper = try XCTUnwrap(frames["paper." + firstPaper.id])
+                let preview = try XCTUnwrap(frames["preview"])
+                let cue = try XCTUnwrap(frames["cue"], "Overflow must announce more options")
+                XCTAssertGreaterThan(sheetFrame.height, NibMetrics.newDocumentSheetSize.height)
+                XCTAssertGreaterThan(paper.height, NibMetrics.paperTileSize.height)
+                XCTAssertLessThanOrEqual(paper.maxY, viewport.maxY - NibSpacing.l + 1,
+                    "The first paper tile and label must clear the bottom fade on opening")
+                XCTAssertGreaterThan(paper.minY, preview.maxY)
+                XCTAssertTrue(sheetFrame.contains(cue))
+                XCTAssertGreaterThanOrEqual(cue.minY, viewport.maxY)
+                XCTAssertFalse(cue.intersects(try XCTUnwrap(frames["documentType"])))
+                let verticals = scrollViews(host.view).filter { $0.contentSize.height > $0.bounds.height + 1 }
+                XCTAssertEqual(verticals.count, 1, "The production sheet has one vertical form scroll")
+                let vertical = try XCTUnwrap(verticals.first)
+                XCTAssertEqual(vertical.contentOffset.y, 0, accuracy: 1,
+                    "The continuation cue must not add a changing top inset")
+                let strip = try XCTUnwrap(frames["coverStrip"])
+                let horizontal = try XCTUnwrap(scrollViews(host.view).first {
+                    $0.contentSize.width > $0.bounds.width + 1
+                        && abs($0.convert($0.bounds, to: window).minY - strip.minY) < 2
+                })
+                horizontal.setContentOffset(CGPoint(x: horizontal.contentSize.width - horizontal.bounds.width
+                    + horizontal.adjustedContentInset.right, y: horizontal.contentOffset.y), animated: false)
+                try await settle()
+                let finalCover = try XCTUnwrap(frames["cover." + lastCover.id])
+                let finalStrip = try XCTUnwrap(frames["coverStrip"])
+                XCTAssertGreaterThanOrEqual(finalCover.minX, finalStrip.minX)
+                XCTAssertLessThanOrEqual(finalCover.maxX, finalStrip.maxX - NibSpacing.l + 0.5,
+                    "The final cover name must clear the entire trailing fade")
+                XCTAssertGreaterThan(finalCover.height, NibMetrics.coverStripSize.height)
+                let resting = vertical.contentOffset.y
+                vertical.setContentOffset(CGPoint(x: vertical.contentOffset.x, y: resting + 100), animated: false)
+                try await settle()
+                XCTAssertEqual(preview.minY - (try XCTUnwrap(frames["preview"])).minY, 100, accuracy: 1)
+            }
+        }
+    }
+
+    func testProductionScrollCueNeverOverlapsDocumentTypeOrChangesViewport() async throws {
+        for typeSize in [DynamicTypeSize.large, .accessibility5] {
+            for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+                let h = harness()
+                var frames: [String: CGRect] = [:]
+                let sheet = NewNotebookSheet(app: h.app, folder: nil, kind: .notebook,
+                    session: h.session, navigator: nil, idiom: .pad, onDone: {})
+                    .environment(\.notebookLayoutDiagnostics, true)
+                    .onPreferenceChange(NotebookLayoutFrames.self) { frames = $0 }
+                    .environment(\.dynamicTypeSize, typeSize)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .ignoresSafeArea()
+                let host = UIHostingController(rootView: sheet)
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                func settle() async throws {
+                    for _ in 0..<10 {
+                        host.view.setNeedsLayout()
+                        host.view.layoutIfNeeded()
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
+                }
+                func scrollViews(_ view: UIView) -> [UIScrollView] {
+                    ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap(scrollViews)
+                }
+                try await settle()
+                let viewport = try XCTUnwrap(frames["viewport"])
+                let cue = try XCTUnwrap(frames["cue"])
+                let type = try XCTUnwrap(frames["documentType"])
+                XCTAssertTrue(viewport.contains(type), "The document-type control must be fully visible on opening")
+                XCTAssertFalse(cue.intersects(type), "The cue must not cover any part of the document-type control")
+                XCTAssertGreaterThanOrEqual(cue.minY, viewport.maxY)
+                let scroll = try XCTUnwrap(scrollViews(host.view).first { $0.contentSize.height > $0.bounds.height + 1 })
+                XCTAssertEqual(scroll.contentOffset.y, 0, accuracy: 1)
+                let inset = scroll.adjustedContentInset
+                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: 100), animated: false)
+                try await settle()
+                XCTAssertEqual(type.minY - (try XCTUnwrap(frames["documentType"])).minY, 100, accuracy: 1)
+                XCTAssertFalse(cue.intersects(try XCTUnwrap(frames["documentType"])))
+                // Reach the end and return: hiding/showing the cue must not alter layout or insets.
+                let end = scroll.contentSize.height - scroll.bounds.height + inset.bottom
+                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: end), animated: false)
+                try await settle()
+                XCTAssertEqual(scroll.contentOffset.y, end, accuracy: 1)
+                XCTAssertEqual(frames["viewport"], viewport)
+                XCTAssertEqual(frames["cue"], cue)
+                XCTAssertEqual(scroll.adjustedContentInset, inset)
+                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: 0), animated: false)
+                try await settle()
+                XCTAssertEqual(frames["viewport"], viewport)
+                XCTAssertEqual(frames["cue"], cue)
+                XCTAssertEqual((try XCTUnwrap(frames["documentType"])).minY, type.minY, accuracy: 1)
+                XCTAssertEqual(scroll.contentOffset.y, 0, accuracy: 1)
+            }
+        }
+    }
+
     func testFormViewportShowsPreviewThenCoverChoicesBeforePaper() async throws {
         for size in [CGSize(width: 720, height: 560), CGSize(width: 720, height: 520),
                      CGSize(width: 402, height: 720), CGSize(width: 320, height: 520)] {
@@ -2027,6 +2166,7 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertGreaterThan(categoryFrame.minY, formFrame.maxY,
                                      "Tall cover controls must remain before Paper, without a separate viewport")
                 let region = try XCTUnwrap(regions.first)
+                let viewport = region.convert(region.bounds, to: window)
                 let initialFormY = formFrame.minY
                 let initialCategoryY = categoryFrame.minY
                 let offset = initialCategoryY - NibSpacing.m
@@ -2045,7 +2185,7 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertEqual(categoryFrame.minY, NibSpacing.m, accuracy: 1)
                 XCTAssertGreaterThanOrEqual(tileFrame.minY, categoryFrame.maxY)
                 XCTAssertGreaterThanOrEqual(tileFrame.height, NibMetrics.paperTileSize.height)
-                XCTAssertLessThan(tileFrame.maxY, size.height - NibSpacing.l,
+                XCTAssertLessThan(tileFrame.maxY, viewport.maxY - NibSpacing.l,
                                   "The entire first tile and its name must be above the continuation fade")
                 XCTAssertGreaterThanOrEqual(categoryFrame.minX, NibSpacing.l)
                 XCTAssertLessThanOrEqual(categoryFrame.maxX, size.width - NibSpacing.l)
@@ -2057,7 +2197,7 @@ final class FeatCreateTests: XCTestCase {
                 let background = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 1, y: size.height - 1)))
                 func contrast(at distance: CGFloat) throws -> Int {
                     let pixel = try XCTUnwrap(NibSnapshot.pixel(image,
-                        at: CGPoint(x: size.width / 2, y: size.height - distance)))
+                        at: CGPoint(x: size.width / 2, y: viewport.maxY - distance)))
                     return abs(Int(pixel.r) - Int(background.r))
                         + abs(Int(pixel.g) - Int(background.g)) + abs(Int(pixel.b) - Int(background.b))
                 }
@@ -2071,6 +2211,49 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertGreaterThan(fadeStart, fadeMiddle)
                 XCTAssertGreaterThan(fadeMiddle, fadeEnd)
                 XCTAssertLessThan(fadeEnd, solid / 4)
+            }
+        }
+    }
+
+    func testMaximumCustomDimensionsFitA375PointViewportAtAccessibility5() async throws {
+        let h = harness()
+        h.app.settings.set(NibSettings.defaultPageSize, PageSize(14_400, 14_400))
+        let size = CGSize(width: 375, height: 667)
+        for scheme in [ColorScheme.light, .dark] {
+            let sheet = NewNotebookSheet(app: h.app, folder: nil, kind: .notebook, session: h.session,
+                                         navigator: nil, onDone: {})
+                .environment(\.dynamicTypeSize, .accessibility5)
+                .environment(\.colorScheme, scheme)
+            let host = UIHostingController(rootView: sheet.ignoresSafeArea())
+            let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            for _ in 0..<5 {
+                host.view.setNeedsLayout()
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            func fields(in view: UIView) -> [UITextField] {
+                ((view as? UITextField).map { [$0] } ?? []) + view.subviews.flatMap { fields(in: $0) }
+            }
+            let dimensions = fields(in: host.view).filter { $0.keyboardType == .decimalPad }
+            XCTAssertEqual(dimensions.count, 2)
+            for field in dimensions {
+                var ancestor = field.superview
+                while let view = ancestor, !(view is UIScrollView) { ancestor = view.superview }
+                let scroll = try XCTUnwrap(ancestor as? UIScrollView)
+                let bounds = scroll.convert(scroll.bounds, to: window)
+                let frame = field.convert(field.bounds, to: window)
+                XCTAssertGreaterThanOrEqual(frame.minX, bounds.minX)
+                XCTAssertLessThanOrEqual(frame.maxX, bounds.maxX)
+                let text = try XCTUnwrap(field.text)
+                let font = try XCTUnwrap(field.font)
+                XCTAssertGreaterThanOrEqual(text.filter(\.isNumber).count, 4, "Both maximum dimensions must remain populated")
+                XCTAssertLessThanOrEqual((text as NSString).size(withAttributes: [.font: font]).width,
+                                         field.textRect(forBounds: field.bounds).width,
+                                         "The entire dimension must fit without horizontal text scrolling")
             }
         }
     }
