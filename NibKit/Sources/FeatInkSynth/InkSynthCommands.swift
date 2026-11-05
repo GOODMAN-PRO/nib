@@ -310,6 +310,23 @@ struct HandwritingReplaceWord: NibCommand {
                     throw NibError.invalid("\(NodeRef.item(doc, page, item.id).description) is locked", path: "$.refs")
                 }
             }
+            // Release dependents in the same undo step, preserving connector endpoints.
+            var released: [Item] = []
+            for item in try tx.items(doc, page: page) where !replacing.contains(item.id) {
+                var next = item
+                if let parent = next.attachedTo, replacing.contains(parent) { next.attachedTo = nil }
+                if var connector = next.connector {
+                    if let id = connector.from.item, replacing.contains(id) {
+                        connector.from = ConnectorEnd(point: connector.from.point)
+                    }
+                    if let id = connector.to.item, replacing.contains(id) {
+                        connector.to = ConnectorEnd(point: connector.to.point)
+                    }
+                    next.connector = connector
+                }
+                if next != item { released.append(next) }
+            }
+            try tx.put(released, doc: doc, page: page)
             try tx.delete(items: items.map { $0.id }, doc: doc, page: page)
             return try InkSynthParams.write(layout.strokes, ids: ids, layer: layer, doc: doc, page: page, tx: tx)
         }

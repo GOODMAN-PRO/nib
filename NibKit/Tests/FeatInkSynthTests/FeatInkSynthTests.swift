@@ -222,6 +222,37 @@ final class FeatInkSynthTests: XCTestCase {
 
     // MARK: handwriting.replaceWord
 
+    func testReplaceWordReleasesAttachmentsAndConnectorEndsInItsUndoStep() async throws {
+        let h = Harness(features: [FeatInkSynthFeature.self])
+        let old = try await seedWord(h, "hello", style: InkStyle())
+        let parent = try XCTUnwrap(old.first).id
+        var child = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        child.id = "WORDNOTE"
+        child.attachedTo = parent
+        var connector = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.connectorID)
+        connector.id = "WORDLINK"
+        connector.connector?.from.item = parent
+        connector.connector?.to.item = parent
+        _ = try await h.insert([child, connector], page: Fixtures.page2)
+        let before = try h.snapshot()
+        try await h.run(CommandIDs.handwritingReplaceWord,
+                        ["refs": .array(old.map { .string(ref(Fixtures.page2, $0.id)) }), "text": "help"])
+        let note = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: child.id)
+        let link = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: connector.id)
+        XCTAssertNil(note.attachedTo)
+        XCTAssertNil(link.connector?.from.item)
+        XCTAssertNil(link.connector?.to.item)
+        XCTAssertEqual(link.connector?.from.point, connector.connector?.from.point)
+        XCTAssertEqual(link.connector?.to.point, connector.connector?.to.point)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        // A later edit of the released child must still pass attachment validation.
+        var moved = note
+        moved.sticky?.frame.x += 1
+        _ = try await h.insert([moved], page: Fixtures.page2)
+    }
+
     func testReplaceWordMatchesPenColourLayerAndPlacementAsOneUndoStep() async throws {
         let h = Harness(features: [FeatInkSynthFeature.self])
         let style = InkStyle(tool: .pen, pen: .ball, color: RGBA(0xD1, 0x3B, 0x2F), width: 1.6)

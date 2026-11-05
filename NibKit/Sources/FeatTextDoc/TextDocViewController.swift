@@ -1069,8 +1069,12 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     /// Renames the document after the first line once typing pauses (`titleDebounce`), or right away (`after: 0`:
     /// on open, when the title's block loses the caret, when the editor closes).
     private func scheduleTitleUpdate(after delay: TimeInterval? = nil) {
-        guard autoTitle, let derived = TextDocTitle.derive(from: blocks), derived != expectedTitle,
-              derived != requestedTitle else { return }
+        guard autoTitle, let derived = TextDocTitle.derive(from: blocks) else { return }
+        if derived == expectedTitle {
+            titleTask?.cancel()
+            return
+        }
+        guard derived != requestedTitle else { return }
         titleTask?.cancel()
         let wait = delay ?? titleDebounce
         if wait <= 0 {
@@ -1385,13 +1389,15 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
     }
 
     func textView(_ textView: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String) -> Bool {
-        guard let tv = textView as? BlockTextView, let id = tv.blockID, let block = byID[id] else { return true }
+        guard let tv = textView as? BlockTextView else { return true }
+        let softBreak = tv.softBreakPending
+        tv.softBreakPending = false
+        guard let id = tv.blockID, let block = byID[id] else { return true }
         guard !isReadOnly else { return false }
         let change = TextDocTextChange(block: block, isCaption: tv.role == .caption, textView: tv, range: range, replacement: text)
         for hook in TextDocHooks.textInterceptors where hook.value(change, self) { return false }
         guard text == "\n", tv.markedTextRange == nil else { return true }
-        if tv.softBreakPending {
-            tv.softBreakPending = false
+        if softBreak {
             if tv.role == .body { return true }
         }
         if tv.role == .caption {

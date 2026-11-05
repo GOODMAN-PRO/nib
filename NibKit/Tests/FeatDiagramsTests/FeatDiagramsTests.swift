@@ -555,6 +555,24 @@ final class FeatDiagramsTests: XCTestCase {
         XCTAssertEqual(link.from.side, ConnectorSide.right.rawValue)
     }
 
+    func testLosingConnectorSelectionDuringDragRestoresCanvas() {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let host = FakeCanvasHost(h)
+        let editor = ConnectorEditor(host: host)
+        editor.attach(to: host)
+        defer { editor.detach(from: host) }
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.connectorID])
+        editor.canvasDidChange(host)
+        editor.touchesBegan(CanvasSample(page: Fixtures.page1, location: Point(400, 190)), host: host)
+        editor.touchesMoved([CanvasSample(page: Fixtures.page1, location: Point(250, 390))], host: host)
+        XCTAssertEqual(host.hidden[Fixtures.page1], [Fixtures.connectorID])
+        h.session.selection = Selection()
+        editor.canvasDidChange(host)
+        XCTAssertNil(host.hidden[Fixtures.page1])
+        editor.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(250, 390)), host: host)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
     func testConnectorEditorDragsAnEndOntoAnotherItem() async throws {
         let h = Harness(features: [FeatDiagramsFeature.self])
         let host = FakeCanvasHost(h)

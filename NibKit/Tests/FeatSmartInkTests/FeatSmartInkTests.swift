@@ -482,7 +482,10 @@ final class FeatSmartInkTests: XCTestCase {
         model.tap(at: word.box.center, page: page, time: 100.2)
         XCTAssertEqual(model.selectedWord, s.words[4])
 
+        let originalIDs = Set(model.layout.ids)
         await model.deleteWord()
+        await model.reload()
+        XCTAssertEqual(Set(model.target?.ids ?? []), originalIDs)
         let after = try layout(h)
         var expected = s.words
         expected.remove(at: 4)
@@ -494,6 +497,10 @@ final class FeatSmartInkTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(doc), 1, "reflow and delete are one undo step")
         h.app.bus.undo(doc)
         XCTAssertEqual(try h.snapshot(), before)
+        await model.reload()
+        XCTAssertEqual(Set(model.layout.ids), originalIDs)
+        model.finish()
+        XCTAssertEqual(Set(h.session.selection.items), originalIDs)
         tool.deactivate(host)
     }
 
@@ -542,6 +549,11 @@ final class FeatSmartInkTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(doc), 1, "paste and reflow are one undo step")
         h.app.bus.undo(doc)
         XCTAssertEqual(try h.snapshot(), before)
+        await model.reload()
+        XCTAssertEqual(Set(model.layout.ids), Set(s.ids))
+        XCTAssertTrue(h.app.bus.redo(doc))
+        await model.reload()
+        XCTAssertEqual(Set(model.layout.ids), Set(s.ids + pasted))
         tool.deactivate(host)
     }
 

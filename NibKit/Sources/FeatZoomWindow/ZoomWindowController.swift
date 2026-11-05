@@ -98,6 +98,7 @@ final class ZoomWindowController: ObservableObject {
     }
 
     func detach() {
+        writing?.finishToolUse()
         removeOptions()
         commits?.cancel()
         commits = nil
@@ -128,6 +129,7 @@ final class ZoomWindowController: ObservableObject {
             configureWriting()
             scheduleRender()
         } else {
+            writing?.finishToolUse()
             removeOptions()
             renderTask?.cancel()
             // A hidden pane renders nothing, so its wet ink would go stale; its commits land on the page regardless,
@@ -166,6 +168,7 @@ final class ZoomWindowController: ObservableObject {
     func paneDisappeared() {
         paneAppearances = max(0, paneAppearances - 1)
         guard paneAppearances == 0 else { return }
+        writing?.finishToolUse()
         removeOptions()
         renderTask?.cancel()
         clearWet()
@@ -234,13 +237,14 @@ final class ZoomWindowController: ObservableObject {
         let w = ZoomWritingView(frame: .zero)
         w.onStroke = { [weak self] pk in self?.captured(pk) ?? false }
         w.onErase = { [weak self] points in self?.erase(points) }
+        w.onToolEnded = { [weak self] in self?.scheduleRender() }
         writing = w
         configureWriting()
         return w
     }
 
     private func clearWet() {
-        writing?.dropWet(Int.max)
+        writing?.clearWet()
         landed = 0
         inFlight = 0
         wetGeneration += 1
@@ -465,8 +469,9 @@ final class ZoomWindowController: ObservableObject {
                 let result = try await renderer.render(request)
                 guard !Task.isCancelled, let self else { return }
                 self.writing?.show(UIImage(cgImage: result.image, scale: CGFloat(screen), orientation: .up), region: result.region)
-                self.writing?.dropWet(drop)
-                self.landed = max(0, self.landed - drop)
+                if self.writing?.dropWet(drop) == true {
+                    self.landed = max(0, self.landed - drop)
+                }
             } catch {
                 ZoomWindowController.log.error("zoom pane render failed: \(String(describing: error), privacy: .public)")
             }
@@ -1052,6 +1057,10 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
     /// A finished stroke; return false when it was not saved, and its wet ink is removed.
     var onStroke: ((PKStroke) -> Bool)?
     var onErase: (([CGPoint]) -> Void)?
+    var onToolEnded: (() -> Void)?
+    private(set) var isUsingTool = false
+    private var pendingRemovals = Set<Int>()
+    private var clearingWet = false
     private let eraser = UILongPressGestureRecognizer()
     private let halo = CAShapeLayer()
     private let ring = CAShapeLayer()
@@ -1062,6 +1071,8 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
     private var region: Rect?
     private var knownStrokes = 0
     private var ignoresChanges = false
+    /// Compare requested fields, since PencilKit may normalise the canvas tool's width.
+    private var configuredTool: PKInkingTool?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1113,14 +1124,36 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
         return nil
     }
 
-    var wetCount: Int { canvas.drawing.strokes.count }
+    var wetCount: Int { canvas.drawing.strokes.count - pendingRemovals.count }
 
-    func configure(box: Rect, pageSize: PageSize, tool: PKTool, erasing: Bool, policy: PKCanvasViewDrawingPolicy,
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { finishToolUse() }
+    }
+
+    /// PencilKit may omit its end callback when hidden or interrupted by a tool switch. Capture any final stroke
+    /// before clearing deferred wet ink, and release the render gate just as a normal lift does.
+    func finishToolUse() {
+        guard isUsingTool else { return }
+        canvasViewDidEndUsingTool(canvas)
+    }
+
+    func configure(box: Rect, pageSize: PageSize, tool: PKInkingTool, erasing: Bool, policy: PKCanvasViewDrawingPolicy,
                    fingersDraw: Bool, eraserDiameter: CGFloat, showsZone: Bool) {
+        let toolChanged: Bool
+        if let current = configuredTool {
+            toolChanged = current.inkType != tool.inkType || current.color != tool.color || current.width != tool.width
+        } else {
+            toolChanged = true
+        }
+        if toolChanged || eraser.isEnabled != erasing || canvas.drawingPolicy != policy { finishToolUse() }
         self.box = box
         self.pageSize = pageSize
         self.eraserDiameter = eraserDiameter
-        canvas.tool = tool
+        if toolChanged {
+            canvas.tool = tool
+            configuredTool = tool
+        }
         canvas.drawingPolicy = policy
         canvas.drawingGestureRecognizer.isEnabled = !erasing
         eraser.isEnabled = erasing
@@ -1140,20 +1173,40 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
         setNeedsLayout()
     }
 
-    /// Removes the oldest `n` wet strokes (their dry ink is in the render now).
-    func dropWet(_ n: Int) {
+    /// Removes the oldest `n` wet strokes only when replacing the drawing cannot interrupt capture.
+    @discardableResult
+    func dropWet(_ n: Int) -> Bool {
+        guard !isUsingTool else { return false }
         let strokes = canvas.drawing.strokes
         let k = min(max(n, 0), strokes.count)
-        guard k > 0 else { return }
-        replaceWet(Array(strokes.dropFirst(k)))
+        if k > 0 { replaceWet(Array(strokes.dropFirst(k))) }
+        return true
     }
 
-    /// Removes the wet stroke at `index` (oldest first): its commit failed, so it must not look saved.
+    /// Failed strokes leave the logical wet list immediately, but the live PKDrawing stays intact until lift.
     func removeWet(at index: Int) {
-        var strokes = canvas.drawing.strokes
-        guard strokes.indices.contains(index) else { return }
-        strokes.remove(at: index)
-        replaceWet(strokes)
+        let strokes = canvas.drawing.strokes
+        let live = strokes.indices.filter { !pendingRemovals.contains($0) }
+        guard live.indices.contains(index) else { return }
+        let physical = live[index]
+        if isUsingTool {
+            pendingRemovals.insert(physical)
+        } else {
+            var kept = strokes
+            kept.remove(at: physical)
+            replaceWet(kept)
+        }
+    }
+
+    /// A page change discards the old page's wet ink, including a stroke still being captured.
+    func clearWet() {
+        if isUsingTool {
+            clearingWet = true
+            pendingRemovals = Set(canvas.drawing.strokes.indices)
+        } else {
+            pendingRemovals = []
+            replaceWet([])
+        }
     }
 
     private func replaceWet(_ strokes: [PKStroke]) {
@@ -1199,24 +1252,36 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
             knownStrokes = strokes.count
             return
         }
-        var kept = Array(strokes.prefix(knownStrokes))
-        var refused = false
-        for s in strokes[knownStrokes...] {
-            if onStroke?(s) ?? false {
-                kept.append(s)
-            } else {
-                refused = true
-            }
+        for index in knownStrokes..<strokes.count {
+            if clearingWet || !(onStroke?(strokes[index]) ?? false) { pendingRemovals.insert(index) }
         }
-        if refused {
-            replaceWet(kept)                                 // a stroke that was not saved must not look saved
-        } else {
-            knownStrokes = strokes.count
-        }
+        knownStrokes = strokes.count
+        if !isUsingTool { removePendingWet() }
     }
 
-    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) { NibHaptics.isInking = true }
-    func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) { NibHaptics.isInking = false }
+    private func removePendingWet() {
+        guard !pendingRemovals.isEmpty || clearingWet else { return }
+        let kept: [PKStroke] = clearingWet ? [] : canvas.drawing.strokes.enumerated().compactMap { index, stroke in
+            pendingRemovals.contains(index) ? nil : stroke
+        }
+        pendingRemovals = []
+        clearingWet = false
+        replaceWet(kept)
+    }
+
+    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+        isUsingTool = true
+        NibHaptics.isInking = true
+    }
+
+    func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
+        // Account for a final drawing callback before removing failed strokes and adjusting knownStrokes.
+        canvasViewDrawingDidChange(canvasView)
+        isUsingTool = false
+        NibHaptics.isInking = false
+        removePendingWet()
+        onToolEnded?()
+    }
 
     // MARK: Eraser
 

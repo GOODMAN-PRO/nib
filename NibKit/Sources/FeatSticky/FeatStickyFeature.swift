@@ -54,7 +54,7 @@ public enum FeatStickyFeature: NibFeature {
         app.ui.inspectors.register(InspectorDescriptor(
             id: "sticky.inspector", title: title, icon: NibSymbol.sticky.name, itemKinds: [.sticky], order: 100,
             owner: id, makeView: { ctx in
-                AnyView(StickyInspector(context: ctx).id(ctx.items.map { $0.id.raw }.joined(separator: ",")))
+                AnyView(StickyInspector(context: ctx).id(StickyInspector.identity(ctx.items)))
             }))
 
         registerMenus(app)

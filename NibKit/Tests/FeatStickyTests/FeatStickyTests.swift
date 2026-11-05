@@ -557,6 +557,63 @@ final class FeatStickyTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
     }
 
+    func testInspectorIdentitySurvivesCommitsWhileControlsRefreshForExternalChangesAndUndo() async throws {
+        let h = harness()
+        func items() throws -> [Item] {
+            [try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)]
+        }
+        func controls() throws -> StickyInspector.Controls {
+            StickyInspector.Controls(try items().compactMap { $0.sticky })
+        }
+        let original = StickyInspector.identity(try items())
+        let originalRevision = StickyInspector.revisions(try items())
+        try await h.run("sticky.setCollapsed", ["refs": [.string(stickyRef)], "collapsed": true])
+        let collapsedRevision = StickyInspector.revisions(try items())
+        XCTAssertEqual(StickyInspector.identity(try items()), original, "commits must preserve picker and task state")
+        XCTAssertNotEqual(collapsedRevision, originalRevision)
+        XCTAssertTrue(try controls().collapsed)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(StickyInspector.identity(try items()), original)
+        XCTAssertNotEqual(StickyInspector.revisions(try items()), collapsedRevision)
+        XCTAssertFalse(try controls().collapsed)
+        let expandedRevision = StickyInspector.revisions(try items())
+        try await h.run("sticky.resolve", ["ref": .string(stickyRef), "resolved": true])
+        XCTAssertEqual(StickyInspector.identity(try items()), original)
+        XCTAssertNotEqual(StickyInspector.revisions(try items()), expandedRevision)
+        XCTAssertTrue(try controls().resolved)
+        try await h.run("sticky.setColor", ["refs": [.string(stickyRef)], "color": .string(StickyColour.sky.rgba.hex)])
+        XCTAssertEqual(StickyInspector.identity(try items()), original, "colour writes must not dismiss the picker")
+        XCTAssertNotEqual(StickyInspector.identity([]), original, "a changed selection still rebuilds the inspector")
+    }
+
+    func testInspectorControlsRefreshAllFormattingWithoutChangingText() {
+        var note = StickyItem(frame: Frame(x: 0, y: 0, w: 160, h: 160))
+        note.text = RichText(plain: "Remember")
+        let original = StickyInspector.Controls([note])
+        note.collapsed = true
+        note.resolved = true
+        note.text = StickyFormat.setting(.bold, true, in: note.text)
+        note.text = StickyFormat.setting(.italic, true, in: note.text)
+        note.text = StickyFormat.setting(.underline, true, in: note.text)
+        note.text = StickyFormat.setting(.strikethrough, true, in: note.text)
+        note.text = StickyFormat.resized(note.text, by: 3)
+        note.text = StickyFormat.aligned(note.text, .center)
+        let refreshed = StickyInspector.Controls([note])
+        XCTAssertTrue(refreshed.collapsed)
+        XCTAssertTrue(refreshed.resolved)
+        XCTAssertTrue(refreshed.bold)
+        XCTAssertTrue(refreshed.italic)
+        XCTAssertTrue(refreshed.underline)
+        XCTAssertTrue(refreshed.strikethrough)
+        XCTAssertEqual(refreshed.size, original.size + 3)
+        XCTAssertEqual(refreshed.alignment, .center)
+        XCTAssertEqual(note.text.plainText, "Remember")
+        XCTAssertFalse(original.bold)
+        XCTAssertFalse(original.italic)
+        XCTAssertFalse(original.underline)
+        XCTAssertFalse(original.strikethrough)
+    }
+
     func testInspectorFormattingKeepsTextChangedSinceItOpened() async throws {
         let h = harness()
         installTextStandIn(h)

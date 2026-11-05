@@ -688,7 +688,8 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         let sel = tv.selectedRange
         let a = PageTextLayout.spot(at: sel.location, in: s)
         let b = PageTextLayout.spot(at: NSMaxRange(sel), in: s)
-        let updated = op(currentRichText(), a.paragraph..<(b.paragraph + 1))
+        let last = sel.length > 0 && b.paragraph > a.paragraph && b.offset == 0 ? b.paragraph - 1 : b.paragraph
+        let updated = op(currentRichText(), a.paragraph..<(last + 1))
         if let last = updated.paragraphs.last { trailing = Self.shell(last) }
         install(RichTextBridge.attributed(updated, base: e.defaults), selection: (a, b))
         textChanged()

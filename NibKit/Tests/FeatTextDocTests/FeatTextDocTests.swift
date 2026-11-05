@@ -945,6 +945,39 @@ final class FeatTextDocTests: XCTestCase {
                      "entries see the block they are for")
     }
 
+    func testConsumedShiftReturnDoesNotAffectTheNextReturn() async throws {
+        let h = harness()
+        let editor = openEditor(h)
+        let tv = BlockTextView()
+        tv.blockID = Fixtures.paragraphBlockID
+        let style = BlockStyle.make(kind: .paragraph)
+        tv.style = style
+        tv.attributedText = style.attributed(RichText(plain: "Hello blocks"))
+        tv.softBreakPending = true
+        TextDocHooks.addTextInterceptor("test.consumeReturn", order: -100) { _, _ in true }
+        defer { TextDocHooks.removeAll(prefix: "test.consumeReturn") }
+        XCTAssertFalse(editor.textView(tv, shouldChangeTextIn: NSRange(location: 5, length: 0), replacementText: "\n"))
+        XCTAssertFalse(tv.softBreakPending)
+        TextDocHooks.removeAll(prefix: "test.consumeReturn")
+        XCTAssertFalse(editor.textView(tv, shouldChangeTextIn: NSRange(location: 5, length: 0), replacementText: "\n"))
+        await editor.flushEdits()
+        XCTAssertEqual(try block(h, "FIXTUREBLK02").text.plainText, "Hello")
+    }
+
+    func testReturningToTheCurrentFirstLineCancelsPendingRename() async throws {
+        let h = harness()
+        registerRename(h)
+        try h.library.rename(doc, to: "Fixture Text")
+        let editor = TextDocViewController(doc: doc, session: h.session, app: h.app)
+        editor.titleDebounce = 0.05
+        editor.loadViewIfNeeded()
+        try await h.run("block.update", ["ref": .string(heading), "text": "Fixture Text!"])
+        try await h.run("block.update", ["ref": .string(heading), "text": "Fixture Text"])
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(h.library.node(doc)?.title, "Fixture Text")
+        XCTAssertTrue(editor.followsFirstLine)
+    }
+
     func testTheNameFollowsTheFirstLineUntilTheUserRenamesTheDocument() async throws {
         let h = harness()
         registerRename(h)

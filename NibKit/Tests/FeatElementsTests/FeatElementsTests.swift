@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import ImageIO
 import SwiftUI
 import NibContracts
 import NibTesting
@@ -171,6 +172,23 @@ final class FeatElementsTests: XCTestCase {
         } catch let e as NibError {
             XCTAssertEqual(e.code, .invalidParams)
         }
+    }
+
+    func testImportingExportedPackKeepsTheReadOnlyPack() async throws {
+        let h = harness()
+        let fragment = try JSONValue.from(Self.box)
+        h.app.content.elementCollections.register(ElementCollectionDescriptor(id: "pack-x", title: "Pack", owner: "test") {
+            [ElementEntry(id: "box", title: "Box", fragment: fragment)]
+        })
+        let exported = try await h.run("element.export", ["collection": "pack-x"])
+        let asset = try XCTUnwrap(exported["asset"]?.stringValue)
+        let imported = try await h.run("element.import", ["url": .string(asset)])
+        let copy = try XCTUnwrap(imported["collection"]?.stringValue)
+        XCTAssertNotEqual(copy, "pack-x")
+        let list = try await h.run("element.collection.list")
+        let pack = try XCTUnwrap(list["collections"]?.arrayValue?.first { $0["id"] == "pack-x" })
+        XCTAssertEqual(pack["readOnly"], true)
+        XCTAssertEqual(try ElementCatalog(app: h.app).list(copy).elements.count, 1)
     }
 
     /// Acceptance: a collection exported as .nibcollection (zip) imports back with the same elements.
@@ -617,6 +635,51 @@ final class FeatElementsTests: XCTestCase {
     }
 
     // MARK: Popover behaviour
+
+    func testCollectionLoadsCannotOverwriteANewerSelectionOrItsLoadingState() async throws {
+        for newestFinishesFirst in [false, true] {
+            let h = harness()
+            let aStarted = expectation(description: "A suspended")
+            let bStarted = expectation(description: "B suspended")
+            var finishA: CheckedContinuation<Void, Never>?
+            var finishB: CheckedContinuation<Void, Never>?
+            h.app.bus.hooks.register(CommandHookDescriptor.guarding(id: "test.elements", owner: "test",
+                                                                   commands: ["element.list"]) { _, _, _ in nil })
+            h.app.commands.register(ElementListCommand.descriptor) { params, _ in
+                let collection = params["collection"]?.stringValue ?? ""
+                await withCheckedContinuation { continuation in
+                    if collection == "a" { finishA = continuation; aStarted.fulfill() }
+                    else { finishB = continuation; bStarted.fulfill() }
+                }
+                let info = ElementInfo(id: collection, collection: collection, title: collection,
+                                       kinds: [], itemCount: 1, size: [10, 10])
+                return ["collection": .string(collection), "title": .string(collection), "readOnly": false,
+                        "elements": .array([try JSONValue.from(info)]), "truncated": false]
+            }
+            let model = ElementsModel(app: h.app, session: h.session)
+            model.select("a")
+            await fulfillment(of: [aStarted], timeout: 2)
+            model.select("b")
+            await fulfillment(of: [bStarted], timeout: 2)
+            if newestFinishesFirst {
+                finishB?.resume()
+                for _ in 0..<200 where model.loading { try await Task.sleep(nanoseconds: 10_000_000) }
+                XCTAssertEqual(model.elements.map { $0.id }, ["b"])
+                finishA?.resume()
+                try await Task.sleep(nanoseconds: 50_000_000)
+            } else {
+                finishA?.resume()
+                try await Task.sleep(nanoseconds: 50_000_000)
+                XCTAssertEqual(model.current, "b")
+                XCTAssertTrue(model.elements.isEmpty)
+                XCTAssertTrue(model.loading, "A finishing must not clear B's loading state")
+                finishB?.resume()
+                for _ in 0..<200 where model.loading { try await Task.sleep(nanoseconds: 10_000_000) }
+            }
+            XCTAssertEqual(model.elements.map { $0.id }, ["b"])
+            XCTAssertFalse(model.loading)
+        }
+    }
 
     /// Non-sticky: after one successful insert the palette goes back to the tool used before Elements (contracts-v2
     /// `finishToolUse`, which announces `tool.finished`); a failed insert leaves Elements active; a temporary switch into
@@ -1092,6 +1155,52 @@ final class FeatElementsTests: XCTestCase {
     }
 
     // MARK: Previews
+
+    func testImagePreviewHonoursFlipsMaskAndOrientedCrop() throws {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 40, height: 40), format: format)
+        let source = renderer.image { context in
+            UIColor.red.setFill(); context.fill(CGRect(x: 0, y: 0, width: 20, height: 40))
+            UIColor.blue.setFill(); context.fill(CGRect(x: 20, y: 0, width: 20, height: 40))
+        }
+        var item = Item.makeImage(ImageItem(frame: Frame(x: 0, y: 0, w: 40, h: 40), asset: AssetRef("test.png")))
+        func rendered(_ data: Data) -> UIImage {
+            renderer.image { ElementRenderer.draw(item, in: $0.cgContext, assets: ["test.png": data]) }
+        }
+        func pixel(_ image: UIImage, _ x: Int, _ y: Int) throws -> [UInt8] {
+            let bitmap = try XCTUnwrap(image.cgImage)
+            var bytes = [UInt8](repeating: 0, count: 40 * 40 * 4)
+            try bytes.withUnsafeMutableBytes { buffer in
+                let context = try XCTUnwrap(CGContext(data: buffer.baseAddress, width: 40, height: 40, bitsPerComponent: 8,
+                                                    bytesPerRow: 160, space: CGColorSpaceCreateDeviceRGB(),
+                                                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+                context.draw(bitmap, in: CGRect(x: 0, y: 0, width: 40, height: 40))
+            }
+            let offset = (y * 40 + x) * 4
+            return Array(bytes[offset..<(offset + 4)])
+        }
+        let png = try XCTUnwrap(source.pngData())
+        item.image?.flipX = true
+        XCTAssertEqual(try pixel(rendered(png), 5, 20), [0, 0, 255, 255])
+        item.image?.flipX = nil
+        item.image?.flipY = true
+        item.image?.mask = [Point(0, 0), Point(1, 0), Point(0, 1)]
+        XCTAssertEqual(try pixel(rendered(png), 35, 5)[3], 0, "the mask flips with the picture")
+        XCTAssertEqual(try pixel(rendered(png), 5, 35)[3], 255)
+        item.image?.flipY = nil
+        item.image?.mask = nil
+
+        let jpeg = NSMutableData()
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithData(jpeg, "public.jpeg" as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, try XCTUnwrap(source.cgImage),
+                                  [kCGImagePropertyOrientation: 6] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        item.image?.crop = Rect(x: 0, y: 0, width: 1, height: 0.5)
+        let colour = try pixel(rendered(jpeg as Data), 20, 30)
+        XCTAssertGreaterThan(colour[0], 230, "the oriented top half is the original red left half")
+        XCTAssertLessThan(colour[2], 25)
+    }
 
     func testThumbnailRendersEveryKind() throws {
         let (content, pages) = Fixtures.sampleContent()

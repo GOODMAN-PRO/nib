@@ -850,6 +850,158 @@ final class FeatZoomWindowTests: XCTestCase {
         overlay.detach(from: host)
     }
 
+    func testWetInkCleanupWaitsForTheActiveToolAndKeepsLaterStrokes() {
+        let view = ZoomWritingView(frame: CGRect(x: 0, y: 0, width: 400, height: 100))
+        view.onStroke = { _ in true }
+        let first = PKBridge.pkStroke(stroke(120, 150))
+        let failed = PKBridge.pkStroke(stroke(160, 190))
+        let alsoFailed = PKBridge.pkStroke(stroke(180, 195))
+        let last = PKBridge.pkStroke(stroke(200, 230))
+        view.canvas.drawing = PKDrawing(strokes: [first, failed, alsoFailed])
+        view.canvasViewDrawingDidChange(view.canvas)
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        let before = view.canvas.drawing.dataRepresentation()
+        XCTAssertFalse(view.dropWet(1))
+        view.removeWet(at: 1)
+        view.removeWet(at: 1)
+        XCTAssertEqual(view.canvas.drawing.dataRepresentation(), before)
+        XCTAssertEqual(view.wetCount, 1, "failed strokes leave logical accounting immediately")
+        view.canvas.drawing = PKDrawing(strokes: [first, failed, alsoFailed, last])
+        view.canvasViewDrawingDidChange(view.canvas)
+        var ended = false
+        view.onToolEnded = { ended = true }
+        view.canvasViewDidEndUsingTool(view.canvas)
+        XCTAssertTrue(ended)
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 2)
+        XCTAssertTrue(view.dropWet(1))
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 1)
+        XCTAssertEqual(view.canvas.drawing.strokes[0].path[0].location, last.path[0].location)
+    }
+
+    func testLeavingWindowFinishesToolAndClearsDeferredWetInk() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        let view = ZoomWritingView(frame: window.bounds)
+        window.addSubview(view)
+        view.onStroke = { _ in true }
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        view.canvas.drawing = PKDrawing(strokes: [PKBridge.pkStroke(stroke(120, 150))])
+        view.canvasViewDrawingDidChange(view.canvas)
+        view.clearWet()
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 1)
+        view.removeFromSuperview()
+        XCTAssertFalse(view.isUsingTool)
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 0)
+        XCTAssertTrue(view.dropWet(1))
+        // The deferred clear must not discard the next stroke when this view is reused.
+        window.addSubview(view)
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        view.canvas.drawing = PKDrawing(strokes: [PKBridge.pkStroke(stroke(160, 190))])
+        view.canvasViewDidEndUsingTool(view.canvas)
+        XCTAssertEqual(view.wetCount, 1)
+    }
+
+    func testToolChangesFinishCaptureButOrdinaryConfigurationKeepsItActive() {
+        let view = ZoomWritingView(frame: CGRect(x: 0, y: 0, width: 400, height: 100))
+        let pen = PKInkingTool(.pen, color: .black, width: 2)
+        let pencil = PKInkingTool(.pencil, color: .black, width: 2)
+        func configure(_ tool: PKInkingTool, erasing: Bool = false) {
+            view.configure(box: Rect(x: 100, y: 200, width: 200, height: 50), pageSize: .a4, tool: tool,
+                           erasing: erasing, policy: .anyInput, fingersDraw: true, eraserDiameter: 14, showsZone: false)
+        }
+        configure(pen)
+        var captured = 0
+        view.onStroke = { _ in captured += 1; return true }
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        configure(PKInkingTool(.pen, color: .black, width: 2))
+        XCTAssertTrue(view.isUsingTool, "layout and box updates must not interrupt capture")
+        view.canvas.drawing = PKDrawing(strokes: [PKBridge.pkStroke(stroke(120, 150))])
+        configure(pencil)
+        XCTAssertFalse(view.isUsingTool)
+        XCTAssertEqual(captured, 1, "a final drawing is captured even without an end callback")
+        XCTAssertTrue(view.dropWet(1))
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        configure(pencil, erasing: true)
+        XCTAssertFalse(view.isUsingTool, "the eraser disables drawing without changing the underlying inking tool")
+    }
+
+    func testConfigurationComparesRequestedToolFieldsInsteadOfCanvasReadback() {
+        let view = ZoomWritingView(frame: CGRect(x: 0, y: 0, width: 400, height: 100))
+        func configure(_ tool: PKInkingTool) {
+            view.configure(box: Rect(x: 100, y: 200, width: 200, height: 50), pageSize: .a4, tool: tool,
+                           erasing: false, policy: .anyInput, fingersDraw: true, eraserDiameter: 14, showsZone: false)
+        }
+        configure(PKInkingTool(.pen, color: .black, width: 2))
+        // Stand in for PencilKit returning a normalised width instead of the requested width.
+        view.canvas.tool = PKInkingTool(.pen, color: .black, width: 3)
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        configure(PKInkingTool(.pen, color: .black, width: 2))
+        XCTAssertTrue(view.isUsingTool, "unchanged requests must preserve capture despite canvas normalisation")
+        configure(PKInkingTool(.pen, color: .black, width: 3))
+        XCTAssertFalse(view.isUsingTool, "a requested width change must finish capture even when it matches the canvas")
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        configure(PKInkingTool(.pen, color: .red, width: 3))
+        XCTAssertFalse(view.isUsingTool, "a colour change must finish capture")
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        configure(PKInkingTool(.pencil, color: .red, width: 3))
+        XCTAssertFalse(view.isUsingTool, "an ink type change must finish capture")
+    }
+
+    func testHidingPaneFinishesCaptureBeforeClearingWetInk() async throws {
+        let h = harness()
+        let (host, overlay) = try await openWindow(h)
+        defer { overlay.detach(from: host) }
+        let c = overlay.controller
+        let view = c.writingView()
+        c.paneAppeared()
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        showWet(c, [stroke(120, 150)])
+        c.paneDisappeared()
+        XCTAssertFalse(view.isUsingTool)
+        XCTAssertEqual(host.committed.count, 1, "hiding must capture the final drawing before clearing it")
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 0)
+        XCTAssertEqual(c.landed, 0)
+        XCTAssertTrue(view.dropWet(1))
+    }
+
+    func testRenderCompletionKeepsLandedInkUntilTheToolEnds() async throws {
+        let h = harness()
+        h.app.services.renderer = FakeRenderer()
+        try await h.run("zoom.setBox", ["page": .string(page1), "rect": [100, 200, 200, 50]])
+        try await h.run("zoom.toggle", ["on": true])
+        let host = ScriptedCanvasHost(h)
+        let overlay = ZoomBoxOverlay(host: host)
+        overlay.attach(to: host)
+        let c = overlay.controller
+        let view = c.writingView()
+        let root = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        window.rootViewController = root
+        root.view.addSubview(view)
+        view.frame = root.view.bounds
+        window.makeKeyAndVisible()
+        c.paneAppeared()
+        defer {
+            c.paneDisappeared()
+            overlay.detach(from: host)
+            window.isHidden = true
+        }
+        XCTAssertNil(view.paper.image, "the first render must not satisfy the completion poll before the stroke")
+        view.onStroke = { _ in true }
+        showWet(c, [stroke(120, 150)])
+        view.canvasViewDrawingDidChange(view.canvas)
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        XCTAssertTrue(c.strokeFinished(stroke(120, 150)))
+        host.finish(.success(nil))
+        for _ in 0..<300 where view.paper.image == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNotNil(view.paper.image, "the render still updates dry ink")
+        XCTAssertEqual(c.landed, 1)
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 1)
+        view.canvasViewDidEndUsingTool(view.canvas)
+        for _ in 0..<300 where c.landed != 0 { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(c.landed, 0)
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 0)
+    }
+
     func testCommitOutcomesDecideWhenWetInkLeaves() async throws {
         let h = harness()
         registerAddStrokes(h)

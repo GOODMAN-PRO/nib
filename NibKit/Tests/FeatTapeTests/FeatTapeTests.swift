@@ -45,6 +45,56 @@ final class FeatTapeTests: XCTestCase {
         XCTAssertEqual(h.app.commands.descriptor("tape.setRevealed")?.undoable, false)
     }
 
+    func testUnreadablePatternInputsReportEveryFailure() async {
+        let h = harness()
+        let model = TapeSettingsModel(app: h.app, session: h.session)
+        let failed = expectation(description: "every unreadable pattern input reports a failure")
+        failed.expectedFulfillmentCount = 4
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { notification in
+            if (notification.userInfo?["command"] as? String) == "tape.importPattern",
+               notification.userInfo?["error"] is NibError {
+                failed.fulfill()
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        let missing = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        await model.importFile(missing)
+        await model.importPhoto { nil }
+        await model.importPhoto { throw URLError(.notConnectedToInternet) }
+        await model.importFileResult(.failure(URLError(.cannotOpenFile)))
+        await fulfillment(of: [failed], timeout: 2)
+        XCTAssertTrue(model.recent.isEmpty)
+    }
+
+    func testPlainTileAndHistoryClearTheStoredSlotPattern() async throws {
+        let h = harness()
+        let applied = expectation(description: "preset applied")
+        applied.expectedFulfillmentCount = 2
+        // The preset command's contract: omitted means keep; an empty string removes the pattern.
+        h.app.commands.register(CommandDescriptor(id: "preset.setSwatch", title: "Set Swatch", summary: "Test preset contract.",
+                                                  params: .obj(["tool": .str(), "index": .int(), "color": .str(), "pattern": .str()]),
+                                                  effect: .session, target: .app)) { params, _ in
+            var presets = h.app.settings.get(NibSettings.presets("tape"))
+            let index = params["index"]?.intValue ?? 0
+            if let pattern = params["pattern"]?.stringValue {
+                presets.swatches[index].pattern = pattern.isEmpty ? nil : AssetRef(pattern)
+            }
+            h.app.settings.set(NibSettings.presets("tape"), presets)
+            applied.fulfill()
+            return [:]
+        }
+        var presets = h.app.settings.get(NibSettings.presets("tape"))
+        presets.swatches[0].pattern = AssetRef("tape.dots.png")
+        presets.selectedSwatch = 0
+        h.app.settings.set(NibSettings.presets("tape"), presets)
+        let model = TapeSettingsModel(app: h.app, session: h.session)
+        model.load()
+        model.choose(pattern: nil)
+        model.choose(pattern: nil, color: .black)
+        await fulfillment(of: [applied], timeout: 2)
+        XCTAssertNil(h.app.settings.get(NibSettings.presets("tape")).swatches[0].pattern)
+    }
+
     // MARK: Hide and reveal
 
     func testTapTogglesTapeWithoutAddingAnUndoEntry() async throws {

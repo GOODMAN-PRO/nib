@@ -302,7 +302,7 @@ final class TapeSettingsModel: ObservableObject {
         let ref = pattern.map { PresetSwatch.tapePatternRef(id: $0) }
         var params: [String: JSONValue] = ["tool": "tape", "index": .number(Double(presets.selectedSwatch)),
                                            "color": .string(colour.hex)]
-        if let ref { params["pattern"] = .string(ref.name) }
+        params["pattern"] = .string(ref?.name ?? "")
         updatePresets(command: "preset.setSwatch", params: .object(params)) { p in
             guard p.swatches.indices.contains(p.selectedSwatch) else { return }
             p.swatches[p.selectedSwatch] = PresetSwatch(color: colour, pattern: ref)
@@ -342,12 +342,36 @@ final class TapeSettingsModel: ObservableObject {
 
     /// Imports a file picked in Files: read off the main actor, inside its security scope.
     func importFile(_ url: URL) async {
-        let data = await Task.detached { () -> Data? in
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            return try? Data(contentsOf: url)
-        }.value
-        if let data { await importImage(data) }
+        do {
+            let data = try await Task.detached { () throws -> Data in
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                return try Data(contentsOf: url)
+            }.value
+            await importImage(data)
+        } catch { reportImportFailure(error) }
+    }
+
+    func importPhoto(_ load: () async throws -> Data?) async {
+        do {
+            guard let data = try await load() else {
+                throw NibError(.unavailable, String(localized: "The selected photo could not be loaded. Please try again."))
+            }
+            await importImage(data)
+        } catch { reportImportFailure(error) }
+    }
+
+    func importFileResult(_ result: Result<URL, Error>) async {
+        switch result {
+        case .success(let url): await importFile(url)
+        case .failure(let error): reportImportFailure(error)
+        }
+    }
+
+    private func reportImportFailure(_ error: Error) {
+        guard let app else { return }
+        NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                        userInfo: ["command": "tape.importPattern", "error": NibError.wrap(error)])
     }
 
     /// Imports picked image bytes as a custom pattern, then puts it on the selected slot.
@@ -360,8 +384,7 @@ final class TapeSettingsModel: ObservableObject {
             let result = try await app.bus.execute("tape.importPattern", ["url": .string(file.absoluteString)], session: session)
             if let id = result["id"]?.stringValue { choose(pattern: id) }
         } catch {
-            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                            userInfo: ["command": "tape.importPattern", "error": NibError.wrap(error)])
+            reportImportFailure(error)
         }
     }
 
@@ -447,12 +470,11 @@ struct TapeSettingsView: View {
             guard let item else { return }
             photo = nil
             Task {
-                if let data = try? await item.loadTransferable(type: Data.self) { await model.importImage(data) }
+                await model.importPhoto { try await item.loadTransferable(type: Data.self) }
             }
         }
         .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.image]) { result in
-            guard case let .success(url) = result else { return }
-            Task { await model.importFile(url) }
+            Task { await model.importFileResult(result) }
         }
     }
 
