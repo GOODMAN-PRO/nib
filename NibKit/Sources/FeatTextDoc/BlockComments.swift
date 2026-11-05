@@ -424,13 +424,16 @@ enum CommentAnchors {
     /// insertion or deletion that could equally have happened before a range's start (repeated characters) is taken
     /// to be outside it, so "b" typed before "blocks" does not join the comment on "blocks".
     static func map(_ range: NSRange, through e: Edit) -> NSRange {
+        let slides = e.lowest < e.start && range.location >= e.lowest + (e.oldEnd - e.start)
+            && range.location < e.oldEnd
         func start(_ x: Int) -> Int {
-            if e.lowest < e.start, x >= e.lowest + (e.oldEnd - e.start), x < e.oldEnd { return x + e.delta }
+            if slides { return x + e.delta }
             if x < e.start { return x }
             if x >= e.oldEnd { return x + e.delta }
             return e.start
         }
         func end(_ x: Int) -> Int {
+            if slides, x <= e.oldEnd { return x + e.delta }
             if x <= e.start { return x }
             if x >= e.oldEnd { return x + e.delta }
             return e.newEnd

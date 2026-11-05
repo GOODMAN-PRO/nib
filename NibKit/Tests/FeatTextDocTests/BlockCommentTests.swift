@@ -269,6 +269,10 @@ final class BlockCommentTests: XCTestCase {
         XCTAssertEqual(moved([1, 2], "aab", "ab"), [0, 2], "a repeated character deleted before the words")
         XCTAssertEqual(moved([0, 2], "abb", "ab"), [0, 2], "and after them")
         XCTAssertEqual(moved([0, 5], "Hello", "Helllo"), [0, 6], "typed inside, it still grows them")
+        XCTAssertEqual(moved([2, 1], "Hmm", "Hmmm"), [3, 1])
+        XCTAssertEqual(moved([1, 2], "Hmm", "Hmmm"), [2, 2])
+        XCTAssertEqual(moved([0, 2], "Hmm", "Hmmm"), [0, 2], "a range starting before the run does not grow")
+        XCTAssertEqual(moved([4, 1], "Hello", "Helloo"), [5, 1])
         // UTF-16: an emoji is two units.
         let emoji = "a\u{1F600}b"
         XCTAssertEqual(moved([3, 1], emoji, "ab"), [1, 1])
