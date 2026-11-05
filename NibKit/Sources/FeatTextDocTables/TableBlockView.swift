@@ -69,6 +69,12 @@ struct TableGridLayout: Equatable {
     func row(at y: CGFloat) -> Int? { TableLayout.band(at: y, offsets: ys) }
     func column(at x: CGFloat) -> Int? { TableLayout.band(at: x, offsets: xs) }
 
+    func resizeDivider(location: CGPoint, translation: CGPoint, origin: CGPoint) -> Int? {
+        let start = CGPoint(x: location.x - translation.x, y: location.y - translation.y)
+        guard start.y >= origin.y - TableMetrics.gutter, start.y <= origin.y + height else { return nil }
+        return divider(near: start.x - origin.x, slop: TableMetrics.dividerSlop)
+    }
+
     /// The column whose right edge is within `slop` of `x` (the closest one).
     func divider(near x: CGFloat, slop: CGFloat) -> Int? {
         guard xs.count > 1 else { return nil }
@@ -2357,7 +2363,7 @@ final class TableBlockView: UIView {
     @objc private func resizePanned(_ g: UIPanGestureRecognizer) {
         switch g.state {
         case .began:
-            guard let c = layout.divider(near: g.location(in: grid).x - gridOrigin.x, slop: TableMetrics.dividerSlop),
+            guard let c = layout.resizeDivider(location: g.location(in: grid), translation: g.translation(in: grid), origin: gridOrigin),
                   layout.columnWidths.indices.contains(c) else { return }
             flushTyping()
             resize = (c, layout.columnWidths[c])
@@ -2510,9 +2516,8 @@ extension TableBlockView: UIGestureRecognizerDelegate {
             guard !isReadOnly else { return false }
             let v = pan.velocity(in: grid)
             guard abs(v.x) > abs(v.y) else { return false }
-            let p = pan.location(in: grid)
-            guard p.y >= gridOrigin.y - TableMetrics.gutter, p.y <= gridOrigin.y + layout.height else { return false }
-            return layout.divider(near: p.x - gridOrigin.x, slop: TableMetrics.dividerSlop) != nil
+            return layout.resizeDivider(location: pan.location(in: grid), translation: pan.translation(in: grid),
+                                        origin: gridOrigin) != nil
         }
         if let pan = g as? UIPanGestureRecognizer, let handle = pan.view as? TableHandleButton {
             guard !isReadOnly else { return false }

@@ -255,6 +255,12 @@ final class FeatTextDocTablesTests: XCTestCase {
         }
     }
 
+    func testResizeUsesTouchDownInsteadOfRecognitionLocation() {
+        let layout = TableGridLayout(columnWidths: [100, 100], rowHeights: [100])
+        XCTAssertNil(layout.resizeDivider(location: CGPoint(x: 82, y: 10), translation: CGPoint(x: 12, y: 0), origin: .zero))
+        XCTAssertEqual(layout.resizeDivider(location: CGPoint(x: 70, y: 10), translation: CGPoint(x: -12, y: 0), origin: .zero), 0)
+    }
+
     func testConformanceAndRegistryIntegration() async throws {
         let problems = await CommandConformance.check(features: [FeatTextDocTablesFeature.self])
         XCTAssertEqual(problems, [])
