@@ -283,7 +283,8 @@ enum DeepLinkParser {
 struct BridgePairing: Equatable {
     /// `BridgeNames.portSetting`'s default: links written before F091 added `port` omit it.
     static let defaultPort = 7331
-    static let maxTokenLength = 512
+    // Matches NibBridge.BridgeAuth: nib_ followed by 43 base64url characters.
+    static let tokenCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
 
     let host: String
     let port: Int
@@ -316,10 +317,10 @@ struct BridgePairing: Equatable {
             }
             number = n
         }
-        let t = (token ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty, t.count <= BridgePairing.maxTokenLength,
-              t.unicodeScalars.allSatisfy({ $0.value > 0x20 && $0.value < 0x7F }) else {
-            throw DeepLinkParser.invalid("the pairing link needs the bridge's token")
+        let t = token ?? ""
+        guard t.hasPrefix("nib_"), t.utf8.count == 47,
+              t.dropFirst(4).unicodeScalars.allSatisfy({ BridgePairing.tokenCharacters.contains($0) }) else {
+            throw DeepLinkParser.invalid(String(localized: "The pairing link needs a valid bridge token. Copy a new pairing link from Settings > Bridge."))
         }
         self.host = bare
         self.port = number

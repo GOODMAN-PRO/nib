@@ -300,9 +300,9 @@ final class FeatSystemIntegrationTests: XCTestCase {
     /// DESIGN.md §15.7: Light, Dark and AX3 renders of the new screen, complete and incomplete, and it still lays out
     /// at AX3 on a phone.
     func testPairingSheetRendersInEveryVariantAndFitsAtAX3() throws {
-        let complete = BridgePairingSheet(pairing: try BridgePairing(host: "100.101.102.103", port: nil, token: "nib_4qVx9SECRET"),
+        let complete = BridgePairingSheet(pairing: try BridgePairing(host: "100.101.102.103", port: nil, token: "nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
                                           onDone: {})
-        let outside = BridgePairingSheet(pairing: try BridgePairing(host: "attacker.example", port: nil, token: "nib_x"),
+        let outside = BridgePairingSheet(pairing: try BridgePairing(host: "attacker.example", port: nil, token: "nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
                                          onDone: {})
         let incomplete = BridgePairingSheet(pairing: nil, onDone: {})
         let size = CGSize(width: 375, height: 812)
