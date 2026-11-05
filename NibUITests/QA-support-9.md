@@ -160,3 +160,14 @@ Should unblock Selection Assistant attribution; next CI must show exact three va
 
 H1 caller review: the batch also reuses its resolved container for initial field-specific focus checks; absent lazy fields retain the existing bounded reveal path. Public callers retain defaults. Native Select All tries the cheap UIKit probe first and retains the existing field-specific fallback for remote editors whose focus the Nib probe cannot classify, preserving Insert/Chrome native selection behavior.
 
+
+### H2 - native context menu transaction
+
+Confirmed P:pages-outline-templates#0 (including the Move-opening post-event stall correction) and #2. Current pressWithoutIdle/tapWithoutIdle and NibTouchPaths.perform support a stationary contact without element idle waits. Added nativeContextMenu: two equal consecutive visible-frame reads, one 0.8-second centre press, query-only named item waits, synthesized taps for every path component, then a bounded menu-gone wait. Captured item frames distinguish the dismissed menu from a same-labelled Rename alert/Delete confirmation. A missing item logs target facts, raw probe, full hierarchy and screenshot and throws that message; there is no second press. Existing board callers and public synthesis signatures stay compatible; Pages callers follow in C2/C4.
+
+Next CI must show menu opening/item/dismissed in seconds without any 60-second idle wait, including Move, then all original assertions. Stable geometry mitigates the unproven custom-tile timing hypothesis; it does not prove its cause.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Native menu callers (Pages outline/thumbnail/template) | Native menu opening / item / dismissed | Which stable frame and named path received contacts, and how long did dismissal take? |
+| Same, on failure | Native menu missing / dismissal failed | Was the item absent after the single press, and what target/probe/tree remained? |

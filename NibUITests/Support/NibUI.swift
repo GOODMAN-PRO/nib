@@ -2011,6 +2011,79 @@ final class NibUI {
                         [CGPoint(x: from.x + spacing, y: from.y), CGPoint(x: to.x + spacing, y: to.y)]], duration: duration)
     }
 
+    /// Native context menus do not reliably let XCTest reach idle. Every menu contact is synthesized.
+    /// A path includes submenu openers, e.g. ["Move", "Move Up"]. Never retry the opening press.
+    func nativeContextMenu(_ element: XCUIElement, path: [String]) throws {
+        guard !path.isEmpty else { throw Failure.message("Context menu needs an action path") }
+        let started = Date()
+        var previous: CGRect?
+        var settled: CGRect?
+        let stable = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            guard hasVisibleFrame(element), element.isEnabled, element.isHittable else {
+                previous = nil; return false
+            }
+            let frame = element.frame
+            defer { previous = frame }
+            guard previous == frame else { return false }
+            settled = frame
+            return true
+        }, object: nil)
+        guard XCTWaiter.wait(for: [stable], timeout: 8) == .completed, let frame = settled else {
+            throw Failure.message("Context menu target did not settle: " + elementFacts(element))
+        }
+        logQA("Native menu opening", "path=\(path) frame=\(frame)")
+        try pressWithoutIdle(at: CGPoint(x: frame.midX, y: frame.midY), duration: 0.8)
+        var activated: [(name: String, item: XCUIElement, frame: CGRect)] = []
+        for name in path {
+            var item: XCUIElement?
+            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                for kind in [XCUIElement.ElementType.button, .menuItem] {
+                    let candidate = app.descendants(matching: kind).matching(NSPredicate(
+                        format: "label == %@ OR identifier == %@", name, name)).firstMatch
+                    if hasVisibleFrame(candidate), candidate.isEnabled, candidate.isHittable {
+                        item = candidate; return true
+                    }
+                }
+                return false
+            }, object: nil)
+            guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed, let item else {
+                let facts = "path=\(path) missing=\(name) target=" + elementFacts(element)
+                let state = " probe=\(String(describing: probe.exists ? probe.value : nil))"
+                let message = "Native context menu item absent: " + facts + state
+                logQA("Native menu missing", message)
+                recordDiagnostics("Native menu missing", includeHierarchy: true)
+                throw Failure.message(message)
+            }
+            activated.append((name, item, item.frame))
+            logQA("Native menu item", "path=\(path) item=" + elementFacts(item))
+            try tapWithoutIdle(item)
+        }
+        var previouslyGone = false
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            let menuVisible = app.menus.firstMatch.exists || app.otherElements["Preview"].firstMatch.exists
+            let itemsGone = !menuVisible && activated.allSatisfy { action in
+                if !action.item.exists { return true }
+                let currentFrame = action.item.frame
+                guard currentFrame != action.frame else { return false }
+                // A frame change alone could be a menu animation. Accept a same-labelled successor
+                // only when it belongs to the Rename alert or Delete confirmation sheet.
+                for type in [XCUIElement.ElementType.alert, .sheet] {
+                    let successor = app.descendants(matching: type).buttons.matching(NSPredicate(
+                        format: "label == %@ OR identifier == %@", action.name, action.name)).firstMatch
+                    if successor.exists, successor.frame == currentFrame { return true }
+                }
+                return false
+            }
+            defer { previouslyGone = itemsGone }
+            return previouslyGone && itemsGone
+        }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
+            recordDiagnostics("Native menu dismissal failed")
+            throw Failure.message("Native menu must disappear before ordinary input: \(path)")
+        }
+        logQA("Native menu dismissed", "path=\(path) seconds=\(Date().timeIntervalSince(started))")
+    }
+
     /// Caller must follow delivery with a bounded UI/state postcondition; completion only proves delivery.
     func pressWithoutIdle(_ element: XCUIElement, duration: TimeInterval) throws {
         guard element.exists, element.isEnabled, element.isHittable else {
