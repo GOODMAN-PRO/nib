@@ -984,7 +984,7 @@ final class ChromeUITests: XCTestCase {
         try rulerMenu("Options"); try tap("Hide Digits")
         XCTAssertNotEqual(ui.canvas.screenshot().pngRepresentation, withDigits, "Hide Digits must change the rendered ruler")
         try rulerMenu("Set Position…")
-        try replace("Horizontal position", "4"); try replace("Vertical position", "5"); try tap("Move Ruler")
+        try replace("Horizontal position", "4"); try replace("Vertical position", "5"); try ui.prepareCoveredControl("Move Ruler"); try tap("Move Ruler")
         try rulerMenu("Set Position…")
         XCTAssertEqual(try require("Horizontal position").value as? String, "4")
         XCTAssertEqual(try require("Vertical position").value as? String, "5")

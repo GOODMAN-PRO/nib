@@ -402,7 +402,7 @@ final class InsertUITests: XCTestCase {
     }
     func testTextBoxStyleAndAutosizePersist() throws {
         try beginText("Styled box"); try tap("More Formatting")
-        try tap("Ivory", scroll: true)
+        try ui.prepareCoveredControl("Ivory"); try tap("Ivory", scroll: true)
         try tap("Thick", scroll: true); try tap("Rounded", scroll: true); try tap("Loose", scroll: true)
         try toggle("Shadow", to: true); try toggle("Fit Height to Text", to: false)
         outside(); try finish()
@@ -426,7 +426,7 @@ final class InsertUITests: XCTestCase {
     }
     func testNamedStyleAndDefaultAffectNewText() throws {
         try beginText("First"); try key("a"); try tap("Larger Text"); try tap("More Formatting")
-        try tap("Save Style…", scroll: true); try replace(try control("Name", .textField), with: "Lab Caption"); try tap("Save")
+        try ui.prepareCoveredControl("Save Style…"); try tap("Save Style…", scroll: true); try replace(try control("Name", .textField), with: "Lab Caption"); try tap("Save")
         try tap("Lab Caption", scroll: true); try tap("Set as Default for New Text", scroll: true); outside(); try finish()
         let first = try snapshot("text")
         outside(); try ui.selectTool("text"); ui.coordinate(CGPoint(x: 0.58, y: 0.82)).tap()

@@ -126,3 +126,11 @@ D:timeouts#0/#1 and verifier correction prove unanswered animation-idle notifica
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | First test in each class | XCTest idle selectors | Which instance selectors for quiescence/idle/animation waiting exist in this XCTest runtime? |
+
+## H8 - explicit covered-control preparation
+
+D:controls-forms#4 correction and D:controls-menus#1 show keyboard overlap/degenerate Format viewport and the number-pad PopoverDismissRegion above Move Ruler. Added one opt-in helper, used only before Save Style, Ivory, Emoji and Move Ruler. It dismisses a keyboard intersecting the target (or the Format container for lazy Ivory) through existing native dismissal; Move Ruler uses a live dismiss-region point outside alert and keypad, then waits for the popover to disappear. Focused readable values are compared after dismissal, never restored. Ivory still uses shared reveal. Expected named-style, text-box style, folder customization and ruler-position tests. Next CI must retain typed values and reach the named control; coverage/render order for Ivory and Emoji remains bounded by the verifier's caveat.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Four covered-control callers | Covered control preparation | Which target/keyboard frames or number-pad surface justified dismissal? |

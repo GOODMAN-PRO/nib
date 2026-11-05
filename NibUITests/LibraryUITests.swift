@@ -584,7 +584,7 @@ final class LibraryUITests: XCTestCase {
     func testFolderStyleColourIconAndFavouritePersist() throws {
         try context(folder, folder: true); try tap("Customise Folder")
         try replace(app.textFields["Hex colour"], with: "#FF8800")
-        try tap("Emoji")
+        try ui.prepareCoveredControl("Emoji"); try tap("Emoji")
         try replace(app.textFields["Emoji"], with: "📚")
         let favourite = app.switches["Show in Favourites"]
         revealFormElement(favourite)

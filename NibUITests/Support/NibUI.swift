@@ -1241,6 +1241,59 @@ final class NibUI {
         }
     }
 
+    /// Explicit opt-in for four known covered controls, not a global tap policy.
+    func prepareCoveredControl(_ name: String) throws {
+        let target = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", name)).firstMatch
+        let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
+        let alert = app.alerts.firstMatch
+        let region = app.otherElements["PopoverDismissRegion"].firstMatch
+        let numberPad = name == "Move Ruler" && alert.exists && region.exists && app.popovers.firstMatch.exists
+        let frame = target.exists ? target.frame : nil
+        let covered = frame.map { rect in keyboards.contains { $0.intersects(rect) } } ?? false
+        // Ivory is lazy: its Format container, rather than the absent swatch, proves the obstruction.
+        let format = app.scrollViews["Format"].firstMatch
+        let lazyCovered = name == "Ivory" && format.exists && keyboards.contains { $0.intersects(format.frame) }
+        guard numberPad || covered || lazyCovered else { return }
+        let editors = app.descendants(matching: .any).matching(NSPredicate(format: "hasKeyboardFocus == true"))
+            .allElementsBoundByIndex.prefix(4).compactMap { element -> (XCUIElement, String)? in
+                guard let snapshot = try? element.snapshot(),
+                      [XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField].contains(snapshot.elementType),
+                      let value = snapshot.value as? String else { return nil }
+                // Rebind without the focus predicate: that predicate stops matching after dismissal.
+                let candidates = app.descendants(matching: snapshot.elementType).matching(
+                    NSPredicate(format: "identifier == %@ AND label == %@", snapshot.identifier, snapshot.label))
+                guard let stable = candidates.allElementsBoundByIndex.first(where: { $0.frame == snapshot.frame }) else {
+                    return nil
+                }
+                return (stable, value)
+            }
+        logQA("Covered control preparation", "name=\(name) target=\(String(describing: frame)) keyboards=\(keyboards) numberPad=\(numberPad)")
+        if numberPad {
+            let window = app.windows.firstMatch.frame
+            let alertFrame = alert.frame
+            let popovers = app.popovers.allElementsBoundByIndex.map(\.frame)
+            let points = [CGPoint(x: window.minX + 24, y: window.maxY - 24),
+                          CGPoint(x: window.maxX - 24, y: window.maxY - 24)]
+            guard let point = points.first(where: { point in
+                region.frame.contains(point) && !alertFrame.contains(point)
+                    && !popovers.contains(where: { $0.contains(point) })
+            }) else {
+                throw Failure.message("No number-pad dismissal point outside the alert")
+            }
+            app.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+            let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in !app.popovers.firstMatch.exists }, object: nil)
+            guard XCTWaiter.wait(for: [gone], timeout: 5) == .completed else {
+                throw Failure.message("Number-pad popover did not dismiss")
+            }
+        } else { try dismissNativeKeyboard() }
+        for (editor, value) in editors {
+            guard editor.exists, editor.value as? String == value else {
+                throw Failure.message("Keyboard dismissal changed the typed value before \(name)")
+            }
+        }
+    }
+
     /// A focused field under a floating keypad can be non-hittable and still be the correct typing target.
     func textEditor(_ name: String, timeout: TimeInterval = 8) throws -> XCUIElement {
         var field: XCUIElement?
