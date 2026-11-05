@@ -68,6 +68,43 @@ final class CanvasInputTests: XCTestCase {
                                                                       worksInReadOnly: readOnly))
     }
 
+    func testMixedContactsKeepOneSampleToolOwner() {
+        XCTAssertFalse(TouchTap().requiresExclusiveTouchType)
+        let harness = Harness(), tool = Tool()
+        let host = FakeCanvasHost(harness)
+        let router = router(host, tool: tool)
+        let finger = sample(id: 1), pencil = sample(pencil: true, id: 2)
+        router.begin(finger, route: .rejected)
+        router.begin(pencil, route: .tool(tool))
+        router.begin(sample(id: 3), route: .tool(tool))
+        router.move([sample(id: 3)])
+        router.cancel(1)
+        router.cancel(3)
+        router.move([pencil])
+        _ = router.end(pencil)
+        XCTAssertEqual(tool.beganIDs, [2])
+        XCTAssertEqual(tool.moved.map(\.touchID), [2])
+        XCTAssertEqual(tool.endedIDs, [2])
+    }
+
+    func testBufferedFingerCannotOverwritePencilOrCancelItsGesture() {
+        let harness = Harness(), tool = Tool()
+        let host = FakeCanvasHost(harness)
+        let router = router(host, tool: tool)
+        let finger = sample(id: 1), pencil = sample(pencil: true, id: 2)
+        router.begin(finger, route: .tool(tool))
+        _ = router.end(finger)
+        router.begin(pencil, route: .tool(tool))
+        router.releaseBufferedSamples(1)
+        router.cancel(1)
+        _ = router.end(pencil)
+        router.begin(sample(id: 3), route: .tool(tool))
+        router.releaseBufferedSamples(3)
+        _ = router.end(sample(id: 3))
+        XCTAssertEqual(tool.beganIDs, [2, 3])
+        XCTAssertEqual(tool.endedIDs, [2, 3])
+    }
+
     func testAttachmentClaimWinsBeforeHandlersAndToolAndKeepsTouchID() async {
         let harness = Harness()
         let host = FakeCanvasHost(harness)

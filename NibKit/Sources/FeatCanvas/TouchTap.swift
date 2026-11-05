@@ -51,6 +51,7 @@ final class TouchTap: UIGestureRecognizer, UIGestureRecognizerDelegate {
         super.init(target: nil, action: nil)
         delegate = self
         cancelsTouchesInView = false
+        requiresExclusiveTouchType = false
         delaysTouchesBegan = false
         delaysTouchesEnded = false
         allowedTouchTypes = [UITouch.TouchType.direct, .pencil, .indirectPointer].map { NSNumber(value: $0.rawValue) }
