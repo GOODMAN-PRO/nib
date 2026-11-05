@@ -17,6 +17,28 @@ public protocol NibEscapeHandling: AnyObject {
 
 @MainActor
 public enum NibEscapeRouting {
+    /// Reuse responder-owned cancellation actions for HID presses too. Do not
+    /// resend pressesBegan: an unhandled press would recurse back into the shell.
+    public static func offer(to firstResponder: UIResponder?, stoppingAt boundary: UIResponder) -> Bool {
+        var current = firstResponder
+        var chain: [UIResponder] = []
+        while let responder = current, responder !== boundary {
+            chain.append(responder)
+            current = responder.next
+        }
+        // Focus capture is process-wide. Never invoke another window's owner.
+        guard current === boundary else { return false }
+        for responder in chain {
+            if let owner = responder as? NibEscapeHandling, owner.handleEscape() { return true }
+            for command in responder.keyCommands ?? [] {
+                guard command.input == UIKeyCommand.inputEscape, command.modifierFlags.isEmpty,
+                      let action = command.action, responder.canPerformAction(action, withSender: command) else { continue }
+                if UIApplication.shared.sendAction(action, to: responder, from: command, for: nil) { return true }
+            }
+        }
+        return false
+    }
+
     /// Only explicit owners participate in the view-tree fallback. It also works
     /// when a sheet's text field has resigned and focus has returned to the shell.
     public static func cancel(in view: UIView) -> Bool {

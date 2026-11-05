@@ -752,7 +752,7 @@ private struct ZoomOptionsKeyboard: UIViewRepresentable {
     }
 }
 
-final class ZoomOptionsKeyView: UIControl {
+final class ZoomOptionsKeyView: UIControl, NibEscapeHandling {
     var onDismiss: (() -> Void)?
     private var presented = false
     private weak var previous: UIResponder?
@@ -762,8 +762,11 @@ final class ZoomOptionsKeyView: UIControl {
         super.init(frame: .zero)
         isUserInteractionEnabled = false
         accessibilityElementsHidden = true
+        NotificationCenter.default.addObserver(self, selector: #selector(windowBecameKey(_:)),
+            name: UIWindow.didBecomeKeyNotification, object: nil)
     }
     required init?(coder: NSCoder) { nil }
+    deinit { NotificationCenter.default.removeObserver(self) }
     override var canBecomeFirstResponder: Bool { true }
 
     override func didMoveToWindow() {
@@ -790,6 +793,22 @@ final class ZoomOptionsKeyView: UIControl {
         becomeFirstResponder()
     }
 
+    @objc private func windowBecameKey(_ notification: Notification) {
+        guard presented, let keyWindow = notification.object as? UIWindow, keyWindow === window else { return }
+        takeFocus()
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandled = presses
+        for press in presses {
+            guard let key = press.key, key.keyCode == .keyboardEscape,
+                  key.modifierFlags.union(event?.modifierFlags ?? []).intersection([.command, .shift, .alternate, .control]).isEmpty,
+                  handleEscape() else { continue }
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
     private static func firstResponder(in view: UIView) -> UIResponder? {
         if view.isFirstResponder { return view }
         if let controller = view.next as? UIViewController, controller.isFirstResponder { return controller }
@@ -807,9 +826,14 @@ final class ZoomOptionsKeyView: UIControl {
     }
 
     @objc func dismissFromKeyboard(_ command: UIKeyCommand) {
-        guard presented else { return }
+        handleEscape()
+    }
+
+    @discardableResult func handleEscape() -> Bool {
+        guard presented else { return false }
         setPresented(false)
         onDismiss?()
+        return true
     }
 }
 

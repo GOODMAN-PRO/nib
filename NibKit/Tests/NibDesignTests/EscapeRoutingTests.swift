@@ -4,6 +4,20 @@ import UIKit
 
 @MainActor
 final class EscapeRoutingTests: XCTestCase {
+    func testResponderEscapeWinsBeforeShellAndDoesNotReenterPressRouting() {
+        let shell = UIView()
+        let responder = EscapeCommandView()
+        shell.addSubview(responder)
+        XCTAssertTrue(NibEscapeRouting.offer(to: responder, stoppingAt: shell))
+        XCTAssertEqual(responder.cancellations, 1)
+        XCTAssertFalse(NibEscapeRouting.offer(to: shell, stoppingAt: shell))
+        XCTAssertFalse(NibEscapeRouting.offer(to: EscapeCommandView(), stoppingAt: shell),
+            "A responder from another window must not receive this Escape")
+        responder.enabled = false
+        XCTAssertFalse(NibEscapeRouting.offer(to: responder, stoppingAt: shell))
+        XCTAssertEqual(responder.cancellations, 1)
+    }
+
     func testModalCancellationPreservesSystemPromptsAndProtectedWork() {
         XCTAssertTrue(NibEscapePolicy.permitsCancellation(isSystemPrompt: false,
             dismissalDisabled: false, delegateAllowsDismissal: true))
@@ -32,4 +46,17 @@ final class EscapeRoutingTests: XCTestCase {
         XCTAssertEqual(cancelled, 1)
         XCTAssertNil(sheet.hitTest(.zero, with: nil))
     }
+}
+
+@MainActor
+private final class EscapeCommandView: UIView {
+    var cancellations = 0
+    var enabled = true
+    override var keyCommands: [UIKeyCommand]? {
+        [UIKeyCommand(input: UIKeyCommand.inputEscape, modifierFlags: [], action: #selector(cancel(_:)))]
+    }
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        action == #selector(cancel(_:)) && enabled
+    }
+    @objc private func cancel(_ sender: UIKeyCommand) { cancellations += 1 }
 }

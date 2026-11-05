@@ -280,10 +280,17 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             if flags.contains(.alternate) { modifiers.insert(.option) }
             if flags.contains(.control) { modifiers.insert(.control) }
             #if DEBUG
-            NSLog("%@", "[Key routing] unhandled \(input) key flags \(key.modifierFlags.rawValue) event flags \(event?.modifierFlags.rawValue ?? 0)")
+            let responderClass = ShellFocus.firstResponder().map { NSStringFromClass(type(of: $0)) } ?? "nil"
+            NSLog("%@", "[Key routing] unhandled \(input) key flags \(key.modifierFlags.rawValue) event flags \(event?.modifierFlags.rawValue ?? 0) responder=\(responderClass)")
             #endif
             NibUITestKeyLog.note("shell unhandled \(input) flags \(flags.rawValue)")
             if input == "escape", modifiers.isEmpty, cancelPresentedSurface() {
+                unhandled.remove(press)
+                continue
+            }
+            if input == "escape", modifiers.isEmpty, !ShellChromePolicy.hasModal(self),
+               NibEscapeRouting.offer(to: ShellFocus.firstResponder(), stoppingAt: self)
+                || NibEscapeRouting.cancel(in: view) {
                 unhandled.remove(press)
                 continue
             }
@@ -302,11 +309,18 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     private func cancelPresentedSurface() -> Bool {
         guard let modal = topmostModal(in: self) else { return false }
         let presentation = modal.presentationController
-        let disabled = modal.isModalInPresentation || modal.children.contains { $0.isModalInPresentation }
+        func dismissalDisabled(in controller: UIViewController) -> Bool {
+            controller.isModalInPresentation || controller.children.contains { dismissalDisabled(in: $0) }
+        }
         let permitted = NibEscapePolicy.permitsCancellation(isSystemPrompt: modal is UIAlertController,
-            dismissalDisabled: disabled,
+            dismissalDisabled: dismissalDisabled(in: modal),
             delegateAllowsDismissal: presentation.map { $0.delegate?.presentationControllerShouldDismiss?($0) ?? true } ?? true)
         guard permitted else { return false }
+        let responder = ShellFocus.firstResponder()
+        let responderView = (responder as? UIView) ?? (responder as? UIViewController)?.viewIfLoaded
+        if responderView?.isDescendant(of: modal.view) == true,
+           NibEscapeRouting.offer(to: responder, stoppingAt: modal) { return true }
+        if NibEscapeRouting.offer(to: modal, stoppingAt: modal.next ?? self) { return true }
         return NibEscapeRouting.cancel(in: modal.view)
     }
 
