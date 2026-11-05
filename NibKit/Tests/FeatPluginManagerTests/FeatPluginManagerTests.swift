@@ -155,6 +155,7 @@ final class FeatPluginManagerTests: XCTestCase {
             ["plugins": try JSONValue.from([plugin])]
         }
         let url = h.library.metadataURL.appendingPathComponent("unreadable-grants.json")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let store = ManagerGrants(url: url)
         h.app.services.set(store, for: ManagerGrants.serviceKey)
         let grants: JSONValue = [.init(plugin.id): ["sha256": "hash", "scopes": ["network"]]]

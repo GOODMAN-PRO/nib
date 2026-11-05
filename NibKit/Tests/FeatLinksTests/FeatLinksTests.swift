@@ -23,7 +23,7 @@ final class FeatLinksTests: XCTestCase {
         for target in targets {
             await assertThrows(.notFound) { _ = try await h.run("link.follow", target) }
             await assertThrows(.notFound) {
-                _ = try await h.run("link.set", ["ref": "block:FIXTUREDOC02/FIXTUREBLK02", "link": target])
+                _ = try await h.run("link.set", ["ref": "block:FIXTUREDOC02/FIXTUREBLK02", "range": [0, 5], "link": target])
             }
         }
         h.app.commands.register(CommandDescriptor(id: "test.followStored", title: "Follow", summary: "Follow stored link", effect: .session)) { _, ctx in

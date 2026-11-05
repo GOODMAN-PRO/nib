@@ -27,6 +27,7 @@ final class TranscriptPanelModel: ObservableObject {
     }
     @Published var editText = ""
     private var editLoaded = false
+    private var editBaseline: TranscriptSegment?
     private(set) var editClip: String?
     private var recordingClip: String?
     private var subscription: EventSubscription?
@@ -85,7 +86,7 @@ final class TranscriptPanelModel: ObservableObject {
             error = nil
             if let editIndex, !editLoaded,
                let line = transcript?.segments.first(where: { $0.index == editIndex }) {
-                editText = line.text; editLoaded = true
+                editText = line.text; editBaseline = line; editLoaded = true
             }
         } catch {
             guard ref == selectedClip else { return }
@@ -94,12 +95,16 @@ final class TranscriptPanelModel: ObservableObject {
     }
 
     func saveEdit() {
-        guard let editClip, let editIndex, editClip == selectedClip else { return }
-        run(CommandIDs.transcriptEditSegment, ["clip": .string(editClip), "index": .number(Double(editIndex)), "text": .string(editText)])
+        guard let editClip, let editIndex, let editBaseline, editClip == selectedClip else { return }
+        do {
+            let baseline = try JSONValue.from(editBaseline)
+            run(CommandIDs.transcriptEditSegment, ["clip": .string(editClip), "index": .number(Double(editIndex)),
+                "text": .string(editText), "baseline": baseline])
+        } catch { self.error = NibError.wrap(error).message }
     }
 
     func beginEdit(_ line: TranscriptSegment) {
-        editClip = selectedClip; editIndex = line.index; editText = line.text; editLoaded = true
+        editClip = selectedClip; editIndex = line.index; editText = line.text; editBaseline = line; editLoaded = true
     }
 
     func seekSummaryWindow(_ window: TranscriptSummary.Window) {

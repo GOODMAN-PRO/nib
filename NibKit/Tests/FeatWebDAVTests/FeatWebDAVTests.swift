@@ -589,6 +589,39 @@ final class FeatWebDAVTests: XCTestCase {
         XCTAssertThrowsError(try WebDAVConfiguration.normalizeFolder("Nib/../etc"))
     }
 
+    func testSettingsSaveShowsLocalisedValidationWithoutChangingConfiguration() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".bundle")
+        let french = directory.appendingPathComponent("fr.lproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: french, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // A French-only bundle with a French development region avoids relying on the simulator's language.
+        // Integration must still extract the validation strings into Nib/Resources/Localizable.xcstrings
+        // and supply their translations; this fixture does not replace that catalogue handoff.
+        let translations = ["'%@' is not an http or https URL": "L’adresse « %@ » n’est pas une URL HTTP ou HTTPS."]
+        let data = try PropertyListSerialization.data(fromPropertyList: translations, format: .xml, options: 0)
+        try data.write(to: french.appendingPathComponent("Localizable.strings"))
+        let info: [String: Any] = ["CFBundleIdentifier": "com.nib.tests.webdav.french",
+                                  "CFBundleName": "WebDAV French Fixture", "CFBundlePackageType": "BNDL",
+                                  "CFBundleDevelopmentRegion": "fr", "CFBundleLocalizations": ["fr"]]
+        let infoData = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try infoData.write(to: directory.appendingPathComponent("Info.plist"))
+        let bundle = try XCTUnwrap(Bundle(path: directory.path))
+        XCTAssertEqual(bundle.localizedString(forKey: "'%@' is not an http or https URL", value: nil, table: nil),
+                       "L’adresse « %@ » n’est pas une URL HTTP ou HTTPS.")
+        let h = Harness(features: [FeatWebDAVFeature.self])
+        let model = WebDAVSettingsModel(app: h.app, validationBundle: bundle)
+        let before = WebDAVSettings.read(h.app.settings)
+        let address = "nas.local"
+        model.url = address
+        let saved = await model.save()
+        XCTAssertFalse(saved)
+        // Restoring the old English literal in normalizeServerURL fails this exact French assertion.
+        XCTAssertEqual(model.errorMessage, "L’adresse « nas.local » n’est pas une URL HTTP ou HTTPS.")
+        XCTAssertEqual(WebDAVSettings.read(h.app.settings), before)
+        XCTAssertTrue(model.isDirty)
+        XCTAssertFalse(model.isWorking)
+    }
+
     // MARK: Client against the fake server
 
     func testClientListsUploadsDownloadsAndDeletes() async throws {
