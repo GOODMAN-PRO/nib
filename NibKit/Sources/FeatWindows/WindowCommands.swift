@@ -289,6 +289,9 @@ final class WindowScenes {
             let invalid = navigator.openDocuments.filter { !canOpen($0) }
             for doc in invalid where doc != navigator.activeDocument { navigator.closeDocument(doc) }
             if let active = navigator.activeDocument, invalid.contains(active) {
+                // Remove the invalid editor synchronously. Closing first can leave it visible
+                // while the replacement tab waits for an unlock that may be cancelled.
+                navigator.showLibrary(folder: nil)
                 navigator.closeDocument(active)
             }
             for doc in invalid {

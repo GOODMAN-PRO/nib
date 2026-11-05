@@ -117,6 +117,7 @@ struct SettingsPageLink: Hashable {
 final class SettingsNavigationState: ObservableObject {
     /// Regular layout: the selected section (nil = the first one).
     @Published var section: SettingsSection?
+    /// Legacy section-relative state; both layouts now navigate with compactPath.
     @Published var detailPath: [SettingsPageLink] = []
     @Published var compactPath: [SettingsPageLink] = []
     @Published var query = ""
@@ -127,8 +128,7 @@ final class SettingsNavigationState: ObservableObject {
         compactPath = []
     }
 
-    /// Shows one page in both layouts: its section, then the page itself (pushed, unless it is the section's only
-    /// page and so already the section's detail).
+    /// Shows one page in both layouts: its section, then the page itself in the shared stack.
     func show(page id: String, in catalog: SettingsCatalog) {
         guard let page = catalog.page(id) else { return }
         query = ""

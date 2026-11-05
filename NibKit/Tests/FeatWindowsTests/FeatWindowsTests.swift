@@ -17,6 +17,8 @@ final class FakeNavigator: SceneNavigator {
     private(set) var activeDocument: DocumentID?
     /// Editors built: one per open that lands (the shell builds the editor of every document it shows).
     private(set) var editorsBuilt = 0
+    /// The displayed editor container, tracked separately from the session like the shell's content.
+    private(set) var displayedDocument: DocumentID?
     var rootViewController: UIViewController?
 
     init(app: NibApp) {
@@ -49,6 +51,7 @@ final class FakeNavigator: SceneNavigator {
         session.document = doc
         session.page = page ?? content.livePages.first?.id
         editorsBuilt += 1
+        displayedDocument = doc
     }
 
     /// contracts-v2.2: the tab joins the strip without being shown or building its editor.
@@ -61,6 +64,8 @@ final class FakeNavigator: SceneNavigator {
         openDocuments.removeAll { $0 == doc }
         guard activeDocument == doc else { return }
         activeDocument = nil
+        // Match the shell: closing a tab behind the library leaves the library visible.
+        guard session.document != nil else { return }
         if let next = openDocuments.last {
             openDocument(next, page: nil, mode: .replace)
         } else {
@@ -68,7 +73,10 @@ final class FakeNavigator: SceneNavigator {
         }
     }
 
-    func showLibrary(folder: FolderID?) { session.document = nil }
+    func showLibrary(folder: FolderID?) {
+        session.document = nil
+        displayedDocument = nil
+    }
     func showSettings(page: String?) {}
     func presentModal(_ viewController: UIViewController) {}
 }
@@ -542,6 +550,41 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertEqual(right.openDocuments, [board])
         try h.library.deletePermanently(board)
         XCTAssertFalse(scenes.canOpen(board), "cached workspace content is not live library membership")
+    }
+
+    func testTrashingActiveTabShowsLibraryWhenRemainingTabUnlockIsDenied() async throws {
+        let (h, scenes, _) = try windows()
+        await FeatWindowsFeature.start(h.app)
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        XCTAssertEqual(navigator.activeDocument, notebook)
+        XCTAssertEqual(navigator.displayedDocument, notebook)
+        let built = navigator.editorsBuilt
+        var rejected: [DocumentID] = []
+        h.app.ui.openGate = { doc in
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            rejected.append(doc)
+            return false
+        }
+
+        try h.library.trash(notebook)
+        h.app.events.emit(NibEventType.libraryChanged)
+        // Reconciliation must remove the session and editor before any deferred open can run.
+        XCTAssertEqual(navigator.openDocuments, [board])
+        XCTAssertNil(navigator.activeDocument)
+        XCTAssertNil(navigator.session.document)
+        XCTAssertNil(navigator.displayedDocument)
+
+        // Selecting the remaining locked tab and cancelling its prompt must keep the library visible.
+        try await run(h, CommandIDs.tabSelect, ["index": 0], in: navigator)
+        try await waitUntil { !rejected.isEmpty }
+        XCTAssertEqual(rejected, [board])
+        XCTAssertEqual(navigator.openDocuments, [board])
+        XCTAssertNil(navigator.activeDocument)
+        XCTAssertNil(navigator.session.document)
+        XCTAssertNil(navigator.displayedDocument)
+        XCTAssertEqual(navigator.editorsBuilt, built)
     }
 
     func testTabsSwitchCloseAndReopenAtTheirPage() async throws {
