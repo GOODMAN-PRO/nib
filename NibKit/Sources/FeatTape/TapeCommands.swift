@@ -259,6 +259,18 @@ final class TapeStore {
         if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
         customIDs.removeAll { $0 == id }
         patterns.unregister(id: id)
+        if let app {
+            let key = NibSettings.presets("tape")
+            var presets = app.settings.get(key)
+            var changed = false
+            for index in presets.swatches.indices {
+                if presets.swatches[index].pattern.map(PresetSwatch.tapePatternID) == id {
+                    presets.swatches[index].pattern = nil
+                    changed = true
+                }
+            }
+            if changed { app.settings.set(key, presets) }
+        }
         forget(patterns: [id])
         if let clock = app?.clock, history.contains(where: { $0.pattern == id && !$0.deleted }) {
             history = try TapeHistory.save(TapeHistory.cleared(history, pattern: id, clock: clock), folder: folder,
