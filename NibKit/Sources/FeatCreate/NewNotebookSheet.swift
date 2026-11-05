@@ -1402,18 +1402,23 @@ struct NewNotebookSheet: View {
 
     @ViewBuilder
     private var customSizeFields: some View {
-        HStack(spacing: NibSpacing.s) {
-            millimetreField(String(localized: "Width"), field: .width, value: $model.customWidth)
-            Text(String(localized: "by"))
-                .font(NibFont.footnote)
-                .foregroundStyle(NibColor.labelSecondary)
-            millimetreField(String(localized: "Height"), field: .height, value: $model.customHeight)
-            Text(String(localized: "mm"))
-                .font(NibFont.footnote)
-                .foregroundStyle(NibColor.labelSecondary)
+        // Each dimension keeps its own label and the full proposed width at accessibility sizes.
+        VStack(alignment: .leading, spacing: NibSpacing.m) {
+            dimensionRow(String(localized: "Width"), field: .width, value: $model.customWidth)
+            dimensionRow(String(localized: "Height"), field: .height, value: $model.customHeight)
         }
         if let message = model.dimensionMessage {
             NibBanner(message, style: .warning)
+        }
+    }
+
+    private func dimensionRow(_ label: String, field: CustomDimension, value: Binding<Double>) -> some View {
+        VStack(alignment: .leading, spacing: NibSpacing.xs) {
+            Text(String(localized: "\(label) in millimetres"))
+                .font(NibFont.footnote)
+                .foregroundStyle(NibColor.labelSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            millimetreField(label, field: field, value: value)
         }
     }
 
@@ -1424,8 +1429,7 @@ struct NewNotebookSheet: View {
             .font(NibFont.body)
             .multilineTextAlignment(.trailing)
             .padding(.horizontal, NibSpacing.m)
-            .frame(minWidth: NibMetrics.hitTarget * 2, minHeight: NibMetrics.hitTarget)
-            .fixedSize(horizontal: true, vertical: false)
+            .frame(minWidth: 0, maxWidth: .infinity, minHeight: NibMetrics.hitTarget)
             .background(NibColor.backgroundTertiary, in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
             .onSubmit { model.applyCustomSize() }
             .onChange(of: value.wrappedValue) { _, _ in model.applyCustomSize() }

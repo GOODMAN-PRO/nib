@@ -2075,6 +2075,49 @@ final class FeatCreateTests: XCTestCase {
         }
     }
 
+    func testMaximumCustomDimensionsFitA375PointViewportAtAccessibility5() async throws {
+        let h = harness()
+        h.app.settings.set(NibSettings.defaultPageSize, PageSize(14_400, 14_400))
+        let size = CGSize(width: 375, height: 667)
+        for scheme in [ColorScheme.light, .dark] {
+            let sheet = NewNotebookSheet(app: h.app, folder: nil, kind: .notebook, session: h.session,
+                                         navigator: nil, onDone: {})
+                .environment(\.dynamicTypeSize, .accessibility5)
+                .environment(\.colorScheme, scheme)
+            let host = UIHostingController(rootView: sheet.ignoresSafeArea())
+            let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            for _ in 0..<5 {
+                host.view.setNeedsLayout()
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            func fields(in view: UIView) -> [UITextField] {
+                ((view as? UITextField).map { [$0] } ?? []) + view.subviews.flatMap { fields(in: $0) }
+            }
+            let dimensions = fields(in: host.view).filter { $0.keyboardType == .decimalPad }
+            XCTAssertEqual(dimensions.count, 2)
+            for field in dimensions {
+                var ancestor = field.superview
+                while let view = ancestor, !(view is UIScrollView) { ancestor = view.superview }
+                let scroll = try XCTUnwrap(ancestor as? UIScrollView)
+                let bounds = scroll.convert(scroll.bounds, to: window)
+                let frame = field.convert(field.bounds, to: window)
+                XCTAssertGreaterThanOrEqual(frame.minX, bounds.minX)
+                XCTAssertLessThanOrEqual(frame.maxX, bounds.maxX)
+                let text = try XCTUnwrap(field.text)
+                let font = try XCTUnwrap(field.font)
+                XCTAssertGreaterThanOrEqual(text.filter(\.isNumber).count, 4, "Both maximum dimensions must remain populated")
+                XCTAssertLessThanOrEqual((text as NSString).size(withAttributes: [.font: font]).width,
+                                         field.textRect(forBounds: field.bounds).width,
+                                         "The entire dimension must fit without horizontal text scrolling")
+            }
+        }
+    }
+
     func testNewNotebookWithCoverColoursFitsA402PointPhone() async throws {
         let h = harness()
         h.app.content.templates.register(Self.ruled())
