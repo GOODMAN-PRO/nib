@@ -861,9 +861,10 @@ final class Indexer {
                 progress?.unitIndexed()
                 if let fresh = try? reader.head(doc) { currentHead = fresh }
             }
-            // Batch unchanged pages. Reload after yielding, because another task may delete a later page.
+            // Even unchanged pages synchronously read and hash items. Yield each time to keep the main actor
+            // responsive; batch only head reads (indexPage also refreshes after waiting for another unit).
+            await Task.yield()
             if (offset + 1) % 32 == 0 {
-                await Task.yield()
                 if let fresh = try? reader.head(doc) { currentHead = fresh }
             }
         }

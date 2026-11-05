@@ -152,6 +152,8 @@ final class TileCache {
         defer { lock.unlock() }
         epoch += 1
         index.removeAll()
+        // The new epoch rejects all old workers, so page counters can safely start over too.
+        generations.removeAll()
         cache.removeAllObjects()
     }
 
@@ -233,7 +235,7 @@ final class NibPageRenderer: PageRenderer {
     private var commitSubscription: EventSubscription?
     private var lifetimeSubscription: EventSubscription?
     private var observers: [NSObjectProtocol] = []
-    /// One fingerprint per page generation, bounded independently of the bitmap cache.
+    /// Loaded-item fingerprints only, one per page generation, bounded independently of the bitmap cache.
     @MainActor private var thumbnailProbes: [String: ThumbnailProbe] = [:]
     typealias ThumbnailProbe = (rev: Rev, fingerprint: String, generation: TileCache.Generation)
 
@@ -417,18 +419,26 @@ final class NibPageRenderer: PageRenderer {
     @MainActor
     func thumbnailProbe(doc: DocumentID, page: PageID) throws -> ThumbnailProbe {
         guard let app = app else { throw NibError.unavailable("page renderer") }
-        guard let record = try app.workspace.content(doc).page(page) else {
+        guard let record = try app.workspace.peekContent(doc).page(page) else {
             throw NibError.notFound("page \(page.raw) in document \(doc.raw)")
         }
         let key = TileCache.pageKey(doc, page)
         let generation = tiles.generation(key)
-        if let probe = thumbnailProbes[key], probe.generation == generation, probe.rev == record.rev { return probe }
+        // Only loaded items change through commits that invalidate the generation. Uncached pages can change
+        // offline without an event; persistence already caches its fingerprint by file stamps.
+        let cachedItems = app.workspace.isPageCached(doc, page: page)
+        if cachedItems, let probe = thumbnailProbes[key], probe.generation == generation, probe.rev == record.rev {
+            return probe
+        }
+        if !cachedItems { thumbnailProbes[key] = nil }
         let fingerprint = try app.workspace.contentFingerprint(doc, page: page)
         // The fingerprint already covers every item revision. Using only the page record here avoids a second
         // item load when persistence cannot supply a maximum revision, and keeps cold/warm keys identical.
         let probe: ThumbnailProbe = (record.rev, record.rev.description + "_" + fingerprint, generation)
-        if thumbnailProbes.count >= 1024 { thumbnailProbes.removeAll() }
-        thumbnailProbes[key] = probe
+        if cachedItems {
+            if thumbnailProbes.count >= 1024 { thumbnailProbes.removeAll() }
+            thumbnailProbes[key] = probe
+        }
         return probe
     }
 
