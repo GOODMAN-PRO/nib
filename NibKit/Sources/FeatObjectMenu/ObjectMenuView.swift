@@ -164,11 +164,9 @@ enum ObjectMenuPlacement {
     /// Below it: past the bottom handles' hit areas.
     static let gapBelow = NibMetrics.hitTarget / 2 + NibSpacing.xs
 
-    /// A freehand lasso can surround much more than the item handles. Keep the action bar outside
-    /// both, so scaling the page cannot move it onto the retained dashed outline.
+    /// Completed selections display their tight item bounds; the original drag path is not a resting anchor.
     static func exclusionBounds(items: Rect, outline: [Point]?) -> Rect {
-        guard let outline, outline.count >= 3, let lasso = Rect.bounding(outline) else { return items }
-        return items.union(lasso)
+        items
     }
 
     /// The canvas already receives the chrome's reserved insets, including a docked palette and its options.
@@ -191,7 +189,8 @@ enum ObjectMenuPlacement {
     }
 
     /// `top` / `bottom`: what the chrome and safe area keep clear at the container's top and bottom.
-    static func place(bar: CGSize, selection: CGRect, in bounds: CGRect, top: CGFloat, bottom: CGFloat) -> Result? {
+    static func place(bar: CGSize, selection: CGRect, in bounds: CGRect, top: CGFloat, bottom: CGFloat,
+                      obstacles: [CGRect] = []) -> Result? {
         guard !selection.isNull, !selection.isInfinite, !bounds.isEmpty,
               selection.intersects(bounds) || bounds.contains(selection) else {
             return nil
@@ -204,9 +203,20 @@ enum ObjectMenuPlacement {
         let lo = bounds.minY + top + halfH
         let hi = max(lo, bounds.maxY - bottom - halfH)
         let aboveY = visible.minY - gapAbove - halfH
-        if aboveY >= lo && aboveY <= hi { return Result(centre: CGPoint(x: x, y: aboveY), above: true) }
         let belowY = visible.maxY + gapBelow + halfH
-        if belowY >= lo && belowY <= hi { return Result(centre: CGPoint(x: x, y: belowY), above: false) }
+        func clear(_ y: CGFloat) -> Bool {
+            let frame = CGRect(x: x - halfW, y: y - halfH, width: bar.width, height: bar.height)
+            return !obstacles.contains { $0.intersects(frame) }
+        }
+        if aboveY >= lo && aboveY <= hi && clear(aboveY) { return Result(centre: CGPoint(x: x, y: aboveY), above: true) }
+        if belowY >= lo && belowY <= hi && clear(belowY) { return Result(centre: CGPoint(x: x, y: belowY), above: false) }
+        // If adjacent content blocks both sides, try the nearest clear row beyond it.
+        let alternatives = obstacles.flatMap { rect -> [CGFloat] in
+            [rect.minY - NibSpacing.l - halfH, rect.maxY + NibSpacing.l + halfH]
+        }.sorted { abs($0 - visible.midY) < abs($1 - visible.midY) }
+        for y in alternatives where y >= lo && y <= hi && (y <= aboveY || y >= belowY) && clear(y) {
+            return Result(centre: CGPoint(x: x, y: y), above: y < visible.midY)
+        }
         // Neither side has the full handle clearance (a large or partially clipped selection). Keep actions
         // reachable inside the visible chrome bounds, on whichever side has more space.
         let above = visible.minY - (bounds.minY + top) >= bounds.maxY - bottom - visible.maxY
@@ -308,6 +318,7 @@ final class ObjectMenuModel: ObservableObject {
     /// The selection in the floating host's container coordinates (`.null` = none).
     @Published private(set) var anchor: CGRect = .null
     @Published private(set) var viewport: CGRect?
+    @Published private(set) var obstacles: [CGRect] = []
     @Published var isShown = false
     @Published var colourOpen = false {
         didSet {
@@ -401,6 +412,7 @@ final class ObjectMenuModel: ObservableObject {
         styleOpen = false
         anchor = .null
         viewport = nil
+        obstacles = []
         lastApplied = nil
     }
 
@@ -410,6 +422,10 @@ final class ObjectMenuModel: ObservableObject {
 
     func setViewport(_ rect: CGRect?) {
         if viewport != rect { viewport = rect }
+    }
+
+    func setObstacles(_ rects: [CGRect]) {
+        if obstacles != rects { obstacles = rects }
     }
 
     func nodes(_ entries: [ObjectMenuEntry]) -> [ObjectMenuNode] { ObjectMenuComposer.group(entries) }
@@ -515,7 +531,7 @@ struct ObjectMenuOverlay: View {
             let bottom = max(NibMetrics.chromeInset,
                              available.maxY - bounds.maxY + proxy.safeAreaInsets.bottom + NibMetrics.chromeInset)
             let placement = ObjectMenuPlacement.place(bar: barSize, selection: model.anchor, in: available,
-                                                      top: top, bottom: bottom)
+                                                      top: top, bottom: bottom, obstacles: model.obstacles)
             ZStack(alignment: .topLeading) {
                 if model.isShown, model.hasEntries, let placement {
                     ObjectMenuBar(model: model,

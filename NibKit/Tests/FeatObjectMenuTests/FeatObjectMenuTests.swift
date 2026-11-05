@@ -839,11 +839,11 @@ final class FeatObjectMenuTests: XCTestCase {
                                                in: bounds, top: 60, bottom: 16))
     }
 
-    func testObjectMenuClearsTheLassoOutlineAtPortraitAndLandscapeScales() throws {
+    func testObjectMenuUsesTightSelectionAtPortraitAndLandscapeScales() throws {
         let items = Rect(x: 300, y: 500, width: 180, height: 80)
         let outline = [Point(240, 400), Point(540, 400), Point(540, 650), Point(240, 650)]
         let exclusion = ObjectMenuPlacement.exclusionBounds(items: items, outline: outline)
-        XCTAssertEqual(exclusion, Rect(x: 240, y: 400, width: 300, height: 250))
+        XCTAssertEqual(exclusion, items, "The original lasso path must not move the bar away from the displayed selection")
         XCTAssertEqual(ObjectMenuPlacement.exclusionBounds(items: items, outline: nil), items)
         XCTAssertEqual(ObjectMenuPlacement.exclusionBounds(items: items, outline: Array(outline.prefix(2))), items)
         XCTAssertEqual(ObjectMenuPlacement.exclusionBounds(items: items,
@@ -857,6 +857,19 @@ final class FeatObjectMenuTests: XCTestCase {
             XCTAssertTrue(placed.above)
             XCTAssertLessThanOrEqual(placed.centre.y + bar.height / 2, projected.minY - ObjectMenuPlacement.gapAbove)
         }
+    }
+
+    func testObjectMenuChoosesBelowWhenAboveCoversAnUnselectedObject() throws {
+        let selection = CGRect(x: 300, y: 500, width: 180, height: 80)
+        let rectangle = CGRect(x: 220, y: 350, width: 180, height: 120)
+        let bar = CGSize(width: 300, height: 44)
+        let placed = try XCTUnwrap(ObjectMenuPlacement.place(bar: bar, selection: selection,
+            in: CGRect(x: 0, y: 0, width: 834, height: 1194), top: 60, bottom: 16, obstacles: [rectangle]))
+        XCTAssertFalse(placed.above)
+        XCTAssertEqual(placed.centre.y, selection.maxY + ObjectMenuPlacement.gapBelow + bar.height / 2)
+        let frame = CGRect(x: placed.centre.x - bar.width / 2, y: placed.centre.y - bar.height / 2,
+                           width: bar.width, height: bar.height)
+        XCTAssertFalse(frame.intersects(rectangle))
     }
 
     func testLandscapePlacementUsesTheVisibleSelectionInContainerCoordinates() throws {
