@@ -454,6 +454,22 @@ final class NibStoreTests: XCTestCase {
         }
     }
 
+    func testAssetWriteRejectsCapturedPackageAfterRelocation() throws {
+        let lib = TestLibrary()
+        let doc = Fixtures.docID
+        let old = lib.package(doc)
+        let moved = lib.root.appendingPathComponent("Renamed.nibnote", isDirectory: true)
+        let assets = lib.assets()
+        let ref = try PackageAssetStore.ref(for: Fixtures.pngData, ext: "png")
+        try FileManager.default.moveItem(at: old, to: moved)
+        lib.locator.set(moved, for: doc)
+        XCTAssertThrowsError(try assets.write(Fixtures.pngData, ref: ref, doc: doc, package: old))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
+        XCTAssertEqual(try assets.put(Fixtures.pngData, ext: "png", doc: doc), ref)
+        XCTAssertEqual(try assets.data(ref, doc: doc), Fixtures.pngData)
+        XCTAssertEqual(assets.url(ref, doc: doc)?.deletingLastPathComponent().deletingLastPathComponent(), moved)
+    }
+
     func testAssetsAreDeduplicatedAndTemporaryAssetsExpire() throws {
         let lib = TestLibrary()
         let doc = Fixtures.docID
