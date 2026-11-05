@@ -29,3 +29,12 @@ Confirmed chrome-timeouts#2 and chrome-singles#0 correction. Round 9b already sc
 | Chrome native forms | Native form field duration | What did one scoped field cost? |
 | Chrome interruptions | Chrome interruption | Which element did XCTest report before its default handler? |
 | Ruler angle/position tests | Ruler alert confirm / Ruler alert after tap | Was confirmation enabled/hittable at which frame, and did the alert remain? |
+
+### H4 - menu closure is a postcondition
+
+Confirmed chrome-state-pdf#1, chrome-singles#6 corrections and insert-pickers-audio#6: More is a labelled ScrollView (not a native Popover), and Replay Options leaves a PopoverDismissRegion. Added a shared query-only bounded menu-disappearance assertion with element/probe/screenshot failure evidence. Chrome More, title/Add Page/Share menu actions, tool-More selections and draw now use it. dismissSheets first closes identifiable native/custom popovers through a safe outside point and verifies disappearance; unidentified dismissal-region geometry explicitly reports an open popover; a remaining toolSettingsOpen probe likewise reports instead of silently returning. Existing sheet/panel close ordering remains, including preserving Audio behind a dismissed share surface. All dismissSheets callers were inventoried. CI must show no cover before canvas input, successful Replay mode iteration or explicit unknown-surface facts. The reason a More action failed to close remains unproven; no automatic extra tap hides that failure.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Chrome More/tool-More and draw; shared dismissal callers | Menu remained open / State step | Which menu frame survived, and what panels/probe state followed its action? |
+| Insert Replay and shared dismissal callers | Popover still open | Was a dismissal region exposed without safe surface geometry? |

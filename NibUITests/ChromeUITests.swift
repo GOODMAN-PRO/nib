@@ -80,7 +80,13 @@ final class ChromeUITests: XCTestCase {
         return found
     }
 
-    private func tap(_ name: String, type: XCUIElement.ElementType = .any) throws { try reachable(name, type: type).tap() }
+    private func tap(_ name: String, type: XCUIElement.ElementType = .any) throws {
+        let toolMenu = ui.app.scrollViews["More tools"].firstMatch
+        let selectsTool = name != "tool.more" && (name.hasPrefix("tool.") || name.hasPrefix("cmd.") || name == "Templates")
+        let closesToolMenu = selectsTool && toolMenu.exists
+        try reachable(name, type: type).tap()
+        if closesToolMenu { try ui.waitForMenuClosed(toolMenu, named: "More tools after " + name) }
+    }
     private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = []) throws {
         if try ui.state().keyResponderIsText == true {
             let field = ui.app.descendants(matching: .any).matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
@@ -120,8 +126,19 @@ final class ChromeUITests: XCTestCase {
             try tap("menu." + id)
         }
     }
-    private func menu(_ id: String, _ action: String) throws { try openMenu(id); try tap(action) }
-    private func more(_ action: String) throws { try openMenu("more"); try tap(action, type: .button) }
+    private func menu(_ id: String, _ action: String) throws {
+        try openMenu(id)
+        let menus = ui.app.scrollViews.containing(.button, identifier: action).allElementsBoundByIndex
+        let surface = try XCTUnwrap(menus.first { $0.identifier != "nib.canvas" && $0.isHittable },
+                                    "The droplet menu must contain its action: " + action)
+        try tap(action)
+        try ui.waitForMenuClosed(surface, named: id + " after " + action)
+    }
+    private func more(_ action: String) throws {
+        try openMenu("more")
+        try tap(action, type: .button)
+        try ui.waitForMenuClosed(ui.app.scrollViews["More"].firstMatch, named: "More after " + action)
+    }
     private func panel(_ id: String, shown: Bool = true) throws {
         _ = try ui.waitForState(timeout: 12) { $0.openPanels.contains(id) == shown }
     }
@@ -147,6 +164,8 @@ final class ChromeUITests: XCTestCase {
         try draw(diagnostic: name)
     }
     private func draw(y: CGFloat = 0.65, diagnostic: String? = nil) throws {
+        try ui.waitForMenuClosed(ui.app.scrollViews["More"].firstMatch, named: "More before drawing")
+        try ui.waitForMenuClosed(ui.app.scrollViews["More tools"].firstMatch, named: "More tools before drawing")
         let before = try ui.state()
         if let diagnostic {
             try ui.diagnoseAction(diagnostic + " stroke", facts: { String(describing: self.ui.probe.value) }) {

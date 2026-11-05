@@ -2400,6 +2400,50 @@ final class NibUI {
         }
     }
 
+    /// Query-only postcondition: never use a canvas tap to hide a failed menu action.
+    func waitForMenuClosed(_ menu: XCUIElement, named name: String) throws {
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            !menu.exists || !hasVisibleFrame(menu)
+        }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
+            let facts = "menu=\(name) " + elementFacts(menu)
+            logQA("Menu remained open", facts)
+            logStateStep("Menu remained open " + name)
+            recordDiagnostics("Menu remained open " + name, facts: facts)
+            throw Failure.message("Menu must close before subsequent input: " + facts)
+        }
+    }
+
+    /// Native popovers expose a dismissal region; custom buds expose labelled scroll views.
+    /// Refuse ambiguous geometry instead of silently returning with an input cover still up.
+    private func dismissPresentedPopover() throws -> Bool {
+        let region = app.otherElements["PopoverDismissRegion"].firstMatch
+        let native = app.popovers.allElementsBoundByIndex.filter { hasVisibleFrame($0) }
+        let buds = app.scrollViews.matching(NSPredicate(format: "label IN {'More', 'More tools'}"))
+            .allElementsBoundByIndex.filter { hasVisibleFrame($0) }
+        guard region.exists || !native.isEmpty || !buds.isEmpty else { return false }
+        let surfaces = native + buds
+        guard !surfaces.isEmpty else {
+            let facts = elementFacts(region)
+            logQA("Popover still open", facts)
+            throw Failure.message("Popover dismissal region is open without identifiable surface: " + facts)
+        }
+        let window = app.windows.firstMatch.frame
+        let frames = surfaces.map(\.frame)
+        let points = [CGPoint(x: window.minX + 24, y: window.maxY - 24),
+                      CGPoint(x: window.maxX - 24, y: window.maxY - 24),
+                      CGPoint(x: window.minX + 24, y: window.minY + 24)]
+        guard let point = points.first(where: { point in
+            !frames.contains { $0.contains(point) } && (!region.exists || region.frame.contains(point))
+        }) else { throw Failure.message("Popover still open: no safe outside dismissal point") }
+        let frame = app.frame
+        app.coordinate(withNormalizedOffset: .zero).withOffset(
+            CGVector(dx: point.x - frame.minX, dy: point.y - frame.minY)).tap()
+        for surface in surfaces { try waitForMenuClosed(surface, named: "dismissSheets popover") }
+        if region.exists { try waitForMenuClosed(region, named: "PopoverDismissRegion") }
+        return true
+    }
+
     func dismissSheets() throws {
         // Modal form sheets are plain containers in the accessibility tree (only confirmation dialogs are
         // typed Sheet, run 41961796255), so the close control is looked up app-wide as before. A panel's own
@@ -2407,6 +2451,7 @@ final class NibUI {
         // the loop must not go on to close the Audio panel behind it (D:controls-forms#9).
         var dismissedSurface = false
         for _ in 0..<8 {
+            if try dismissPresentedPopover() { dismissedSurface = true; continue }
             var close: XCUIElement?
             for id in ["sheet.dismiss", "cmd.panel.close", "Cancel", "Done", "Close", "Close export options"] {
                 if dismissedSurface, id == "cmd.panel.close" { continue }
@@ -2419,6 +2464,10 @@ final class NibUI {
             }
             if let sheet = app.sheets.allElementsBoundByIndex.first(where: { hasVisibleFrame($0) && $0.isHittable }) {
                 sheet.swipeDown(); continue
+            }
+            if let settings = try readState()?.toolSettingsOpen {
+                logQA("Popover still open", "toolSettingsOpen=\(settings)")
+                throw Failure.message("Tool settings popover still open after sheet dismissal: " + settings)
             }
             return
         }
