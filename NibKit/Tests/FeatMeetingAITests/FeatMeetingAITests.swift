@@ -27,6 +27,42 @@ final class FeatMeetingAITests: XCTestCase {
         XCTAssertNotNil(h.app.ui.panels.get(FeatMeetingAIFeature.panelID))
         XCTAssertNotNil(h.app.ui.settingsPages.get(FeatMeetingAIFeature.settingsID))
     }
+
+    func testAutomaticSummaryWaitsForCommittedSpeechWithoutErrorOrBackoff() async throws {
+        let (h, ai) = harness()
+        let runtime = try XCTUnwrap(h.app.services.get(LiveSummarizer.serviceKey, as: LiveSummarizer.self))
+        h.app.settings.set(MeetingSettings.live, true)
+        registerTranscript(h, committed: [], transcribing: true)
+        runtime.receive(AudioRecordingPayload(clip: ref, state: "recording", duration: 0))
+        let first = Date(timeIntervalSinceNow: 61)
+        await runtime.tick(now: first)
+        XCTAssertNil(runtime.errors[ref])
+        XCTAssertTrue(ai.requests.isEmpty)
+        registerTranscript(h, committed: lines, transcribing: true)
+        await runtime.tick(now: first.addingTimeInterval(61))
+        XCTAssertEqual(ai.requests.count, 1, "silence must not trigger error backoff")
+        XCTAssertNil(runtime.errors[ref])
+    }
+
+    func testManualSummaryClearsAutomaticFailureEvenWhenLiveIsOff() async throws {
+        let (h, ai) = harness()
+        let runtime = try XCTUnwrap(h.app.services.get(LiveSummarizer.serviceKey, as: LiveSummarizer.self))
+        h.app.settings.set(MeetingSettings.live, true)
+        runtime.receive(AudioRecordingPayload(clip: ref, state: "recording", duration: 20))
+        ai.responses = [.init(text: "invalid JSON")]
+        let first = Date(timeIntervalSinceNow: 61)
+        await runtime.tick(now: first)
+        XCTAssertNotNil(runtime.errors[ref])
+        h.app.settings.set(MeetingSettings.live, false)
+        ai.responses = [.init(text: LiveSummarizerTests.answer), .init(text: LiveSummarizerTests.answer)]
+        _ = try await h.run(CommandIDs.meetingSummarize, ["clip": .string(ref)])
+        XCTAssertNil(runtime.errors[ref])
+        h.app.settings.set(MeetingSettings.live, true)
+        let extra = TranscriptSegment(index: 1, start: 61, duration: 20, text: "Prepare the next release together.")
+        registerTranscript(h, committed: lines + [extra])
+        await runtime.tick(now: first.addingTimeInterval(61))
+        XCTAssertEqual(ai.requests.count, 3, "manual success also clears automatic error backoff")
+    }
     func testSummaryAndRegenerationUndoRedo() async throws {
         let (h, ai) = harness()
         let before = try h.snapshot()
