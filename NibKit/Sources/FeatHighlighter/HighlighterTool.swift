@@ -50,7 +50,7 @@ final class HighlighterTool: CanvasTool {
 
     private struct Hold {
         let generation: Int
-        let stroke: Stroke
+        var stroke: Stroke
         let page: PageID
         /// Where the pen rested: the reference for live scale and rotation.
         let holdPoint: Point
@@ -63,6 +63,7 @@ final class HighlighterTool: CanvasTool {
         var mergeWith: [String] = []
         var recognitionDone = false
         var touchEnded = false
+        var lastTimestamp: TimeInterval?
     }
 
     private var hold: Hold?
@@ -104,9 +105,22 @@ final class HighlighterTool: CanvasTool {
         guard var h = hold, let sample = samples.last(where: { !$0.isPredicted }) ?? samples.last else { return }
         // The pen may wander onto the next page: follow it in the held stroke's page coordinates.
         h.current = host.convert(sample.location, from: sample.page, to: h.page) ?? h.current
-        if let r = h.recognised { h.shape = HeldShape.adjusted(r, from: h.holdPoint, to: h.current) }
+        if let r = h.recognised {
+            h.shape = HeldShape.adjusted(r, from: h.holdPoint, to: h.current)
+        } else {
+            for sample in samples where !sample.isPredicted {
+                guard let point = host.convert(sample.location, from: sample.page, to: h.page) else { continue }
+                let elapsed = max(0, sample.timestamp - (h.lastTimestamp ?? sample.timestamp))
+                var segment = [StrokePoint(x: Float(point.x), y: Float(point.y),
+                    t: (h.stroke.points.last?.t ?? 0) + Float(elapsed), force: Float(sample.force),
+                    azimuth: Float(sample.azimuth), altitude: Float(sample.altitude), roll: Float(sample.roll))]
+                InkModel.fillSizes(&segment, style: h.stroke.style)
+                h.stroke.points.append(contentsOf: segment)
+                h.lastTimestamp = sample.timestamp
+            }
+        }
         hold = h
-        if h.recognised != nil { refreshPreview(host) }
+        refreshPreview(host)
     }
 
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {

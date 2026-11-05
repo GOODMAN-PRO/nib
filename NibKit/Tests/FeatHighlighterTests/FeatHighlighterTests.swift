@@ -459,9 +459,24 @@ final class FeatHighlighterTests: XCTestCase {
         }
         defer { subscription.cancel() }
         XCTAssertTrue(tool.strokeHeld(stroke, page: Fixtures.page1, host: host))
-        tool.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(110, 100)), host: host)
+        tool.touchesMoved([
+            CanvasSample(page: Fixtures.page1, location: Point(120, 110), force: 0.2, timestamp: 1),
+            CanvasSample(page: Fixtures.page1, location: Point(130, 120), force: 0.7, timestamp: 1.1),
+            CanvasSample(page: Fixtures.page1, location: Point(140, 110), timestamp: 1.2),
+            CanvasSample(page: Fixtures.page1, location: Point(999, 999), isPredicted: true)
+        ], host: host)
+        tool.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(150, 100), timestamp: 1.3), host: host)
         for _ in 0..<200 where host.committed.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
-        XCTAssertEqual(host.committed.first?.stroke, stroke)
+        let kept = try XCTUnwrap(host.committed.first?.stroke)
+        XCTAssertEqual(kept.style, stroke.style)
+        XCTAssertEqual(kept.t0, stroke.t0)
+        XCTAssertEqual(kept.tapeRevealed, stroke.tapeRevealed)
+        XCTAssertEqual(Array(kept.points.prefix(stroke.points.count)), stroke.points)
+        XCTAssertEqual(Array(kept.polyline.suffix(4)), [Point(120, 110), Point(130, 120), Point(140, 110), Point(150, 100)])
+        XCTAssertEqual(kept.points.count, stroke.points.count + 4)
+        XCTAssertEqual(kept.points[stroke.points.count].force, 0.2, accuracy: 0.001)
+        XCTAssertTrue(kept.points.suffix(4).allSatisfy { $0.width > 0 && $0.height > 0 })
+        XCTAssertEqual(try XCTUnwrap(kept.points.last).t, try XCTUnwrap(stroke.points.last).t + 0.3, accuracy: 0.001)
         XCTAssertEqual(host.committed.count, 1)
         XCTAssertEqual(host.renderWaits, [Fixtures.page1], "the preview stays until the kept stroke has rendered")
         XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
