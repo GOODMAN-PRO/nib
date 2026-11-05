@@ -37,6 +37,20 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
     private var waiters: [PageID: [Waiter]] = [:]
     /// commitStroke calls still executing, per page: their commit has not happened yet.
     private var expecting: [PageID: Int] = [:]
+    private var strokeCommitGroup: StrokeCommitGroup?
+
+    /// Tracks all commits synchronously started by one tool hand-off, including early failures and replacements.
+    @MainActor private final class StrokeCommitGroup {
+        var pending = 1 // the tool's strokeFinished call itself
+        var succeeded = true
+        let completion: @MainActor (Bool) -> Void
+        init(_ completion: @escaping @MainActor (Bool) -> Void) { self.completion = completion }
+        func finish(_ success: Bool) {
+            succeeded = succeeded && success
+            pending -= 1
+            if pending == 0 { completion(succeeded) }
+        }
+    }
     /// The longest a tool waits for dry tiles (a failed command, a page scrolled away, no renderer).
     static let renderWaitLimit: UInt64 = 1_500_000_000
 
@@ -143,13 +157,39 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
     // MARK: Strokes
 
     func commitStroke(_ stroke: Stroke, page: PageID) {
-        commitStroke(stroke, page: page) { _ in }
+        commitStroke(stroke, page: page) { [app] result in
+            if case .failure(let error) = result {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                    userInfo: ["command": CommandIDs.inkAddStrokes, "error": error])
+            }
+        }
+    }
+
+    /// The render fence alone cannot distinguish saved ink from a failed commit.
+    func observeStrokeCommits(_ body: () -> Void, completion: @escaping @MainActor (Bool) -> Void) {
+        let previous = strokeCommitGroup
+        let group = StrokeCommitGroup(completion)
+        strokeCommitGroup = group
+        body()
+        strokeCommitGroup = previous
+        group.finish(true)
     }
 
     /// Stroke processors in registry order (stabilisation, straight highlighter, ruler projection), then
     /// `ink.addStrokes` as the user. A processor that drops the stroke succeeds with nil; a failing command reports
     /// its error, so a tool never records history for a stroke that was not written.
     func commitStroke(_ stroke: Stroke, page: PageID, completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void) {
+        let group = strokeCommitGroup
+        group?.pending += 1
+        commitProcessedStroke(stroke, page: page) { result in
+            completion(result)
+            if case .failure = result { group?.finish(false) }
+            else { group?.finish(true) }
+        }
+    }
+
+    private func commitProcessedStroke(_ stroke: Stroke, page: PageID,
+                                       completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void) {
         guard !isReadOnly else {
             completion(.failure(NibError(.permissionDenied, "This document is read-only.",
                                          hint: "turn off read-only mode (view.setReadOnly) to write")))

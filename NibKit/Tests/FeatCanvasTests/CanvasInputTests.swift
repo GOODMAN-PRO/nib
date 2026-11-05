@@ -220,6 +220,55 @@ final class CanvasInputTests: XCTestCase {
         XCTAssertEqual(retires, 1)
     }
 
+    func testFailedDefaultCommitReportsErrorAndKeepsWetStrokeAfterRenderFence() async throws {
+        for readOnly in [false, true] {
+            let h = Harness()
+            h.session.readOnly = readOnly
+            let host = CanvasHostImpl(app: h.app, session: h.session, documentID: Fixtures.docID,
+                scrollView: DocumentScrollView(frame: .zero), fixedOverlay: PassThroughView())
+            let handoff = WetStrokeHandoff()
+            let notice = expectation(description: "default commit failure is visible")
+            let token = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+                XCTAssertEqual(note.userInfo?["command"] as? String, CommandIDs.inkAddStrokes)
+                XCTAssertNotNil(note.userInfo?["error"] as? NibError)
+                notice.fulfill()
+            }
+            defer { NotificationCenter.default.removeObserver(token) }
+            var retired = false
+            let stroke = Stroke(style: .defaultPen, points: [StrokePoint(x: 1, y: 2), StrokePoint(x: 3, y: 4)], t0: 1)
+            handoff.deliver(PKBridge.pkStroke(stroke), style: stroke.style, page: Fixtures.page1,
+                tool: Tool(), host: host) { retired = true }
+            await fulfillment(of: [notice], timeout: 5)
+            host.flushAllWaiters()
+            await Task.yield()
+            XCTAssertFalse(retired)
+            XCTAssertFalse(handoff.retired)
+        }
+    }
+
+    func testCommitGroupWaitsForEveryCommitAndRemembersEarlyFailure() async throws {
+        let h = Harness()
+        let host = CanvasHostImpl(app: h.app, session: h.session, documentID: Fixtures.docID,
+            scrollView: DocumentScrollView(frame: .zero), fixedOverlay: PassThroughView())
+        let stroke = Stroke(style: .defaultPen, points: [StrokePoint(x: 1, y: 2)], t0: 1)
+        var results = 0
+        let done = expectation(description: "all commits completed")
+        host.observeStrokeCommits({
+            h.session.readOnly = true
+            host.commitStroke(stroke, page: Fixtures.page1) { _ in results += 1 }
+            h.session.readOnly = false
+            host.commitStroke(stroke, page: Fixtures.page1) { _ in results += 1 }
+        }, completion: { success in
+            XCTAssertFalse(success)
+            XCTAssertEqual(results, 2)
+            done.fulfill()
+        })
+        await fulfillment(of: [done], timeout: 5)
+        var emptySucceeded = false
+        host.observeStrokeCommits({}, completion: { emptySucceeded = $0 })
+        XCTAssertTrue(emptySucceeded, "Tools that intentionally consume ink need no commit")
+    }
+
     func testCancellationFromStrokeFinishedIsIdempotentAndDiscardsOnlyThatWetStroke() {
         let host = FencedHost(Harness()), tool = Tool(), handoff = WetStrokeHandoff()
         tool.cancelOnFinish = true
