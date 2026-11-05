@@ -8,6 +8,34 @@ import NibTesting
 final class FeatTranscriptionTests: XCTestCase {
     private let ref = "audio:FIXTUREDOC01/FIXTUREAUD01"
 
+    func testTerminalEmptyWindowsDoNotBackOff() async throws {
+        for disabled in [false, true] {
+            for complete in [false, true] {
+                let h = Harness(features: [FeatTranscriptionFeature.self])
+                try writeAudio(h, duration: 0.01)
+                let live = try XCTUnwrap(h.app.services.get(LiveTranscriber.serviceKey, as: LiveTranscriber.self))
+                let speech = TestSpeechBackend()
+                speech.completeImmediately = complete
+                speech.outcomes = [SpeechWindowResult(lines: [], complete: true)]
+                live.speech = speech
+                var delays = 0
+                live.emptyWindowDelay = { delays += 1 }
+                h.app.settings.set(TranscriptSettings.live, true)
+                live.recording(AudioRecordingPayload(clip: ref, state: "recording", duration: 0))
+                if disabled {
+                    h.app.settings.set(TranscriptSettings.live, false)
+                } else {
+                    live.recording(AudioRecordingPayload(clip: ref, state: "stopped", duration: 0))
+                }
+                await live.waitForRecording(ref)
+                XCTAssertEqual(delays, 0, "a terminal window must not wait to retry")
+                XCTAssertNil(live.jobs[ref])
+                XCTAssertNil(live.errors[ref])
+                XCTAssertTrue(speech.sessions.allSatisfy(\.cancelled))
+            }
+        }
+    }
+
     func testSpeechFailureBeforeAudioIsReportedAndRetriesAreBounded() async throws {
         let h = Harness(features: [FeatTranscriptionFeature.self])
         try writeAudio(h, duration: 61)
@@ -61,6 +89,11 @@ final class FeatTranscriptionTests: XCTestCase {
             live.speech = speech
             _ = try await h.run(CommandIDs.settingsSet, ["name": "transcription.live", "value": true])
             _ = try await h.run(CommandIDs.settingsSet, ["name": "security.transcription.cloud", "value": .bool(cloud)])
+            var errorEvents = 0
+            let subscription = h.app.events.subscribe { event in
+                if event.type == LiveTranscriber.statusEvent, event.payload?["error"] != nil { errorEvents += 1 }
+            }
+            defer { subscription.cancel() }
             live.recording(AudioRecordingPayload(clip: ref, state: "recording", duration: 0))
             try await Task.sleep(nanoseconds: 100_000_000)
             h.app.commands.register(CommandDescriptor(id: "test.deleteRecording", title: "Delete", summary: "Tombstone recording", effect: .edit)) { _, ctx in
@@ -80,6 +113,8 @@ final class FeatTranscriptionTests: XCTestCase {
             live.jobs[ref]?.cancel()
             await live.waitForRecording(ref)
             XCTAssertTrue(speech.sessions.allSatisfy(\.cancelled))
+            XCTAssertNil(live.errors[ref], "deleting a recording is a quiet end to its job")
+            XCTAssertEqual(errorEvents, 0)
         }
     }
 
