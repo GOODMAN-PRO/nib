@@ -1252,8 +1252,72 @@ final class NibUI {
         }
     }
 
+    enum RemotePicker { case photos, files }
+
+    /// Query-only readiness: remote placeholders and loading views are not usable picker trees.
+    func awaitRemotePicker(_ kind: RemotePicker) throws {
+        let started = Date()
+        func ready() -> Bool {
+            switch kind {
+            case .photos:
+                return app.collectionViews["PhotosSidebarScrollView"].firstMatch.exists
+                    || app.otherElements["photos_sectioned_layout"].firstMatch.exists
+                    || app.collectionViews.cells.matching(NSPredicate(format: "label BEGINSWITH 'Photo,'")).firstMatch.exists
+            case .files:
+                return app.otherElements["Browse View (Picker)"].firstMatch.exists
+                    && app.cells.matching(NSPredicate(format: "identifier BEGINSWITH 'DOC.sidebar.item'")).firstMatch.exists
+            }
+        }
+        let loaded = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in ready() }, object: nil)
+        let success = ready() || XCTWaiter.wait(for: [loaded], timeout: 45) == .completed
+        logQA("Remote picker readiness", "kind=\(kind) ready=\(success) seconds=\(Date().timeIntervalSince(started))")
+        guard success else {
+            logRemotePickerInventory("readiness \(kind)")
+            throw Failure.message("Remote picker hierarchy did not become ready: \(kind)")
+        }
+    }
+
+    func logRemotePickerInventory(_ stage: String) {
+        guard let root = try? app.snapshot() else { logQA("Remote picker inventory", stage + " snapshot unavailable"); return }
+        func visit(_ node: XCUIElementSnapshot) {
+            if node.elementType == .button || node.elementType == .cell {
+                logQA("Remote picker inventory", "stage=\(stage) type=\(node.elementType.rawValue) label=\(node.label) id=\(node.identifier) frame=\(node.frame) enabled=\(node.isEnabled)")
+            }
+            for child in node.children { visit(child) }
+        }
+        visit(root)
+    }
+
+    func cancelRemotePicker(_ kind: RemotePicker) throws {
+        try awaitRemotePicker(kind)
+        let cancel = app.buttons.matching(NSPredicate(format: "label == 'Cancel' OR identifier == 'Cancel'")).firstMatch
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            cancel.exists && cancel.isEnabled && cancel.isHittable
+        }, object: nil)
+        let result = XCTWaiter.wait(for: [ready], timeout: 8)
+        logQA("Remote picker Cancel", "kind=\(kind) " + elementFacts(cancel))
+        guard result == .completed else {
+            logRemotePickerInventory("Cancel missing \(kind)")
+            recordDiagnostics("Remote picker Cancel missing", includeHierarchy: false)
+            throw Failure.message("Ready remote picker has no hittable Cancel: \(kind)")
+        }
+        cancel.tap()
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            switch kind {
+            case .photos:
+                return !app.collectionViews["PhotosSidebarScrollView"].firstMatch.exists
+                    && !app.otherElements["photos_sectioned_layout"].firstMatch.exists
+            case .files: return !app.otherElements["Browse View (Picker)"].firstMatch.exists
+            }
+        }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
+            throw Failure.message("Cancelled remote picker must disappear: \(kind)")
+        }
+    }
+
     /// Photos on iOS 26 exposes assets as Images under photos_sectioned_layout, not collection cells.
     func photoAsset(diagnostics: Bool = false) throws -> XCUIElement {
+        try awaitRemotePicker(.photos)
         let assets = app.otherElements["photos_sectioned_layout"].images.matching(
             NSPredicate(format: "identifier == 'PXGGridLayout-Info' AND label BEGINSWITH 'Photo,'"))
         let legacy = app.collectionViews.cells.matching(NSPredicate(format: "label BEGINSWITH 'Photo,'"))

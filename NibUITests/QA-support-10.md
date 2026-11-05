@@ -186,3 +186,14 @@ CI must show exact field values, Provider saved and original diagram/transcript/
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | NativeDiagram; both transcript tests; GIPHY save/search | Native form field duration / Insert provider setup | Which field or total setup still consumes the unchanged allowance? |
+
+### I6 - remote picker readiness and export destination
+
+Confirmed insert-pickers-audio#0/#1 corrections: loading remote views exhausted the old Any-query budget; non-hittability/AX transport failure remains possible. The save location was **unknown**, since both optional location taps were skipped. Added a bounded 45-second query-only wait for observed Photos grid/sidebar or Files Browse/sidebar markers. Typed Cancel waits separately, logs frame/hittability, and inventories all buttons/cells on failure; disappearance is required. photoAsset uses the same readiness gate before its existing selection logic (including Pages callers); the existing legacy Photo-cell route also qualifies readiness.
+
+Image/collection/GIF/tape cancel paths use the helper. Collection save and reimport both require and tap On My iPad after readiness, with file inventory on a missing Stickers package. No Recents assumption and no guessed coordinate Cancel. CI must show ready markers, actual Cancel facts and dismissal, and the exported file in the explicitly selected location with all original asset/count assertions. Remote AX failures may remain.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Image Photos/Files, image replacement, collection import/export, GIF Files, tape pattern; shared Photos callers | Remote picker readiness / Remote picker Cancel / Remote picker inventory | Did the remote tree load, was Cancel hittable at its frame, and what controls/files actually existed? |
+| CollectionExportSaveAndReimport | Collection Files location | Which named location was actually tapped in save and import? |

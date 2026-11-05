@@ -758,7 +758,7 @@ final class InsertUITests: XCTestCase {
     func testImageToolPhotosAndFilesCancelInsertNothing() throws {
         for source in ["Photos", "Files"] {
             try ui.selectTool("image"); ui.coordinate(point).tap(); try tap(source)
-            try tap("Cancel")
+            try ui.cancelRemotePicker(source == "Photos" ? .photos : .files)
             try counts(4, strokes: 1)
             XCTAssertFalse(try ui.state().undoAvailable)
         }
@@ -817,7 +817,7 @@ final class InsertUITests: XCTestCase {
     }
     func testImageReplaceCancelPreservesAssetAndFrame() throws {
         try image(); let before = try item("image")
-        try menu("Replace Image"); try tap("Cancel")
+        try menu("Replace Image"); try ui.cancelRemotePicker(.photos)
         XCTAssertEqual(json(try item("image")), json(before)); try counts(5)
     }
     func testImageReplaceFromPhotosKeepsFrameAndUndoRestoresAsset() throws {
@@ -848,7 +848,7 @@ final class InsertUITests: XCTestCase {
         outside(); try ui.selectTool("image"); ui.coordinate(CGPoint(x: 0.63, y: 0.8)).tap(); try tap("Photos")
         let photo = try ui.photoAsset(diagnostics: true)
         XCTAssertTrue(photo.waitForExistence(timeout: 10), "Saved image must be available in Photos, or a useful permission error must be shown")
-        try tap("Cancel"); try counts(5)
+        try ui.cancelRemotePicker(.photos); try counts(5)
     }
 
     // MARK: collections, elements and GIF controls
@@ -948,7 +948,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertTrue(ui.app.otherElements["ActivityListView"].waitForExistence(timeout: 10) || query("Save to Files").firstMatch.exists,
                       "Export must produce a share sheet for the collection")
         try ui.dismissSheets(); try elements(); try tap("Collection Options"); try tap("Import Collection")
-        try tap("Cancel"); try counts(4)
+        try ui.cancelRemotePicker(.files); try counts(4)
         XCTAssertTrue(query("Stickers").firstMatch.exists)
     }
     func testGIFLinkDownloadsAnimatedAssetExactlyOnce() throws {
@@ -961,16 +961,26 @@ final class InsertUITests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(fragment()["assets"] as? JSON).isEmpty)
         try undo(4, redo: 5)
     }
+    private func filesLocation() throws {
+        try ui.awaitRemotePicker(.files)
+        let location = ui.app.cells.matching(NSPredicate(
+            format: "identifier == 'DOC.sidebar.item.On My iPad' OR label == 'On My iPad'")).firstMatch
+        try wait("Files must expose the explicit On My iPad destination") { location.exists && location.isHittable }
+        ui.logQA("Collection Files location", ui.elementFacts(location))
+        location.tap()
+    }
     func testCollectionExportSaveAndReimportRetainsElementsAndAssets() throws {
         try elements(); try tap("Collection Options"); try tap("Export Collection")
         try tap("Save to Files", scroll: true)
-        if visible("On My iPad") { try tap("On My iPad") }
+        try filesLocation()
         try tap("Save")
         if visible("Replace") { try tap("Replace") }
         try ui.dismissSheets(); try elements(); try tap("Collection Options"); try tap("Import Collection")
-        if visible("Recents") { try tap("Recents") }
+        try filesLocation()
         let file = ui.app.collectionViews.cells.matching(NSPredicate(format: "label BEGINSWITH 'Stickers'")).firstMatch
-        XCTAssertTrue(file.waitForExistence(timeout: 10), "Exported Stickers.nibcollection must be selectable in Files")
+        let exportedFileExists = file.waitForExistence(timeout: 10)
+        if !exportedFileExists { ui.logRemotePickerInventory("Stickers missing in On My iPad") }
+        XCTAssertTrue(exportedFileExists, "Exported Stickers.nibcollection must be selectable in Files")
         file.tap()
         try tap("Heart"); try counts(5)
         try all(); XCTAssertFalse(try XCTUnwrap(fragment()["assets"] as? JSON).isEmpty)
@@ -994,7 +1004,7 @@ final class InsertUITests: XCTestCase {
         ui.recordDiagnostics("Invalid GIF submit result", facts: "error appeared=\(errorAppeared); inspect active prompt and visible toast accessibility representation; no error was synthesized by the test", includeHierarchy: false)
         XCTAssertTrue(errorAppeared, "Invalid GIF link must give an actionable error")
         if visible("Cancel") { try tap("Cancel") }
-        try tap("Add GIF from Files"); try tap("Cancel"); try counts(4)
+        try tap("Add GIF from Files"); try ui.cancelRemotePicker(.files); try counts(4)
     }
     func testGIPHYKeySaveRemoveAndSearchRetryRetainsQuery() throws {
         try elements(); try tap("GIFs"); try tap("Open Settings")
@@ -1142,7 +1152,7 @@ final class InsertUITests: XCTestCase {
     }
     func testTapeImportPatternFilesCancelRetainsBuiltIns() throws {
         try ui.openToolSettings("tape"); try tap("Add a pattern from an image", scroll: true)
-        try tap("Files"); try tap("Cancel")
+        try tap("Files"); try ui.cancelRemotePicker(.files)
         XCTAssertTrue(query("Stripes").firstMatch.exists)
         XCTAssertFalse(query("Image 1").firstMatch.exists)
         try counts(4, strokes: 1)
