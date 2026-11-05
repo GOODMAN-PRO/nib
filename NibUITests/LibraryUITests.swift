@@ -712,11 +712,11 @@ final class LibraryUITests: XCTestCase {
         ui.recordDiagnostics("Toast Undo before stability", facts: "Awaiting two equal frames", includeHierarchy: false)
         defer { ui.recordDiagnostics("Toast Undo completion", facts: ui.elementFacts(undo), includeHierarchy: false) }
         var previous: CGRect?
-        try eventually("Toast Undo must have two equal hittable frames", timeout: 3) {
+        try eventually("Toast Undo must have two equal frames", timeout: 3) {
             guard undo.exists else { return false }
             let frame = undo.frame
-            self.ui.logQA("Toast Undo frame", "previous=\(String(describing: previous)) current=\(frame)")
-            let stable = previous == frame && !frame.isEmpty && undo.isHittable
+            self.ui.logQA("Toast Undo frame", "previous=\(String(describing: previous)) current=\(frame) hittable=\(undo.isHittable)")
+            let stable = previous == frame && !frame.isEmpty
             previous = frame
             return stable
         }

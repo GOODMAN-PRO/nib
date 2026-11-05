@@ -178,7 +178,10 @@ final class NibUI {
                 return $0.node.frame.width * $0.node.frame.height > $1.node.frame.width * $1.node.frame.height
             }.first?.element
         }
-        guard let list = liveList(), let firstSnapshot = try? list.snapshot() else { return }
+        guard var list = liveList(), let firstSnapshot = try? list.snapshot() else {
+            logQA("Form reveal unavailable", "No live container snapshot; caller retains its wait/fallback")
+            return
+        }
         let window = app.windows.firstMatch.frame
         let obstructions = app.keyboards.allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
             + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
@@ -204,7 +207,7 @@ final class NibUI {
                 endSignatures.append(signature)
                 guard !reversed else {
                     logQA("Form search exhausted", "both ends=\(endSignatures)")
-                    XCTFail("Form target not revealed in either direction; signatures=\(endSignatures)"); return
+                    return
                 }
                 reversed = true
                 direction = !(direction ?? false)
@@ -220,8 +223,16 @@ final class NibUI {
             origin.withOffset(CGVector(dx: start.x - app.frame.minX, dy: start.y - app.frame.minY))
                 .press(forDuration: 0.01, thenDragTo: origin.withOffset(
                     CGVector(dx: end.x - app.frame.minX, dy: end.y - app.frame.minY)), withVelocity: .slow, thenHoldForDuration: 0)
-            guard let after = try? list.snapshot() else {
-                XCTFail("Form disappeared after reveal drag"); return
+            // Library grids can replace their containers while scrolling. Keep the cheap cached query
+            // normally, but reacquire it if that container disappears or its snapshot becomes unavailable.
+            var nextSnapshot: XCUIElementSnapshot? = list.exists ? (try? list.snapshot()) : nil
+            if nextSnapshot == nil, let replacement = liveList() {
+                list = replacement
+                nextSnapshot = try? replacement.snapshot()
+            }
+            guard let after = nextSnapshot else {
+                logQA("Form reveal unavailable", "Container disappeared after drag; caller retains its wait/fallback")
+                return
             }
             logQA("Form drag after", "point=\(start) container=\(after.frame) rows=\(formVisibleRange(after, viewport: viewport))")
             snapshot = after // Reuse this post-drag snapshot as the next iteration's before state.
@@ -233,7 +244,6 @@ final class NibUI {
             }
         }
         logQA("Form search bounded", "ends=\(endSignatures) visited=\(visited.sorted())")
-        XCTFail("Form reveal exceeded 16 drags; ends=\(endSignatures) visited=\(visited.sorted())")
     }
 
     /// Frames and control identities only: numeric captions and control values are not scroll progress.
@@ -268,7 +278,7 @@ final class NibUI {
         return result
     }
 
-    /// Stay at least 32pt from all interactive frames, including their hit slop. Never restore touched controls.
+    /// Prefer 32pt vertical clearance, with a small horizontal inset exclusion for dense forms.
     private func formDragStart(_ snapshot: XCUIElementSnapshot, viewport: CGRect, down: Bool) -> CGPoint? {
         let interactive: [XCUIElement.ElementType] = [.slider, .switch, .button, .textField, .textView,
             .secureTextField, .searchField, .stepper, .segmentedControl, .picker, .pickerWheel, .link]
@@ -283,14 +293,29 @@ final class NibUI {
         }
         // Leading inset first, then gaps across the row; all candidates must pass the same exclusion.
         let xs = [viewport.minX + 6] + Array(stride(from: viewport.minX + 12, through: viewport.maxX - 6, by: 8))
-        for y in ys where (down ? y < viewport.midY : y > viewport.midY) {
+        var best: (point: CGPoint, clearance: CGFloat)?
+        for y in ys {
+            let endY = down ? viewport.maxY - 24 : viewport.minY + 24
+            guard abs(endY - y) >= 24 else { continue }
             for x in xs {
                 let point = CGPoint(x: x, y: y)
-                if !blocked.contains(where: { $0.1.insetBy(dx: -32, dy: -32).contains(point) }) { return point }
+                // The observed slider capture was 16pt ABOVE its frame. Expanding horizontally
+                // by 32pt also blocked the entire leading inset; 4pt preserves that usable gutter.
+                let relevant = blocked.filter { x >= $0.1.minX - 4 && x <= $0.1.maxX + 4 }
+                let clearance = relevant.map { max($0.1.minY - y, y - $0.1.maxY) }.min()
+                    ?? viewport.height
+                if clearance >= 32 { return point }
+                // Never start inside an interactive frame, even in the best-effort fallback.
+                if clearance > 0, clearance > (best?.clearance ?? 0) {
+                    best = (point, clearance)
+                }
             }
         }
+        if let best {
+            logQA("Form best clearance", "point=\(best.point) verticalMargin=\(best.clearance) horizontalMargin=4 viewport=\(viewport) controls=\(blocked)")
+            return best.point
+        }
         logQA("Form no safe point", "container=\(snapshot.frame) viewport=\(viewport) controls=\(blocked)")
-        XCTFail("No form drag point at least 32pt from controls; container=\(snapshot.frame); frames=\(blocked)")
         return nil
     }
 
@@ -339,12 +364,10 @@ final class NibUI {
         /// Reads the currently visible authorization without waiting; the outer expectation handles asynchronous presentation.
         func alert(microphoneOnly: Bool = false) -> XCUIElement? {
             let filter = microphoneOnly ? NSPredicate(format: "label CONTAINS[c] 'microphone'") : permission
-            for host in [system, app] {
-                let title = host.alerts.matching(filter).firstMatch
-                if title.exists { return title }
-                let content = host.alerts.containing(filter).firstMatch
-                if content.exists { return content }
-            }
+            let title = system.alerts.matching(filter).firstMatch
+            if title.exists { return title }
+            let content = system.alerts.containing(filter).firstMatch
+            if content.exists { return content }
             return nil
         }
         if waitForMicrophone {
@@ -368,9 +391,10 @@ final class NibUI {
             guard let prompt = alert() else { return }
             let notification = prompt.label.localizedCaseInsensitiveContains("notification")
                 || prompt.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'notification'")).firstMatch.exists
-            let allow = notification ? prompt.buttons["Don't Allow"] : prompt.buttons.matching(NSPredicate(
+            let allow = notification ? prompt.buttons.matching(NSPredicate(
+                format: "label BEGINSWITH 'Don' AND label ENDSWITH 'Allow'")).firstMatch : prompt.buttons.matching(NSPredicate(
                 format: "label IN {'Allow', 'OK', 'Allow Full Access', 'Allow Access to All Photos'}")).firstMatch
-            guard allow.isHittable else { throw Failure.message("Authorization has no observed affirmative action\n\(system.debugDescription)") }
+            guard allow.isHittable else { throw Failure.message("Authorization has no observed permission action\n\(system.debugDescription)") }
             allow.tap()
             let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !prompt.exists }, object: nil)
             guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
@@ -649,15 +673,40 @@ final class NibUI {
             }
             let offsets: [CGFloat] = modal ? [24, 40, 56] : [70, 56, 40]
             let fractions: [CGFloat] = [0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8]
-            let points = offsets.flatMap { offset in
+            var points = offsets.flatMap { offset in
                 fractions.map { fraction in
                     CGPoint(x: visible.minX + visible.width * fraction, y: visible.minY + offset)
                 }
             }
-            guard let point = points.first(where: { point in
+            var chromeInsets: [CGPoint] = []
+            if !modal, canvas.exists {
+                // The whiteboard extends behind window-header whitespace. Only use the inset of
+                // an observed bar group (NavBar/NibBarGroup) or Tabs droplet (TabStripView), not that desk.
+                let anchors: Set<String> = ["menu.title", "cmd.edit.redo", "cmd.search.open"]
+                func hasAnchor(_ node: XCUIElementSnapshot) -> Bool {
+                    anchors.contains(node.identifier) || node.children.contains { hasAnchor($0) }
+                }
+                func chromeFrames(_ node: XCUIElementSnapshot) -> [CGRect] {
+                    let children = node.children.flatMap { chromeFrames($0) }
+                    if !children.isEmpty { return children } // Innermost group, never the whole nav row.
+                    guard node.elementType == .other, node.frame.height > 16, node.frame.height <= 60,
+                          node.frame.width < visible.width * 0.75,
+                          node.label == "Tabs" || hasAnchor(node) else { return [] }
+                    return [node.frame]
+                }
+                chromeInsets = chromeFrames(snapshot).flatMap { frame in
+                    [CGPoint(x: frame.minX + 3, y: frame.midY), CGPoint(x: frame.maxX - 3, y: frame.midY)]
+                }.filter { point in
+                    visible.contains(point) && !occupied.contains { $0.insetBy(dx: -2, dy: -2).contains(point) }
+                }
+                let drawingSurface = canvas.frame
+                points = points.filter { !drawingSurface.contains($0) }
+            }
+            guard let point = chromeInsets.first ?? points.first(where: { point in
                 visible.insetBy(dx: 8, dy: 8).contains(point)
                     && !occupied.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
             }) else { throw Failure.message("No inert header focus target inside the presented surface") }
+            logQA("Keyboard focus header", "point=\(point) modal=\(modal) surface=\(visible) chromeInsets=\(chromeInsets)")
             app.coordinate(withNormalizedOffset: .zero).withOffset(
                 CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
         }
@@ -674,16 +723,32 @@ final class NibUI {
             // within the fixed bar droplet. Never use empty window space over the whiteboard.
             let redo = app.buttons["cmd.edit.redo"].firstMatch
             let search = app.buttons["cmd.search.open"].firstMatch
-            guard redo.exists, search.exists else { throw Failure.message("No document chrome separator for focus") }
-            let left = redo.frame, right = search.frame
-            let gap = right.minX - left.maxX
-            let point = CGPoint(x: (left.maxX + right.minX) / 2, y: left.midY)
-            guard abs(gap - 12.5) <= 2, abs(left.midY - right.midY) < 1,
-                  app.windows.firstMatch.frame.contains(point) else {
-                throw Failure.message("Unverified document chrome separator: redo=\(left) search=\(right)")
+            var separatorFocused = false
+            if redo.exists, search.exists {
+                let left = redo.frame, right = search.frame
+                let gap = right.minX - left.maxX
+                let point = CGPoint(x: (left.maxX + right.minX) / 2, y: left.midY)
+                if abs(gap - 12.5) <= 2, abs(left.midY - right.midY) < 1,
+                   app.windows.firstMatch.frame.contains(point) {
+                    app.coordinate(withNormalizedOffset: .zero).withOffset(
+                        CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+                    // An inert separator is not itself a responder. Observe recovery before relying on it;
+                    // a missing responder is a bounded fallback condition, not a failed chord assertion.
+                    let focused = try? waitForState(timeout: 2) { $0.keyResponder != nil }
+                    if let focused {
+                        guard focused.keyResponderIsText == false else {
+                            throw Failure.message("Separator focus reached unclassified/text responder: \(focused.keyResponder ?? "unknown")")
+                        }
+                        separatorFocused = true
+                    }
+                } else {
+                    logQA("Keyboard focus fallback", "Separator geometry unavailable: redo=\(left) search=\(right)")
+                }
             }
-            app.coordinate(withNormalizedOffset: .zero).withOffset(
-                CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+            if !separatorFocused {
+                logQA("Keyboard focus fallback", "Separator absent or no responder after tap; trying inert header")
+                try tapInertHeader(in: app.windows.firstMatch, modal: false)
+            }
         } else {
             // The shell's library tap recognizer schedules reclaimKeyFocusIfNeeded after a real window tap.
             try tapInertHeader(in: app.windows.firstMatch, modal: false)

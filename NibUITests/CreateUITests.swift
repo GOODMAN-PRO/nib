@@ -796,6 +796,17 @@ final class CreateUITests: XCTestCase {
 
     private func scrollTo(_ element: XCUIElement, name: String = "creation control", in application: XCUIApplication? = nil) throws {
         let app = application ?? ui.app
+        func visibleRows(_ scroll: XCUIElement, viewport: CGRect) -> [String]? {
+            guard scroll.exists, let snapshot = try? scroll.snapshot() else { return nil }
+            func rows(_ node: XCUIElementSnapshot) -> [String] {
+                let rowTypes: [XCUIElement.ElementType] = [.cell, .button, .textField, .switch, .slider]
+                let own = rowTypes.contains(node.elementType) && node.frame.intersects(viewport)
+                    ? ["\(node.elementType.rawValue)|\(node.identifier)|\(node.label)|\(node.frame)"] : []
+                return own + node.children.flatMap { rows($0) }
+            }
+            let signature = rows(snapshot)
+            return signature.isEmpty ? nil : signature
+        }
         for _ in 0..<12 {
             let exists = element.exists
             if exists && element.elementType != .textField && element.isHittable { return }
@@ -831,6 +842,7 @@ final class CreateUITests: XCTestCase {
                 if element.elementType != .textField || visible.contains(required) { return }
             }
             let targetY = name == "Title" ? target.map { $0.midY - 68 } : target?.midY
+            let beforeRows = target == nil ? visibleRows(scroll, viewport: visible) : nil
             let drag = NibUITestScrollGeometry.drag(in: visible, toward: targetY)
             let origin = app.coordinate(withNormalizedOffset: .zero)
             origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
@@ -839,7 +851,12 @@ final class CreateUITests: XCTestCase {
                     withVelocity: XCUIGestureVelocity(rawValue: 80), thenHoldForDuration: 0.3)
             let after = element.exists ? element.frame : nil
             ui.logQA("Creation scroll", "name=\(name) target=\(String(describing: target)) after=\(String(describing: after)) viewport=\(visible)")
-            if after == target { break }
+            if let target, let after, after == target { break }
+            if target == nil, after == nil, let beforeRows,
+               let afterRows = visibleRows(scroll, viewport: visible), beforeRows == afterRows {
+                ui.logQA("Creation scroll exhausted", "name=\(name) visible rows unchanged=\(afterRows)")
+                break
+            }
         }
         try require(element, "Missing required creation control: \(name)")
         XCTAssertTrue(element.isHittable, "Creation control is unreachable after scrolling")
