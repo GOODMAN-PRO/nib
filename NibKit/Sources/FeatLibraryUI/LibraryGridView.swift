@@ -400,6 +400,17 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate {
         return UIContextMenuConfiguration(identifier: nil, previewProvider: { [weak self] in self?.preview?() },
                                    actionProvider: { [weak self] _ in self?.menu?() })
     }
+    #if DEBUG
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                willEndFor configuration: UIContextMenuConfiguration,
+                                animator: UIContextMenuInteractionAnimating?) {
+        NSLog("%@", "[Nib QA reflow] native-menu willEnd view=\(ObjectIdentifier(self))")
+        animator?.addCompletion { [weak self] in
+            NSLog("%@", "[Nib QA reflow] native-menu ended view=\(String(describing: self.map { ObjectIdentifier($0) }))")
+        }
+    }
+    #endif
+
 }
 
 final class LibraryItemTapRecognizer: UITapGestureRecognizer {

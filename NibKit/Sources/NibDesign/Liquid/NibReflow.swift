@@ -303,6 +303,10 @@ public final class NibReflow<ID: Hashable> {
     @ObservationIgnored var spaceOrigin: CGPoint = .zero
     @ObservationIgnored private var order: [ID] = []
     @ObservationIgnored private var hover: ID?
+    #if DEBUG
+    @ObservationIgnored private var qaHoverSince: CFTimeInterval?
+    @ObservationIgnored var qaCarrierVisualFrame: CGRect?
+    #endif
     @ObservationIgnored private var armWork: DispatchWorkItem?
     @ObservationIgnored private var landingWork: DispatchWorkItem?
     /// The finger (reflow space) and the re-check that gives a finger resting on a cover its gap after the dwell.
@@ -377,6 +381,9 @@ public final class NibReflow<ID: Hashable> {
         let g = global(point)
         carrierFrame = m.slots[m.from].offsetBy(dx: spaceOrigin.x, dy: spaceOrigin.y)
         lift = Lift(id: id, start: g, location: g, phase: .dragging)
+        #if DEBUG
+        qaCarrierVisualFrame = nil
+        #endif
     }
 
     /// The finger moved (reflow space): the carrier follows, the gap reflows (unless paused, held, or waiting out the
@@ -411,6 +418,17 @@ public final class NibReflow<ID: Hashable> {
     /// `.reorder` to the data in this same update.
     @discardableResult
     public func end(velocity: CGVector = .zero) -> NibReflowDrop<ID> {
+        #if DEBUG
+        let hovered = hover
+        let elapsed = qaHoverSince.map { CACurrentMediaTime() - $0 } ?? 0
+        let targetFrame = hovered.flatMap { globalFrame(of: $0) }
+        let sourceFrame = carrierFrame
+        let visualFrame = qaCarrierVisualFrame
+        var decision = "none"
+        defer {
+            NSLog("%@", String("[Nib QA reflow] drop=\(decision) hovered=\(String(describing: hovered)) dwell=\(elapsed) threshold=\(NibMotion.combineHold) carrierRest=\(String(describing: sourceFrame)) carrierVisual=\(String(describing: visualFrame)) target=\(String(describing: targetFrame))".prefix(890)))
+        }
+        #endif
         cancelArming()
         cancelDwell()
         guard let m = model, var l = lift else { return .none }
@@ -425,6 +443,9 @@ public final class NibReflow<ID: Hashable> {
         } else {
             drop = .none
         }
+        #if DEBUG
+        decision = String(describing: drop)
+        #endif
         // A reorder lands the data where the neighbours already are: reset them without animation. Otherwise they
         // spring back to their own slots.
         if case .reorder = drop { animatesOffsets = false }
@@ -479,6 +500,9 @@ public final class NibReflow<ID: Hashable> {
         }
         guard candidate != hover else { return }
         hover = candidate
+        #if DEBUG
+        qaHoverSince = candidate == nil ? nil : CACurrentMediaTime()
+        #endif
         armWork?.cancel()
         armWork = nil
         guard let candidate, combines else { return }
@@ -496,6 +520,9 @@ public final class NibReflow<ID: Hashable> {
         armWork?.cancel()
         armWork = nil
         hover = nil
+        #if DEBUG
+        qaHoverSince = nil
+        #endif
     }
 
     private func cancelDwell() {
@@ -900,6 +927,11 @@ struct CarrierDriver<ID: Hashable>: View {
 
     private func drive(_ lift: NibReflow<ID>.Lift?) {
         guard let field, let lift, field.visualFrame(id) != nil else { return }
+        #if DEBUG
+        // visualFrame is in the droplet container; targetFrame is global.
+        let offset = toField(.zero)
+        reflow.qaCarrierVisualFrame = field.visualFrame(id)?.offsetBy(dx: -offset.x, dy: -offset.y)
+        #endif
         switch lift.phase {
         case .dragging:
             if !field.isDragging(id) { field.beginDrag(id, at: toField(lift.start)) }
