@@ -219,11 +219,14 @@ public struct NibProposalReceipt: View {
             .buttonStyle(.plain)
             .font(NibFont.button)
             .foregroundStyle(NibColor.accent)
-            Button(String(localized: "Show", bundle: .module), action: onShow)
+            Button(action: onShow) {
+                Text(String(localized: "Show", bundle: .module))
+                    .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+                    .contentShape(Rectangle())
+            }
                 .buttonStyle(.plain)
                 .font(NibFont.button)
                 .foregroundStyle(NibColor.accent)
-                .frame(minHeight: NibMetrics.hitTarget)
         }
         .accessibilityElement(children: .contain)
     }
