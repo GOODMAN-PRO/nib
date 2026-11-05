@@ -711,6 +711,9 @@ final class LiftRecognizer: UIGestureRecognizer {
         beganAt = touch.timestamp; sampledAt = beganAt
         let timeout = DispatchWorkItem { [weak self] in
             guard let self, self.state == .possible else { return }
+            #if DEBUG
+            NSLog("%@", "[Nib QA reflow] hold decision recognizer=\(ObjectIdentifier(self)) eventElapsed=\(self.sampledAt - self.beganAt) wallElapsed=\(CACurrentMediaTime() - self.beganAt) distance=\(hypot(self.point.x - self.start.x, self.point.y - self.start.y)) sinceSample=\(CACurrentMediaTime() - self.sampledAt)")
+            #endif
             guard ReflowLiftIntent.yieldsToMenu(distance: hypot(self.point.x - self.start.x, self.point.y - self.start.y),
                                               stationaryFor: CACurrentMediaTime() - self.sampledAt) else {
                 // A little drift that stops is still a context-menu hold. Keep
@@ -721,7 +724,7 @@ final class LiftRecognizer: UIGestureRecognizer {
                 return
             }
             #if DEBUG
-            NSLog("%@", "[Reflow diagnostic] stationary timeout")
+            NSLog("%@", "[Nib QA reflow] winner=menu eligible after stationary timeout recognizer=\(ObjectIdentifier(self))")
             #endif
             self.state = .failed
         }
@@ -732,9 +735,15 @@ final class LiftRecognizer: UIGestureRecognizer {
         guard let touch = touches.first else { return }
         sample(touch)
         if state == .possible {
+            #if DEBUG
+            NSLog("%@", "[Nib QA reflow] moved recognizer=\(ObjectIdentifier(self)) elapsed=\(touch.timestamp - beganAt) distance=\(hypot(point.x - start.x, point.y - start.y)) deliveryLag=\(CACurrentMediaTime() - touch.timestamp)")
+            #endif
             guard hypot(point.x - start.x, point.y - start.y) >= DropletPhysics.pickupSlop else { return }
             guard touch.timestamp - beganAt >= NibReflowMetrics.liftDelay else { state = .failed; return }
             state = .began
+            #if DEBUG
+            NSLog("%@", "[Nib QA reflow] winner=lift recognizer=\(ObjectIdentifier(self)) elapsed=\(touch.timestamp - beganAt)")
+            #endif
         } else { state = .changed }
     }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
@@ -763,7 +772,7 @@ final class LiftRecognizer: UIGestureRecognizer {
                 distance: hypot(point.x - start.x, point.y - start.y)) { return false }
         #if DEBUG
         if beganAt > 0 {
-            NSLog("%@", "[Reflow diagnostic] prevention by \(type(of: preventingGestureRecognizer)) at \(CACurrentMediaTime() - beganAt)")
+            NSLog("%@", "[Nib QA reflow] prevention candidate=\(type(of: preventingGestureRecognizer)) recognizer=\(ObjectIdentifier(self)) state=\(state.rawValue) eventElapsed=\(sampledAt - beganAt) wallElapsed=\(CACurrentMediaTime() - beganAt) distance=\(hypot(point.x - start.x, point.y - start.y))")
         }
         #endif
         return super.canBePrevented(by: preventingGestureRecognizer)

@@ -394,7 +394,10 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate {
     required init?(coder: NSCoder) { nil }
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                 configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
-        UIContextMenuConfiguration(identifier: nil, previewProvider: { [weak self] in self?.preview?() },
+        #if DEBUG
+        NSLog("%@", "[Nib QA reflow] winner=native-menu view=\(ObjectIdentifier(self)) location=\(location)")
+        #endif
+        return UIContextMenuConfiguration(identifier: nil, previewProvider: { [weak self] in self?.preview?() },
                                    actionProvider: { [weak self] _ in self?.menu?() })
     }
 }
