@@ -289,23 +289,52 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(), before)
     }
 
+    func testDeleteRejectsHiddenSelectedOrAttachedContentWithoutWriting() async throws {
+        for hiddenTarget in [true, false] {
+            let h = Harness(features: [FeatObjectMenuFeature.self])
+            edit(h, Fixtures.imageID) { image in
+                image.layer = 2
+                if !hiddenTarget { image.attachedTo = Fixtures.shapeID }
+            }
+            h.session.hiddenLayers = [2]
+            select(h, [hiddenTarget ? Fixtures.imageID : Fixtures.shapeID])
+            let before = try h.snapshot()
+            do {
+                try await h.run("item.delete")
+                XCTFail("hidden selected items and hidden attached children must be protected")
+            } catch let error as NibError {
+                XCTAssertEqual(error.code, .invalidParams)
+            }
+            XCTAssertEqual(try h.snapshot(), before)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        }
+    }
+
     func testDeletingTheSelectionUsesAndClearsIt() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
+        h.session.tool = "pen"
+        h.session.selectTemporarily("lasso")
         select(h, [Fixtures.strokeID, Fixtures.textID])
         try await h.run("item.delete")                                  // a key command: no refs, the selection
         XCTAssertThrowsError(try item(h, Fixtures.strokeID))
         XCTAssertThrowsError(try item(h, Fixtures.textID))
         XCTAssertTrue(h.session.selection.isEmpty)
+        XCTAssertEqual(h.session.tool, "pen")
+        XCTAssertNil(h.session.temporaryReturnTool)
         let nothing = try await h.run("item.delete")                    // nothing selected: nothing happens
         XCTAssertEqual(nothing["deleted"], .array([]))
     }
 
     func testPartOfTheSelectionDeletedKeepsTheRest() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
+        h.session.tool = "pen"
+        h.session.selectTemporarily("lasso")
         select(h, [Fixtures.strokeID, Fixtures.imageID])
         try await h.run("item.delete", ["refs": [ref(Fixtures.strokeID)]])
         XCTAssertEqual(h.session.selection.items, [Fixtures.imageID])
         XCTAssertEqual(h.session.selection.bounds, try item(h, Fixtures.imageID).bounds)
+        XCTAssertEqual(h.session.tool, "lasso")
+        XCTAssertEqual(h.session.temporaryReturnTool, "pen")
     }
 
     func testOtherCallersMustNameTheItems() async throws {

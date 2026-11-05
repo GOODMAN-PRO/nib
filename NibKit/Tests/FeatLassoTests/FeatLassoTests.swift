@@ -126,6 +126,48 @@ final class FeatLassoTests: XCTestCase {
         XCTAssertEqual(all["count"]?.intValue, 1)
     }
 
+    func testHiddenLayerCannotBeSelectedByAnyCommand() async throws {
+        let h = harness()
+        h.session.hiddenLayers = [0]
+        let before = try h.snapshot()
+        let commands: [(String, JSONValue)] = [
+            ("selection.selectAll", [:]), // keyboard defaults
+            ("selection.selectAll", ["page": .string(pageRef)]),
+            ("selection.set", ["refs": [.string(ref(Fixtures.imageID))]]),
+            ("selection.fromRect", ["page": .string(pageRef), "rect": [0, 0, 595, 842]]),
+            ("selection.fromPolygon", polygon([(0, 0), (595, 0), (595, 842), (0, 842)]))
+        ]
+        for (command, params) in commands {
+            let result = try await h.run(command, params)
+            XCTAssertEqual(result["count"]?.intValue, 0, command)
+            XCTAssertTrue(h.session.selection.isEmpty, command)
+        }
+        for tool in ["pen", "lasso"] {
+            h.session.tool = tool
+            let result = try await h.run("selection.tapAt", ["page": .string(pageRef), "point": [352, 512]])
+            XCTAssertEqual(result["handled"]?.boolValue, false)
+            XCTAssertTrue(h.session.selection.isEmpty)
+            XCTAssertEqual(h.session.tool, tool)
+        }
+        do {
+            try await h.run("selection.fromLoop", ["page": .string(pageRef), "stroke": .string(ref(Fixtures.strokeID))])
+            XCTFail("Circle to Lasso must not delete a hidden loop")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .invalidParams)
+        }
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testHiddenLayerPencilTapCannotSelectAnItem() async throws {
+        let h = harness()
+        h.session.hiddenLayers = [0]
+        let host = FakeCanvasHost(h)
+        let tool = LassoTool()
+        tool.tap(sample(352, 512), host: host)
+        await tool.pending?.value
+        XCTAssertTrue(h.session.selection.isEmpty)
+    }
+
     func testRectSetSelectAllAndClear() async throws {
         let h = harness()
         let rect = try await h.run("selection.fromRect", ["page": .string(pageRef), "rect": [400, 570, -100, -100]])

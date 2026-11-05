@@ -16,8 +16,10 @@ private struct WhiteboardHitTarget: UIViewRepresentable {
 private final class ScriptedRenderer: PageRenderer {
     var before: (@MainActor () async throws -> Void)?
     var fails = false
+    var requests: [RenderRequest] = []
 
     func render(_ request: RenderRequest) async throws -> RenderResult {
+        requests.append(request)
         if let before { try await before() }
         if fails { throw NibError(.internalError, "the test renderer fails") }
         let region = request.region ?? Rect(x: 0, y: 0, width: PageSize.a4.width, height: PageSize.a4.height)
@@ -222,6 +224,138 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertEqual(try h.app.workspace.content(doc).meta.kind, .notebook)
     }
 
+    func testConvertRendersOnlyBackgroundsAndKeepsLiveInkOnce() async throws {
+        let h = harness()
+        let renderer = ScriptedRenderer()
+        h.app.services.renderer = renderer
+        var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+        let imagePage = try XCTUnwrap(head.pages.firstIndex { $0.id == Fixtures.page2 })
+        head.pages[imagePage].background = .ofImage(Fixtures.pngAsset)
+        h.persistence.heads[Fixtures.docID] = head
+        for page in [Fixtures.page2, Fixtures.pdfPage] {
+            let ink = Item(id: NibID("INK" + page.raw), kind: .stroke,
+                           stroke: Stroke(style: .defaultPen, points: [StrokePoint(x: 10, y: 10), StrokePoint(x: 40, y: 20)]))
+            try await h.insert([ink], page: page)
+        }
+        let before = try h.snapshot()
+        try await h.run("doc.convertToWhiteboard", ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertEqual(Set(renderer.requests.map(\.page)), [Fixtures.page2, Fixtures.pdfPage])
+        for request in renderer.requests {
+            XCTAssertEqual(request.layers, Set<Int>(), "nil includes live ink and leaves ghosts when it is moved")
+            XCTAssertTrue(request.background)
+            XCTAssertFalse(request.annotations)
+        }
+        let board = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).livePages.first)
+        let items = try h.app.workspace.items(Fixtures.docID, page: board.id)
+        for page in [Fixtures.page2, Fixtures.pdfPage] {
+            XCTAssertEqual(items.filter { $0.id == NibID("INK" + page.raw) }.count, 1)
+        }
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testConvertRotatedPagesPreservesDisplayedCoordinatesAndCardFrames() async throws {
+        for rotation in [90, 180, 270] {
+            let h = harness()
+            h.app.services.renderer = FakeRenderer()
+            var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+            for i in head.pages.indices {
+                head.pages[i].rotation = rotation
+                head.pages[i].size = PageSize(300, 200)
+            }
+            head.pages[1].background = .ofImage(Fixtures.pngAsset)
+            h.persistence.heads[Fixtures.docID] = head
+            let ink = Item(id: "ROTATEDINK", kind: .stroke,
+                           stroke: Stroke(style: .defaultPen, points: [StrokePoint(x: 10, y: 10), StrokePoint(x: 40, y: 20)]))
+            try await h.insert([ink], page: Fixtures.pdfPage)
+            let original = try h.app.workspace.items(Fixtures.docID, page: Fixtures.pdfPage)
+            let before = try h.snapshot()
+            try await h.run("doc.convertToWhiteboard", ["doc": "doc:FIXTUREDOC01"])
+            let board = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).livePages.first)
+            let items = try h.app.workspace.items(Fixtures.docID, page: board.id)
+            let cards = items.filter(\.locked).sorted { $0.bounds.x < $1.bounds.x }
+            XCTAssertEqual(cards.count, 3)
+            for (index, card) in cards.enumerated() {
+                XCTAssertEqual(card.frame, Frame(x: Double(index) * (300 + Whiteboard.gap), y: 0, w: 300, h: 200))
+            }
+            let moved = try XCTUnwrap(items.first { $0.id == ink.id })
+            let expected = try XCTUnwrap(original.first).transformed(by: .translation(2 * (300 + Whiteboard.gap), 0))
+            XCTAssertEqual(moved.stroke, expected.stroke)
+            XCTAssertEqual(items.first { $0.id == Fixtures.shapeID }?.frame, Frame(x: 100, y: 200, w: 160, h: 90))
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), before)
+        }
+    }
+
+    func testConvertRotatedImageBackgroundWithoutRendererKeepsDisplayedSize() async throws {
+        let h = harness()
+        var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+        head.pages[0].background = .ofImage(Fixtures.pngAsset)
+        head.pages[0].size = PageSize(120, 80)
+        head.pages[0].rotation = 90
+        h.persistence.heads[Fixtures.docID] = head
+        try await h.run("doc.convertToWhiteboard", ["doc": "doc:FIXTUREDOC01"])
+        let board = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).livePages.first)
+        let card = try XCTUnwrap(h.app.workspace.items(Fixtures.docID, page: board.id).first(where: \.locked))
+        XCTAssertEqual(card.frame, Frame(x: 0, y: 0, w: 120, h: 80))
+        let asset = try XCTUnwrap(card.image?.asset)
+        XCTAssertNotEqual(asset, Fixtures.pngAsset, "the raw image must be turned and aspect-fitted onto its paper")
+        let raster = try XCTUnwrap(UIImage(data: try h.assets.data(asset, doc: Fixtures.docID))?.cgImage)
+        XCTAssertEqual(raster.width, 240)
+        XCTAssertEqual(raster.height, 160)
+    }
+
+    func testImageBackgroundFallbackTurnsClockwiseAndAspectFitsOnWhitePaper() throws {
+        let h = harness()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let data = UIGraphicsImageRenderer(size: CGSize(width: 40, height: 20), format: format).pngData { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 20, height: 20))
+            UIColor.blue.setFill()
+            context.fill(CGRect(x: 20, y: 0, width: 20, height: 20))
+        }
+        let asset = try h.assets.put(data, ext: "png", doc: Fixtures.docID)
+        let url = try XCTUnwrap(h.assets.url(asset, doc: Fixtures.docID))
+        let image = try XCTUnwrap(PageRaster.imagePage(url: url, size: PageSize(40, 40), scale: 1, rotation: 90))
+        func pixel(_ x: Int, _ y: Int) throws -> [UInt8] {
+            let sample = try XCTUnwrap(image.cropping(to: CGRect(x: x, y: y, width: 1, height: 1)))
+            var bytes = [UInt8](repeating: 0, count: 4)
+            try bytes.withUnsafeMutableBytes { buffer in
+                let context = try XCTUnwrap(CGContext(data: buffer.baseAddress, width: 1, height: 1,
+                    bitsPerComponent: 8, bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue))
+                context.draw(sample, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+            }
+            return bytes
+        }
+        XCTAssertEqual(try pixel(20, 10), [255, 0, 0, 255], "the source's left half turns to the top")
+        XCTAssertEqual(try pixel(20, 30), [0, 0, 255, 255])
+        XCTAssertEqual(try pixel(2, 20), [255, 255, 255, 255], "aspect-fit leaves a white paper margin")
+    }
+
+    func testConvertRefusesAnUnreadableImageBackgroundWithoutWriting() async throws {
+        let h = harness()
+        var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+        head.pages[0].background = .ofImage(Fixtures.pngAsset)
+        h.persistence.heads[Fixtures.docID] = head
+        h.assets.install(Data("not an image".utf8), as: Fixtures.pngAsset, doc: Fixtures.docID)
+        let before = try h.snapshot()
+        await expectError(.unavailable) { _ = try await h.run("doc.convertToWhiteboard", ["doc": "doc:FIXTUREDOC01"]) }
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
+    func testPDFBackgroundFallbackHonoursPageRotation() throws {
+        let h = harness()
+        let url = try XCTUnwrap(h.assets.url(Fixtures.pdfAsset, doc: Fixtures.docID))
+        let upright = try XCTUnwrap(PageRaster.pdfPage(url: url, index: 0, size: .a4, scale: 1))
+        let turned = try XCTUnwrap(PageRaster.pdfPage(url: url, index: 0, size: .a4, scale: 1, rotation: 180))
+        XCTAssertEqual(upright.width, turned.width)
+        XCTAssertEqual(upright.height, turned.height)
+        XCTAssertNotEqual(PageRaster.png(upright), PageRaster.png(turned))
+    }
+
     func testConvertDrawsThePDFPageItselfWithoutARenderer() async throws {
         let h = harness()
         XCTAssertNil(h.app.services.renderer)
@@ -274,6 +408,49 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertEqual(content.livePages.map(\.id), [Fixtures.page1, Fixtures.page2, Fixtures.pdfPage])
         XCTAssertTrue(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).contains { $0.id == "LATESTICKY01" },
                       "the late write survives")
+    }
+
+    func testConvertRemapsEveryItemTextLinkAndUndoes() async throws {
+        let h = harness()
+        h.app.services.renderer = FakeRenderer()
+        let internalLink = TextLink(document: Fixtures.docID, page: Fixtures.pdfPage)
+        let externalLink = TextLink(document: Fixtures.whiteboardID, page: Fixtures.boardID)
+        let webLink = TextLink(url: "https://example.com")
+        let audioLink = TextLink(document: Fixtures.docID, audioClip: Fixtures.audioID, audioTime: 12)
+        let text = RichText(paragraphs: [
+            Paragraph(runs: [TextRun("Later page", TextAttributes(bold: true, link: internalLink)),
+                             TextRun("Other document", TextAttributes(link: externalLink))]),
+            Paragraph(runs: [TextRun("Web", TextAttributes(link: webLink)),
+                             TextRun("Recording", TextAttributes(link: audioLink))])
+        ])
+        var sources = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        for i in sources.indices {
+            if sources[i].text != nil { sources[i].text?.text = text }
+            if sources[i].sticky != nil { sources[i].sticky?.text = text }
+            if sources[i].shape != nil { sources[i].shape?.text = text }
+            if sources[i].connector != nil { sources[i].connector?.label = text }
+        }
+        try await h.insert(sources)
+        let before = try h.snapshot()
+        try await h.run("doc.convertToWhiteboard", ["doc": "doc:FIXTUREDOC01"])
+        let board = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).livePages.first)
+        let moved = try h.app.workspace.items(Fixtures.docID, page: board.id)
+        let texts = moved.flatMap { [$0.text?.text, $0.sticky?.text, $0.shape?.text, $0.connector?.label].compactMap { $0 } }
+        XCTAssertEqual(texts.count, 4)
+        var expected = text
+        expected.paragraphs[0].runs[0].attrs.link?.page = board.id
+        for actual in texts { XCTAssertEqual(actual, expected) }
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testPageLinksCanTargetADifferentConvertedBoard() {
+        let link = TextLink(document: Fixtures.docID, page: Fixtures.pdfPage)
+        let item = Item.makeSticky(StickyItem(frame: Frame(x: 0, y: 0, w: 100, h: 100),
+                                              text: RichText(plain: "Next board", attrs: TextAttributes(link: link))))
+        let moved = NotebookLayout.remappingPageLinks(in: item, doc: Fixtures.docID,
+                                                       boards: [Fixtures.page1: "BOARD1", Fixtures.pdfPage: "BOARD2"])
+        XCTAssertEqual(moved.sticky?.text.paragraphs.first?.runs.first?.attrs.link?.page, "BOARD2")
     }
 
     func testConvertGivesACollidingItemIDANewIDAndRewiresItsConnector() async throws {
@@ -756,18 +933,19 @@ final class FeatWhiteboardTests: XCTestCase {
 
     // MARK: Pure logic
 
-    func testNotebookLayoutRotatesPagesAndSplitsBoardsAtTheLimit() {
-        let pages = [PageSlotInput(id: "P1", size: .a4, rotation: 0, itemCount: 3),
-                     PageSlotInput(id: "P2", size: .a4, rotation: 90, itemCount: 3),
-                     PageSlotInput(id: "P3", size: .a4, rotation: 0, itemCount: 5)]
+    func testNotebookLayoutUsesDisplayedSizesAndSplitsBoardsAtTheLimit() {
+        let pages = [PageSlotInput(id: "P1", size: .a4, itemCount: 3),
+                     PageSlotInput(id: "P2", size: PageSize(842, 595), itemCount: 3),
+                     PageSlotInput(id: "P3", size: .a4, itemCount: 5)]
         let boards = NotebookLayout.boards(pages, gap: 50, limit: 10)
         XCTAssertEqual(boards.map { $0.map(\.page) }, [["P1", "P2"], ["P3"]])
-        // Turned clockwise, page 2's bottom-left corner becomes the slot's top-left, right after page 1.
+        // Page size is already displayed: content only translates, even on a landscape page.
         let turned = boards[0][1]
-        let corner = turned.transform.apply(Point(0, PageSize.a4.height))
+        let corner = turned.transform.apply(.zero)
         XCTAssertEqual(corner.x, PageSize.a4.width + 50, accuracy: 1e-6)
         XCTAssertEqual(corner.y, 0, accuracy: 1e-6)
-        XCTAssertEqual(turned.frame.bounds.width, PageSize.a4.height, accuracy: 1e-6)
+        XCTAssertEqual(turned.frame.bounds.width, 842, accuracy: 1e-6)
+        XCTAssertEqual(turned.frame.rotation, 0)
         XCTAssertEqual(boards[1][0].frame.x, 0, accuracy: 1e-9)
     }
 

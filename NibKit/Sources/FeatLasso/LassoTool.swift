@@ -106,6 +106,7 @@ final class LassoTool: CanvasTool {
         let items = (try? host.app.workspace.items(doc, page: page)) ?? []
         let tolerance = SelectionEngine.tapTolerance(zoom: host.zoomScale)
         if let hit = SelectionEngine.tapTarget(at: point, in: items, layer: session.activeLayer, tolerance: tolerance,
+                                               hiddenLayers: session.hiddenLayers,
                                                hitArea: SelectionSupport.hitArea(host.app.content),
                                                accept: { include.contains(LassoCategory.of($0)) }) {
             run(SelectionSet.self, SelectionSet.Params(refs: [NodeRef.item(doc, page, hit.id).description]), host: host)

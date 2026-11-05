@@ -251,12 +251,56 @@ final class FeatTransformTests: XCTestCase {
             XCTAssertEqual(a.x, b.x, accuracy: 1e-9)
             XCTAssertEqual(a.y, b.y, accuracy: 1e-9)
         }
+        XCTAssertEqual(h.session.selection.bounds, try item(h, Fixtures.shapeID).bounds,
+                       "lasso housekeeping must see the same padded bounds after a rotation")
         try await h.run("item.moveToPage", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "offset": [0, 40]])
         XCTAssertEqual(h.session.selection.page, page2)
         let moved = try XCTUnwrap(h.session.selection.outline)
         for (a, b) in zip(moved, expected) {
             XCTAssertEqual(a.x, b.x, accuracy: 1e-9)
             XCTAssertEqual(a.y, b.y + 40, accuracy: 1e-9)
+        }
+        XCTAssertEqual(h.session.selection.bounds, try item(h, Fixtures.shapeID, on: page2).bounds)
+    }
+
+    func testRepeatedShapeNudgesKeepPaddedSelectionBoundsAndOutline() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let shape = try item(h, Fixtures.shapeID)
+        let outline = [Point(90, 190), Point(270, 190), Point(270, 300), Point(90, 300)]
+        h.session.selection = Selection(doc: doc, page: page1, items: [shape.id], bounds: shape.bounds, outline: outline)
+        for step in 1...3 {
+            try await h.run("item.transform", ["translate": [10, 0]])
+            XCTAssertEqual(h.session.selection.bounds, try item(h, shape.id).bounds,
+                           "a housekeeping refresh must not rescale the already transformed outline")
+            XCTAssertEqual(h.session.selection.outline, outline.map { Point($0.x + Double(step * 10), $0.y) })
+        }
+    }
+
+    func testNudgeAndPageMoveRejectHiddenSelectedOrAttachedContent() async throws {
+        for hiddenTarget in [true, false] {
+            let h = Harness(features: [FeatTransformFeature.self])
+            edit(h, Fixtures.imageID) { image in
+                image.layer = 2
+                if !hiddenTarget { image.attachedTo = Fixtures.shapeID }
+            }
+            h.session.hiddenLayers = [2]
+            h.session.selection = Selection(doc: doc, page: page1,
+                                              items: [hiddenTarget ? Fixtures.imageID : Fixtures.shapeID])
+            let before = try h.snapshot()
+            let commands: [(String, JSONValue)] = [
+                ("item.transform", ["translate": [1, 0]]),
+                ("item.moveToPage", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+            ]
+            for (command, params) in commands {
+                do {
+                    try await h.run(command, params)
+                    XCTFail("hidden selected items and hidden attached children must be protected")
+                } catch let error as NibError {
+                    XCTAssertEqual(error.code, .invalidParams)
+                }
+                XCTAssertEqual(try h.snapshot(), before)
+                XCTAssertEqual(h.undoDepth(doc), 0)
+            }
         }
     }
 

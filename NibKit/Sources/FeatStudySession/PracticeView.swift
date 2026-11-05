@@ -237,7 +237,10 @@ final class StudySessionModel: ObservableObject {
         return formatter.string(from: s.interval * Scheduler.day) ?? ""
     }
     func picture(_ face: CardFace, card: StudyCard, back: Bool) -> UIImage? {
-        let key = (card.id.raw + card.rev.description + (back ? "/back" : "/front")) as NSString
+        let paperStyle: UIUserInterfaceStyle = cardIsDark ? .dark : .light
+        let side = back ? "/back" : "/front"
+        let appearance = paperStyle == .dark ? "/dark" : "/light"
+        let key = (card.id.raw + card.rev.description + side + appearance) as NSString
         if let image = pictures.object(forKey: key) { return image }
         var image: UIImage?
         if face.kind == .image, let asset = face.asset, let data = try? app.services.assets?.data(asset, doc: doc) {
@@ -249,7 +252,10 @@ final class StudySessionModel: ObservableObject {
         } else if face.kind == .ink {
             let size = face.size ?? PageSize(Double(NibMetrics.studyCardSize.width), Double(NibMetrics.studyCardSize.height))
             let scale = min(2, NibMetrics.studyCardSize.width * 2 / CGFloat(max(size.width, size.height, 1)))
-            image = PKBridge.drawing(face.ink ?? []).image(from: CGRect(x: 0, y: 0, width: size.width, height: size.height), scale: scale)
+            // The paper's theme, not the surrounding window, determines PencilKit's ink appearance.
+            UITraitCollection(userInterfaceStyle: paperStyle).performAsCurrent {
+                image = PKBridge.drawing(face.ink ?? []).image(from: CGRect(x: 0, y: 0, width: size.width, height: size.height), scale: scale)
+            }
         }
         if let image {
             pictures.setObject(image, forKey: key, cost: (image.cgImage?.bytesPerRow ?? 0) * (image.cgImage?.height ?? 0))

@@ -4,6 +4,7 @@ import NibTesting
 import NibDesign
 import SwiftUI
 import UIKit
+import PencilKit
 @testable import FeatStudySession
 
 @MainActor
@@ -127,6 +128,45 @@ final class FeatStudySessionTests: XCTestCase {
         catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
         do { try await local.cancel(doc: doc); XCTFail("Hostless cancellation must also be guarded") }
         catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+    }
+
+    func testInkPicturesFollowCardPaperAndInvalidateWhenItsAppearanceChanges() async throws {
+        let (h, runtime, _) = harness()
+        let model = runtime.model(app: h.app, doc: doc, session: h.session)
+        try await model.reload()
+        let stroke = Stroke(style: InkStyle(pen: .ball, color: .black, width: 6),
+                            points: [StrokePoint(x: 10, y: 20, width: 6, height: 6),
+                                     StrokePoint(x: 80, y: 20, t: 0.2, width: 6, height: 6)])
+        let face = CardFace(kind: .ink, ink: [stroke], size: PageSize(100, 60))
+        let card = StudyCard(front: face, back: face)
+        func expected(_ style: UIUserInterfaceStyle) throws -> Data {
+            var image: UIImage?
+            UITraitCollection(userInterfaceStyle: style).performAsCurrent {
+                image = PKBridge.drawing([stroke]).image(from: CGRect(x: 0, y: 0, width: 100, height: 60), scale: 2)
+            }
+            return try XCTUnwrap(image?.pngData())
+        }
+        var lightPaper: UIImage?
+        UITraitCollection(userInterfaceStyle: .dark).performAsCurrent {
+            lightPaper = model.picture(face, card: card, back: false)
+        }
+        let light = try XCTUnwrap(lightPaper)
+        XCTAssertEqual(try XCTUnwrap(light.pngData()), try expected(.light))
+        // Theme writes leave the card revision alone: the cache must include paper appearance.
+        try await h.run(CommandIDs.studySetTheme, ["doc": .string(docRef), "card": "night"])
+        try await model.reload()
+        XCTAssertTrue(model.cardIsDark)
+        var darkPaper: UIImage?
+        UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
+            darkPaper = model.picture(face, card: card, back: false)
+        }
+        let dark = try XCTUnwrap(darkPaper)
+        XCTAssertFalse(light === dark)
+        XCTAssertEqual(try XCTUnwrap(dark.pngData()), try expected(.dark))
+        XCTAssertTrue(model.picture(face, card: card, back: false) === dark)
+        try await h.run(CommandIDs.studySetTheme, ["doc": .string(docRef), "card": "white"])
+        try await model.reload()
+        XCTAssertTrue(model.picture(face, card: card, back: false) === light)
     }
 
     func testPracticeNavigationSpeechAndDueOnlySessionSummary() async throws {

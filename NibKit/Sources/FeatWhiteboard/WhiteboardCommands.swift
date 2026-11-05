@@ -292,15 +292,14 @@ enum TemplatePlacement {
 struct PageSlotInput {
     var id: PageID
     var size: PageSize
-    var rotation: Int
     var itemCount: Int
 }
 
 struct PageSlot {
     var page: PageID
-    /// Page coordinates → board coordinates (rotation baked in).
+    /// Displayed page coordinates → board coordinates (translation only).
     var transform: Affine
-    /// The page's own box on the board (rotated with the page).
+    /// The page's displayed box on the board.
     var frame: Frame
 }
 
@@ -322,24 +321,15 @@ enum NotebookLayout {
                 count = 0
                 x = 0
             }
-            let placed = transform(size: page.size, rotation: page.rotation, x: x)
-            let frame = Frame(x: 0, y: 0, w: page.size.width, h: page.size.height).applying(placed.transform)
-            current.append(PageSlot(page: page.id, transform: placed.transform, frame: frame))
+            let frame = Frame(x: x, y: 0, w: page.size.width, h: page.size.height)
+            current.append(PageSlot(page: page.id, transform: .translation(x, 0), frame: frame))
             count += cost
-            x += placed.width + gap
+            x += page.size.width + gap
         }
         if !current.isEmpty { out.append(current) }
         return out
     }
 
-    /// Rotates the page clockwise by `rotation` degrees about its origin, then moves its rotated box to (x, 0).
-    static func transform(size: PageSize, rotation: Int, x: Double) -> (transform: Affine, width: Double) {
-        let turn = Affine.rotation(Double(rotation) * .pi / 180)
-        let corners = [Point(0, 0), Point(size.width, 0), Point(size.width, size.height), Point(0, size.height)]
-        let box = Rect.bounding(corners.map { turn.apply($0) })
-            ?? Rect(x: 0, y: 0, width: size.width, height: size.height)
-        return (turn.concatenating(.translation(x - box.x, -box.y)), box.width)
-    }
 }
 
 // MARK: - Command support
@@ -708,11 +698,11 @@ struct DocConvertToWhiteboard: NibCommand {
         for page in pages { items[page.id] = try ctx.workspace.items(doc, page: page.id) }
         let snapshot = ConversionSnapshot(pages: pages, items: items)
         let plan = NotebookLayout.boards(pages.map {
-            PageSlotInput(id: $0.id, size: $0.size ?? .a4, rotation: $0.rotation, itemCount: items[$0.id]?.count ?? 0)
+            PageSlotInput(id: $0.id, size: $0.size ?? .a4, itemCount: items[$0.id]?.count ?? 0)
         })
         let slots = Dictionary(uniqueKeysWithValues: plan.joined().map { ($0.page, $0) })
 
-        // Slow work before the transaction: each page's paper becomes a card. PDF pages are rendered to images one at a
+        // Slow work before the transaction: each page's paper becomes a card. Backgrounds are rendered one at a
         // time, off the main actor; a page that cannot be rendered stops the conversion before anything is written.
         let templates = ctx.content.templates
         var cards: [PageID: Item] = [:]
@@ -720,8 +710,8 @@ struct DocConvertToWhiteboard: NibCommand {
         for (index, page) in pages.enumerated() {
             guard let slot = slots[page.id] else { continue }
             var raster: AssetRef?
-            if page.background.kind == .pdf {
-                raster = try await PageCards.rasterisePDFPage(page, number: index + 1, doc: doc, ctx: ctx, urls: &pdfURLs)
+            if page.background.kind == .pdf || page.background.kind == .image {
+                raster = try await PageCards.rasteriseBackground(page, number: index + 1, doc: doc, ctx: ctx, urls: &pdfURLs)
             }
             cards[page.id] = PageCards.card(for: page, number: index + 1, frame: slot.frame, raster: raster,
                                             templates: templates)
@@ -753,27 +743,30 @@ struct DocConvertToWhiteboard: NibCommand {
                 record.bookmarked = boardSlots.contains { bookmarked.contains($0.page) }
                 let board = try tx.put(record, doc: doc)
                 created.append(board.id)
+                for slot in boardSlots { boardOf[slot.page] = board.id }
+            }
+            // Build the entire page map before moving content: links can target a later board.
+            for (boardSlots, boardID) in zip(plan, created) {
                 // Balanced keys stay a few characters long however many items a board takes.
                 let count = boardSlots.reduce(0) { $0 + 1 + (items[$1.page]?.count ?? 0) }
                 var zs = FractionalIndex.balanced(count: count)[...]
                 var used = Set<ElementID>()
                 for slot in boardSlots {
-                    boardOf[slot.page] = board.id
                     if var card = cards[slot.page] {
                         card.z = zs.popFirst() ?? ""
                         used.insert(card.id)
-                        try tx.put(card, doc: doc, page: board.id)
+                        try tx.put(card, doc: doc, page: boardID)
                     }
                     let sources = items[slot.page] ?? []
                     for (source, moved) in zip(sources, NotebookLayout.rehome(sources, transform: slot.transform, used: &used)) {
-                        var item = moved
+                        var item = NotebookLayout.remappingPageLinks(in: moved, doc: doc, boards: boardOf)
                         item.z = zs.popFirst() ?? ""
                         if item.id == source.id {
                             // The same record on its board: whoever wrote it still did (the AI converting a notebook
                             // does not become the author of the user's handwriting).
-                            try tx.put(item, doc: doc, page: board.id, keepingProvenanceFrom: slot.page)
+                            try tx.put(item, doc: doc, page: boardID, keepingProvenanceFrom: slot.page)
                         } else {
-                            try tx.put(item, doc: doc, page: board.id)
+                            try tx.put(item, doc: doc, page: boardID)
                         }
                     }
                 }
@@ -822,6 +815,28 @@ struct ConversionSnapshot: Equatable {
 }
 
 extension NotebookLayout {
+    /// Only links within this notebook follow the converted pages; external documents and URLs stay intact.
+    static func remappingPageLinks(in item: Item, doc: DocumentID, boards: [PageID: PageID]) -> Item {
+        func remap(_ text: RichText) -> RichText {
+            var text = text
+            for p in text.paragraphs.indices {
+                for r in text.paragraphs[p].runs.indices {
+                    guard var link = text.paragraphs[p].runs[r].attrs.link, link.document == doc,
+                          let page = link.page, let board = boards[page] else { continue }
+                    link.page = board
+                    text.paragraphs[p].runs[r].attrs.link = link
+                }
+            }
+            return text
+        }
+        var item = item
+        if var text = item.text { text.text = remap(text.text); item.text = text }
+        if var sticky = item.sticky { sticky.text = remap(sticky.text); item.sticky = sticky }
+        if var shape = item.shape { shape.text = shape.text.map(remap); item.shape = shape }
+        if var connector = item.connector { connector.label = connector.label.map(remap); item.connector = connector }
+        return item
+    }
+
     /// A page's items moved onto its board slot. An id already used on the board (the cards, earlier pages) gets a
     /// fresh one, and the page's own attachments and connector anchors follow the new id.
     static func rehome(_ items: [Item], transform: Affine, used: inout Set<ElementID>) -> [Item] {
@@ -842,24 +857,21 @@ extension NotebookLayout {
     }
 }
 
-/// The card a converted page leaves on its board, under its content: the page's image background as an image item, a
-/// PDF page rendered to an image, otherwise a vector card drawn from the page's template (crisp at any zoom). Cards are
+/// The card a converted page leaves on its board, under its content: a PDF or image background rendered to an image,
+/// otherwise a vector card drawn from the page's template (crisp at any zoom). Cards are
 /// locked so writing over them never drags the paper.
 @MainActor
 enum PageCards {
-    /// Pixels per point of a rendered PDF page.
+    /// Pixels per point of a rendered page background.
     /// ponytail: 2 px per point is sharp at 100 % and soft past 200 %; a vector PDF item type is the upgrade path.
     static let pdfScale = 2.0
 
-    /// `raster` is the rendered page of a `.pdf` background (see `rasterisePDFPage`).
+    /// `raster` is the displayed PDF or image background (see `rasteriseBackground`).
     static func card(for page: PageRecord, number: Int, frame: Frame, raster: AssetRef?,
                      templates: Registry<TemplateDefinition>) -> Item {
         let title = page.title ?? String(localized: "Page \(number)")
         if let raster {
             return locked(.makeImage(ImageItem(frame: frame, asset: raster, altText: title)))
-        }
-        if page.background.kind == .image, let asset = page.background.asset {
-            return locked(.makeImage(ImageItem(frame: frame, asset: asset, altText: title)))
         }
         let data: JSONValue = ["title": .string(title), "page": .string(page.id.raw),
                                "background": (try? JSONValue.from(page.background)) ?? .null]
@@ -890,21 +902,21 @@ enum PageCards {
         return DisplayList(ops: [sheet] + ops)
     }
 
-    /// Renders a PDF-backed page to a PNG asset: through the renderer service, else straight from the PDF with Core
-    /// Graphics. Rendering and PNG encoding run off the main actor. A page neither can draw (damaged or locked PDF,
+    /// Renders only a page's PDF or image background to a PNG: through the renderer, else straight from its asset.
+    /// Rendering and PNG encoding run off the main actor. A page neither can draw (damaged or locked PDF,
     /// missing asset) throws `unavailable`, so a conversion never trades a PDF page for blank paper.
-    static func rasterisePDFPage(_ page: PageRecord, number: Int, doc: DocumentID, ctx: CommandContext,
+    static func rasteriseBackground(_ page: PageRecord, number: Int, doc: DocumentID, ctx: CommandContext,
                                  urls: inout [String: URL]) async throws -> AssetRef {
-        let failure = NibError(.unavailable, "page \(number) of the PDF could not be rendered, so the notebook was not "
-                                   + "converted", path: "$.doc",
-                               hint: "check that the PDF opens in Nib (it may be damaged or password-protected), or move "
-                                   + "that page out of the notebook and convert again")
+        let failure = NibError(.unavailable,
+                               String(localized: "The background of page \(number) could not be rendered. The notebook was not converted."),
+                               path: "$.doc", hint: String(localized: "Check that the page background opens in Nib, or move that page out of the notebook and convert again."))
         let assets = try ctx.services.require(ctx.services.assets, "the asset store")
         let size = page.size ?? .a4
         var png: Data?
         if let renderer = ctx.services.renderer {
             do {
-                let request = RenderRequest(doc: doc, page: page.id, scale: pdfScale, background: true, annotations: false)
+                let request = RenderRequest(doc: doc, page: page.id, scale: pdfScale, layers: [],
+                                            background: true, annotations: false)
                 let image = try await renderer.render(request).image
                 png = await Task.detached(priority: .userInitiated) { PageRaster.png(image) }.value
             } catch {
@@ -917,7 +929,10 @@ enum PageCards {
                 let index = page.background.pdfPage ?? 0
                 let scale = pdfScale
                 png = await Task.detached(priority: .userInitiated) {
-                    PageRaster.pdfPage(url: url, index: index, size: size, scale: scale).flatMap(PageRaster.png)
+                    let image = page.background.kind == .pdf
+                        ? PageRaster.pdfPage(url: url, index: index, size: size, scale: scale, rotation: page.rotation)
+                        : PageRaster.imagePage(url: url, size: size, scale: scale, rotation: page.rotation)
+                    return image.flatMap(PageRaster.png)
                 }.value
             }
         }
@@ -952,8 +967,8 @@ enum PageRaster {
     }
 
     /// Page `index` (0-based) of the PDF at `url`, aspect-fitted on white into a page of `size` points at `scale`
-    /// pixels per point, honouring the PDF page's own rotation. nil when the PDF cannot be opened or unlocked.
-    static func pdfPage(url: URL, index: Int, size: PageSize, scale: Double) -> CGImage? {
+    /// pixels per point, honouring both PDF rotation and the record's extra turn. nil when it cannot be opened.
+    static func pdfPage(url: URL, index: Int, size: PageSize, scale: Double, rotation: Int = 0) -> CGImage? {
         guard let document = CGPDFDocument(url as CFURL) else { return nil }
         if document.isEncrypted && !document.isUnlocked && !document.unlockWithPassword("") { return nil }
         guard index >= 0, let page = document.page(at: index + 1) else { return nil }
@@ -967,7 +982,7 @@ enum PageRaster {
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         let box = page.getBoxRect(.cropBox)
         guard box.width > 0, box.height > 0 else { return nil }
-        let angle = ((Int(page.rotationAngle) % 360) + 360) % 360
+        let angle = (((Int(page.rotationAngle) + rotation) % 360) + 360) % 360
         let turned = angle == 90 || angle == 270
         let fit = min(CGFloat(width) / (turned ? box.height : box.width), CGFloat(height) / (turned ? box.width : box.height))
         // PDF space is y-up like a bitmap context; /Rotate turns the page clockwise as displayed.
@@ -976,6 +991,32 @@ enum PageRaster {
         context.rotate(by: -CGFloat(angle) * .pi / 180)
         context.translateBy(x: -box.midX, y: -box.midY)
         context.drawPDFPage(page)
+        return context.makeImage()
+    }
+
+    /// Image backgrounds use the same clockwise turn and aspect fit as the page renderer, including EXIF orientation.
+    static func imagePage(url: URL, size: PageSize, scale: Double, rotation: Int) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 4096
+              ] as CFDictionary) else { return nil }
+        let s = min(scale, (maxPixels / max(size.width * size.height, 1)).squareRoot())
+        let width = max(1, Int((size.width * s).rounded())), height = max(1, Int((size.height * s).rounded()))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        context.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.translateBy(x: 0, y: CGFloat(height))
+        context.scaleBy(x: s, y: -s)
+        let sourceSize = PageSize(Double(image.width), Double(image.height))
+        context.concatenate(PageRecord.backgroundTransform(sourceSize: sourceSize, rotation: rotation, pageSize: size).cg)
+        context.translateBy(x: 0, y: CGFloat(image.height))
+        context.scaleBy(x: 1, y: -1)
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
         return context.makeImage()
     }
 }

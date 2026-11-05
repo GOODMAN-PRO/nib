@@ -45,10 +45,10 @@ enum OutlineMetrics {
 }
 
 enum PageGeometry {
-    /// Width / height of a page as shown (quarter turns swap the sides); A4 when unknown.
+    /// Width / height of the already displayed page size; A4 when unknown.
     static func aspect(_ page: PageRecord?) -> CGFloat {
         guard let page = page, let size = page.size, size.width > 0, size.height > 0 else { return 595.28 / 841.89 }
-        return (page.rotation / 90) % 2 == 1 ? CGFloat(size.height / size.width) : CGFloat(size.width / size.height)
+        return CGFloat(size.width / size.height)
     }
 }
 
