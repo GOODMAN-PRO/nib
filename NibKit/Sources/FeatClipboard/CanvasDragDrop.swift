@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import UniformTypeIdentifiers
+import os
 import NibContracts
 import NibDesign
 
@@ -183,6 +184,14 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
     /// Pastes the dropped content as one undo step, centred where it was dropped; files go to `import.files`.
     static func apply(_ payload: DropReader.Payload, doc: DocumentID, page: PageID, at point: Point, app: NibApp,
                       session: EditorSession) async {
+        // Refuse the whole drop before writing if any provider had no usable fallback. A retry cannot duplicate
+        // the providers that did load, and the source drag is never consumed by a partial write.
+        if payload.hasUnreadableFragment {
+            let error = NibError(.unsupported, String(localized: "Couldn't read this selection. Copy it as an image or text and try again."))
+            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                            userInfo: ["command": ClipboardPaste.descriptor.id, "error": error])
+            return
+        }
         var added = false
         if let fragment = NibFragment.combine(payload.fragments) {
             let params = ClipboardPaste.Params(page: NodeRef.page(doc, page).description, at: [point.x, point.y],
@@ -371,6 +380,7 @@ enum DropReader {
     struct Payload {
         var fragments: [NibFragment] = []
         var files: [URL] = []
+        var hasUnreadableFragment = false
     }
 
     @MainActor
@@ -378,18 +388,28 @@ enum DropReader {
         var out = Payload()
         for provider in providers {
             let types = provider.registeredTypeIdentifiers
+            var unreadableFragment = false
             if types.contains(NibFragment.typeIdentifier) || provider.hasItemConformingToTypeIdentifier(NibFragment.typeIdentifier) {
-                if let data = await loadData(provider, NibFragment.typeIdentifier), let fragment = try? NibFragment.decode(data) {
-                    out.fragments.append(fragment)
+                if let data = await loadData(provider, NibFragment.typeIdentifier) {
+                    do {
+                        let fragment = try NibFragment.decode(data)
+                        out.fragments.append(fragment)
+                        continue
+                    } catch {
+                        Clipboard.log.error("unreadable Nib fragment in drop: \(error.localizedDescription, privacy: .public)")
+                    }
                 }
-                continue
+                unreadableFragment = true
             }
             if let type = types.first(where: { conforms($0, to: .image) }) {
                 if let data = await loadData(provider, type) {
                     let ext = UTType(type)?.preferredFilenameExtension ?? "png"
-                    out.fragments.append(ContentFragments.images([(data: data, ext: ext)], maxSize: limits.imageSize))
+                    let fragment = ContentFragments.images([(data: data, ext: ext)], maxSize: limits.imageSize)
+                    if !fragment.items.isEmpty {
+                        out.fragments.append(fragment)
+                        continue
+                    }
                 }
-                continue
             }
             if let type = types.first(where: { ContentFragments.isRichText($0) }), let data = await loadData(provider, type),
                let rich = ContentFragments.richText(data, type: type), !isBlank(rich.plainText) {
@@ -400,7 +420,11 @@ enum DropReader {
                 out.fragments.append(ContentFragments.text(RichText(plain: text), style: style, width: limits.textWidth))
                 continue
             }
-            if let type = types.first, let url = await loadFile(provider, type) { out.files.append(url) }
+            if let type = types.first(where: { $0 != NibFragment.typeIdentifier }), let url = await loadFile(provider, type) {
+                out.files.append(url)
+                continue
+            }
+            if unreadableFragment { out.hasUnreadableFragment = true }
         }
         return out
     }
