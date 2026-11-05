@@ -711,6 +711,34 @@ final class FeatWebDAVTests: XCTestCase {
         XCTAssertEqual(h.app.ui.settingsPages.get(FeatWebDAVFeature.settingsPageID)?.section, .sync)
     }
 
+    func testStaleSettingsDraftCannotRevertConfigurationOrTouchPasswords() async throws {
+        let (h, _, first) = try makeHarness()
+        _ = try await h.run(CommandIDs.webdavConfigure, ["url": .string(first.baseURL), "user": "alex", "folder": "Nib"])
+        WebDAVCredentials.setPassword("first password", url: first.baseURL, user: "alex")
+        let stale = WebDAVSettingsModel(app: h.app)
+        let clean = WebDAVSettingsModel(app: h.app)
+        let newer = WebDAVSettingsModel(app: h.app)
+        let second = FakeDAVServer.install()
+        newer.url = second.baseURL
+        newer.password = "new password"
+        let saved = await newer.save()
+        XCTAssertTrue(saved)
+        let expected = WebDAVSettings.read(h.app.settings)
+        stale.folder = "Another folder"
+        stale.password = "stale password"
+        stale.reconcileFields()
+        XCTAssertNotNil(stale.errorMessage)
+        let accepted = await stale.save()
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(WebDAVSettings.read(h.app.settings), expected)
+        XCTAssertEqual(WebDAVCredentials.password(url: second.baseURL, user: "alex"), "new password")
+        XCTAssertNil(WebDAVCredentials.password(url: first.baseURL, user: "alex"), "the stale password was never written")
+        clean.reconcileFields()
+        XCTAssertEqual(clean.url, second.baseURL)
+        XCTAssertFalse(clean.isDirty)
+        WebDAVCredentials.setPassword(nil, url: second.baseURL, user: "alex")
+    }
+
     func testConfigureValidatesStoresAndReportsMissingCredentials() async throws {
         let (h, _, server) = try makeHarness()
         do {
