@@ -77,3 +77,12 @@ Confirmed S:singles-insert#1 correction (a/c) and D:keyboard-and-state#1: first 
 ## H3 - dismiss only presented surfaces
 
 D:controls-forms#9 confirms header.closeButton followed by cmd.panel.close closed Audio after export. dismissSheets now searches only visible Sheet/Popover/ActivityListView descendants for their own close controls, includes the observed activity header close identifier, and never uses cmd.panel.close or a swipe. No surface returns without acting; an unclosable presented surface fails explicitly. Audited all callers: their generic dismissals must preserve sidebar/floating panels; explicit panel-closing remains with callers. Expected Audio rename/export/delete retains Motion lecture after sharing. CI must confirm native and custom sheet containment and that only the activity sheet closes.
+
+## H4 - Photos grid coordinate selection
+
+S:singles-insert#0 and S:singles-rest#0 correction show real visible Photo frames and false hittability. Only photos_sectioned_layout assets now bypass hittability, retaining existence/visible-frame and centre-in-grid checks; legacy collection cells keep their old gate. Actual selection callers tap the frame centre in app coordinates and wait for enabled Add/Done or asset disappearance, logging the outcome before continuing. All four callers request diagnostics. The save-to-Photos availability/cancel test still only inspects the asset (it intentionally cancels without insertion). Expected: Insert replacement, saved asset availability, Tape photo pattern and Pages Add Image. Coordinate delivery remains a probe, not a proven remote-view fix; CI must show selection confirmation then the existing result/content assertions.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Three Photos selection flows | Photos asset coordinate selection / selection unobserved | Did the coordinate tap enable Add/Done or close the picker? Failure retains hierarchy and screenshot. |
+| All four Photos lookup callers | Photos assets before/after lookup | Are grid assets visible and still reported non-hittable? |

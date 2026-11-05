@@ -987,10 +987,14 @@ final class NibUI {
         inspect("before lookup")
         defer { inspect("after lookup") }
         func candidate() -> XCUIElement? {
-            for query in [assets, legacy] {
-                let first = query.firstMatch
-                if hasVisibleFrame(first), first.isHittable { return first }
+            let grid = app.otherElements["photos_sectioned_layout"].firstMatch
+            let first = assets.firstMatch
+            if grid.exists, hasVisibleFrame(first) {
+                let frame = first.frame
+                if grid.frame.contains(CGPoint(x: frame.midX, y: frame.midY)) { return first }
             }
+            let old = legacy.firstMatch
+            if hasVisibleFrame(old), old.isHittable { return old }
             return nil
         }
         if let asset = candidate() { return asset }
@@ -999,6 +1003,31 @@ final class NibUI {
             throw Failure.message("Photos must expose a selectable asset in its grid\n\(app.debugDescription)")
         }
         return asset
+    }
+
+    func tapPhotoAsset(_ asset: XCUIElement) throws {
+        guard hasVisibleFrame(asset) else { throw Failure.message("Photos asset lost its visible frame") }
+        let frame = asset.frame, origin = app.frame.origin
+        let grid = app.otherElements["photos_sectioned_layout"].firstMatch
+        let picker = app.otherElements.matching(NSPredicate(format: "label == 'Photos'")).firstMatch
+        let selectionScope = picker.exists ? picker : app
+        app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: frame.midX - origin.x, dy: frame.midY - origin.y)).tap()
+        var outcome = "unobserved"
+        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            if !grid.exists && !asset.exists { outcome = "picker closed"; return true }
+            for name in ["Add", "Done"] {
+                let button = selectionScope.buttons[name].firstMatch
+                if button.exists && button.isEnabled { outcome = name + " enabled"; return true }
+            }
+            return false
+        }, object: nil)
+        let result = XCTWaiter.wait(for: [selected], timeout: 8)
+        logQA("Photos asset coordinate selection", "frame=\(frame) outcome=\(outcome) wait=\(result.rawValue)")
+        guard result == .completed else {
+            recordDiagnostics("Photos asset selection unobserved")
+            throw Failure.message("Coordinate tap did not select the Photos asset")
+        }
     }
 
     /// Exports the current share sheet to a uniquely named Files directory and waits for the real PNG bytes on disk.

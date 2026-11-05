@@ -771,8 +771,8 @@ final class InsertUITests: XCTestCase {
         try counts(5); try selectAt()
         let before = try item("image")
         try menu("Replace Image")
-        let photo = try ui.photoAsset()
-        XCTAssertTrue(photo.waitForExistence(timeout: 10)); photo.tap()
+        let photo = try ui.photoAsset(diagnostics: true)
+        XCTAssertTrue(photo.waitForExistence(timeout: 10)); try ui.tapPhotoAsset(photo)
         if visible("Add") { try tap("Add") }
         // F034 replaces an existing item, so its unchanged count is not a completion
         // signal. Let the native picker finish before querying the canvas hierarchy.
@@ -788,7 +788,7 @@ final class InsertUITests: XCTestCase {
         try image(); try menu("Save to Photos")
         try allowSystemPermissionIfPresented()
         outside(); try ui.selectTool("image"); ui.coordinate(CGPoint(x: 0.63, y: 0.8)).tap(); try tap("Photos")
-        let photo = try ui.photoAsset()
+        let photo = try ui.photoAsset(diagnostics: true)
         XCTAssertTrue(photo.waitForExistence(timeout: 10), "Saved image must be available in Photos, or a useful permission error must be shown")
         try tap("Cancel"); try counts(5)
     }
@@ -1072,8 +1072,8 @@ final class InsertUITests: XCTestCase {
     func testTapeImportedPhotoPatternCanBeDrawnAndDeleted() throws {
         try image(); try menu("Save to Photos"); try allowSystemPermissionIfPresented(); outside()
         try ui.selectTool("tape"); try tap("tool.tape"); try tap("Add a pattern from an image", scroll: true); try tap("Photos")
-        let photo = try ui.photoAsset()
-        XCTAssertTrue(photo.waitForExistence(timeout: 10)); photo.tap()
+        let photo = try ui.photoAsset(diagnostics: true)
+        XCTAssertTrue(photo.waitForExistence(timeout: 10)); try ui.tapPhotoAsset(photo)
         try tap("Image 1", scroll: true); outside(); try drawTape()
         XCTAssertNotNil((try snapshot("stroke")["style"] as? JSON)?["tapePattern"])
         try ui.selectTool("tape"); try tap("tool.tape")

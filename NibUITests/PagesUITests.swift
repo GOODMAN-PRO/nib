@@ -179,7 +179,7 @@ final class PagesUITests: XCTestCase {
         try more("Image")
         let photo = try ui.photoAsset(diagnostics: true)
         try require(photo, "Add Page > Image must present selectable Photos assets")
-        photo.tap()
+        try ui.tapPhotoAsset(photo)
         let add = button("Add")
         if add.exists && add.isHittable { add.tap() }
         try count(5)
