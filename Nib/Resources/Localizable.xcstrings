@@ -345889,6 +345889,95 @@
         }
       }
     },
+    "These records changed after this step. The history entry was kept; undo the later changes and try again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Diese Einträge wurden nach diesem Schritt geändert. Der Verlaufseintrag bleibt erhalten. Widerrufe die späteren Änderungen und versuche es erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Estos registros cambiaron después de este paso. La entrada del historial se ha conservado; deshaz los cambios posteriores e inténtalo de nuevo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ces éléments ont été modifiés après cette étape. L’entrée de l’historique a été conservée ; annulez les modifications ultérieures et réessayez."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Questi elementi sono stati modificati dopo questo passaggio. La voce della cronologia è stata mantenuta; annulla le modifiche successive e riprova."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "これらの項目はこの手順のあとに変更されました。履歴の項目は残してあります。あとの変更を取り消してから、もう一度お試しください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 항목들은 이 단계 이후에 변경되었습니다. 기록 항목은 그대로 유지됩니다. 이후 변경 사항을 실행 취소한 다음 다시 시도하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deze onderdelen zijn na deze stap gewijzigd. De geschiedenisvermelding is bewaard; maak de latere wijzigingen ongedaan en probeer het opnieuw."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Te elementy zmieniły się po tym kroku. Wpis historii został zachowany; cofnij późniejsze zmiany i spróbuj ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Estes itens foram alterados depois desta etapa. A entrada do histórico foi mantida; desfaça as alterações posteriores e tente novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Эти элементы изменились после этого шага. Запись в истории сохранена. Отмените более поздние изменения и повторите попытку."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De här objekten har ändrats efter det här steget. Historikposten finns kvar. Ångra de senare ändringarna och försök igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bu öğeler bu adımdan sonra değişti. Geçmiş girişi korundu; sonraki değişiklikleri geri alıp yeniden deneyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "这些项目在此步骤之后已更改。历史记录条目已保留；请先撤销之后的更改，然后重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "這些項目在此步驟之後已更動。歷史記錄項目已保留；請先還原之後的更動，然後再試一次。"
+          }
+        }
+      }
+    },
     "These work while you are not typing in a text box." : {
       "extractionState" : "manual",
       "localizations" : {
