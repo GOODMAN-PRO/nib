@@ -284,17 +284,27 @@ final class PagesUITests: XCTestCase {
     }
 
     func testBatchDuplicateAndTrashCancellationScope() throws {
+        diagnoseBatchActions = true
+        defer { diagnoseBatchActions = false; ui.recordDiagnostics("Batch pages completion", includeHierarchy: false) }
         let before = try ids()
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope initial")
         try pages(window: true); try beginSelection(); try tapThumb(1); try tapThumb(2)
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope selected two")
         try selectionAction("Duplicate"); try count(6)
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope duplicated")
         XCTAssertEqual(Set(try ids()).intersection(before).count, 4)
         try tap("Done"); try closeNavigator(); try ui.tapCommand("edit.undo"); try count(4)
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope undo duplicate")
         try pages(window: true); try beginSelection(); try tapThumb(1); try tapThumb(2)
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope selected two")
         try selectionAction("Move to Trash"); try ui.cancelConfirmation(action: "Move to Trash")
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope cancelled trash")
         XCTAssertEqual(try ids(), before)
         try selectionAction("Move to Trash"); try confirm("Move to Trash"); try count(2)
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope confirmed trash")
         XCTAssertEqual(try ids(), Array(before.suffix(2)))
         try closeNavigator(); try ui.tapCommand("edit.undo"); try count(4)
+        ui.logStateStep("testBatchDuplicateAndTrashCancellationScope undo trash")
         XCTAssertEqual(try ids(), before)
     }
 
@@ -606,8 +616,12 @@ final class PagesUITests: XCTestCase {
             if candidate.isHittable && candidate.isEnabled { target = candidate }
         }
         guard let target else { throw NibUI.Failure.message("Button cannot be used: \(text)") }
+        if diagnoseBatchActions {
+            ui.recordDiagnostics("Batch page action resolved", facts: "requested=\(text) " + ui.elementFacts(target, includeOverlaps: true), includeHierarchy: false)
+        }
         target.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
+    private var diagnoseBatchActions = false
     private func more(_ text: String) throws {
         try require(ui.app.buttons["menu.more"]).tap()
         let host = ui.app.scrollViews.matching(NSPredicate(format: "label == 'More'")).firstMatch

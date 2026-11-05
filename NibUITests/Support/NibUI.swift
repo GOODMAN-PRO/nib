@@ -428,6 +428,11 @@ final class NibUI {
         }
     }
 
+    func logStateStep(_ step: String) {
+        let value = (try? probe.snapshot())?.value
+        logQA("State step", "\(step) probe=\(String(describing: value))")
+    }
+
     private static var idleSelectorClasses: Set<String> = []
 
     /// Discovery only: do not invoke, replace or swizzle any private XCTest waiting selector.
@@ -1522,8 +1527,8 @@ final class NibUI {
         _ = try waitForState { $0.screen == "document" && $0.document != nil }
     }
 
-    func tapCommand(_ id: String) throws {
-        try tapControl("cmd." + id, overflow: ["menu.more", "tool.more"])
+    func tapCommand(_ id: String, diagnostics: Bool = false) throws {
+        try tapControl("cmd." + id, overflow: ["menu.more", "tool.more"], diagnostics: diagnostics)
     }
 
     /// Uses the real Copy control and reads its actual pasteboard output in the writing app. A background runner's
@@ -1557,18 +1562,23 @@ final class NibUI {
         _ = try waitForState { $0.tool == id }
     }
 
-    private func tapControl(_ id: String, overflow: [String]) throws {
+    private func tapControl(_ id: String, overflow: [String], diagnostics: Bool = false) throws {
+        func activate(_ control: XCUIElement) {
+            if diagnostics { recordDiagnostics("Command tap resolved", facts: elementFacts(control, includeOverlaps: true)) }
+            control.tap()
+            if diagnostics { recordDiagnostics("Command tap returned", facts: "command=\(id)", includeHierarchy: false) }
+        }
         func candidate(_ identifier: String) -> XCUIElement? {
             guard let control = findControl(identifier, type: .button), control.isEnabled else { return nil }
             return control
         }
         // XCTest taps the hittable activation point; do not scan every retained scroll host
         // for a control already available on screen (Add Page previously cost 40-50s per tap).
-        if let control = candidate(id) { control.tap(); return }
+        if let control = candidate(id) { activate(control); return }
         let target = app.buttons.matching(identifier: id).firstMatch
         if target.exists {
             revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
-            if let control = candidate(id) { control.tap(); return }
+            if let control = candidate(id) { activate(control); return }
         }
         for identifier in overflow {
             guard let menu = candidate(identifier) else { continue }
@@ -1580,7 +1590,7 @@ final class NibUI {
                 _ = XCTWaiter.wait(for: [ready], timeout: 3)
             }
             revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
-            if let control = candidate(id) { control.tap(); return }
+            if let control = candidate(id) { activate(control); return }
             if menu.exists && menu.isHittable { menu.tap() }
         }
         throw Failure.message("No enabled control \(id)\n\(app.debugDescription)")

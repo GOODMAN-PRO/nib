@@ -276,3 +276,23 @@ S:singles-rest#3 verifier rejects an environment classification without AX evide
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Pages DragPagesBetweenWindows / Selection ExternalDragToSafari | Window control inventory / hierarchy Nib / hierarchy SpringBoard / before lookup | Which process exposes which window controls, or do both trees lack them? |
+
+## X6 - per-step unresolved state evidence
+
+D:keyboard-and-state#9 establishes five failing state waits without causes. Added raw probe logging after meaningful steps in Cut/paste/undo, Batch duplicate/trash, Element drag, Tape visibility/history and RotateAll navigation/undo. Cut opts into shared tap diagnostics on the exact resolved Button, with frame/hittability/AX overlaps and before/after screenshots (AX overlap is not a UIKit hit-test result). Batch's existing tap wrapper logs the actual Duplicate and other action targets, with screenshots, without changing resolution. Element drag retains its action geometry and gains a post-drop screenshot; rotation gains a post-action screenshot, and Tape retains existing boundary diagnostics. No state mutation workaround or wait relaxation. CI must show the first divergent step and the actual command identities.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Selection CutMenuRemovesAndPasteRestoresContent | State step / Command tap resolved / returned | Which Cut Button was tapped, was it AX hittable, and did counts/clipboard change? |
+| Pages BatchDuplicateAndTrashCancellationScope | State step / Batch page action resolved / completion | Did Duplicate resolve to the selected-pages action and when did count diverge? |
+| Insert ElementDragInsertsAtDropPoint | State step | Did the drop insert/select anything before the geometry assertion? Post-drop screenshot retained. |
+| Insert TapeDrawHideRevealDoesNotAddUndoAndRemoveAllRestores | State step | Which visibility/history transition first changes counts or undo state? |
+| Canvas RotateAllPagesChangesEveryPageAndUndoesTogether | State step / Go to Page focus | Does navigation/focus or rotation state fail first, before or after Undo? |
+
+## Final local verification - 2026-11-05
+
+Completed H1-H11, C1-C18 and X1-X6 in 35 cluster commits. Re-read the changed Swift code and shared-helper callers against current signatures. Review corrections retained offscreen typed Pages matches for reveal, rebound covered editors independently of keyboard focus, kept the thumbnail viewport tall enough for the shared geometry helper, corrected the non-waiting Canvas lookup, and scoped Photos completion buttons to its observed Photos surface. No app source or protected key/touch source changed.
+
+`python Scripts/lint.py`: 0 errors, 25 warnings in untouched app/architecture declarations. `git diff --check e6abd81`: clean. A separate local source audit retained all 585 test declarations (including the separate key probe), every executionTimeAllowance assignment, all four Capture presentation test bodies, and the original revealFormElement/liveList/form helpers plus openHardwareKeyRoute/hardwareKey/sendHardwareKey implementations. The two protected external-window tests differ only by the requested X5 diagnostic call. All shared NibUI method references resolve by name and all 35 evidence sections are present. Autosquash preserved the exact source tree; final history has one commit per cluster with the required attribution body. No push.
+
+These are static checks, not Swift/Objective-C compilation or simulator proof. This Windows host has no relevant compiler/simulator. CI must especially compile/load C16's new runner-only NibUIReadiness Objective-C class via NSObject.perform, validate the XCTest runtime selector inventory, and confirm remote-picker and modal containment. The existing project.yml includes the whole NibUITests source directory, so no project or protected bridging-header edit is needed. Unknown failures remain diagnostic-only; no assertion tolerance or allowance was raised. C8's replacement presentation assertions are justified above. Estimated savings remain unmeasured: about 177s per Selection class from empty-modifier drags, about 235s in Insert probe reads, plus reduced swatch and empty-clear queries; launch priming and diagnostics add overhead. No 60s idle-stall saving is claimed. No clusters remain unfinished.

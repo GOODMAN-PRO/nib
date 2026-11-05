@@ -854,14 +854,20 @@ final class InsertUITests: XCTestCase {
     }
     func testElementDragInsertsAtDropPoint() throws {
         try elements()
+        ui.logStateStep("testElementDragInsertsAtDropPoint elements open")
         let star = try control("Star")
+        ui.logStateStep("testElementDragInsertsAtDropPoint Star resolved")
         let drop = ui.coordinate(end)
         let dropPoint = ui.interfacePoint(end)
         ui.recordGeometry("Element drag start", touches: [CGPoint(x: star.frame.midX, y: star.frame.midY), dropPoint])
         star.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8, thenDragTo: drop)
+        ui.logStateStep("testElementDragInsertsAtDropPoint drag returned")
+        ui.recordDiagnostics("Element drag returned", includeHierarchy: false)
         try counts(5)
+        ui.logStateStep("testElementDragInsertsAtDropPoint item count converged")
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount > 0 }
         let selection = try selectedBounds()
+        ui.logStateStep("testElementDragInsertsAtDropPoint selection ready")
         ui.recordGeometry("Element drag selection projection", touches: [dropPoint], selection: selection)
         XCTAssertTrue(selection.insetBy(dx: -20, dy: -20).contains(dropPoint))
     }
@@ -1033,15 +1039,19 @@ final class InsertUITests: XCTestCase {
             }
         }
         try ui.selectTool("pen"); try ui.drawStroke([point, end]); try counts(5, strokes: 2)
+        ui.logStateStep("Tape visibility pen inserted")
         try drawTape(); try counts(6, strokes: 3)
+        ui.logStateStep("Tape visibility tape inserted")
         ui.recordDiagnostics("Tape committed before visibility toggles", facts: "pen + tape insertion completed", includeHierarchy: false)
         let masked = try canvasPixels()
         ui.coordinate(CGPoint(x: 0.53, y: 0.70)).tap()
+        ui.logStateStep("Tape visibility visibility tap")
         try wait("Reveal tape must visibly expose underlying pen ink") {
             guard let current = try? self.canvasPixels() else { return false }
             return self.changedPixels(masked, current) > 40
         }
         ui.coordinate(CGPoint(x: 0.53, y: 0.70)).tap()
+        ui.logStateStep("Tape visibility visibility tap")
         try wait("Hide tape restores the opaque strip") {
             guard let current = try? self.canvasPixels() else { return false }
             return self.changedPixels(masked, current) < 20
@@ -1052,11 +1062,15 @@ final class InsertUITests: XCTestCase {
         ui.recordDiagnostics("Tape immediately after undo", includeHierarchy: false)
         try counts(5, strokes: 2)
         try ui.tapCommand("edit.redo"); try counts(6, strokes: 3)
+        ui.logStateStep("Tape visibility redo")
         try tap("tool.tape"); try tap("Remove All Tape", scroll: true); try tap("Cancel")
+        ui.logStateStep("Tape visibility cancel remove")
         try counts(6, strokes: 3)
         try tap("Remove All Tape", scroll: true); try tap("Remove All Tape")
+        ui.logStateStep("Tape visibility confirm remove")
         outside(); try counts(5, strokes: 2)
         try ui.tapCommand("edit.undo"); try counts(6, strokes: 3)
+        ui.logStateStep("Tape visibility undo remove")
         completed = true
     }
     func testTapePatternWidthStraightnessOrientationAndClearHistory() throws {

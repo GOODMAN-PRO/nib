@@ -608,13 +608,18 @@ final class SelectionUITests: XCTestCase {
     }
     func testCutMenuRemovesAndPasteRestoresContent() throws {
         try selectedInk(); let before = try ui.state()
-        try ui.tapCommand("clipboard.cut")
+        ui.logStateStep("testCutMenuRemovesAndPasteRestoresContent selected")
+        try ui.tapCommand("clipboard.cut", diagnostics: true)
+        ui.logStateStep("testCutMenuRemovesAndPasteRestoresContent cut sent")
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage - 1 && $0.selectionCount == 0 }
         try pageMenu(); try tap("Paste")
+        ui.logStateStep("testCutMenuRemovesAndPasteRestoresContent paste sent")
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage && $0.itemCountOnPage == before.itemCountOnPage }
         try ui.tapCommand("edit.undo")
+        ui.logStateStep("testCutMenuRemovesAndPasteRestoresContent undo sent")
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage - 1 }
         try undoCounts(before)
+        ui.logStateStep("testCutMenuRemovesAndPasteRestoresContent restored")
     }
     func testCommandXCutIsUndoableAndPasteable() throws {
         try selectedInk(); let before = try ui.state(); try key("x") { try self.ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage - 1 } }

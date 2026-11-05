@@ -530,15 +530,21 @@ final class CanvasUITests: XCTestCase {
     func testRotateAllPagesChangesEveryPageAndUndoesTogether() throws {
         executionTimeAllowance = 300
         try open()
+        ui.logStateStep("testRotateAllPagesChangesEveryPageAndUndoesTogether opened")
         try more("Rotate All Pages")
+        ui.logStateStep("testRotateAllPagesChangesEveryPageAndUndoesTogether rotated")
+        ui.recordDiagnostics("Rotate All Pages returned", includeHierarchy: false)
         for number in 1...4 {
             try go(number)
+            ui.logStateStep("testRotateAllPagesChangesEveryPageAndUndoesTogether navigated page \(number)")
             let paper = try page(number).frame
             XCTAssertGreaterThan(paper.width, paper.height, "Rotate All Pages must rotate page \(number)")
         }
         try ui.tapCommand("edit.undo")
+        ui.logStateStep("testRotateAllPagesChangesEveryPageAndUndoesTogether undone")
         for number in 1...4 {
             try go(number)
+            ui.logStateStep("testRotateAllPagesChangesEveryPageAndUndoesTogether navigated page \(number)")
             let paper = try page(number).frame
             XCTAssertLessThan(paper.width, paper.height)
         }
