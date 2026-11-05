@@ -606,6 +606,36 @@ final class NibPluginHostTests: XCTestCase {
 
     // MARK: Enable, exposure, commands
 
+    func testSettingsAreEditableBeforeAPluginRunsAndAfterItStops() async throws {
+        for mode in ["disabled", "needsReview", "failed", "safeMode"] {
+            let kit = PluginTestKit()
+            let id = "dev.test.settings"
+            let manifest = kit.manifest(id, contributes: ["settings": ["type": "object", "properties": [
+                "enabled": ["type": "boolean", "default": false]
+            ]]])
+            try kit.install(manifest)
+            if mode != "needsReview" { try kit.grant(id, scopes: ["document:read", "document:write"]) }
+            if mode == "disabled" { PluginEnablement.set(id, enabled: false, settings: kit.h.app.settings) }
+            if mode == "failed" { kit.runtime.failing.insert(id) }
+            if mode == "safeMode" { kit.host.isSafeMode = { true } }
+            // Listing alone must expose declarations without starting JavaScript.
+            _ = try await kit.h.run(CommandIDs.pluginList)
+            XCTAssertTrue(kit.runtime.started.isEmpty)
+            let name = "plugin." + id + ".enabled"
+            _ = try await kit.h.run(CommandIDs.settingsSet, ["name": .string(name), "value": true])
+            XCTAssertEqual(kit.h.app.settings.json(name), true, mode)
+            do { try await kit.host.load(id) } catch { /* expected for unapproved, failed and Safe Mode */ }
+            XCTAssertEqual(kit.host.state(id)?.rawValue, mode)
+            kit.host.unload(id)
+            _ = try await kit.h.run(CommandIDs.settingsSet, ["name": .string(name), "value": false])
+            XCTAssertEqual(kit.h.app.settings.json(name), false, mode)
+            do {
+                _ = try await kit.h.run(CommandIDs.settingsSet, ["name": .string(name), "value": "wrong type"])
+                XCTFail("inactive settings still require schema validation")
+            } catch { XCTAssertEqual((error as? NibError)?.code, .invalidParams) }
+        }
+    }
+
     func testEnableDisableAndHiddenCommandExposure() async throws {
         let kit = PluginTestKit()
         let id = "dev.test.hidden"

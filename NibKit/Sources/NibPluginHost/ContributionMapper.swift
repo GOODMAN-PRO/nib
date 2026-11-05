@@ -192,7 +192,7 @@ struct ContributionMapper {
 
     /// `plugin.<id>.` is declared as a prefix (synced with the library, like the plugin itself); every key of
     /// `contributes.settings` is also declared on its own, so `settings.set` validates it against its schema.
-    private func declareSettings() {
+    func declareSettings() {
         let prefix = PluginSettingsNames.prefix(pid)
         app.settings.declarePrefix(prefix, synced: true, summary: "Settings of the plugin \(manifest.name).", owner: pid)
         guard let properties = contributes?.settings?["properties"]?.objectValue else { return }

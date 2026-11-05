@@ -584,6 +584,9 @@ final class PluginHost: PluginHosting {
             finish(.failed, error)
             throw error
         }
+        // Settings are data declarations, not executable contributions. Keep them editable before approval,
+        // while disabled, in Safe Mode, and if the runtime subsequently fails to start.
+        ContributionMapper(app: app, host: self, manifest: scan.manifest, folder: folder).declareSettings()
         authority.store.reload()
         guard let grant = authority.store.grant(id), grant.sha256 == scan.sha256 else {
             let e = NibError(.permissionDenied,
@@ -822,11 +825,15 @@ final class PluginHost: PluginHosting {
         record.manifest = s.manifest
         record.sha256 = s.sha256
         record.signature = s.signature
+        let problems = ManifestValidator.problems(s.manifest, folder: folder, folderName: id)
+        if problems.isEmpty, let app = app {
+            ContributionMapper(app: app, host: self, manifest: s.manifest, folder: folder).declareSettings()
+        }
         let approved = authority.store.grant(id)?.sha256 == s.sha256
         if !approved {
             if !listing { unload(id) }
             record.state = .needsReview
-        } else if let problem = ManifestValidator.problems(s.manifest, folder: folder, folderName: id).first {
+        } else if let problem = problems.first {
             record.state = .failed
             record.error = problem.message
         } else if record.state != .running {
