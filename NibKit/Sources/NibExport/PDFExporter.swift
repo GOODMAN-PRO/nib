@@ -219,8 +219,9 @@ final class ExportPlan {
     }
 
     func backgroundURL(_ record: PageRecord) throws -> URL? {
-        guard options.background else { return nil }
         guard record.background.kind == .pdf || record.background.kind == .image, let ref = record.background.asset else { return nil }
+        // Source-PDF links remain available when only the painted background is excluded.
+        if !options.background { return environment.assets?.url(ref, doc: doc) }
         guard let url = environment.assets?.url(ref, doc: doc) else { throw ExportAssets.unavailable(ref.name) }
         if record.background.kind == .pdf {
             guard backgrounds.pdfPage(url, index: record.background.pdfPage ?? 0) != nil else {
