@@ -536,7 +536,8 @@ struct ExportPopover: View {
     }
     private var title: String { printing ? String(localized: "Print") : String(localized: "Share & Export") }
     @ViewBuilder private var contents: some View {
-        NibIconButton(.xmark, label: String(localized: "Close export options"), size: .round, shortcut: .cancelAction) { close() }
+        // NibPopoverPanel owns the title row. Bud dismissal handles Escape and VoiceOver;
+        // the outside-touch shield also closes the popover without an extra header row.
         ExportDialog(selection: selection, printing: printing, app: app, session: session, dismiss: close, draft: draft)
     }
     private func close() { host.dismiss("exportui.dialog"); host.removeAnchor("exportui.source") }

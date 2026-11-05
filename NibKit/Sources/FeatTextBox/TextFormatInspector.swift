@@ -966,6 +966,7 @@ private struct TextEmphasisSection: View {
             HStack(spacing: NibSpacing.s) {
                 ForEach(TextBoxEditor.Toggle.all, id: \.self) { t in
                     NibIconButton(t.symbol, label: t.title, size: .panel, isOn: model.state.isOn(t)) { model.toggle(t) }
+                        .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
                 }
                 Spacer(minLength: 0)
             }
@@ -977,7 +978,7 @@ private struct TextParagraphSection: View {
     @ObservedObject var model: TextFormatModel
 
     var body: some View {
-        NibInspectorSection(String(localized: "Alignment")) {
+        NibInspectorSection(String(localized: "Paragraph")) {
             VStack(alignment: .leading, spacing: NibSpacing.s) {
                 NibSegmentedControl(selection: Binding(get: { model.state.align == .natural ? .left : model.state.align },
                                                        set: { model.setAlign($0) }),
@@ -988,6 +989,7 @@ private struct TextParagraphSection: View {
                 Text(String(localized: "Line Spacing"))
                     .font(NibFont.footnote)
                     .foregroundStyle(NibColor.labelSecondary)
+                    .accessibilityHidden(true)
                 NibSegmentedControl(selection: Binding(get: { model.state.lineSpacingOption }, set: { model.setLineSpacing($0) }),
                                     options: LineSpacingOption.allCases,
                                     title: { $0.title })

@@ -654,6 +654,7 @@ struct PagesPanel: View {
 
 /// Filter chips and Select; in select mode Select All, the count and Done.
 struct PagesPanelHeader: View {
+    @Environment(\.isEnabled) private var isEnabled
     @ObservedObject var model: PagesPanelModel
 
     var body: some View {
@@ -710,6 +711,7 @@ struct PagesPanelHeader: View {
             Text(String(localized: "Select"))
                 .font(NibFont.button)
                 .foregroundStyle(NibColor.accent)
+                .opacity(isEnabled && !model.rows.isEmpty ? 1 : NibOpacity.disabled)
                 .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget, alignment: .leading)
         }
             .buttonStyle(NibPressStyle())

@@ -310,6 +310,7 @@ struct StudySessionView: View {
                            model.end(close: close)
                        }) {
             HStack(spacing: NibSpacing.xs) {
+                if model.current != nil { flip }
                 if !smartLearn, model.current != nil {
                     NibIconButton(.back, label: String(localized: "Previous Card"), size: .panel,
                                   shortcut: KeyboardShortcut(.leftArrow, modifiers: [])) {
@@ -451,9 +452,8 @@ struct StudySessionView: View {
 
     private var grading: some View {
         VStack(spacing: NibSpacing.s) {
-            // Grading stays disabled until the answer is revealed. Keep the enabled next action visible
-            // beside those controls instead of making an unflipped card look like an inactive session.
-            flip
+            // The reveal action lives in the header, so grading reserves only the grade rows.
+            // GeometryReader receives the remaining height and StudyCardLayout shrinks the paper to fit.
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: NibSpacing.l) { ForEach(StudyRating.allCases, id: \.self) { gradeButton($0) } }
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: NibSpacing.l) {
@@ -474,7 +474,6 @@ struct StudySessionView: View {
 
     private var controls: some View {
         VStack(alignment: .leading, spacing: NibSpacing.m) {
-            if model.current != nil { flip }
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: NibSpacing.m) { speech; language; scratch }
                 VStack(alignment: .leading, spacing: NibSpacing.s) { speech; language; scratch }
