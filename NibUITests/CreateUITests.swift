@@ -1036,6 +1036,8 @@ final class CreateUITests: XCTestCase {
         let eventTitle = "Nib Creation Event " + UUID().uuidString.prefix(8)
         let calendar = XCUIApplication(bundleIdentifier: "com.apple.mobilecal")
         let monitor = addUIInterruptionMonitor(withDescription: "Calendar first-launch permissions") { alert in
+            let fullAccess = alert.buttons.matching(NSPredicate(format: "label CONTAINS 'Allow Full Access'")).firstMatch
+            if fullAccess.exists { fullAccess.tap(); return true }
             for label in ["Allow While Using App", "Allow", "OK"] where alert.buttons[label].exists {
                 alert.buttons[label].tap()
                 return true
@@ -1047,7 +1049,7 @@ final class CreateUITests: XCTestCase {
         calendar.tap() // Triggers the interruption monitor for first-launch system prompts.
         let continueButton = calendar.buttons["Continue"]
         if continueButton.waitForExistence(timeout: 3) { continueButton.tap(); calendar.tap() }
-        try NibUI.openCalendarEvent(in: calendar)
+        try NibUI.openCalendarEvent(in: calendar) { self.ui.logQA($0, $1) }
         let title = calendar.textFields["Title"]
         try replace(title, with: eventTitle, in: calendar)
         try dismissKeyboard(in: calendar)
@@ -1062,7 +1064,21 @@ final class CreateUITests: XCTestCase {
         if connect.exists { connect.tap() }
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         let allow = springboard.buttons.matching(NSPredicate(format: "label CONTAINS 'Allow Full Access'")).firstMatch
-        if allow.waitForExistence(timeout: 3) { allow.tap() }
+        let summary = ui.app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label BEGINSWITH %@", eventTitle)).firstMatch
+        let calendarReady = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            if allow.exists && allow.isHittable {
+                self.ui.logQA("Calendar full access", "Accepting observed Allow Full Access prompt")
+                allow.tap()
+                return false
+            }
+            return summary.exists
+        }, object: nil)
+        // A lazy event row may enter AX only after scrollTo reveals it. This is an early exit,
+        // not an assertion; tapEventAction retains the required event/action checks after scrolling.
+        if XCTWaiter.wait(for: [calendarReady], timeout: 15) != .completed {
+            ui.logQA("Calendar readiness", "Event not exposed yet; continuing with bounded scrollTo")
+        }
         try tapEventAction("Take Notes", eventTitle: eventTitle)
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         let package = try package(id)

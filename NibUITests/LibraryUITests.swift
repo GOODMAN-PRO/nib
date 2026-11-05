@@ -74,7 +74,7 @@ final class LibraryUITests: XCTestCase {
         try ui.timedAction("Library tap \(label)") { try self.performTap(label, file: file, line: line) }
     }
     private func performTap(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
-        let diagnose = ["Move to Trash", "Save to Files"].contains(label)
+        let diagnose = ["Move to Trash", "Save to Files", "Move earlier", "Move later"].contains(label)
         var firstPoll = true
         func candidate() -> XCUIElement? {
             if diagnose && firstPoll {
@@ -90,6 +90,7 @@ final class LibraryUITests: XCTestCase {
         }
         if candidate() == nil {
             ui.revealFormElement { self.app.buttons.matching(self.matching(label)).firstMatch }
+            if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
         }
         do {
             try eventually("Action is not enabled and hittable: \(label)", file: file, line: line) { candidate() != nil }
@@ -535,7 +536,7 @@ final class LibraryUITests: XCTestCase {
         XCTAssertFalse(button(folder).isHittable, "Cannot move a folder into itself")
         let allFolders = app.switches["All folders"]
         try visible(allFolders, "Move picker must offer recursive folder browsing")
-        allFolders.tap()
+        try ui.setSwitch(allFolders, to: true)
         XCTAssertFalse(button("Child").exists, "Cannot move a folder into its own descendant")
         try tap("Destination"); try tap("Move Here")
         try eventually("Moved folder must leave root") { !self.item(self.folder, folder: true).exists }
@@ -607,7 +608,7 @@ final class LibraryUITests: XCTestCase {
         let favourite = app.switches["Show in Favourites"]
         revealFormElement(favourite)
         try visible(favourite, "Folder style must offer favourite toggle")
-        favourite.tap()
+        try ui.setSwitch(favourite, to: true)
         try tap("Save Changes")
         try eventually("Folder style sheet must dismiss before reopening its context menu") { !self.app.textFields["Folder name"].exists }
         try context(folder, folder: true); try tap("Customise Folder")
@@ -727,24 +728,12 @@ final class LibraryUITests: XCTestCase {
         item(physics).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
             .press(forDuration: 0.4, thenDragTo: item(folder, folder: true).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
                    withVelocity: .slow, thenHoldForDuration: 0.6)
-        try eventually("Completed folder move must expose its Undo toast", timeout: 5) { undo.exists && !self.item(self.physics).exists }
+        try eventually("Completed folder move must expose its Undo toast", timeout: 5) { undo.exists && undo.isHittable && !self.item(self.physics).exists }
         defer { ui.recordDiagnostics("Toast Undo completion", facts: ui.elementFacts(undo), includeHierarchy: false) }
-        var previous: CGRect?
-        try eventually("Toast Undo must have two equal frames", timeout: 3) {
-            guard undo.exists else { return false }
-            let frame = undo.frame
-            self.ui.logQA("Toast Undo frame", "previous=\(String(describing: previous)) current=\(frame) hittable=\(undo.isHittable)")
-            let stable = previous == frame && !frame.isEmpty
-            previous = frame
-            return stable
-        }
-        let buttonSnapshot = try undo.snapshot()
-        func labels(_ node: XCUIElementSnapshot) -> [CGRect] {
-            let own = node.elementType == .staticText && node.label == "Undo" ? [node.frame] : []
-            return own + node.children.flatMap { labels($0) }
-        }
-        let buttonFrame = buttonSnapshot.frame
-        ui.logQA("Toast Undo button and label", "button=\(buttonFrame) labels=\(labels(buttonSnapshot))")
+        let buttonFrame = undo.frame
+        // The containment query already identifies this toast's Undo. Avoid another snapshot or
+        // stability loop between its first hittable observation and the contact.
+        ui.logQA("Toast Undo before tap", "toast=\(toast) button=Undo exists=true hittable=true frame=\(buttonFrame)")
         app.coordinate(withNormalizedOffset: .zero).withOffset(
             CGVector(dx: buttonFrame.midX - app.frame.minX, dy: buttonFrame.midY - app.frame.minY)).tap()
         ui.recordDiagnostics("Toast Undo immediately after tap", includeHierarchy: false)
@@ -760,6 +749,11 @@ final class LibraryUITests: XCTestCase {
         item(copy).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
             .press(forDuration: 0.4, thenDragTo: item(physics).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3)),
                    withVelocity: .slow, thenHoldForDuration: 0.7)
+        if app.buttons["Move earlier"].exists && app.buttons["Duplicate"].exists {
+            let message = "Combine drag left the card context menu open; lift lost to the native menu"
+            ui.recordDiagnostics("Combine context menu after drag", facts: message)
+            throw NibUI.Failure.message(message)
+        }
         ui.recordDiagnostics("Combine drag completed", facts: "confirmation=\(button("Combine").exists); target=\(item(physics).frame); source=\(item(copy).frame). Arming is not exposed by the current probe; inspect the retained target highlight and confirmation.")
         try tap("Combine")
         try eventually("Combined source must leave library") { !self.item(copy).exists }
@@ -980,6 +974,18 @@ final class LibraryUITests: XCTestCase {
         try visible(payload, "Exported PDF must be available as an external Files drag payload")
         // Use iPad multitasking to expose the destination next to Files. Missing system
         // multitasking controls are reported as shared setup limitations, never as import success.
+        if let snapshot = try? files.snapshot() {
+            func controls(_ node: XCUIElementSnapshot) -> [String] {
+                let own = node.elementType == .button || node.elementType == .window
+                    ? ["type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) frame=\(node.frame)"] : []
+                return own + node.children.flatMap { controls($0) }
+            }
+            ui.logQA("Files window controls", controls(snapshot).joined(separator: "\n"))
+        } else { ui.logQA("Files window controls", "Files snapshot unavailable") }
+        ui.logQA("Files hierarchy before multitasking", files.debugDescription)
+        ui.logQA("SpringBoard before Files multitasking", XCUIApplication(bundleIdentifier: "com.apple.springboard").debugDescription)
+        let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        screenshot.name = "Files before multitasking"; screenshot.lifetime = .keepAlways; add(screenshot)
         let multitasking = files.buttons.matching(NSPredicate(format: "label CONTAINS[cd] 'multitasking'")).firstMatch
         try visible(multitasking, "External drop setup requires iPad multitasking controls")
         multitasking.tap()

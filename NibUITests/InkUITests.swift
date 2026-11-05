@@ -58,36 +58,39 @@ final class InkUITests: XCTestCase {
 
     /// Waits for the Squeeze section and its palette row; repeated labels in Double-tap are outside this scope.
     private func squeezePaletteBinding() throws -> XCUIElement {
-        let heading = ui.app.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).firstMatch
-        let pencilDetail = ui.app.collectionViews.containing(NSPredicate(
+        let started = Date()
+        let detail = ui.app.collectionViews.containing(NSPredicate(
             format: "elementType == %@ AND label == %@", NSNumber(value: XCUIElement.ElementType.button.rawValue),
             "Switch between current tool and eraser")).firstMatch
-        ui.revealFormElement(in: pencilDetail) { heading }
+        guard detail.exists else { throw NibUI.Failure.message("Apple Pencil settings list missing") }
+        ui.logQA("Pencil AX duration", "resolve detail seconds=\(Date().timeIntervalSince(started))")
+        let heading = detail.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).firstMatch
+        ui.revealFormElement(in: detail) { heading }
         try wait("Squeeze section heading must be visible") { heading.exists && heading.isHittable }
-        let detail = try XCTUnwrap(scrollPanels.filter {
-            $0.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).count > 0
-        }.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
-        let section = detail.otherElements.containing(.staticText, identifier: heading.label)
-            .matching(NSPredicate(format: "label != 'Double-tap'")).allElementsBoundByIndex
-            .filter {
-                let rows = $0.buttons.matching(NSPredicate(format: "label == 'Show tool palette'"))
-                return rows.count == 1 && rows.firstMatch.frame.minY > heading.frame.maxY
-            }
-            .min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
-        if let section {
-            let row = section.buttons.matching(NSPredicate(format: "label == 'Show tool palette'")).firstMatch
-            ui.revealFormElement(in: detail) { row }
-            if row.isHittable { return row }
-        }
-        // Native grouped lists can flatten Section containers. Bind by the visible header/footer range instead.
-        let footer = detail.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Squeeze Apple Pencil Pro'")).firstMatch
         let choices = detail.buttons.matching(NSPredicate(format: "label == 'Show tool palette'"))
-        /// Reacquires the row between current section boundaries; the enclosing form search waits for visibility.
+        // One immutable list snapshot per observation supplies section boundaries and all row frames.
+        // Resolve only the chosen live row; never index a snapshot's children into a live query.
         func scopedRow() -> XCUIElement {
-            guard heading.exists else { return choices.matching(NSPredicate(value: false)).firstMatch }
-            return choices.allElementsBoundByIndex.first {
-                $0.frame.minY > heading.frame.maxY && (!footer.exists || $0.frame.maxY < footer.frame.minY)
-            } ?? choices.matching(NSPredicate(value: false)).firstMatch
+            let started = Date()
+            defer { ui.logQA("Pencil AX duration", "section snapshot/bind seconds=\(Date().timeIntervalSince(started))") }
+            guard let snapshot = try? detail.snapshot() else {
+                return choices.matching(NSPredicate(value: false)).firstMatch
+            }
+            func nodes(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
+                [node] + node.children.flatMap { nodes($0) }
+            }
+            let all = nodes(snapshot)
+            guard let heading = all.first(where: { $0.elementType == .staticText && $0.label.lowercased() == "squeeze" }) else {
+                return choices.matching(NSPredicate(value: false)).firstMatch
+            }
+            let footer = all.first { $0.elementType == .staticText && $0.label.hasPrefix("Squeeze Apple Pencil Pro") }
+            let footerY = footer?.frame.minY ?? CGFloat.greatestFiniteMagnitude
+            guard let match = all.first(where: {
+                $0.elementType == .button && $0.label == "Show tool palette"
+                    && $0.frame.minY > heading.frame.maxY && $0.frame.maxY < footerY
+            }) else { return choices.matching(NSPredicate(value: false)).firstMatch }
+            for candidate in choices.allElementsBoundByIndex.prefix(8) where candidate.frame == match.frame { return candidate }
+            return choices.matching(NSPredicate(value: false)).firstMatch
         }
         ui.revealFormElement(in: detail, target: scopedRow)
         let row = scopedRow()
@@ -164,8 +167,8 @@ final class InkUITests: XCTestCase {
                 ui.revealFormElement(in: panel) { element }
             }
             XCTAssertTrue(target.isHittable, "\(label) switch thumb must be visible")
-            target.coordinate(withNormalizedOffset: CGVector(dx: native.exists ? 0.5 : 0.92, dy: 0.5)).tap()
         }
+        try ui.setSwitch(element, to: enabled)
         try wait("\(label) must become \(enabled)") { (element.value as? String == "1") == enabled }
         return element
     }
@@ -263,22 +266,69 @@ final class InkUITests: XCTestCase {
 
     private var colourPicker: XCUIElement { ui.app.otherElements["UIColorPicker"].firstMatch }
 
+    private func waitForColourSliders() throws {
+        try wait("Remote colour picker and Sliders must be ready") {
+            let picker = self.colourPicker
+            let sliders = picker.buttons["Sliders"].firstMatch
+            return picker.exists && sliders.exists && sliders.isHittable
+        }
+    }
+
     private func closeColourPicker() throws {
         let picker = colourPicker
         guard picker.exists else { throw NibUI.Failure.message("Native colour picker is not presented") }
-        let done = picker.buttons.matching(NSPredicate(format: "label ==[c] 'done'")).firstMatch
-        if let candidate = try? done.snapshot(), let root = try? picker.snapshot() {
-            func parent(_ node: XCUIElementSnapshot) -> String? {
-                if node.children.contains(where: { $0.elementType == .button && $0.label == candidate.label && $0.frame == candidate.frame }) {
-                    return "type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) frame=\(node.frame)"
-                }
-                return node.children.compactMap { parent($0) }.first
+        let popover = ui.app.popovers.containing(.other, identifier: "UIColorPicker").firstMatch
+        let sheet = ui.app.sheets.containing(.other, identifier: "UIColorPicker").firstMatch
+        let isPopover = popover.exists
+        let surface = isPopover ? popover : (sheet.exists ? sheet : picker)
+        if let snapshot = try? surface.snapshot() {
+            func controls(_ node: XCUIElementSnapshot) -> [String] {
+                let own = "type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) frame=\(node.frame)"
+                return [own] + node.children.flatMap { controls($0) }
             }
-            ui.logQA("Colour picker Done candidate", "frame=\(candidate.frame) parent=\(parent(root) ?? "unobserved")")
-        } else { ui.logQA("Colour picker Done candidate", "Done or parent snapshot absent") }
-        let close = picker.buttons.matching(NSPredicate(format: "label ==[c] 'close'")).firstMatch
-        try wait("Native colour picker must expose its close control") { self.ui.hasVisibleFrame(close) && close.isHittable }
-        close.tap()
+            ui.logQA("Colour picker controls", controls(snapshot).joined(separator: "\n"))
+        }
+        let close = surface.buttons.matching(NSPredicate(format: "label ==[c] 'close'")).firstMatch
+        let done = surface.buttons.matching(NSPredicate(format: "label ==[c] 'done'")).firstMatch
+        var dismissal: XCUIElement?
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            if close.exists && close.isHittable { dismissal = close; return true }
+            if done.exists && done.isHittable { dismissal = done; return true }
+            return false
+        }, object: nil)
+        let foundControl = XCTWaiter.wait(for: [ready], timeout: isPopover ? 2 : 8) == .completed
+        guard foundControl || isPopover else {
+            throw NibUI.Failure.message("Native colour picker must expose close, Done or a popover dismissal surface")
+        }
+        if let dismissal {
+            ui.logQA("Colour picker dismissal", ui.elementFacts(dismissal))
+            dismissal.tap()
+        } else {
+            let window = ui.app.windows.firstMatch.frame
+            let panel = popover.frame
+            let region = ui.app.otherElements["PopoverDismissRegion"].firstMatch
+            guard region.exists else {
+                throw NibUI.Failure.message("Colour popover has no dismissal region")
+            }
+            let regionFrame = region.frame.intersection(window)
+            guard !regionFrame.isNull, !regionFrame.isInfinite,
+                  regionFrame.width > 48, regionFrame.height > 48 else {
+                throw NibUI.Failure.message("Colour popover has no visible dismissal region")
+            }
+            let surfaces = ui.app.popovers.allElementsBoundByIndex.map(\.frame) + [panel]
+            let points = [CGPoint(x: regionFrame.minX + 24, y: regionFrame.minY + 24),
+                          CGPoint(x: regionFrame.maxX - 24, y: regionFrame.minY + 24),
+                          CGPoint(x: regionFrame.minX + 24, y: regionFrame.maxY - 24),
+                          CGPoint(x: regionFrame.maxX - 24, y: regionFrame.maxY - 24)]
+            guard let point = points.first(where: { point in
+                regionFrame.contains(point) && !surfaces.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
+            }) else {
+                throw NibUI.Failure.message("Colour popover has no outside dismissal point")
+            }
+            ui.logQA("Colour picker dismissal", "outside=\(point) popover=\(panel) dismissRegion=\(regionFrame)")
+            ui.app.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(dx: point.x - ui.app.frame.minX, dy: point.y - ui.app.frame.minY)).tap()
+        }
         try wait("Native colour picker must dismiss") { !picker.exists }
     }
 
@@ -762,6 +812,7 @@ final class InkUITests: XCTestCase {
 
     func testCustomColourValidHexUpdatesSlotAndInvalidHexIsRejected() throws {
         try swatchMenu("Change Colour"); try tap("Custom Colour")
+        try waitForColourSliders()
         try ui.diagnoseAction("Colour Sliders", facts: { self.ui.elementFacts(self.ui.app.buttons["Sliders"].firstMatch, includeOverlaps: true) }) {
             try tap("Sliders")
         }
@@ -780,7 +831,9 @@ final class InkUITests: XCTestCase {
         closePopover()
         XCTAssertTrue(swatches[0].label.uppercased().contains("D03080"), "Valid HEX must update the edited slot")
         let valid = swatches[0].label
-        try swatchMenu("Change Colour"); try tap("Custom Colour"); try ui.diagnoseAction("Colour Sliders", facts: { self.ui.elementFacts(self.ui.app.buttons["Sliders"].firstMatch, includeOverlaps: true) }) {
+        try swatchMenu("Change Colour"); try tap("Custom Colour")
+        try waitForColourSliders()
+        try ui.diagnoseAction("Colour Sliders", facts: { self.ui.elementFacts(self.ui.app.buttons["Sliders"].firstMatch, includeOverlaps: true) }) {
             try tap("Sliders")
         }
         let invalid = try hexField()

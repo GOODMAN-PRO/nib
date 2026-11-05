@@ -9,6 +9,7 @@ struct QAState: Decodable {
     let keyResponderIsText: Bool?
     /// The app's last hardware key events (fixture mode): window presses, the responder that took each, the command run.
     let keyLog: [String]?
+    let keyLogTotal: Int?
     let screen: String
     let document: String?
     let page: String?
@@ -41,6 +42,7 @@ struct QAState: Decodable {
 final class NibUI {
     let app = XCUIApplication()
     var probe: XCUIElement { app.otherElements["nib.qa.state"].firstMatch }
+    private(set) var formRevealFailure: String?
     var canvas: XCUIElement { app.scrollViews["nib.canvas"].firstMatch }
 
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
@@ -122,6 +124,7 @@ final class NibUI {
                     ?? self.app.descendants(matching: type).matching(NSPredicate(
                         format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
             }
+            if let failure = formRevealFailure { throw Failure.message(failure) }
             if let found = findControl(name, type: type) { return found }
         }
         var found: XCUIElement?
@@ -135,18 +138,98 @@ final class NibUI {
         return found
     }
 
+    /// The labelled SwiftUI row owns the value; its nested native switch owns the touch.
+    func setSwitch(_ element: XCUIElement, to enabled: Bool) throws {
+        guard element.exists else { throw Failure.message("Missing labelled switch: " + elementFacts(element)) }
+        let expected = enabled ? "1" : "0"
+        if element.value as? String != expected {
+            let native = element.descendants(matching: .switch).firstMatch
+            var hasNative = native.exists
+            var target = hasNative ? native : element
+            if target.exists && !target.isHittable {
+                revealFormElement(element)
+                if let failure = formRevealFailure { throw Failure.message(failure) }
+                hasNative = native.exists
+                target = hasNative ? native : element
+            }
+            let facts = "row: " + elementFacts(element) + "\nthumb: " + elementFacts(target, includeOverlaps: true)
+            logQA("Switch before press", facts)
+            guard target.isEnabled && target.isHittable else {
+                throw Failure.message("Switch thumb must be enabled and visible\n" + facts)
+            }
+            target.coordinate(withNormalizedOffset: CGVector(dx: hasNative ? 0.5 : 0.92, dy: 0.5))
+                .press(forDuration: 0.05)
+        }
+        let changed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            element.exists && element.value as? String == expected
+        }, object: nil)
+        guard XCTWaiter.wait(for: [changed], timeout: 8) == .completed else {
+            let facts = elementFacts(element, includeOverlaps: true)
+            logQA("Switch value failed", "expected=\(expected) " + facts)
+            throw Failure.message("Switch must become \(enabled)\n" + facts)
+        }
+    }
+
     /// Waits for a target in its actual form, searching both directions until the visible rows stop changing.
     /// Existing callers pass lazy firstMatch queries; the closure overload also supports fresh section-scoped queries.
     func revealFormElement(_ element: XCUIElement) { revealFormElement { element } }
 
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
     func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
+        formRevealFailure = nil
+        var ancestorClip: CGRect?
+        var containerIsTransient = false
+        func ancestry(_ target: XCUIElementSnapshot, in root: XCUIElementSnapshot) -> (clip: CGRect, transient: Bool)? {
+            func visit(_ node: XCUIElementSnapshot, clip: CGRect, transient: Bool) -> (clip: CGRect, transient: Bool)? {
+                let frame = node.frame
+                let clipped = frame.isNull || frame.isInfinite || frame.isEmpty ? clip : clip.intersection(frame)
+                // UIKit's native context menu in L:#0 exposes Other ancestors and a Preview sibling,
+                // rather than a Menu node. Keep that observed surface distinct from ordinary forms.
+                let isTransient = transient || node.elementType == .menu || node.elementType == .popover
+                    || (node.elementType == .other && node.children.contains { $0.elementType == .other && $0.label == "Preview" })
+                if node.elementType == target.elementType && node.identifier == target.identifier
+                    && node.label == target.label && node.frame == target.frame { return (clipped, isTransient) }
+                for child in node.children {
+                    if let match = visit(child, clip: clipped, transient: isTransient) { return match }
+                }
+                return nil
+            }
+            return visit(root, clip: app.windows.firstMatch.frame, transient: false)
+        }
+        func containerLost(_ detail: String) {
+            let message = "Reveal drag dismissed or replaced its menu/popover/container: " + detail
+            formRevealFailure = message
+            recordDiagnostics("Form container changed", facts: message)
+            XCTFail(message)
+        }
         let initial = target()
         let initialSnapshot = initial.exists ? (try? initial.snapshot()) : nil
         // Unlabelled native thumbs are not unique identities; keep the caller's scoped query.
         let identity = initialSnapshot.flatMap { $0.identifier.isEmpty && $0.label.isEmpty ? nil : $0 }
         func liveList() -> XCUIElement? {
-            if let form, form.exists, hasVisibleFrame(form) { return form }
+            if let form, form.exists, hasVisibleFrame(form) {
+                ancestorClip = nil
+                containerIsTransient = false
+                // Ordinary explicit forms keep the cheap window clip. Only inspect ancestry
+                // within a presented transient surface; native UIKit menus use a Preview sibling.
+                let surfaces = app.popovers.allElementsBoundByIndex + app.menus.allElementsBoundByIndex
+                let hasNativeMenu = app.otherElements["Preview"].firstMatch.exists
+                if !surfaces.isEmpty || hasNativeMenu, let node = try? form.snapshot() {
+                    for surface in surfaces where hasVisibleFrame(surface) {
+                        if let root = try? surface.snapshot(), let context = ancestry(node, in: root) {
+                            ancestorClip = context.clip
+                            containerIsTransient = context.transient
+                            break
+                        }
+                    }
+                    if ancestorClip == nil, hasNativeMenu, let root = try? app.snapshot(),
+                       let context = ancestry(node, in: root), context.transient {
+                        ancestorClip = context.clip
+                        containerIsTransient = true
+                    }
+                }
+                return form
+            }
             guard let root = try? app.snapshot() else {
                 logQA("Form reveal unavailable", "snapshotCandidates=0; app snapshot unavailable; candidates not collected")
                 return nil
@@ -214,6 +297,9 @@ final class NibUI {
             var fallback: (element: XCUIElement, rank: Int, frame: CGRect)?
             func chosen(_ element: XCUIElement, rank: Int, frame: CGRect, hittable: Bool) -> XCUIElement {
                 let node = ranked[rank].node
+                let context = ancestry(node, in: root)
+                ancestorClip = context?.clip
+                containerIsTransient = context?.transient ?? false
                 logQA("Form reveal container", "type=\(node.elementType) label=\(node.label) frame=\(frame) rank=\(rank + 1)/\(ranked.count) hittable=\(hittable)")
                 return element
             }
@@ -286,8 +372,14 @@ final class NibUI {
         var endSignatures: [String] = []
         for _ in 0..<16 {
             let listFrame = snapshot.frame
-            guard let viewport = NibUITestScrollGeometry.viewport(
-                scroll: listFrame, window: window, obstructions: obstructions) else { return }
+            var clippedViewport = NibUITestScrollGeometry.viewport(
+                scroll: listFrame.intersection(ancestorClip ?? window), window: window, obstructions: obstructions)
+            if clippedViewport == nil, let ancestorClip {
+                logQA("Form viewport fallback", "Unusable ancestor clip=\(ancestorClip); using container=\(listFrame) intersected with window=\(window)")
+                clippedViewport = NibUITestScrollGeometry.viewport(
+                    scroll: listFrame, window: window, obstructions: obstructions)
+            }
+            guard let viewport = clippedViewport else { return }
             let element: XCUIElement
             if let identity {
                 element = list.descendants(matching: identity.elementType).matching(NSPredicate(
@@ -312,6 +404,7 @@ final class NibUI {
             guard let start = formDragStart(snapshot, viewport: viewport, down: down) else { return }
             let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
             let values = formControlValues(snapshot)
+            let wasTransient = containerIsTransient
             logQA("Form drag before", "point=\(start) container=\(listFrame) rows=\(signature)")
             let origin = app.coordinate(withNormalizedOffset: .zero)
             origin.withOffset(CGVector(dx: start.x - app.frame.minX, dy: start.y - app.frame.minY))
@@ -325,8 +418,26 @@ final class NibUI {
                 nextSnapshot = try? replacement.snapshot()
             }
             guard let after = nextSnapshot else {
-                logQA("Form reveal unavailable", "Container disappeared after drag; caller retains its wait/fallback")
+                if wasTransient {
+                    containerLost("container disappeared after drag: before=\(snapshot.elementType) \(listFrame)")
+                } else {
+                    logQA("Form reveal unavailable", "Container snapshot unavailable after drag; before=\(listFrame); caller retains its wait/fallback")
+                }
                 return
+            }
+            let dx0: CGFloat = abs(after.frame.minX - listFrame.minX)
+            let dy0: CGFloat = abs(after.frame.minY - listFrame.minY)
+            let dx1: CGFloat = abs(after.frame.maxX - listFrame.maxX)
+            let dy1: CGFloat = abs(after.frame.maxY - listFrame.maxY)
+            let sameFrame = dx0 <= 1.0 && dy0 <= 1.0 && dx1 <= 1.0 && dy1 <= 1.0
+            if wasTransient && (after.elementType != snapshot.elementType || !sameFrame) {
+                containerLost("before=\(snapshot.elementType) \(listFrame) after=\(after.elementType) \(after.frame)")
+                return
+            }
+            if after.elementType != snapshot.elementType || !sameFrame {
+                logQA("Form container changed", "Ordinary form rebuilt or resized; before=\(listFrame) after=\(after.frame); continuing with new snapshot")
+                // A previous ordinary ancestor clip can be stale after a resize or lazy-query rebind.
+                ancestorClip = nil
             }
             logQA("Form drag after", "point=\(start) container=\(after.frame) rows=\(formVisibleRange(after, viewport: viewport))")
             snapshot = after // Reuse this post-drag snapshot as the next iteration's before state.
@@ -787,7 +898,8 @@ final class NibUI {
             let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) route=runner hardware event responder=\(recipient) window=\(window.frame)\n\(probe.value ?? "missing")")
             request.lifetime = .keepAlways; activity.add(request)
             // Deliver at device level after verifying UIKit focus; non-text responders have no AX recipient.
-            let logBeforeDelivery = focused.keyLog ?? []
+            let deliveryBefore = chordProbeSnapshot()
+            let logBeforeDelivery = deliveryBefore.state?.keyLog ?? focused.keyLog ?? []
             try hardwareKey(key, modifiers)
             // The app's own account of the key (window press, responder, command run) goes into the test log
             // for passing and failing chords alike.
@@ -797,6 +909,15 @@ final class NibUI {
             }
             do { try postcondition() }
             catch {
+                // Allow the caller's bounded postcondition to observe delivery before declaring
+                // the key log unchanged; an immediate snapshot can race a late app log entry.
+                let deliveryAfter = chordProbeSnapshot()
+                if let prior = deliveryBefore.state, let after = deliveryAfter.state,
+                   let priorLog = prior.keyLog, let afterLog = after.keyLog,
+                   priorLog == afterLog, prior.keyLogTotal == after.keyLogTotal {
+                    logQA("Chord no new key event", "key=\(key) modifiers=\(modifiers.rawValue)\nbefore delivery: "
+                        + deliveryBefore.facts + "\nafter failed postcondition: " + deliveryAfter.facts)
+                }
                 // Retry only a proven modifier loss on a fresh printable press outside text editing.
                 // In particular, missing events and control keys are not retry evidence.
                 if let current = try? state(), current.keyResponderIsText != true,
@@ -814,6 +935,23 @@ final class NibUI {
                 throw error
             }
         }
+    }
+
+    private func chordProbeSnapshot() -> (state: QAState?, facts: String) {
+        let raw = (try? probe.snapshot())?.value as? String
+        let decoded = raw.flatMap { try? JSONDecoder().decode(QAState.self, from: Data($0.utf8)) }
+        // Current probe exposes responder/log but not key-window identity/frame. Preserve the raw
+        // probe for future optional fields and identify the AX frame as a separate observation.
+        let object = raw.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) } as? [String: Any]
+        let keyWindowValue = object?["keyWindow"]
+        let windowFrameValue = object?["windowFrame"]
+        let keyWindow = keyWindowValue.map { String(describing: $0) } ?? "unavailable in probe"
+        let probeFrame = windowFrameValue.map { String(describing: $0) } ?? "unavailable in probe"
+        let window = app.windows.firstMatch
+        let axFrame = window.exists ? String(describing: window.frame) : "absent"
+        let facts = "keyWindow=\(keyWindow) probeWindowFrame=\(probeFrame) AXFirstWindowFrame=\(axFrame)"
+            + " responder=\(decoded?.keyResponder ?? "unavailable") probe=\(raw ?? "unavailable")"
+        return (decoded, facts)
     }
 
     private func missingChordModifiers(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags,
@@ -1169,6 +1307,7 @@ final class NibUI {
             revealFormElement {
                 shareAction("Save to Files", actionable: false) ?? self.app.cells["Save to Files"].firstMatch
             }
+            if let failure = formRevealFailure { throw Failure.message(failure) }
         }
         var action: XCUIElement?
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
@@ -1318,6 +1457,25 @@ final class NibUI {
             } else { try hardwareKey(XCUIKeyboardKey.escape.rawValue) }
         }
         inspect("after Hide")
+        // In the custom-size decimal editor the first outside tap dismisses only the floating pad.
+        // A second contact is justified only by a still-present keyboard, never by a fixed delay.
+        let firstDismissal = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
+        if inertHeader != nil, source.keyboards.firstMatch.exists,
+           XCTWaiter.wait(for: [firstDismissal], timeout: 2) != .completed,
+           source.keyboards.firstMatch.exists {
+            guard let dockedHide = source.keyboards.buttons.matching(NSPredicate(
+                format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).allElementsBoundByIndex.prefix(8).first(where: {
+                    hasVisibleFrame($0, in: viewport)
+                }) else {
+                logQA("Decimal keyboard remaining", source.keyboards.debugDescription)
+                throw Failure.message("Decimal keyboard remains but exposes no visible Hide keyboard key")
+            }
+            let frame = dockedHide.frame
+            logQA("Decimal keyboard remaining", "second contact on Hide keyboard frame=\(frame)")
+            source.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(dx: frame.midX - source.frame.minX, dy: frame.midY - source.frame.minY)).tap()
+            inspect("after docked Hide")
+        }
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
         guard !source.keyboards.firstMatch.exists || XCTWaiter.wait(for: [gone], timeout: 5) == .completed else {
             throw Failure.message("Keyboard did not dismiss after \(route)")
@@ -1400,7 +1558,10 @@ final class NibUI {
     /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.
     func focusField(_ field: XCUIElement) throws {
         if isKeyboardFocused(field) { return }
-        if !hasVisibleFrame(field) || !field.isHittable { revealFormElement(field) }
+        if !hasVisibleFrame(field) || !field.isHittable {
+            revealFormElement(field)
+            if let failure = formRevealFailure { throw Failure.message(failure) }
+        }
         guard hasVisibleFrame(field) && field.isHittable else {
             // Only a keyboard-occluded editor justifies the expensive Attributes-line check (GIPHY, LaTeX).
             if isKeyboardFocused(field, allowingAttributeFallback: true) { return }
@@ -1598,8 +1759,7 @@ final class NibUI {
         guard let point = NibUITestScrollGeometry.tapPoint(control: document.frame, viewport: visible) else {
             throw Failure.message("Document has no visible tap area: \(title)")
         }
-        app.coordinate(withNormalizedOffset: .zero)
-            .withOffset(CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+        try pressWithoutIdle(at: point, duration: 0.05)
         _ = try waitForState { $0.screen == "document" && $0.document != nil }
     }
 
@@ -1654,6 +1814,7 @@ final class NibUI {
         let target = app.buttons.matching(identifier: id).firstMatch
         if target.exists {
             revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
+            if let failure = formRevealFailure { throw Failure.message(failure) }
             if let control = candidate(id) { activate(control); return }
         }
         for identifier in overflow {
@@ -1666,6 +1827,7 @@ final class NibUI {
                 _ = XCTWaiter.wait(for: [ready], timeout: 3)
             }
             revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
+            if let failure = formRevealFailure { throw Failure.message(failure) }
             if let control = candidate(id) { activate(control); return }
             if menu.exists && menu.isHittable { menu.tap() }
         }
@@ -1807,8 +1969,35 @@ final class NibUI {
                         [CGPoint(x: from.x + spacing, y: from.y), CGPoint(x: to.x + spacing, y: to.y)]], duration: duration)
     }
 
+    /// Caller must follow delivery with a bounded UI/state postcondition; completion only proves delivery.
+    func pressWithoutIdle(_ element: XCUIElement, duration: TimeInterval) throws {
+        guard element.exists, element.isEnabled, element.isHittable else {
+            throw Failure.message("Non-idle press requires an enabled hittable element: " + elementFacts(element))
+        }
+        let frame = element.frame
+        guard !frame.isNull, !frame.isInfinite, frame.width > 0, frame.height > 0 else {
+            throw Failure.message("Non-idle press has invalid frame: \(frame)")
+        }
+        try pressWithoutIdle(at: CGPoint(x: frame.midX, y: frame.midY), duration: duration)
+    }
+
+    func tapWithoutIdle(_ element: XCUIElement) throws {
+        try pressWithoutIdle(element, duration: 0.05)
+    }
+
+    private func pressWithoutIdle(at point: CGPoint, duration: TimeInterval) throws {
+        let frame = app.frame
+        let screen = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: point.x - frame.minX, dy: point.y - frame.minY)).screenPoint
+        try synthesize(screenPaths: [[screen]], duration: duration)
+    }
+
     private func synthesize(_ paths: [[CGPoint]], duration: TimeInterval) throws {
-        let points = paths.map { $0.map { NSValue(cgPoint: coordinate($0).screenPoint) } }
+        try synthesize(screenPaths: paths.map { $0.map { coordinate($0).screenPoint } }, duration: duration)
+    }
+
+    private func synthesize(screenPaths: [[CGPoint]], duration: TimeInterval) throws {
+        let points = screenPaths.map { $0.map { NSValue(cgPoint: $0) } }
         let done = XCTestExpectation(description: "Touch path completed")
         var failure: Error?
         logTouchPaths(points)
@@ -1899,7 +2088,7 @@ final class NibUI {
 /// fixture contract; an unlabeled toolbar symbol must not prevent ordinary input.
 @MainActor
 extension NibUI {
-    static func openCalendarEvent(in calendar: XCUIApplication) throws {
+    static func openCalendarEvent(in calendar: XCUIApplication, log: ((String, String) -> Void)? = nil) throws {
         let title = calendar.textFields["Title"]
         // iPadOS 26 exposes the toolbar action as add-plus-button / lowercase "add".
         // Prefer its stable identifier; localized display casing is not a command contract.
@@ -1911,10 +2100,30 @@ extension NibUI {
             return (identified + labelled).first { $0.isEnabled && $0.isHittable }
         }
         func editorIsReady() -> Bool { title.exists && title.isEnabled && title.isHittable }
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            editorIsReady() || addButton() != nil
+            let alerts = springboard.alerts
+            let count = alerts.count
+            let add = calendar.buttons["add-plus-button"].firstMatch
+            let facts = add.exists ? "enabled=\(add.isEnabled) hittable=\(add.isHittable) frame=\(add.frame)" : "absent"
+            log?("Calendar readiness", "springboardAlerts=\(count) Add=\(facts)")
+            if count > 0 {
+                let alert = alerts.firstMatch
+                let allow = alert.buttons.matching(NSPredicate(
+                    format: "label IN {'Allow While Using App', 'Allow', 'OK'} OR label CONTAINS 'Allow Full Access'")).firstMatch
+                if allow.exists && allow.isHittable { allow.tap() }
+                return false // Re-observe after dismissal before resolving Add.
+            }
+            return editorIsReady() || addButton() != nil
         }, object: nil)
-        _ = XCTWaiter.wait(for: [ready], timeout: 15)
+        let readiness = XCTWaiter.wait(for: [ready], timeout: 15)
+        if readiness != .completed {
+            log?("Calendar readiness failed", springboard.debugDescription + "\n" + calendar.debugDescription)
+            if springboard.alerts.firstMatch.exists {
+                throw NibUI.Failure.message("Calendar permission alert did not dismiss")
+            }
+            // Preserve the native Command-N fallback when Calendar omits a usable Add control.
+        }
         if editorIsReady() { return }
         addButton()?.tap()
         let opened = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in editorIsReady() }, object: nil)
@@ -1923,6 +2132,7 @@ extension NibUI {
         // Calendar's New Event keyboard command also reaches the native editor when
         // iPadOS omits the visible + symbol's accessibility label. Unlike a screen
         // coordinate this remains valid across orientation and toolbar layouts.
+        log?("Calendar Command-N", "Add did not open editor; delivering native key to Calendar")
         calendar.typeKey("n", modifierFlags: [.command])
         let shortcutOpened = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in editorIsReady() }, object: nil)
         guard XCTWaiter.wait(for: [shortcutOpened], timeout: 10) == .completed else {
