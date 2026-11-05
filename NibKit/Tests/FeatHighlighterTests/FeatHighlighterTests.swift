@@ -192,18 +192,13 @@ final class FeatHighlighterTests: XCTestCase {
         var presets = h.app.settings.get(HighlighterSettings.presets)
         let expected = RGBA(0x12, 0xA4, 0xC8, RGBA.highlighterAlpha)
         var picks = 0
-        var finished = false
-        let picker = SystemColourPicker(initial: presets.color.uiColor, onPick: { colour in
+        let binding = HighlighterColourSelection.customBinding(presets: presets) { edit in
             picks += 1
-            PresetEdit.setColour(index: presets.selectedSwatch, color: RGBA(colour).asHighlighter).apply(to: &presets)
-        }, onDone: { finished = true })
-        let coordinator = picker.makeCoordinator()
-        let controller = UIColorPickerViewController()
-        controller.selectedColor = RGBA(expected.r, expected.g, expected.b).uiColor
-        coordinator.colorPickerViewController(controller, didSelect: controller.selectedColor, continuously: false)
-        coordinator.colorPickerViewControllerDidFinish(controller)
-        XCTAssertEqual(picks, 1, "Closing the system picker must not duplicate its final selection")
-        XCTAssertTrue(finished)
+            edit.apply(to: &presets)
+        }
+        // This is the binding passed to the production NibCustomColourPicker.
+        binding.wrappedValue = Color(uiColor: RGBA(expected.r, expected.g, expected.b).uiColor)
+        XCTAssertEqual(picks, 1)
         XCTAssertEqual(presets.color, expected)
         try await h.run(CommandIDs.settingsSet, ["name": .string(HighlighterSettings.presets.name),
                                                 "value": try JSONValue.from(presets)])

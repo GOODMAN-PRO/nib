@@ -495,6 +495,12 @@ extension RGBA {
 // MARK: - Settings popover
 
 enum HighlighterColourSelection {
+    static func customBinding(presets: ToolPresets, edit: @escaping (PresetEdit) -> Void) -> Binding<Color> {
+        Binding(get: { Color(uiColor: presets.color.uiColor) }, set: { colour in
+            edit(.setColour(index: presets.selectedSwatch, color: RGBA(UIColor(colour)).asHighlighter))
+        })
+    }
+
     static func id(for colour: RGBA) -> String? {
         NibHighlighter.allCases.first { $0.rgba.r == colour.r && $0.rgba.g == colour.g && $0.rgba.b == colour.b }?.rawValue
     }
@@ -571,9 +577,7 @@ struct HighlighterSettingsView: View {
     }
 
     private var customColour: Binding<Color> {
-        Binding(get: { Color(uiColor: presets.color.uiColor) }, set: { colour in
-            edit(.setColour(index: presets.selectedSwatch, color: RGBA(UIColor(colour)).asHighlighter))
-        })
+        HighlighterColourSelection.customBinding(presets: presets, edit: edit)
     }
 
     private var widthRange: ClosedRange<Double> {
@@ -629,54 +633,6 @@ struct HighlighterSettingsView: View {
             drawAndHold = s.get(HighlighterSettings.drawAndHold)
         default:
             break
-        }
-    }
-}
-
-/// The system colour picker (grid, spectrum, sliders, hex, eyedropper) for a custom highlighter colour.
-struct SystemColourPicker: UIViewControllerRepresentable {
-    let initial: UIColor
-    let onPick: (UIColor) -> Void
-    let onDone: () -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(self) }
-
-    func makeUIViewController(context: Context) -> UIColorPickerViewController {
-        let picker = UIColorPickerViewController()
-        picker.selectedColor = initial
-        picker.supportsAlpha = false                           // highlighters keep the preset translucency
-        picker.delegate = context.coordinator
-        return picker
-    }
-
-    func updateUIViewController(_ picker: UIColorPickerViewController, context: Context) {
-        context.coordinator.parent = self
-    }
-
-    @MainActor
-    final class Coordinator: NSObject, UIColorPickerViewControllerDelegate {
-        var parent: SystemColourPicker
-        private var last: UIColor?
-
-        init(_ parent: SystemColourPicker) {
-            self.parent = parent
-        }
-
-        func colorPickerViewController(_ viewController: UIColorPickerViewController, didSelect color: UIColor,
-                                       continuously: Bool) {
-            guard !continuously else { return }                // one command per choice, not per drag frame
-            pick(color)
-        }
-
-        func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
-            pick(viewController.selectedColor)
-            parent.onDone()
-        }
-
-        private func pick(_ color: UIColor) {
-            guard last != color else { return }
-            last = color
-            parent.onPick(color)
         }
     }
 }
