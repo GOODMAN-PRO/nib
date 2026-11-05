@@ -422,7 +422,7 @@ enum ChatCommands {
                 case "answer":
                     let id = try string(p, "message")
                     guard let entry = model.entries.first(where: { $0.id == id && $0.role == "assistant" }) else { throw NibError.notFound("answer") }
-                    model.draft = ChatDraft(text: entry.text, prompt: entry.text)
+                    model.draft = ChatDraft(text: entry.displayText, prompt: entry.displayText)
                 case "text":
                     guard model.draft != nil else { throw NibError.notFound("draft") }
                     model.draft?.text = try string(p, "text")

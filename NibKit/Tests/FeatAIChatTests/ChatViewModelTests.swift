@@ -6,6 +6,20 @@ import NibTesting
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testAnswerDraftUsesReadableCitationLabelsAndUnresolvedFallback() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        var answer = ChatEntry(id: "CITEDANSWER", role: "assistant", text: "See page:FIXTUREDOC01/FIXTUREPG001.")
+        answer.resolveCitations(model.citationLabel)
+        model.entries = [answer]
+        _ = try await h.run("ai.chat.draft", ["action": "answer", "message": .string(answer.id)])
+        XCTAssertEqual(model.draft?.text, "See Page 1.")
+        XCTAssertEqual(model.draft?.prompt, "See Page 1.")
+        model.entries = [ChatEntry(id: "UNRESOLVED", role: "assistant", text: "See page:UNKNOWN/PAGE.")]
+        _ = try await h.run("ai.chat.draft", ["action": "answer", "message": "UNRESOLVED"])
+        XCTAssertEqual(model.draft?.text, "See Reference.")
+    }
+
     func testArchiveInterleavesReceiptsWithoutReorderingListedMessages() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let messages = [("USER1", "user", 1.0), ("ANSWER1", "assistant", 2.0),
