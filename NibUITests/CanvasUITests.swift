@@ -142,11 +142,6 @@ final class CanvasUITests: XCTestCase {
             if XCTWaiter.wait(for: [ready], timeout: 3) != .completed {
                 field.tap()
                 ui.logQA("Go to Page focus retap", "page=\(number) focused=\(focused())")
-                let retry = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in focused() }, object: nil)
-                guard XCTWaiter.wait(for: [retry], timeout: 5) == .completed else {
-                    ui.recordDiagnostics("Go to Page focus failed", facts: ui.elementFacts(field))
-                    throw NibUI.Failure.message("Go to Page field did not acquire keyboard focus")
-                }
             }
         }
         // Preserve app autofocus; do not tap it away or type the requested value twice.

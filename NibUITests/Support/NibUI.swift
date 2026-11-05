@@ -74,6 +74,10 @@ final class NibUI {
             name, name, name, name)
         let command = ["cmd.", "tool.", "menu.", "sheet."].contains { name.hasPrefix($0) }
         let kind: XCUIElement.ElementType = type == .any && command ? .button : type
+        let matches = (scope ?? app).descendants(matching: kind).matching(predicate)
+        let first = matches.firstMatch
+        // A missing control should cost one query, not every typed query on each poll.
+        guard first.exists else { return nil }
         // Remote picker trees can lose an indexed Any match between count and exists.
         // Resolve concrete first matches before using that fallback, preserving disabled controls.
         if kind == .any {
@@ -84,9 +88,6 @@ final class NibUI {
                 }
             }
         }
-        let matches = (scope ?? app).descendants(matching: kind).matching(predicate)
-        let first = matches.firstMatch
-        guard first.exists else { return nil }
         if kind != .any {
             if !actionable, matches.count == 1 { return first }
             if hasVisibleFrame(first), !first.isEnabled || first.isHittable { return first }
@@ -1701,18 +1702,19 @@ final class NibUI {
     func canvasMultiTap(touches: Int, taps: Int = 2) throws {
         guard (2...3).contains(touches), (1...2).contains(taps) else { throw Failure.message("Unsupported multi-tap") }
         let before = app.windows.firstMatch.frame
-        let frame = canvas.frame
-        let normalized = (0..<touches).map { index in
-            CGPoint(x: 0.18 + CGFloat(index - 1) * 20 / frame.width, y: 0.65)
+        let centre = coordinate(CGPoint(x: 0.18, y: 0.65)).screenPoint
+        let points = (0..<touches).map { index in
+            CGPoint(x: centre.x + CGFloat(index - 1) * 20, y: centre.y)
         }
-        let points = normalized.map { interfacePoint($0) }
-        guard points.allSatisfy({ before.insetBy(dx: 60, dy: 60).contains($0) }) else {
+        let interfaceCentre = interfacePoint(CGPoint(x: 0.18, y: 0.65))
+        // Contacts are at most 20pt from the centre in any device orientation.
+        guard before.insetBy(dx: 80, dy: 80).contains(interfaceCentre) else {
             throw Failure.message("Multi-tap must stay clear of system window edges")
         }
-        recordGeometry("Stationary multi-tap", touches: points)
+        recordGeometry("Stationary multi-tap centre (contacts within 20pt)", touches: [interfaceCentre])
         let done = XCTestExpectation(description: "Stationary multi-tap completed")
         var failure: Error?
-        NibTouchPaths.tap(at: normalized.map { NSValue(cgPoint: coordinate($0).screenPoint) }, count: UInt(taps)) { error in
+        NibTouchPaths.tap(at: points.map { NSValue(cgPoint: $0) }, count: UInt(taps)) { error in
             failure = error; done.fulfill()
         }
         guard XCTWaiter.wait(for: [done], timeout: 10) == .completed else { throw Failure.message("Multi-tap timed out") }
@@ -1791,11 +1793,18 @@ final class NibUI {
     }
 
     func dismissSheets() throws {
-        for _ in 0..<8 {
+        for iteration in 0..<8 {
             let surfaces = app.sheets.allElementsBoundByIndex + app.popovers.allElementsBoundByIndex
                 + app.otherElements.matching(identifier: "ActivityListView").allElementsBoundByIndex
             let presented = surfaces.filter { hasVisibleFrame($0) }
-            if presented.isEmpty { return }
+            if presented.isEmpty {
+                // Legacy callers also close docked/floating panels. Never fall through to
+                // their close button after dismissing a presented surface (for example Audio's share sheet).
+                if iteration == 0, let close = findControl("cmd.panel.close", type: .button), close.isEnabled {
+                    close.tap()
+                }
+                return
+            }
             var close: XCUIElement?
             for surface in presented {
                 for id in ["sheet.dismiss", "header.closeButton", "Cancel", "Done", "Close", "Close export options"] {
@@ -1806,6 +1815,9 @@ final class NibUI {
                 if close != nil { break }
             }
             if let close { close.tap(); continue }
+            if let sheet = presented.first(where: { $0.elementType == .sheet && $0.isHittable }) {
+                sheet.swipeDown(); continue
+            }
             throw Failure.message("Presented surface has no own close control\n\(app.debugDescription)")
         }
         throw Failure.message("Sheet did not dismiss\n\(app.debugDescription)")

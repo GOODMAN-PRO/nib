@@ -690,8 +690,10 @@ final class PagesUITests: XCTestCase {
         let imageTarget = CGRect(x: frame.midX - 24, y: frame.minY + frame.height * 0.12,
                                  width: 48, height: frame.height * 0.30)
         let corridor = CGRect(x: imageTarget.minX, y: frame.minY, width: imageTarget.width, height: frame.height)
+        // The viewport helper clips only below the scroll origin; upper chrome must not collapse it.
+        let obstructions = (palette + options).filter { $0.minY > corridor.minY }
         guard let viewport = NibUITestScrollGeometry.viewport(scroll: corridor.intersection(grid.frame),
-                  window: ui.app.frame, obstructions: palette + options),
+                  window: ui.app.frame, obstructions: obstructions),
               let point = NibUITestScrollGeometry.tapPoint(control: imageTarget, viewport: viewport) else {
             throw NibUI.Failure.message("Thumbnail \(number) has no visible tap target")
         }
