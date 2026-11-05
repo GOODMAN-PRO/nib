@@ -90,7 +90,7 @@ struct PageAdd: NibCommand {
         let source = try PageAdd.source(p)
 
         if source == "clipboard" {
-            guard let payload = PageClipboard.read() else { throw PageClipboard.emptyError }
+            guard let payload = await PageClipboard.read() else { throw PageClipboard.emptyError }
             let refs = try await PagePasting.paste(payload, into: doc, position: position, anchor: anchor,
                                                    id: p.id, ids: p.ids, ctx: ctx)
             await PageNavigation.reveal(refs.first, doc: doc, ctx)
@@ -398,7 +398,7 @@ struct PagePaste: NibCommand {
         let payload: PagesPayload
         if let json = p.payload {
             payload = try PagesPayload.from(json)
-        } else if let clip = PageClipboard.read() {
+        } else if let clip = await PageClipboard.read() {
             payload = clip
         } else {
             throw PageClipboard.emptyError
@@ -1026,7 +1026,7 @@ enum PagePasting {
                       id: String?, ids: [String]?, ctx: CommandContext) async throws -> [String] {
         guard !payload.pages.isEmpty else { throw PageClipboard.emptyError }
         let chosen = try NewPageIDs.parse(id: id, ids: ids, count: payload.pages.count)
-        try NewPageIDs.checkUnused(chosen, in: ctx.workspace.content(doc))
+        try NewPageIDs.checkUnused(chosen, in: PageArgs.pagedContent(doc, ctx))
         let intoSource = payload.source == NodeRef.document(doc).description
         // Back in its own document a page keeps its references; anywhere else its PDF page must travel with it, unless
         // this document already holds that PDF (same name, same bytes).
@@ -1048,7 +1048,7 @@ enum PagePasting {
             }.value
         }
         // The document may have changed while the assets were copied: place the pages in it as it is now.
-        let content = try ctx.workspace.content(doc)
+        let content = try PageArgs.pagedContent(doc, ctx)
         try NewPageIDs.checkUnused(chosen, in: content)
         let placement = OrderKeys.plan(position, anchor: anchor, count: payload.pages.count, in: content.livePages)
         let keys = placement.keys

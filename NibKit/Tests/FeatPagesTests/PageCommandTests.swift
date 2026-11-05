@@ -362,7 +362,8 @@ final class PageCommandTests: XCTestCase {
         let start = Date()
         try await h.run("page.copy", ["pages": ["page:FIXTUREDOC01/LECTURE00251"]])
         XCTAssertLessThan(Date().timeIntervalSince(start), budget * 4)
-        let clip = try XCTUnwrap(PageClipboard.read())
+        let read = await PageClipboard.read()
+        let clip = try XCTUnwrap(read)
         XCTAssertNil(clip.assets.first?.data, "the in-process clipboard holds no bytes")
 
         // The system pasteboard gets that one PDF page, renumbered.
@@ -380,10 +381,47 @@ final class PageCommandTests: XCTestCase {
         XCTAssertEqual(pdfPageCount(try h.assets.data(XCTUnwrap(page.background.asset), doc: Fixtures.whiteboardID)), 1)
     }
 
+    func testSystemClipboardDecodesAssetsOffMainAndCachesUnchangedData() async throws {
+        let h = harness()
+        let page = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).page(Fixtures.page1))
+        let bytes = Data(repeating: 42, count: 2 * 1024 * 1024)
+        let payload = PagesPayload(source: nil, pages: [.init(page: page, items: [])],
+                                   assets: [.init(name: "large.pdf", data: bytes, pdfPages: nil)])
+        let encoded = try JSONEncoder().encode(payload)
+        let probe = ClipboardDecodeProbe()
+        var reads = 0
+        for _ in 0..<2 {
+            let loaded = await PageClipboard.read(changeCount: { 17 }, data: { reads += 1; return encoded },
+                                                  decode: { probe.decode($0) })
+            XCTAssertEqual(loaded, payload)
+        }
+        XCTAssertEqual(reads, 1, "the cached payload avoids another system read")
+        XCTAssertEqual(probe.calls, 1, "unchanged clipboard bytes decode only once")
+        XCTAssertFalse(probe.wasMainThread)
+        let changed = await PageClipboard.read(changeCount: { 18 }, data: { encoded }, decode: { probe.decode($0) })
+        XCTAssertEqual(changed, payload)
+        XCTAssertEqual(probe.calls, 2)
+    }
+
+    func testSystemClipboardDiscardsAResultIfTheClipboardChangesDuringDecode() async throws {
+        let h = harness()
+        let page = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).page(Fixtures.page1))
+        let payload = PagesPayload(source: nil, pages: [.init(page: page, items: [])], assets: [])
+        let encoded = try JSONEncoder().encode(payload)
+        var countReads = 0
+        let loaded = await PageClipboard.read(changeCount: {
+            countReads += 1
+            return countReads == 1 ? 1 : 2
+        }, data: { encoded })
+        XCTAssertNil(loaded, "an old decode must not replace the clipboard or paste obsolete pages")
+        XCTAssertFalse(PageClipboard.hasPages)
+    }
+
     func testPasteAcceptsAPayloadAndAddPageCanPasteToo() async throws {
         let h = harness()
         try await h.run("page.copy", ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"]])
-        let payload = try JSONValue.from(try XCTUnwrap(PageClipboard.read()))
+        let read = await PageClipboard.read()
+        let payload = try JSONValue.from(try XCTUnwrap(read))
         PageClipboard.clear()
         let r = try await h.run("page.paste", ["doc": "doc:FIXTUREDOC01", "position": "start", "payload": payload,
                                                "ids": ["PASTED000001"]])
@@ -898,4 +936,19 @@ private final class GatedMoveAssetStore: AssetStore {
     func url(_ ref: AssetRef, doc: DocumentID) -> URL? { inner.url(ref, doc: doc) }
     func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try inner.putTemporary(data, ext: ext) }
     func temporaryURL(_ ref: AssetRef) -> URL? { inner.temporaryURL(ref) }
+}
+
+private final class ClipboardDecodeProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var onMain = false
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return count }
+    var wasMainThread: Bool { lock.lock(); defer { lock.unlock() }; return onMain }
+    func decode(_ data: Data) -> PagesPayload? {
+        lock.lock()
+        count += 1
+        onMain = onMain || Thread.isMainThread
+        lock.unlock()
+        return PagesPayload.decode(data)
+    }
 }

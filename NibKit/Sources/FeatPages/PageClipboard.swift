@@ -173,10 +173,10 @@ enum PageClipboard {
     /// the assets, cutting PDFs and encoding run off the main actor (ARCHITECTURE §14).
     static func write(_ payload: PagesPayload, store: AssetStore?) async throws {
         memory = payload
+        generation += 1
         guard usesSystemPasteboard else { return }
         let board = UIPasteboard.general
         writtenChangeCount = board.changeCount
-        generation += 1
         let mine = generation
         let pdfUse = payload.pdfUse
         let data = try await Task.detached(priority: .userInitiated) {
@@ -196,17 +196,30 @@ enum PageClipboard {
         return board.contains(pasteboardTypes: [typeIdentifier])
     }
 
-    static func read() -> PagesPayload? {
+    static func read() async -> PagesPayload? {
         guard usesSystemPasteboard else { return memory }
         let board = UIPasteboard.general
-        if board.changeCount == writtenChangeCount, let m = memory { return m }
-        guard board.contains(pasteboardTypes: [typeIdentifier]),
-              let data = board.data(forPasteboardType: typeIdentifier) else { return nil }
-        return PagesPayload.decode(data)
+        return await read(changeCount: { board.changeCount }, data: { board.data(forPasteboardType: typeIdentifier) })
+    }
+
+    /// The system read path, injectable without the simulator pasteboard. Only Data acquisition touches UIKit;
+    /// decoding its potentially large base64 assets runs on a worker, once per unchanged clipboard.
+    static func read(changeCount: () -> Int, data: () -> Data?,
+                     decode: @escaping @Sendable (Data) -> PagesPayload? = { PagesPayload.decode($0) }) async -> PagesPayload? {
+        let count = changeCount()
+        if count == writtenChangeCount, let memory { return memory }
+        guard let bytes = data() else { return nil }
+        let mine = generation
+        let payload = await Task.detached(priority: .userInitiated) { decode(bytes) }.value
+        guard mine == generation, changeCount() == count else { return nil }
+        memory = payload
+        writtenChangeCount = count
+        return payload
     }
 
     /// Tests start from an empty clipboard.
     static func clear() {
+        generation += 1
         memory = nil
         writtenChangeCount = nil
     }
