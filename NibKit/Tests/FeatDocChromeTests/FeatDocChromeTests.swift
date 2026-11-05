@@ -934,6 +934,19 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertLessThan(try XCTUnwrap(frames["audio"]).minY, try XCTUnwrap(frames["search"]).minY)
     }
 
+    func testPortraitPageHUDKeepsChromeInsetInsidePaperEdge() throws {
+        let region = CGRect(x: 16, y: 100, width: 802, height: 1000)
+        let page = CGRect(x: 16, y: 100, width: 802, height: 1200)
+        let item = ChromeOverlayGeometry.Item(id: "canvas.pageHUD", placement: .bottomTrailing,
+                                              size: CGSize(width: 104, height: 40))
+        let portrait = try XCTUnwrap(ChromeOverlayGeometry.frames([item], in: region,
+            portraitPageFrame: page)[item.id])
+        XCTAssertEqual(page.maxX - portrait.maxX, NibMetrics.chromeInset)
+        let landscape = try XCTUnwrap(ChromeOverlayGeometry.frames([item], in: region)[item.id])
+        XCTAssertEqual(landscape.maxX, region.maxX, "Landscape keeps its existing window inset")
+        XCTAssertEqual(portrait.maxY, landscape.maxY)
+    }
+
     func testOverlayGeometryPlacesAndStacksEachPlacement() {
         let region = CGRect(x: 16, y: 88, width: 1162, height: 710)
         typealias Item = ChromeOverlayGeometry.Item

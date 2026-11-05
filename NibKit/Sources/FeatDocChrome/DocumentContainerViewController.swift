@@ -820,6 +820,7 @@ final class DocumentContainerViewController: UIViewController {
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         updateGeometry()
+        overlays.scheduleRefresh()
         Task { @MainActor [weak self] in self?.updateBackdrop() }
     }
 
@@ -1063,7 +1064,8 @@ struct ChromeRootView: View {
         ZStack(alignment: .topLeading) {
             sidebars(layout)
             ChromeOverlayLayer(model: overlays, inking: inking, region: layout.activeOverlayRegion,
-                               keyboardFrame: geometry.keyboardFrame)
+                               keyboardFrame: geometry.keyboardFrame,
+                               isPortrait: geometry.size.height >= geometry.size.width)
             if let toolbar, showsPalette(layout), paletteCorrection(layout) == nil {
                 // Full height between open sidebars; padded by the safe area the root ignores (see ChromeLayout).
                 toolbar
