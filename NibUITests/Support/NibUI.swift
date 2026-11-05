@@ -1793,32 +1793,26 @@ final class NibUI {
     }
 
     func dismissSheets() throws {
-        for iteration in 0..<8 {
-            let surfaces = app.sheets.allElementsBoundByIndex + app.popovers.allElementsBoundByIndex
-                + app.otherElements.matching(identifier: "ActivityListView").allElementsBoundByIndex
-            let presented = surfaces.filter { hasVisibleFrame($0) }
-            if presented.isEmpty {
-                // Legacy callers also close docked/floating panels. Never fall through to
-                // their close button after dismissing a presented surface (for example Audio's share sheet).
-                if iteration == 0, let close = findControl("cmd.panel.close", type: .button), close.isEnabled {
-                    close.tap()
-                }
-                return
-            }
+        // Modal form sheets are plain containers in the accessibility tree (only confirmation dialogs are
+        // typed Sheet, run 41961796255), so the close control is looked up app-wide as before. A panel's own
+        // close button counts only until something else was dismissed: after Audio's share sheet closes,
+        // the loop must not go on to close the Audio panel behind it (D:controls-forms#9).
+        var dismissedSurface = false
+        for _ in 0..<8 {
             var close: XCUIElement?
-            for surface in presented {
-                for id in ["sheet.dismiss", "header.closeButton", "Cancel", "Done", "Close", "Close export options"] {
-                    if let found = findControl(id, type: .button, in: surface), found.isEnabled {
-                        close = found; break
-                    }
-                }
-                if close != nil { break }
+            for id in ["sheet.dismiss", "cmd.panel.close", "Cancel", "Done", "Close", "Close export options"] {
+                if dismissedSurface, id == "cmd.panel.close" { continue }
+                if let found = findControl(id, type: .button), found.isEnabled { close = found; break }
             }
-            if let close { close.tap(); continue }
-            if let sheet = presented.first(where: { $0.elementType == .sheet && $0.isHittable }) {
+            if let close {
+                if close.identifier != "cmd.panel.close" { dismissedSurface = true }
+                close.tap()
+                continue
+            }
+            if let sheet = app.sheets.allElementsBoundByIndex.first(where: { hasVisibleFrame($0) && $0.isHittable }) {
                 sheet.swipeDown(); continue
             }
-            throw Failure.message("Presented surface has no own close control\n\(app.debugDescription)")
+            return
         }
         throw Failure.message("Sheet did not dismiss\n\(app.debugDescription)")
     }
