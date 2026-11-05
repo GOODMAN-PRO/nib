@@ -24,6 +24,9 @@ final class PluginTimers {
         self.maxTimers = maxTimers
     }
 
+    /// JavaScript numbers are untrusted, including calls to the native timer boundary.
+    static func identifier(_ value: Double) -> Int? { Int(exactly: value) }
+
     /// Number of scheduled timers (tests, diagnostics).
     var count: Int {
         lock.lock()

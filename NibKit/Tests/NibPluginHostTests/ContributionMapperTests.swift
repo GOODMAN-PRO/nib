@@ -315,6 +315,77 @@ final class ContributionMapperTests: XCTestCase {
         XCTAssertThrowsError(try PluginPaths.resolve("/etc/hosts", in: empty, path: "$"))
     }
 
+    func testNumberFieldsKeepLargeStoredValuesReadableAndRejectNonFiniteEdits() {
+        for n in [1e30, -1e30, Double(Int.max), Double.infinity, -Double.infinity, Double.nan] {
+            XCTAssertFalse(PluginNumberField.format(n, integer: false).isEmpty)
+            XCTAssertFalse(PluginNumberField.format(n, integer: true).isEmpty)
+        }
+        XCTAssertEqual(PluginNumberField.format(42, integer: false), "42")
+        XCTAssertEqual(PluginNumberField.format(1.25, integer: false), "1.25")
+        XCTAssertEqual(PluginNumberField.parse("1e30", min: nil, max: nil, integer: false), .number(1e30))
+        for text in ["inf", "-inf", "nan", "1e999"] {
+            XCTAssertNil(PluginNumberField.parse(text, min: nil, max: nil, integer: false))
+        }
+    }
+
+    func testIntegerSchemaBoundsOutsideIntRangeDoNotTrapDuringManifestValidation() throws {
+        for n in [1e30, -1e30, Double(Int.max), Double.infinity, -Double.infinity, Double.nan] {
+            let schema = SchemaConverter.schema(["type": "integer", "minimum": .number(n), "maximum": .number(n)])
+            XCTAssertTrue(schema.validate(1).isEmpty, "unrepresentable bounds are omitted")
+        }
+        let kit = PluginTestKit()
+        let value = kit.manifest("dev.test.bounds", contributes: ["commands": [[
+            "id": "dev.test.bounds.run", "title": "Run", "summary": "Run.", "effect": "read",
+            "params": ["type": "object", "properties": ["n": ["type": "integer", "minimum": 1e30, "maximum": 1e31]]]
+        ]]])
+        let manifest = try value.decode(PluginManifest.self)
+        XCTAssertTrue(ManifestValidator.problems(manifest, folder: nil).isEmpty)
+    }
+
+    func testManifestRejectsEveryUnhashedFileReference() throws {
+        let kit = PluginTestKit()
+        let value = kit.manifest(Self.pid, contributes: [
+            "panels": [["id": "dev.test.all.panel", "title": "Panel", "entry": ".panels/main.html"]],
+            "templates": [["id": "dev.test.all.pdf", "title": "PDF", "kind": "pdf", "file": ".templates/page.pdf"]],
+            "elements": [["id": "dev.test.all.elements", "title": "Elements", "files": ["elements/.items.json"]]],
+            "tapePatterns": [["id": "dev.test.all.tape", "title": "Tape", "file": ".tape.png"]],
+            "boardTemplates": [["id": "dev.test.all.board", "title": "Board", "file": ".boards/frame.json"]]
+        ]).merging(["entry": ".main.js"])
+        let manifest = try value.decode(PluginManifest.self)
+        let folder = try kit.install(value)
+        let locations: [URL?] = [nil, folder]
+        for location in locations {
+            let paths = Set(ManifestValidator.problems(manifest, folder: location).compactMap { $0.path })
+            for expected in ["$.entry", "$.contributes.panels[0].entry", "$.contributes.templates[0].file",
+                             "$.contributes.elements[0].files[0]", "$.contributes.tapePatterns[0].file",
+                             "$.contributes.boardTemplates[0].file"] {
+                XCTAssertTrue(paths.contains(expected), expected)
+            }
+        }
+        for path in [".main.js", ".x/main.js", "panels/.main.html", "dist/.main.js", "a/.b", ".."] {
+            XCTAssertFalse(PluginPaths.isValid(path), path)
+            XCTAssertThrowsError(try PluginPaths.resolve(path, in: folder, path: "$.entry"))
+        }
+    }
+
+    func testManifestAcceptsSingleDotPathComponents() throws {
+        let kit = PluginTestKit()
+        for entry in ["./main.js", "dist/./main.js", "./dist/main.js"] {
+            XCTAssertTrue(PluginPaths.isValid(entry), entry)
+            let value = kit.manifest(Self.pid, contributes: [
+                "panels": [["id": "dev.test.all.panel", "title": "Stats", "entry": "./panels/stats.html"]]
+            ]).merging(["entry": .string(entry)])
+            let manifest = try value.decode(PluginManifest.self)
+            let folder = try kit.install(value, files: [
+                "dist/main.js": Data("// entry".utf8),
+                "panels/stats.html": Data("<p>stats</p>".utf8)
+            ])
+            XCTAssertNoThrow(try ManifestValidator.validate(manifest, folder: nil), entry)
+            XCTAssertNoThrow(try ManifestValidator.validate(manifest, folder: folder), entry)
+            XCTAssertNoThrow(try PluginPaths.existing(entry, in: folder, path: "$.entry"), entry)
+        }
+    }
+
     func testSchemaConversionKeepsTypesBoundsAndDefaults() throws {
         let schema = SchemaConverter.schema(try JSONValue.parse(#"""
         {"type": "object", "required": ["page"], "properties": {

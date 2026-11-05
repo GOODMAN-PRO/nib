@@ -44,10 +44,16 @@ struct PluginRecord: Equatable {
 /// Paths inside a plugin folder: relative, no "..", no absolute paths or backslashes, and (symlinks resolved) still
 /// inside the folder.
 enum PluginPaths {
+    /// Hidden paths are excluded from the approval hash, so no manifest may reference them.
+    static func isValid(_ relative: String) -> Bool {
+        let trimmed = relative.trimmingCharacters(in: .whitespaces)
+        return !trimmed.isEmpty && !trimmed.hasPrefix("/") && !trimmed.contains("\\") && !trimmed.contains("\0")
+            && !trimmed.split(separator: "/").contains(where: { $0.hasPrefix(".") && $0 != "." })
+    }
+
     static func resolve(_ relative: String, in folder: URL, path: String) throws -> URL {
         let trimmed = relative.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, !trimmed.hasPrefix("/"), !trimmed.contains("\\"), !trimmed.contains("\0"),
-              !trimmed.split(separator: "/").contains(where: { $0 == ".." }) else {
+        guard isValid(relative) else {
             throw NibError.invalid("'\(relative)' must be a relative path inside the plugin folder", path: path)
         }
         let base = folder.resolvingSymlinksInPath()
@@ -126,7 +132,7 @@ enum ManifestValidator {
         }
         if let folder = folder {
             do { _ = try PluginPaths.existing(m.entry, in: folder, path: "$.entry") } catch { out.append(NibError.wrap(error)) }
-        } else if m.entry.isEmpty || m.entry.hasPrefix("/") || m.entry.contains("..") {
+        } else if !PluginPaths.isValid(m.entry) {
             fail("the entry must be a path inside the plugin folder", "$.entry")
         }
         for (i, p) in m.permissions.enumerated() {
@@ -168,6 +174,7 @@ enum ManifestValidator {
         }
         func file(_ relative: String?, _ path: String) {
             guard let r = relative, !r.isEmpty else { return fail("missing file path", path) }
+            guard PluginPaths.isValid(r) else { return fail("file paths must not contain hidden components or leave the plugin folder", path) }
             guard let folder = folder else { return }
             do { _ = try PluginPaths.existing(r, in: folder, path: path) } catch { out.append(NibError.wrap(error)) }
         }
@@ -577,6 +584,9 @@ final class PluginHost: PluginHosting {
             finish(.failed, error)
             throw error
         }
+        // Settings are data declarations, not executable contributions. Keep them editable before approval,
+        // while disabled, in Safe Mode, and if the runtime subsequently fails to start.
+        ContributionMapper(app: app, host: self, manifest: scan.manifest, folder: folder).declareSettings()
         authority.store.reload()
         guard let grant = authority.store.grant(id), grant.sha256 == scan.sha256 else {
             let e = NibError(.permissionDenied,
@@ -815,11 +825,15 @@ final class PluginHost: PluginHosting {
         record.manifest = s.manifest
         record.sha256 = s.sha256
         record.signature = s.signature
+        let problems = ManifestValidator.problems(s.manifest, folder: folder, folderName: id)
+        if problems.isEmpty, let app = app {
+            ContributionMapper(app: app, host: self, manifest: s.manifest, folder: folder).declareSettings()
+        }
         let approved = authority.store.grant(id)?.sha256 == s.sha256
         if !approved {
             if !listing { unload(id) }
             record.state = .needsReview
-        } else if let problem = ManifestValidator.problems(s.manifest, folder: folder, folderName: id).first {
+        } else if let problem = problems.first {
             record.state = .failed
             record.error = problem.message
         } else if record.state != .running {

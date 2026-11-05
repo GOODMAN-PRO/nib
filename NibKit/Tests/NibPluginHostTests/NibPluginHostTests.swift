@@ -541,6 +541,33 @@ final class NibPluginHostTests: XCTestCase {
         XCTAssertEqual(try kit.text(of: revoked["ref"]?.stringValue ?? ""), "e")
     }
 
+    func testUnansweredHooksHaveABudgetAndAreRemovedAfterRepeatedTimeouts() async throws {
+        let kit = PluginTestKit()
+        kit.registerAddText()
+        let id = "dev.test.slowhook"
+        var pending: [CheckedContinuation<JSONValue, Never>] = []
+        kit.runtime.handlers[id + ".guard"] = { _, _ in
+            await withCheckedContinuation { pending.append($0) }
+        }
+        defer { for continuation in pending { continuation.resume(returning: [:]) } }
+        try await kit.installAndLoad(kit.manifest(id, permissions: ["document:read"], contributes: [
+            "commands": [kit.command(id + ".guard", effect: "read").merging(["longRunning": true])],
+            "commandHooks": [["commands": ["test.*"], "command": .string(id + ".guard")]]
+        ]))
+        for i in 0..<3 {
+            // The outer deadline also bounds the regression test when a fake handler never resumes.
+            let outcome = await Deadline.run(seconds: 3) {
+                try await kit.h.run("test.addText", ["text": .string("line \(i)")])
+            }
+            guard case .finished(.success(let result)) = outcome else { return XCTFail("hook blocked the user command") }
+            XCTAssertEqual(try kit.text(of: result["ref"]?.stringValue ?? ""), "line \(i)")
+        }
+        XCTAssertEqual(pending.count, 3)
+        XCTAssertFalse(kit.h.app.bus.hooks.all.contains { $0.owner == id })
+        _ = try await kit.h.run("test.addText", ["text": "after breaker"])
+        XCTAssertEqual(pending.count, 3, "disabled hooks must not be invoked again")
+    }
+
     /// The on/off switch is written only by plugin.enable: settings.set on it is refused for everyone.
     func testEnablementSettingIsReadOnlyForSettingsSet() async throws {
         let kit = PluginTestKit()
@@ -578,6 +605,36 @@ final class NibPluginHostTests: XCTestCase {
     }
 
     // MARK: Enable, exposure, commands
+
+    func testSettingsAreEditableBeforeAPluginRunsAndAfterItStops() async throws {
+        for mode in ["disabled", "needsReview", "failed", "safeMode"] {
+            let kit = PluginTestKit()
+            let id = "dev.test.settings"
+            let manifest = kit.manifest(id, contributes: ["settings": ["type": "object", "properties": [
+                "enabled": ["type": "boolean", "default": false]
+            ]]])
+            try kit.install(manifest)
+            if mode != "needsReview" { try kit.grant(id, scopes: ["document:read", "document:write"]) }
+            if mode == "disabled" { PluginEnablement.set(id, enabled: false, settings: kit.h.app.settings) }
+            if mode == "failed" { kit.runtime.failing.insert(id) }
+            if mode == "safeMode" { kit.host.isSafeMode = { true } }
+            // Listing alone must expose declarations without starting JavaScript.
+            _ = try await kit.h.run(CommandIDs.pluginList)
+            XCTAssertTrue(kit.runtime.started.isEmpty)
+            let name = "plugin." + id + ".enabled"
+            _ = try await kit.h.run(CommandIDs.settingsSet, ["name": .string(name), "value": true])
+            XCTAssertEqual(kit.h.app.settings.json(name), true, mode)
+            do { try await kit.host.load(id) } catch { /* expected for unapproved, failed and Safe Mode */ }
+            XCTAssertEqual(kit.host.state(id)?.rawValue, mode)
+            kit.host.unload(id)
+            _ = try await kit.h.run(CommandIDs.settingsSet, ["name": .string(name), "value": false])
+            XCTAssertEqual(kit.h.app.settings.json(name), false, mode)
+            do {
+                _ = try await kit.h.run(CommandIDs.settingsSet, ["name": .string(name), "value": "wrong type"])
+                XCTFail("inactive settings still require schema validation")
+            } catch { XCTAssertEqual((error as? NibError)?.code, .invalidParams) }
+        }
+    }
 
     func testEnableDisableAndHiddenCommandExposure() async throws {
         let kit = PluginTestKit()

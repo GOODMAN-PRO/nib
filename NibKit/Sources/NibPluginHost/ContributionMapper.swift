@@ -192,7 +192,7 @@ struct ContributionMapper {
 
     /// `plugin.<id>.` is declared as a prefix (synced with the library, like the plugin itself); every key of
     /// `contributes.settings` is also declared on its own, so `settings.set` validates it against its schema.
-    private func declareSettings() {
+    func declareSettings() {
         let prefix = PluginSettingsNames.prefix(pid)
         app.settings.declarePrefix(prefix, synced: true, summary: "Settings of the plugin \(manifest.name).", owner: pid)
         guard let properties = contributes?.settings?["properties"]?.objectValue else { return }
@@ -324,24 +324,53 @@ struct ContributionMapper {
     /// and a hook that cannot answer (not running, timed out, lost the scope it reads with) lets the call pass.
     private func mapCommandHooks(_ c: PluginContributions?) {
         let pid = self.pid
+        let budget = PluginHookBudget()
+        let mappedHandle = host?.handle(pid)
         for (i, h) in (c?.commandHooks ?? []).enumerated() {
             let hookCommand = h.command
             var d = CommandHookDescriptor.guarding(id: "\(pid).hook.\(i)", owner: pid, commands: h.commands,
-                                                   order: 1000 + i) { command, params, ctx in
+                                                   order: 1000 + i) { [weak host, weak mappedHandle, weak app] command, params, ctx in
+                guard !budget.disabled, !budget.inFlight else { return nil }
                 let registry = ctx.bus.registry
                 if HookPolicy.isExempt(command, params: params, registry: registry) { return nil }
                 guard let hook = registry.descriptor(hookCommand),
                       hook.scopes.isSubset(of: ctx.bus.gateway.grants(.plugin(pid))) else { return nil }
+                budget.inFlight = true
+                defer { budget.inFlight = false }
                 let r: InvocationResult
                 do {
-                    r = try await ctx.bus.execute(Invocation(command: hookCommand,
-                                                             params: ["command": .string(command), "params": params],
-                                                             principal: .plugin(pid), session: ctx.session, group: ctx.group,
-                                                             dryRun: ctx.dryRun, depth: ctx.depth + 1, readOnly: true,
-                                                             inheritedPolicy: ctx.inheritedPolicy, skipHooks: true))
+                    let outcome = await Deadline.run(seconds: PluginHookBudget.seconds) {
+                        try await ctx.bus.execute(Invocation(command: hookCommand,
+                                                            params: ["command": .string(command), "params": params],
+                                                            principal: .plugin(pid), session: ctx.session, group: ctx.group,
+                                                            dryRun: ctx.dryRun, depth: ctx.depth + 1, readOnly: true,
+                                                            inheritedPolicy: ctx.inheritedPolicy, skipHooks: true))
+                    }
+                    switch outcome {
+                    case .finished(let result): r = try result.get()
+                    case .timedOut: throw NibError(.timeout, "plugin command hook exceeded its time budget")
+                    }
+                    budget.timeouts = 0
                 } catch let error where HookPolicy.letsPass(error) {
+                    if NibError.wrap(error).code == .timeout {
+                        budget.timeouts += 1
+                        if budget.timeouts >= PluginHookBudget.limit {
+                            budget.disabled = true
+                            // A late result from an old mapping must not unregister a reloaded plugin's hooks.
+                            if let mappedHandle = mappedHandle, let current = host?.handle(pid), current === mappedHandle {
+                                ctx.bus.hooks.unregister(owner: pid)
+                                let notice = NibError(.timeout,
+                                    String(localized: "A plugin's command hooks stopped responding and were disabled. Reload the plugin in Settings to try again."))
+                                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                    userInfo: ["command": hookCommand, "error": notice])
+                            }
+                        }
+                    } else { budget.timeouts = 0 }
                     hostLog.error("hook \(hookCommand, privacy: .public) did not answer for \(command, privacy: .public): \(NibError.wrap(error).message, privacy: .public)")
                     return nil
+                } catch {
+                    budget.timeouts = 0
+                    throw error
                 }
                 guard let replaced = r.value["params"], replaced != .null else { return nil }
                 try HookPolicy.checkReplacement(command, original: params, replacement: replaced, registry: registry)
@@ -626,6 +655,16 @@ enum HookPolicy {
     }
 }
 
+/// Shared by all hooks of one mapping; reload creates a fresh budget. Concurrent calls bypass an occupied hook.
+@MainActor
+private final class PluginHookBudget {
+    static let seconds: TimeInterval = 1
+    static let limit = 3
+    var timeouts = 0
+    var inFlight = false
+    var disabled = false
+}
+
 // MARK: - JSON Schema → the flat schema
 
 /// Plugin manifests carry standard JSON Schema; commands and settings validate with NibContracts' flat `JSONSchema`.
@@ -669,8 +708,8 @@ enum SchemaConverter {
         case "string"?:
             return .str(description, choices: enumStrings)
         case "integer"?:
-            return .int(description, min: o["minimum"]?.doubleValue.map { Int($0.rounded(.up)) },
-                        max: o["maximum"]?.doubleValue.map { Int($0.rounded(.down)) })
+            return .int(description, min: o["minimum"]?.doubleValue.flatMap { Int(exactly: $0.rounded(.up)) },
+                        max: o["maximum"]?.doubleValue.flatMap { Int(exactly: $0.rounded(.down)) })
         case "number"?:
             return .num(description, min: o["minimum"]?.doubleValue, max: o["maximum"]?.doubleValue)
         case "boolean"?:
@@ -1648,26 +1687,24 @@ struct SchemaFieldControl: View {
                 Text(verbatim: field.title)
             }
         case let .number(min, max, integer):
-            if let lo = min, let hi = max, hi > lo {
+            if let lo = min, let hi = max, lo.isFinite, hi.isFinite, hi > lo,
+               (hi - lo).isFinite, (hi - lo) / 100 > 0 {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text(verbatim: field.title)
                         Spacer()
-                        Text(verbatim: format(number, integer: integer)).monospacedDigit()
+                        Text(verbatim: PluginNumberField.format(number, integer: integer)).monospacedDigit()
                     }
                     Slider(value: $number, in: lo...hi, step: integer ? 1 : (hi - lo) / 100) { editing in
                         if !editing { commit(field.key, .number(integer ? number.rounded() : number)) }
                     }
                     .accessibilityLabel(Text(verbatim: field.title))
-                    .accessibilityValue(Text(verbatim: format(number, integer: integer)))
+                    .accessibilityValue(Text(verbatim: PluginNumberField.format(number, integer: integer)))
                 }
                 .frame(minWidth: compact ? 180 : nil)
             } else {
                 textField(keyboard: .numbersAndPunctuation) {
-                    guard let n = Double(draft.replacingOccurrences(of: ",", with: ".")) else { return nil }
-                    if let lo = min, n < lo { return nil }
-                    if let hi = max, n > hi { return nil }
-                    return .number(integer ? n.rounded() : n)
+                    PluginNumberField.parse(draft, min: min, max: max, integer: integer)
                 }
             }
         case .text:
@@ -1720,7 +1757,7 @@ struct SchemaFieldControl: View {
         switch field.kind {
         case .number:
             number = value?.doubleValue ?? 0
-            draft = value?.doubleValue.map { format($0, integer: false) } ?? ""
+            draft = value?.doubleValue.map { PluginNumberField.format($0, integer: false) } ?? ""
         case .text:
             draft = value?.stringValue ?? ""
         case .json:
@@ -1732,9 +1769,22 @@ struct SchemaFieldControl: View {
         }
     }
 
-    private func format(_ n: Double, integer: Bool) -> String {
-        if integer || n == n.rounded() { return String(Int(n.rounded())) }
+}
+
+/// Keep legacy large values readable without converting an untrusted Double with a trapping initializer.
+enum PluginNumberField {
+    static func format(_ n: Double, integer: Bool) -> String {
+        guard n.isFinite, let whole = Int(exactly: n.rounded()) else { return String(format: "%g", n) }
+        if integer || n == n.rounded() { return String(whole) }
         return String(format: "%.2f", n)
+    }
+
+    static func parse(_ draft: String, min: Double?, max: Double?, integer: Bool) -> JSONValue? {
+        guard let n = Double(draft.replacingOccurrences(of: ",", with: ".")), n.isFinite else { return nil }
+        let value = integer ? n.rounded() : n
+        if let lo = min, value < lo { return nil }
+        if let hi = max, value > hi { return nil }
+        return .number(value)
     }
 }
 
