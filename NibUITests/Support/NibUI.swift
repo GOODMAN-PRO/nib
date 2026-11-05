@@ -1724,9 +1724,16 @@ final class NibUI {
         let points = paths.map { $0.map { NSValue(cgPoint: coordinate($0).screenPoint) } }
         let done = XCTestExpectation(description: "Touch path completed")
         var failure: Error?
+        logTouchPaths(points)
         NibTouchPaths.perform(points, duration: duration) { error in failure = error; done.fulfill() }
         guard XCTWaiter.wait(for: [done], timeout: duration + 15) == .completed else { throw Failure.message("Gesture synthesis timed out") }
         if let failure { throw failure }
+    }
+
+    func logTouchPaths(_ paths: [[NSValue]]) {
+        for (index, path) in paths.enumerated() {
+            logQA("Touch path orientation", "orientation=\(XCUIDevice.shared.orientation.rawValue) path=\(index) first=\(String(describing: path.first?.cgPointValue)) last=\(String(describing: path.last?.cgPointValue))")
+        }
     }
 
     func cancelConfirmation(action: String) throws {

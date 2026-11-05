@@ -738,7 +738,16 @@ final class LibraryUITests: XCTestCase {
             previous = frame
             return stable
         }
-        undo.tap()
+        let buttonSnapshot = try undo.snapshot()
+        func labels(_ node: XCUIElementSnapshot) -> [CGRect] {
+            let own = node.elementType == .staticText && node.label == "Undo" ? [node.frame] : []
+            return own + node.children.flatMap { labels($0) }
+        }
+        let buttonFrame = buttonSnapshot.frame
+        ui.logQA("Toast Undo button and label", "button=\(buttonFrame) labels=\(labels(buttonSnapshot))")
+        app.coordinate(withNormalizedOffset: .zero).withOffset(
+            CGVector(dx: buttonFrame.midX - app.frame.minX, dy: buttonFrame.midY - app.frame.minY)).tap()
+        ui.recordDiagnostics("Toast Undo immediately after tap", includeHierarchy: false)
         try eventually("Toast Undo command must restore the document to its original root parent") { self.item(self.physics).exists }
         try openFolder(folder)
         XCTAssertFalse(item(physics).exists, "Undo must remove document from drop destination")

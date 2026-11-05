@@ -258,3 +258,13 @@ D:controls-forms#12/#16/#15 verifiers leave Connector end, Spectrum, and Library
 | Insert ConnectorDragAnchorRoutesBendsAndUndo | Connector end before lookup | What exists/frame/hittability/overlap evidence describes the handle? |
 | Ink HighlighterCustomColourPersistsAndDrawsTranslucentInk | Colour Spectrum before lookup | Is Spectrum covered, missing, or otherwise non-hittable? |
 | Library TrashPageBrowsingSelectionAndRecovery / ExternalFilesDropImportsIntoCurrentFolder | Library action first poll / action timeout | Was a menu/share surface present before polling, and which matches survived at timeout? |
+
+## X4 - toast, tabs and touch orientation evidence
+
+D:app-round-4#11/#14/#15 corrections leave ownership unknown. Toast Undo now records its typed Button snapshot frame and descendant Undo label frames (empty means no label exposed), tapping the Button frame centre, with immediate after-tap screenshot; stable-frame and restore-parent assertions remain. Capture three-tabs logs the toggle value and one snapshot inventory of every Tab-prefixed value/open-documents summary before its unchanged wait, with screenshot. Shared touch synthesis and the direct ruler path log device orientation plus first/last supplied screen points for every path; ruler screenshots remain at the gesture boundary. No transform, tab-setting repair or handler workaround is inferred.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Library DragDocumentIntoFolderAndToastUndo | Toast Undo button and label / immediately after tap | Which Button centre was tapped versus the label frame, and what remained immediately afterward? |
+| Capture four ThreeDocumentTabs variants | Capture tabs toggle / tabs before wait | Did the setting change, and which tab values exist? |
+| Chrome ruler rotation and shared NibUI paths | Touch path orientation | Which device orientation and first/last screen points were actually supplied? |

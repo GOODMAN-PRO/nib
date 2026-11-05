@@ -1001,6 +1001,7 @@ final class ChromeUITests: XCTestCase {
         }
         let done = XCTestExpectation(description: "Two fingers rotate ruler")
         var failure: Error?
+        ui.logTouchPaths(paths)
         NibTouchPaths.perform(paths, duration: 0.8) { error in failure = error; done.fulfill() }
         XCTAssertEqual(XCTWaiter.wait(for: [done], timeout: 16), .completed)
         ui.recordDiagnostics("Ruler rotation after", facts: ui.elementFacts(ruler), includeHierarchy: false)

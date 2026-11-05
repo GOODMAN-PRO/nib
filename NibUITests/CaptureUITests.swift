@@ -389,11 +389,21 @@ final class CaptureUITests: XCTestCase {
             let toggle = self.ui.app.switches.matching(NSPredicate(format: "label == 'Show document tabs'")).firstMatch
             guard toggle.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("Tab visibility setting missing") }
             if toggle.value as? String != "1" { toggle.tap() }
+            self.ui.logQA("Capture tabs toggle", "value=\(String(describing: toggle.value)) frame=\(toggle.frame)")
             try self.ui.dismissSheets()
             // Open through the library, preserving the app's normal tab preference.
             for title in ["Concept map", "Lab report", self.notebook] {
                 if try self.ui.state().screen == "document" { try self.ui.tapCommand("window.showLibrary") }
                 try self.ui.openDocument(title)
+            }
+            if let snapshot = try? self.ui.app.snapshot() {
+                func tabs(_ node: XCUIElementSnapshot) -> [String] {
+                    let value = node.value as? String ?? ""
+                    let own = value.hasPrefix("Tab ") || value.contains("open documents")
+                        ? ["type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) value=\(value) frame=\(node.frame)"] : []
+                    return own + node.children.flatMap { tabs($0) }
+                }
+                self.ui.recordDiagnostics("Capture tabs before wait", facts: tabs(snapshot).joined(separator: "\n"), includeHierarchy: false)
             }
             try self.wait("Three document tabs must be reachable") {
                 self.ui.app.descendants(matching: .any).matching(NSPredicate(
