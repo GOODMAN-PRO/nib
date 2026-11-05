@@ -76,6 +76,7 @@ final class ExportPlan {
     private let workspace: Workspace
     private let numbers: [PageID: Int]
     private let cache: PageCacheGuard
+    private let backgrounds = BackgroundCache()
     private var recognized: [PageID: [TextRecognition]] = [:]
 
     /// Space around a board's content.
@@ -181,6 +182,9 @@ final class ExportPlan {
     func snapshot(_ index: Int) throws -> PageSnapshot {
         let record = pages[index]
         let visible = try visibleItems(record)
+        var refs = Set(visible.flatMap { PackageAssets.refs(in: $0) })
+        if options.background, let asset = record.background.asset { refs.insert(asset.name) }
+        for name in refs { _ = try ExportAssets.readableURL(AssetRef(name), doc: doc, assets: environment.assets) }
         var drawn: [Item] = []
         drawn.reserveCapacity(visible.count)
         var comments: [Item] = []
@@ -195,7 +199,7 @@ final class ExportPlan {
                                     comments: comments, paintBounds: Dictionary(uniqueKeysWithValues: (drawn + comments).map {
                                         ($0.id, environment.registries.paintBounds(for: $0))
                                     }), template: template(for: record),
-                                    backgroundURL: backgroundURL(record), text: recognized[record.id] ?? [])
+                                    backgroundURL: try backgroundURL(record), text: recognized[record.id] ?? [])
         return snapshot
     }
 
@@ -214,9 +218,18 @@ final class ExportPlan {
         return TemplateSource(definition: definition, params: definition.defaults.merging(ref.params) { _, new in new })
     }
 
-    func backgroundURL(_ record: PageRecord) -> URL? {
+    func backgroundURL(_ record: PageRecord) throws -> URL? {
+        guard options.background else { return nil }
         guard record.background.kind == .pdf || record.background.kind == .image, let ref = record.background.asset else { return nil }
-        return environment.assets?.url(ref, doc: doc)
+        guard let url = environment.assets?.url(ref, doc: doc) else { throw ExportAssets.unavailable(ref.name) }
+        if record.background.kind == .pdf {
+            guard backgrounds.pdfPage(url, index: record.background.pdfPage ?? 0) != nil else {
+                throw ExportAssets.unavailable(ref.name)
+            }
+        } else if ExportImages.decode(url: url, maxPixel: 4096) == nil {
+            throw ExportAssets.unavailable(ref.name)
+        }
+        return url
     }
 
     /// Distinct PDF backgrounds: asset name → file, and (asset, 0-based PDF page) → first sheet showing it.

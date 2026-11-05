@@ -2209,6 +2209,18 @@ final class FeatCanvasTests: XCTestCase {
         // The design system's empty state (DESIGN.md §14.18), hosted as the canvas's child.
         XCTAssertTrue(vc.children.contains(vc.errorView.hosting))
         XCTAssertGreaterThan(vc.errorView.frame.height, 0)
+        let paper = try XCTUnwrap(vc.host.pageFrame(Fixtures.page1))
+        let visiblePaper = vc.scrollView.convert(paper, to: vc.fixedOverlay).intersection(vc.fixedOverlay.bounds)
+        XCTAssertEqual(vc.errorView.frame, visiblePaper)
+        XCTAssertTrue(vc.errorView.isOpaque)
+        vc.errorView.layoutIfNeeded()
+        XCTAssertEqual(vc.errorView.hosting.view.center.x, vc.errorView.bounds.midX, accuracy: 0.5)
+        XCTAssertEqual(vc.errorView.hosting.view.center.y, vc.errorView.bounds.midY, accuracy: 0.5)
+        XCTAssertNil(vc.errorView.hitTest(CGPoint(x: 1, y: 1), with: nil), "Error paper must still allow scrolling")
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            let colour = try XCTUnwrap(vc.errorView.backgroundColor).resolvedColor(with: UITraitCollection(userInterfaceStyle: style))
+            XCTAssertEqual(colour.cgColor.alpha, 1, "Failed page content must never show through the error field")
+        }
         XCTAssertEqual(vc.errorView.actionTitles, ["Try Again"], "no backups without the Cloud & Backup panel")
 
         var opened: [JSONValue] = []

@@ -273,6 +273,79 @@ final class NibExportTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: package.appendingPathComponent("pages/FIXTUREPG002").path), "empty pages have no file")
     }
 
+    func testMissingAssetsFailPDFImageAndPackageExportsAndCleanOutput() async throws {
+        for format in ["pdf", "png", "nibnote"] {
+            for page in [Fixtures.pdfPage, Fixtures.page1] {
+                let h = Harness(features: [NibExportFeature.self])
+                h.app.services.assets = InMemoryAssetStore(root: h.persistence.root)
+                let root = FileManager.default.temporaryDirectory.appendingPathComponent("nib-export")
+                let before = Set((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [])
+                do {
+                    _ = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"],
+                        "pages": [.string(NodeRef.page(Fixtures.docID, page).description)], "format": .string(format)])
+                    XCTFail("Missing assets must fail \(format), not deliver incomplete content")
+                } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+                let after = Set((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [])
+                XCTAssertEqual(after, before)
+            }
+        }
+    }
+
+    func testUnreadablePDFBackgroundFailsInsteadOfExportingBlankPaper() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        h.assets.install(Data("broken PDF".utf8), as: Fixtures.pdfAsset, doc: Fixtures.docID)
+        do {
+            _ = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"],
+                "pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "format": "pdf"])
+            XCTFail("Undecodable background must fail")
+        } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+        // Explicitly excluding backgrounds does not require the background asset to decode.
+        _ = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"],
+            "pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "format": "pdf", "options": ["background": false]])
+    }
+
+    func testEmptyAssetFileIsNotReadableExportContent() throws {
+        let h = Harness()
+        h.assets.install(Data(), as: Fixtures.pngAsset, doc: Fixtures.docID)
+        XCTAssertThrowsError(try ExportAssets.readableURL(Fixtures.pngAsset, doc: Fixtures.docID, assets: h.assets)) { error in
+            XCTAssertEqual((error as? NibError)?.code, .unavailable)
+        }
+    }
+
+    func testUnreadableImageBackgroundFailsInsteadOfExportingBlankPaper() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        h.assets.install(Data("broken image".utf8), as: Fixtures.pngAsset, doc: Fixtures.docID)
+        h.app.commands.register(CommandDescriptor(id: "test.imageBackground", title: "Background", summary: "Test image background.",
+            effect: .edit, exposure: .ui)) { _, ctx in
+            try ctx.mutate { tx in
+                var page = try XCTUnwrap(tx.content(Fixtures.docID).page(Fixtures.pdfPage))
+                page.background = .ofImage(Fixtures.pngAsset)
+                try tx.put(page, doc: Fixtures.docID)
+            }
+            return .null
+        }
+        try await h.run("test.imageBackground")
+        do {
+            _ = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"],
+                "pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "format": "png"])
+            XCTFail("Undecodable image background must fail")
+        } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+    }
+
+    func testExportWithoutAnAssetServiceFailsWhenAssetsAreReferenced() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        h.app.services.assets = nil
+        h.app.commands.register(CommandDescriptor(id: "test.noAssets", title: "Export", summary: "Missing asset service.",
+            effect: .read, exposure: .ui)) { _, ctx in
+            _ = try await PackageExporter.exportPackages(ExportRequest(documents: [Fixtures.docID]), ctx)
+            return .null
+        }
+        do {
+            try await h.run("test.noAssets")
+            XCTFail("A backup must not omit its assets")
+        } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+    }
+
     func testNibnoteExportIsAZippedPackage() async throws {
         let h = Harness(features: [NibExportFeature.self])
         let out = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC03"], "format": "nibnote", "inline": true])
@@ -318,6 +391,29 @@ final class NibExportTests: XCTestCase {
         XCTAssertTrue(file["asset"]?.stringValue?.hasPrefix("tmp:") ?? false)
         XCTAssertFalse(FileManager.default.fileExists(atPath: big.path), "the exporter's file is cleaned up")
     }
+    func testExportDoesNotCloseADocumentOpenedByAnotherWindow() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        h.session.document = nil
+        for openedByWindow in [false, true] {
+            h.app.workspace.close(Fixtures.docID)
+            h.app.commands.register(CommandDescriptor(id: "test.documentUse", title: "Document use",
+                summary: "Exercise export lifetime.", effect: .read, exposure: .ui)) { _, ctx in
+                let use = ExportDocumentUse(Fixtures.docID, ctx: ctx)
+                _ = try ctx.workspace.content(Fixtures.docID)
+                let other = EditorSession()
+                if openedByWindow {
+                    other.document = Fixtures.docID
+                    ctx.services.sessions.add(other)
+                }
+                defer { ctx.services.sessions.remove(other) }
+                use.end()
+                XCTAssertEqual(ctx.workspace.isLoaded(Fixtures.docID), openedByWindow)
+                return .null
+            }
+            try await h.run("test.documentUse")
+        }
+    }
+
     func testCacheGuardPreservesPagesLoadedByTheCanvasDuringExport() throws {
         let h = Harness(features: [NibExportFeature.self])
         h.app.workspace.evictPages(Fixtures.docID, keeping: [])
@@ -352,6 +448,8 @@ final class NibExportTests: XCTestCase {
 
     func testFailedPDFExportRemovesEarlierFilesAndClosesDocuments() async throws {
         let h = Harness(features: [NibExportFeature.self])
+        // This export starts in the library; no editor owns the document it loads.
+        h.session.document = nil
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("nib-export")
         func folders() -> Set<String> { Set((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []) }
         let before = folders()

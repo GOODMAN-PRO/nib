@@ -133,14 +133,24 @@ final class WetStrokeHandoff {
             stroke.points[i].x += Float(origin.x)
             stroke.points[i].y += Float(origin.y)
         }
-        tool.strokeFinished(stroke, page: page, host: host)
         let finish: @MainActor () -> Void = { [self] in
             guard !retired else { return }
             retired = true
             retire()
         }
-        if cancelled { finish() }
-        else { host.afterNextRender(page: page, finish) }
+        let committed: @MainActor (Bool) -> Void = { [self] succeeded in
+            // Keep the original PencilKit ink when any replacement/commit failed. A render timeout is never
+            // permission to discard unsaved work.
+            guard succeeded else { return }
+            if cancelled { finish() }
+            else { host.afterNextRender(page: page, finish) }
+        }
+        if let canvas = host as? CanvasHostImpl {
+            canvas.observeStrokeCommits({ tool.strokeFinished(stroke, page: page, host: host) }, completion: committed)
+        } else {
+            tool.strokeFinished(stroke, page: page, host: host)
+            committed(true)
+        }
     }
 }
 

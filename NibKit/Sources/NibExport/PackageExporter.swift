@@ -287,12 +287,8 @@ enum PackageWriter {
             let dir = package.appendingPathComponent("assets", isDirectory: true)
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             for name in names {
-                do {
-                    guard let data = try job.assets?.data(AssetRef(name), doc: job.doc) else { continue }
-                    try data.write(to: dir.appendingPathComponent(name), options: .atomic)
-                } catch {
-                    log.error("asset \(name, privacy: .public) of doc \(job.doc.raw, privacy: .public) left out: \(String(describing: error), privacy: .public)")
-                }
+                let data = try ExportAssets.data(AssetRef(name), doc: job.doc, assets: job.assets)
+                try data.write(to: dir.appendingPathComponent(name), options: .atomic)
             }
         }
         for file in job.files where PackageAssets.isSafeRelative(file.path) {
@@ -301,6 +297,30 @@ enum PackageWriter {
             try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fm.copyItem(at: file.url, to: target)
         }
+    }
+}
+
+/// Missing or evicted assets must fail an export, never silently produce an incomplete backup or PDF.
+enum ExportAssets {
+    static func unavailable(_ name: String) -> NibError {
+        NibError(.unavailable, String(localized: "The asset \(name) could not be read. Download it and try exporting again."))
+    }
+
+    static func data(_ ref: AssetRef, doc: DocumentID, assets: AssetStore?) throws -> Data {
+        guard let assets = assets else { throw unavailable(ref.name) }
+        do { return try assets.data(ref, doc: doc) }
+        catch { throw unavailable(ref.name) }
+    }
+
+    /// Probe readability without loading an entire PDF again for every page that uses it.
+    static func readableURL(_ ref: AssetRef, doc: DocumentID, assets: AssetStore?) throws -> URL {
+        guard let url = assets?.url(ref, doc: doc) else { throw unavailable(ref.name) }
+        do {
+            let file = try FileHandle(forReadingFrom: url)
+            defer { try? file.close() }
+            guard let firstByte = try file.read(upToCount: 1), !firstByte.isEmpty else { throw unavailable(ref.name) }
+            return url
+        } catch { throw unavailable(ref.name) }
     }
 }
 

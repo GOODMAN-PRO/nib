@@ -758,7 +758,13 @@ final class WebDAVMirrorRun {
             var remainingRemote = Set(tree.files.values.map { $0.path })
             var deletedRemote: [String] = []
             var applied = 0
+            var copyFailed = false
             for phase in [copies, deletions] {
+                // A move is copies followed by deletions. Keep the old copies until every new copy is safe.
+                if copyFailed {
+                    report.pending += deletions.count
+                    break
+                }
                 try await execute(phase, scan: scan, tree: tree, scratch: scratch) { outcome in
                     for (key, entry) in outcome.updates { state.entries[key] = entry }
                     if let counter = outcome.counter { report.count(counter) }
@@ -770,6 +776,7 @@ final class WebDAVMirrorRun {
                     }
                     if let path = outcome.deletedLocalPath { deletedLocal.append(path) }
                     if let error = outcome.error {
+                        copyFailed = true
                         report.pending += 1
                         if case .changedDuringSync = error {} else { report.errors.append(error.message) }
                     }
@@ -961,8 +968,21 @@ final class WebDAVMirrorRun {
         let parent = remotePath.split(separator: "/").dropLast().joined(separator: "/")
         try await client.ensureCollections(client.serverComponents(libraryPath: parent))
         let etag = try await client.put(file: copy, to: target, precondition: precondition)
-        let version = (try? await client.version(ofLibraryFile: remotePath))
-            ?? etag.map { "e:" + WebDAVPaths.normalizeETag($0) }
+        let observed: String?
+        do { observed = try await client.version(ofLibraryFile: remotePath) }
+        catch {
+            let failure = WebDAVError.from(error, host: client.host)
+            if failure.isFatal { throw failure }
+            observed = nil
+        }
+        let uploaded = etag.map { "e:" + WebDAVPaths.normalizeETag($0) }
+        // A later PROPFIND may already describe another device's write. Never pair that version with our bytes.
+        let version: String?
+        if let observed = observed, let uploaded = uploaded, observed != uploaded {
+            version = nil
+        } else {
+            version = observed ?? uploaded
+        }
         // An unknown version reads as "changed on the server" next time: one harmless re-download, then stable.
         return SyncedEntry(local: entry.fingerprint, remote: version ?? "")
     }

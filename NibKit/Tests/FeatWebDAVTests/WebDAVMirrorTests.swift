@@ -309,6 +309,33 @@ final class WebDAVMirrorTests: XCTestCase {
         XCTAssertEqual(server.requestCount("PUT"), puts)
     }
 
+    func testFailedMoveCopyDefersRemoteAndLocalDeletions() async throws {
+        let server = FakeDAVServer.install()
+        let root = DAVTest.tempDir("move-failure"), state = DAVTest.tempDir("state")
+        try DAVTest.write(root, "Old.nibnote/asset.json", "original")
+        try DAVTest.write(root, "remote-deleted.json", "local safety copy")
+        try DAVTest.write(root, "keep.json", "keep")
+        _ = try await sync(server, root, state, dev)
+        try FileManager.default.moveItem(at: root.appendingPathComponent("Old.nibnote"),
+                                        to: root.appendingPathComponent("New.nibnote"))
+        server.remove("/dav/Nib/remote-deleted.json")
+        // A non-fatal copy failure must also stop deletions, independently of fatal-error handling.
+        server.intercept = { method, path in
+            method == "PUT" && path == "/dav/Nib/New.nibnote/asset.json" ? (423, [:], Data()) : nil
+        }
+        let result = try await sync(server, root, state, dev)
+        XCTAssertEqual(result.deletedRemote, 0)
+        XCTAssertEqual(result.deletedLocal, 0)
+        XCTAssertFalse(result.errors.isEmpty)
+        XCTAssertGreaterThan(result.pending, 1)
+        XCTAssertEqual(server.text("/dav/Nib/Old.nibnote/asset.json"), "original")
+        XCTAssertTrue(DAVTest.exists(root, "remote-deleted.json"))
+        server.intercept = nil
+        let retry = try await sync(server, root, state, dev)
+        XCTAssertGreaterThan(retry.deletedRemote, 0)
+        XCTAssertEqual(server.text("/dav/Nib/New.nibnote/asset.json"), "original")
+    }
+
     func testSamePathDivergenceKeepsBothVersionsOnEveryDevice() async throws {
         let server = FakeDAVServer.install()
         let a = DAVTest.tempDir("A"), b = DAVTest.tempDir("B")
@@ -394,6 +421,25 @@ final class WebDAVMirrorTests: XCTestCase {
         XCTAssertEqual(r.downloaded, 1)
     }
 
+    func testConcurrentWriteAfterPutIsNotRecordedAsSynced() async throws {
+        let server = FakeDAVServer.install()
+        let root = DAVTest.tempDir("put-race"), state = DAVTest.tempDir("state")
+        try DAVTest.write(root, "a.json", "ours")
+        server.intercept = { [unowned server] method, path in
+            if method == "PROPFIND", path == "/dav/Nib/a.json", server.text(path) == "ours" {
+                server.put(path, "theirs")
+            }
+            return nil
+        }
+        _ = try await sync(server, root, state, dev)
+        server.intercept = nil
+        let saved = MirrorStateStore(directory: state, key: dev).load()
+        XCTAssertEqual(saved.entries["a.json"]?.remote, "")
+        let next = try await sync(server, root, state, dev)
+        XCTAssertEqual(next.downloaded, 1)
+        XCTAssertEqual(DAVTest.read(root, "a.json"), "theirs")
+    }
+
     func testServerWithoutPutETagsStaysStable() async throws {
         let server = FakeDAVServer.install()
         server.omitPutETag = true
@@ -403,6 +449,26 @@ final class WebDAVMirrorTests: XCTestCase {
         _ = try await sync(server, a, state, "0000000a")
         let r = try await sync(server, a, state, "0000000a")
         XCTAssertEqual(r.uploaded + r.downloaded, 0, "the version read back after PUT matches the listing")
+    }
+
+    func testBusyServerStopsSchedulingCopies() async throws {
+        for status in [429, 503] {
+            for method in ["PUT", "PROPFIND"] {
+                let server = FakeDAVServer.install()
+                let root = DAVTest.tempDir("busy"), state = DAVTest.tempDir("state")
+                for i in 0..<10 { try DAVTest.write(root, "file\(i).json", "keep") }
+                server.intercept = { request, path in
+                    request == method && path.hasSuffix(".json") ? (status, [:], Data()) : nil
+                }
+                let run = try makeRun(server, root: root, state: state, device: dev)
+                run.concurrency = 1
+                let result = await run.run()
+                XCTAssertEqual(result.failure, "serverBusy")
+                XCTAssertEqual(result.errors.count, 1)
+                XCTAssertEqual(server.requestCount("PUT"), 1)
+                XCTAssertEqual(result.deletedRemote + result.deletedLocal, 0)
+            }
+        }
     }
 
     func testAuthenticationFailureStopsTheRunAndKeepsTheLibrary() async throws {
@@ -549,6 +615,26 @@ final class WebDAVMirrorTests: XCTestCase {
         XCTAssertFalse(DAVTest.exists(b, "Doc.nibnote/doc.1a2b3c4d (WebDAV conflict 0000000b 2).json"))
         XCTAssertEqual(server.text("/dav/Nib/" + path), "edited on B!")
         XCTAssertEqual(server.text("/dav/Nib/" + copy), "edited on A")
+    }
+
+    func testRejectedSubfolderListingLeavesItsFilesAloneAndSyncsOthers() async throws {
+        for status in [403, 423, 500] {
+            let server = FakeDAVServer.install()
+            let root = DAVTest.tempDir("unreadable"), state = DAVTest.tempDir("state")
+            try DAVTest.write(root, "Locked.nibnote/doc.json", "keep")
+            try DAVTest.write(root, "other.json", "before")
+            _ = try await sync(server, root, state, dev)
+            try DAVTest.write(root, "other.json", "after, longer")
+            server.intercept = { method, path in
+                method == "PROPFIND" && path == "/dav/Nib/Locked.nibnote" ? (status, [:], Data()) : nil
+            }
+            let result = try await sync(server, root, state, dev)
+            XCTAssertEqual(result.pending, 1)
+            XCTAssertEqual(result.uploaded, 1)
+            XCTAssertEqual(result.deletedLocal + result.deletedRemote, 0)
+            XCTAssertEqual(DAVTest.read(root, "Locked.nibnote/doc.json"), "keep")
+            XCTAssertEqual(server.text("/dav/Nib/other.json"), "after, longer")
+        }
     }
 
     func testUnreadableOrVanishingServerPathsNeverDeleteLocalFiles() async throws {

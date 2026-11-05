@@ -760,9 +760,8 @@ enum ImportEngine {
                                   folders: folderRefs.isEmpty ? nil : folderRefs, failed: failed.isEmpty ? nil : failed)
         if let session = session {
             session.finish(imported: importedFiles, failures: failed, stopped: session.isCancelled)
-            // The person has seen what failed; Open In and share copies of files that failed as a whole are not offered
-            // again. A zip or folder imported in part stays (it still holds what was skipped).
-            for f in failed where f.entry == nil { consumeInboxCopy(f.url) }
+            // A failed import is not consent to discard its source. Keep it, without repeatedly prompting.
+            for f in failed where f.entry == nil { keepSource(f.url) }
         } else if ctx.principal.isUser, !failed.isEmpty {
             ImportUI.reportPartialFailure(failed, ctx: ctx)
         }
@@ -788,7 +787,7 @@ enum ImportEngine {
     }
 
     /// Replaces the share-extension hand-off link (nib://import?from=pasteboard) by the files on the pasteboard.
-    private static func expandHandoff(_ sources: [ImportSource], staging: ImportStaging,
+    static func expandHandoff(_ sources: [ImportSource], staging: ImportStaging,
                                       ctx: CommandContext) throws -> [ImportSource] {
         var out: [ImportSource] = []
         for s in sources {
@@ -800,8 +799,12 @@ enum ImportEngine {
                 throw NibError(.permissionDenied, "only the user can import what another app shared through the pasteboard",
                                path: "$.urls")
             }
-            let urls = try ShareHandoff.take(into: try staging.directory("handoff"))
-            out += urls.map { ImportSource(original: $0.absoluteString, name: $0.lastPathComponent, local: $0) }
+            // Clear the pasteboard only after its bytes live outside disposable staging. Failed presentation or
+            // import leaves these inbox files available; success and explicit decline consume them normally.
+            let inbox = ImportLocations.openInInbox
+            try FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)
+            let urls = try ShareHandoff.take(into: inbox)
+            out += urls.map { ImportSource(original: $0.absoluteString) }
         }
         return out
     }

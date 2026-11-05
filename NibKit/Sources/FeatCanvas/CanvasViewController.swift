@@ -1560,11 +1560,10 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         if let page = displayedPage, failedPages.contains(page), let f = host.pageFrame(page) {
             errorView.showsRestore = canRestoreFromBackup
             let visible = scrollView.convert(f, to: fixedOverlay).intersection(b)
-            let size = errorView.fittingSize(width: max(NibMetrics.hitTarget, min(b.width, PageErrorView.maxWidth)))
-            let centre = visible.isNull ? CGPoint(x: b.midX, y: b.midY) : CGPoint(x: visible.midX, y: visible.midY)
-            errorView.frame = CGRect(x: centre.x - size.width / 2, y: centre.y - size.height / 2, width: size.width,
-                                     height: size.height)
+            // The failure state replaces the visible paper, including stale tiles and attachments beneath it.
+            errorView.frame = visible.isNull ? b : visible
             errorView.isHidden = false
+            fixedOverlay.bringSubviewToFront(scrubber)
         } else {
             errorView.isHidden = true
         }
@@ -2003,17 +2002,29 @@ final class PageErrorView: UIView {
     override init(frame: CGRect) {
         hosting = UIHostingController(rootView: NibEmptyState(symbol: .warningTriangle, title: ""))
         super.init(frame: frame)
-        backgroundColor = .clear
+        backgroundColor = NibUIColor.background
+        isOpaque = true
         hosting.view.backgroundColor = .clear
         // Placed by the canvas, clear of the chrome already: no safe-area padding of its own.
         hosting.safeAreaRegions = []
-        hosting.view.frame = bounds
-        hosting.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         addSubview(hosting.view)
         update()
     }
 
     required init?(coder: NSCoder) { return nil }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let size = fittingSize(width: min(bounds.width, Self.maxWidth))
+        hosting.view.frame = CGRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2,
+                                    width: size.width, height: size.height)
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hit = super.hitTest(point, with: event)
+        // The paper field replaces the pixels, but scrolling outside the actions still reaches the canvas.
+        return hit === self ? nil : hit
+    }
 
     private func update() {
         let retry = NibAction(String(localized: "Try Again")) { [weak self] in self?.onRetry?() }
@@ -2022,6 +2033,7 @@ final class PageErrorView: UIView {
         actions = [retry] + (restore.map { [$0] } ?? [])
         hosting.rootView = NibEmptyState(symbol: .warningTriangle, title: String(localized: "Couldn't show this page."),
                                          primary: retry, secondary: restore)
+        setNeedsLayout()
     }
 
     /// The size the empty state takes at most `width` wide.

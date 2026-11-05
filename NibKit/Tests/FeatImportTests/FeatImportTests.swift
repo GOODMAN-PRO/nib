@@ -770,6 +770,75 @@ final class FeatImportTests: XCTestCase {
         }
     }
 
+    func testHandoffSurvivesUnavailableDialogAndStagingCleanup() async throws {
+        let h = harness()
+        let board = UIPasteboard.general
+        let previous = board.items
+        defer { board.items = previous }
+        let bytes = Data("shared original".utf8)
+        let name = UUID().uuidString + ".pdf"
+        board.items = [[ShareHandoff.nameType: name, ShareHandoff.dataType: bytes]]
+        let saved = ImportLocations.openInInbox.appendingPathComponent(name)
+        defer { try? FileManager.default.removeItem(at: saved) }
+        h.app.commands.register(CommandDescriptor(id: "test.handoff", title: "Import", summary: "Exercise failed presentation.",
+            effect: .read, exposure: .ui)) { _, ctx in
+            let staging = try ImportStaging()
+            let sources = try ImportEngine.expandHandoff([ImportSource(original: ShareHandoff.link)], staging: staging, ctx: ctx)
+            let navigator = StubNavigator()
+            let dialog = ImportDialogSession(navigator: navigator, library: h.library, workspace: ctx.workspace,
+                session: h.session, sources: sources, preset: nil)
+            if case .notShown = await dialog.choose() {} else { XCTFail("Expected unavailable dialog") }
+            staging.cleanUp()
+            XCTAssertEqual(try Data(contentsOf: saved), bytes)
+            let claimed = ImportEngine.claim(sources)
+            defer { ImportEngine.release(claimed.paths) }
+            XCTAssertFalse(claimed.paths.isEmpty, "Inbox scan must not import the same handoff concurrently")
+            return .null
+        }
+        try await h.run("test.handoff")
+        XCTAssertFalse(ShareHandoff.isWaiting)
+    }
+
+    func testHandoffSurvivesImporterFailure() async throws {
+        let h = harness()
+        let board = UIPasteboard.general
+        let previous = board.items
+        defer { board.items = previous }
+        let name = UUID().uuidString + ".png"
+        let bytes = Data("not a decodable image".utf8)
+        board.items = [[ShareHandoff.nameType: name, ShareHandoff.dataType: bytes]]
+        let saved = ImportLocations.openInInbox.appendingPathComponent(name)
+        defer { try? FileManager.default.removeItem(at: saved) }
+        do {
+            try await h.run("import.files", ["urls": [.string(ShareHandoff.link)], "folder": "lib"])
+            XCTFail("Invalid image must fail")
+        } catch {
+            XCTAssertEqual(try Data(contentsOf: saved), bytes)
+        }
+    }
+
+    func testFailedInboxFileSurvivesTheDialogsFailureReport() async throws {
+        let h = harness()
+        let inbox = ImportLocations.openInInbox
+        try FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)
+        let source = inbox.appendingPathComponent(UUID().uuidString + ".png")
+        let bytes = Data("not an image".utf8)
+        try bytes.write(to: source)
+        defer { try? FileManager.default.removeItem(at: source) }
+        h.app.commands.register(CommandDescriptor(id: "test.failedDialogImport", title: "Import", summary: "Exercise failed import cleanup.",
+            effect: .read, exposure: .ui)) { _, ctx in
+            let sources = [ImportSource(original: source.absoluteString)]
+            let navigator = StubNavigator()
+            let dialog = ImportDialogSession(navigator: navigator, library: h.library, workspace: ctx.workspace,
+                session: h.session, sources: sources, preset: nil)
+            let result = try await ImportEngine.perform(sources, destination: .libraryRoot, ids: nil, ctx: ctx, dialog: dialog)
+            XCTAssertEqual(result.failed?.count, 1)
+            XCTAssertEqual(try Data(contentsOf: source), bytes)
+            return .null
+        }
+        try await h.run("test.failedDialogImport")
+    }
+
     func testPickerPresentationFailureIsNotUserCancellation() async {
         await expectError(.unavailable) {
             _ = try await DocumentPicker.pick(types: [.pdf], navigator: StubNavigator())

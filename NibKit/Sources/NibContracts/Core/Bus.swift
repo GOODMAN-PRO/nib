@@ -496,7 +496,7 @@ public final class CommandBus {
     // MARK: Undo / redo / selective revert
 
     /// Undoes the latest step of `doc` (and, for a group linked across documents, the same group's latest step in
-    /// every other document where it is still the latest). Returns false when there is nothing to undo.
+    /// every other document where it is still the latest). Returns false when no record can be reverted.
     @discardableResult
     public func undo(_ doc: DocumentID) -> Bool {
         guard let entry = history.popUndo(doc) else { return false }
@@ -512,11 +512,12 @@ public final class CommandBus {
         for (d, e) in entries {
             var r = UndoEntry(group: e.group, label: e.label, principal: e.principal,
                               mutations: tx.mutations.filter { $0.document == d })
+            guard !r.mutations.isEmpty else { continue }
             r.linked = e.linked
             history.pushRedo(r, doc: d)
         }
         finishUnrecorded(tx, label: "Undo " + entry.label, command: CommandIDs.undo)
-        return true
+        return !tx.mutations.isEmpty
     }
 
     @discardableResult
@@ -534,11 +535,12 @@ public final class CommandBus {
         for (d, e) in entries {
             var r = UndoEntry(group: e.group, label: e.label, principal: e.principal,
                               mutations: tx.mutations.filter { $0.document == d })
+            guard !r.mutations.isEmpty else { continue }
             r.linked = e.linked
             history.pushUndo(r, doc: d)
         }
         finishUnrecorded(tx, label: "Redo " + entry.label, command: CommandIDs.redo)
-        return true
+        return !tx.mutations.isEmpty
     }
 
     /// Reverts one undo group (e.g. an AI turn) even after later edits; records the revert as a new undo step.
