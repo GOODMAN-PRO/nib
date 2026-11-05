@@ -173,7 +173,8 @@ final class NibUI {
         }
     }
 
-    /// Reveals in the actual form: sheets scan toward the bottom first; other lazy lists home then scan.
+    /// Reveals in the actual list: home only from a proven nonzero scroll position.
+    /// Unknown positions scan bottom-first, including plain-Other modal forms.
     /// Existing callers pass lazy firstMatch queries; the closure overload also supports fresh section-scoped queries.
     func revealFormElement(_ element: XCUIElement) { revealFormElement { element } }
 
@@ -376,16 +377,21 @@ final class NibUI {
         var direction: Bool?
         var reversed = false
         var endSignatures: [String] = []
-        // Pulling down at the top of an idle sheet can dismiss it. Preserve the original
-        // bottom-first search there, reversing only after a repeated visible range.
+        // A missing Sheet node says nothing about Nib's plain-Other forms. Decide from
+        // this list's own scroll position; unknown positions must never start by pulling down.
         let lazySearch = initialSnapshot == nil
-        let sheetVisible = lazySearch && app.sheets.allElementsBoundByIndex.contains { hasVisibleFrame($0) }
-        let homeThenScan = lazySearch && !sheetVisible
+        let modal = presentedFormSnapshot()
+        let coverVisible = hasVisibleFrame(app.otherElements["PopoverDismissRegion"].firstMatch)
+        if let modal, let context = ancestry(firstSnapshot, in: modal) {
+            ancestorClip = (ancestorClip ?? window).intersection(context.clip)
+        }
+        let initialTop = formTopPosition(firstSnapshot)
+        let homeThenScan = lazySearch && initialTop.atTop == false
         var homing = homeThenScan
         var homeMoves = 0
         let appFrame = app.frame
-        let searchPath = sheetVisible ? "sheet bottom-first then reverse" : (homeThenScan ? "slow home then scan" : "target-directed")
-        logQA("Form reveal path", "path=\(searchPath) lazy=\(lazySearch) velocity=slow")
+        let searchPath = lazySearch ? (homeThenScan ? "proven offset home then scan" : "bottom-first then reverse") : "target-directed"
+        logQA("Form reveal path", "path=\(searchPath) lazy=\(lazySearch) cover=\(coverVisible) OtherForm=\(String(describing: modal?.frame)) top=\(initialTop.evidence) velocity=slow")
         // Homing may consume six moves; preserve sixteen downward scans for a lazy row.
         let moveLimit = lazySearch ? 22 : 16
         for _ in 0..<moveLimit {
@@ -406,6 +412,12 @@ final class NibUI {
             let targetFrame = element.exists ? element.frame : nil
             if let targetFrame, viewport.contains(CGPoint(x: targetFrame.midX, y: targetFrame.midY)),
                element.isHittable { return }
+            let top = formTopPosition(snapshot)
+            if homing, top.atTop != false {
+                homing = false
+                visited.removeAll()
+                logQA("Form lazy edge", "stop homing without another downward drag: \(top.evidence)")
+            }
             let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
             if !visited.insert(signature).inserted {
                 endSignatures.append(signature)
@@ -416,7 +428,7 @@ final class NibUI {
                     }
                     homing = false
                     visited = [signature]
-                    logQA("Form lazy edge", "top confirmed after \(homeMoves) moves; scanning toward bottom")
+                    logQA("Form lazy edge", "homing range repeated after \(homeMoves) moves; scanning toward bottom")
                 } else {
                     guard !reversed else {
                         logQA("Form search exhausted", "both ends=\(endSignatures)")
@@ -433,15 +445,24 @@ final class NibUI {
                 return
             }
             if !homeThenScan && direction == nil {
-                direction = sheetVisible ? false : (targetFrame.map { $0.midY < viewport.midY } ?? false)
+                direction = lazySearch ? false : (targetFrame.map { $0.midY < viewport.midY } ?? false)
             }
             guard homeThenScan || direction != nil else { return }
             let down = homeThenScan ? homing : (direction == true)
-            guard let start = formDragStart(snapshot, viewport: viewport, down: down) else { return }
+            if down, top.atTop != false {
+                logQA("Form downward drag prevented", "path=\(searchPath) top=\(top.evidence) viewport=\(viewport)")
+                return // At top or unclassified: never discover the edge by dismissing a modal.
+            }
+            // All downward drags start inside content, even if modal ancestry was unavailable.
+            // Keep clear of both the list's top and a known form's grabber/header.
+            let contentStart = max(viewport.minY + max(80, viewport.height * 0.35),
+                                   (modal?.frame.minY ?? snapshot.frame.minY) + 96)
+            guard let start = formDragStart(snapshot, viewport: viewport, down: down,
+                                            minimumY: down ? contentStart : viewport.minY + 24) else { return }
             let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
             let values = formControlValues(snapshot)
             let wasTransient = containerIsTransient
-            logQA("Form drag before", "point=\(start) container=\(listFrame) rows=\(signature)")
+            logQA("Form drag before", "point=\(start) container=\(listFrame) dragDown=\(down) top=\(top.evidence) minimumY=\(contentStart) rows=\(signature)")
             let origin = app.coordinate(withNormalizedOffset: .zero)
             let moveStarted = Date()
             origin.withOffset(CGVector(dx: start.x - appFrame.minX, dy: start.y - appFrame.minY))
@@ -451,6 +472,10 @@ final class NibUI {
             moves += 1
             if homing { homeMoves += 1 }
             logQA("Form move timing", "move=\(moves) homing=\(homing) seconds=\(Date().timeIntervalSince(moveStarted))")
+            if coverVisible, !hasVisibleFrame(app.otherElements["PopoverDismissRegion"].firstMatch) {
+                containerLost("modal dismissal cover disappeared after reveal; form=\(String(describing: modal?.frame))")
+                return
+            }
             // Library grids can replace their containers while scrolling. Keep the cheap cached query
             // normally, but reacquire it if that container disappears or its snapshot becomes unavailable.
             var nextSnapshot: XCUIElementSnapshot? = list.exists ? (try? list.snapshot()) : nil
@@ -524,8 +549,44 @@ final class NibUI {
         return result
     }
 
-    /// Search real row gaps first, then a row of plain buttons, then the leading inset of a dense form.
-    private func formDragStart(_ snapshot: XCUIElementSnapshot, viewport: CGRect, down: Bool) -> CGPoint? {
+    /// Read only this list's vertical position, never a nested picker's or a background canvas's.
+    /// A rounded zero is conservatively top. Missing values are not evidence of a nonzero offset.
+    private func formTopPosition(_ snapshot: XCUIElementSnapshot) -> (atTop: Bool?, evidence: String) {
+        func percentage(_ node: XCUIElementSnapshot) -> Double? {
+            guard let value = node.value as? String, value.hasSuffix("%"),
+                  let number = Double(value.dropLast().trimmingCharacters(in: .whitespaces)),
+                  number.isFinite, (0...100).contains(number) else { return nil }
+            return number
+        }
+        var positions: [Double] = []
+        if let value = percentage(snapshot) { positions.append(value) }
+        var firstRow: CGRect?
+        func visit(_ node: XCUIElementSnapshot) {
+            if [.scrollView, .table, .collectionView].contains(node.elementType) { return }
+            if node.label.hasPrefix("Vertical scroll bar,"), let value = percentage(node) {
+                positions.append(value)
+            }
+            if firstRow == nil, [.cell, .button, .staticText].contains(node.elementType),
+               !node.frame.isEmpty, !node.frame.isInfinite, !node.frame.isNull {
+                firstRow = node.frame
+            }
+            for child in node.children { visit(child) }
+        }
+        for child in snapshot.children { visit(child) }
+        if let position = positions.min() {
+            return (position == 0, "verticalPercent=\(positions) atTop=\(position == 0)")
+        }
+        // An instantiated first row above the list proves there is content to scroll back to.
+        // A row inside the viewport may be a virtualized later row, so it cannot prove 'top'.
+        if let firstRow, firstRow.minY < snapshot.frame.minY - 1 {
+            return (false, "firstRow=\(firstRow) above listTop=\(snapshot.frame.minY)")
+        }
+        return (nil, "unknown; firstRow=\(String(describing: firstRow)) list=\(snapshot.frame)")
+    }
+
+    /// Search real row gaps, plain rows, then the leading inset, all below minimumY.
+    private func formDragStart(_ snapshot: XCUIElementSnapshot, viewport: CGRect, down: Bool,
+                               minimumY: CGFloat) -> CGPoint? {
         let interactive: [XCUIElement.ElementType] = [.slider, .switch, .button, .textField, .textView,
             .secureTextField, .searchField, .stepper, .segmentedControl, .picker, .pickerWheel, .link]
         func controls(_ node: XCUIElementSnapshot) -> [(String, CGRect)] {
@@ -549,7 +610,7 @@ final class NibUI {
         }
         let blocked = controls(snapshot)
         let preferredY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
-        let ys = stride(from: viewport.minY + 24, through: viewport.maxY - 24, by: 4).sorted {
+        let ys = stride(from: max(viewport.minY + 24, minimumY), through: viewport.maxY - 24, by: 4).sorted {
             abs($0 - preferredY) < abs($1 - preferredY)
         }
         let endY = down ? viewport.maxY - 24 : viewport.minY + 24

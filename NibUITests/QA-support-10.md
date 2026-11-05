@@ -427,3 +427,30 @@ Re-read every dismissSheets caller in Canvas, Capture, Ink, Library, Selection, 
 | Failed form dismissal | Modal form remained open / Modal form hierarchy | Which form, cover and tree survived the close action? |
 
 CI must verify plain-Other ancestry, close-button identity/frame binding, Document Editing closure and Replay/Audio ordering. Existing XCTest snapshot/query APIs are reused; no local compile/runtime pass is claimed.
+
+### 2. Reveal from observed list position, without pull-down probing at the top
+
+Removed the app.sheets guard entirely. The list snapshot supplies its own percent value or vertical scroll-bar percent (the recorded native hierarchy exposes `Vertical scroll bar, ...` / `0%`); nested scroll views are excluded. Without a percent, an instantiated first row above the list's top proves a nonzero position. A row inside the viewport does not prove it is the first logical row of a lazy list. Zero and unknown positions skip homing and scan bottom-first. Every subsequent downward drag, including reversal and existing-target searches, rechecks this evidence; top/unknown stops safely instead of probing by pulling the form down. Homing switches to scanning as soon as the top is reached. Repeated ranges, six homing moves, 22 lazy/16 existing-target moves, slow delivery, clipping and slider/switch value checks remain bounded and unchanged in strength.
+
+All downward start-point passes now share a minimum inside the content: at least 80pt or 35% below the clipped viewport top, and at least 96pt below the known Other form's top (or list top if unclassified). No pass or fallback can start at the grabber/header. A resolved Other form also clips the viewport; losing its dismissal cover after a gesture fails immediately. A missing top signal is logged and may leave an above-fold target for the caller's existing failure rather than risking dismissal; CI must establish native percent coverage.
+
+| Modal/form callers reviewed | Protection |
+| --- | --- |
+| Customise Toolbar (Chrome layout/show/hide/reset/apply) | Its lazy collection starts bottom-first at zero/unknown; only observed nonzero position permits a content-interior downward gesture. |
+| Document Editing (Chrome) and Settings: Editing/Tabs/Layers/Alignment, Writing/Shape Recognition, Stylus/Apple Pencil/Squeeze/haptics, AI, Elements and GIFs, Recording Settings, Plugins, Bridge, About (Canvas, Capture, Chrome, Ink, Insert, Library, Selection) | All untyped/typed requireControl and explicit detail-list reveals use the same position guard, clipped viewport and minimum start; no Sheet-node dependency or extra single-page navigation. |
+| Add provider (Insert, Selection) | Preset reveal and missing Name/Base URL/Chat model/Transcription model through fillNativeForm/focusField inherit both the initial and per-move guard. |
+| New Notebook and other creation forms / Quick Note | Any shared missing-field/focus reveal has the same guard; Create's existing direct field/keyboard routines are not changed into drags. |
+| Customise Folder (Library) | Name/hex/emoji/favourite existing-target reveals cannot drag down at zero/unknown; control-value checks stay intact. |
+| Rename/Save Layout/ruler alerts, Share and Export/collection or Audio share sheets, colour/import forms, Delete Specific Items and Go to Page | Shared fallback reveal uses the same rule even when no Other form can be classified; small viewports retain the 24pt travel rule. No new swipe is added. |
+| Time Keeper, tool buds, object menus, Pages fallback, library cards, Calendar event summary | Nonmodal callers also use their own position, retaining target re-querying and caller assertions. Explicit Time Keeper and Pencil scopes remain compatible. |
+
+Re-grepped every class and read all direct reveal callers, requireControl/findControl wrappers with scroll enabled, setSwitch, fillNativeForm, focusField and shared command/PNG-share fallbacks. No caller signature or control-value postcondition changed.
+
+| Diagnostic | Log prefix | Question answered |
+| --- | --- | --- |
+| All reveals | Form reveal path | Which list-position evidence, cover and Other form selected homing or bottom-first? |
+| Each downward attempt | Form downward drag prevented / Form lazy edge | Was the top reached, or was the position unknown, before another drag? |
+| Delivered gestures | Form drag before | What percent/first-row evidence and minimum content y justified this start point? |
+| Lost modal | Form container changed | Did the cover vanish during reveal? |
+
+Validation for items 1-2: python Scripts/lint.py reports 0 errors, 25 existing warnings; git diff --check passes. Swift APIs, optional Bool comparisons, numeric conversion and all three start-point passes were reviewed statically. CI must verify percent exposure, plain-Other clipping and retained below-fold field access; no local runtime pass or speedup is claimed.
