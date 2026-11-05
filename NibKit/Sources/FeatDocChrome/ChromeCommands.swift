@@ -636,9 +636,9 @@ public enum ShellChromePolicy {
     }
 
     public static func permits(_ descriptor: KeyCommandDescriptor, hasModal: Bool) -> Bool {
-        guard hasModal else { return true }
-        return descriptor.scope != .canvas
-            && !descriptor.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
+        // The presented controller owns its keys. Filtering one scope must never promote
+        // an underlying document/global descriptor that happens to share the shortcut.
+        !hasModal
     }
 
     public static func makeTabBar(openDocuments: [DocumentID], make: () -> UIView?) -> UIView? {
