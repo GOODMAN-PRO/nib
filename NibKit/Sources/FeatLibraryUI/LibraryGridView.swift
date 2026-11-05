@@ -509,6 +509,8 @@ struct LibraryCover: View {
                 ZStack {
                     NibPaper.white.color
                     Image(uiImage: rendered).resizable().scaledToFit()
+                        // Infinite-board thumbnails are framed around their marks, not a paper edge.
+                        .padding(row.kind == DocumentKind.whiteboard.rawValue ? NibSpacing.s : 0)
                 }
             } else {
                 // Paper does not invert with chrome. Its missing/locked glyph uses opaque paper ink too.
