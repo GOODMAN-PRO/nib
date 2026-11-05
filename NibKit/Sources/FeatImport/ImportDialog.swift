@@ -468,10 +468,10 @@ final class ImportDialogSession {
         host.modalPresentationStyle = .formSheet
         host.isModalInPresentation = true
         ImportUI.applySheetChrome(host)
-        navigator.presentModal(host)
-        guard host.presentingViewController != nil else { return false }
         controller = host
-        return true
+        let shown = await ImportUI.present(host, navigator: navigator)
+        if !shown { controller = nil }
+        return shown
     }
 
     func choose() async -> ImportDialogOutcome {
@@ -489,11 +489,12 @@ final class ImportDialogSession {
             host.modalPresentationStyle = .formSheet
             host.isModalInPresentation = true
             ImportUI.applySheetChrome(host)
-            navigator.presentModal(host)
             controller = host
-            if host.presentingViewController == nil {
-                controller = nil
-                resolve(.notShown)
+            Task { @MainActor in
+                if !(await ImportUI.present(host, navigator: navigator)) {
+                    self.controller = nil
+                    self.resolve(.notShown)
+                }
             }
         }
     }
@@ -581,10 +582,12 @@ final class ImportDialogSession {
 final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
     private static var active: DocumentPicker?
     private var continuation: CheckedContinuation<[URL], Error>?
+    private var finishing = false
 
-    static func pick(types: [UTType], navigator: SceneNavigator) async throws -> [URL] {
+    static func pick(types: [UTType], navigator: SceneNavigator,
+                     presentation: ImportUI.Presentation? = nil) async throws -> [URL] {
         await ImportUI.waitUntilPresentable(navigator)
-        guard navigator.rootViewController?.viewIfLoaded?.window != nil else {
+        guard active == nil, navigator.rootViewController?.viewIfLoaded?.window != nil else {
             throw NibError(.unavailable,
                 String(localized: "Couldn't open the Files picker. Choose Import Files again."))
         }
@@ -597,10 +600,12 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
         defer { if active === delegate { active = nil } }
         let urls = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[URL], Error>) in
             delegate.continuation = continuation
-            navigator.presentModal(picker)
-            if picker.presentingViewController == nil {
-                delegate.finish(.failure(NibError(.unavailable,
-                    String(localized: "Couldn't open the Files picker. Choose Import Files again."))))
+            Task { @MainActor in
+                let shown = await ImportUI.present(picker, navigator: navigator, presentation: presentation)
+                if !shown {
+                    delegate.finish(.failure(NibError(.unavailable,
+                        String(localized: "Couldn't open the Files picker. Choose Import Files again."))))
+                }
             }
         }
         await ImportUI.waitUntilPresentable(navigator)             // the picker finishes dismissing first
@@ -612,7 +617,7 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
         NSLog("%@", "[Nib QA import] didPick count=\(urls.count)")
         #endif
         importLog.info("Files picker delivered \(urls.count) URLs")
-        finish(.success(urls))
+        finish(.success(urls), dismissing: controller)
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
@@ -620,12 +625,22 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
         NSLog("%@", "[Nib QA import] picker cancelled")
         #endif
         importLog.info("Files picker cancelled")
-        finish(.success([]))
+        finish(.success([]), dismissing: controller)
     }
 
-    private func finish(_ result: Result<[URL], Error>) {
-        continuation?.resume(with: result)
-        continuation = nil
+    private func finish(_ result: Result<[URL], Error>, dismissing controller: UIViewController? = nil) {
+        guard !finishing else { return }
+        finishing = true
+        let complete = { [self] in
+            continuation?.resume(with: result)
+            continuation = nil
+        }
+        // Retain the delegate until the dismissal completes, including duplicate delegate callbacks.
+        if let controller, controller.presentingViewController != nil {
+            controller.dismiss(animated: true, completion: complete)
+        } else {
+            complete()
+        }
     }
 }
 
@@ -633,6 +648,32 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
 
 @MainActor
 enum ImportUI {
+    typealias Presentation = @MainActor (UIViewController, UIViewController, @escaping @MainActor () -> Void) -> Void
+
+    /// Resolve from UIKit's presentation completion, never from the relationship immediately after `present`.
+    /// All preflight checks and the call run together on the main actor; an ongoing transition is not presented over.
+    static func present(_ controller: UIViewController, navigator: SceneNavigator,
+                        presentation: Presentation? = nil) async -> Bool {
+        await waitUntilPresentable(navigator)
+        guard let root = navigator.rootViewController, root.viewIfLoaded?.window != nil else { return false }
+        var top = root
+        while let next = top.presentedViewController { top = next }
+        guard !top.isBeingPresented, !top.isBeingDismissed, top.viewIfLoaded?.window != nil else { return false }
+        controller.overrideUserInterfaceStyle = root.traitCollection.userInterfaceStyle
+        return await withCheckedContinuation { continuation in
+            let complete: @MainActor () -> Void = {
+                #if DEBUG
+                let presented = String(describing: top.presentedViewController)
+                let presenting = String(describing: controller.presentingViewController)
+                NSLog("%@", "[Nib QA import] presentation completed presentedViewController=\(presented) isBeingDismissed=\(controller.isBeingDismissed) presentingViewController=\(presenting)")
+                #endif
+                continuation.resume(returning: true)
+            }
+            if let presentation { presentation(top, controller, complete) }
+            else { top.present(controller, animated: true, completion: complete) }
+        }
+    }
+
     /// The window that asks the user, waiting briefly for it: an Open In at launch arrives before the window is active.
     /// The shell makes the window the user works in the active one (key window, Open In, key commands), so that is
     /// `ctx.navigator`; a call from another window (a drop into a window that is not key, in Split View or Stage
