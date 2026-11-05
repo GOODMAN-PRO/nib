@@ -19,13 +19,11 @@ struct SidebarPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             // §14.4: tabs lead every navigator, including panels that embed their own header.
-            // The host menu rides in the tab row only when that row exists: a self-headed panel on its own
-            // keeps its single header (no second, untitled More row).
+            // Self-headed panels keep their own overflow menu. Host placement actions
+            // remain available by holding the tabs, without taking a segment's width.
             if selected.id != PanelIDs.assistant, SidebarNavigation.primary(tabs).count > 1 {
-                HStack(spacing: 0) {
-                    tabStrip.frame(maxWidth: .infinity)
-                    if !chrome.drawsHeader(selected) { placementMenu }
-                }
+                tabStrip.frame(maxWidth: .infinity)
+                    .contextMenu { placementMenu.items }
             }
             Rectangle()
                 .fill(NibColor.separatorSoft)
@@ -48,7 +46,7 @@ struct SidebarPanelView: View {
         }
     }
 
-    private var placementMenu: some View {
+    private var placementMenu: PanelPlacementMenu {
         PanelPlacementMenu(chrome: chrome, panel: selected, current: side.spot,
                            mode: showsModeToggle ? mode : nil, additionalPanels: tabs)
     }
@@ -84,29 +82,7 @@ struct PanelPlacementMenu: View {
     var additionalPanels: [PanelDescriptor] = []
 
     var body: some View {
-        Menu {
-            if !additionalPanels.isEmpty {
-                Section(String(localized: "Panels")) {
-                    ForEach(additionalPanels, id: \.id) { tab in
-                        Button(tab.title) { chrome.tap("panel.open", ["id": .string(tab.id)]) }
-                        .accessibilityIdentifier("cmd." + "panel.open")
-                    }
-                }
-            }
-            if let mode {
-                Button(mode == .window ? String(localized: "Show as Sidebar") : String(localized: "Show as Window")) {
-                    chrome.tap("sidebar.toggle", ["mode": .string(mode == .window ? "sidebar" : "window")])
-                }
-                .accessibilityIdentifier("cmd." + "sidebar.toggle")
-            }
-            option(.left, String(localized: "Move to Left Side"), symbol: .sidebar)
-            option(.right, String(localized: "Move to Right Side"), symbol: .sidebar)
-            option(.floating, String(localized: "Float Panel"), symbol: .externalDisplay)
-            if hasOverride {
-                Divider()
-                Button(String(localized: "Use Default Position")) { set(nil) }
-            }
-        } label: {
+        Menu { items } label: {
             Image(nib: .more)
                 .font(NibFont.glyph(.panel))
                 .foregroundStyle(NibColor.labelSecondary)
@@ -114,6 +90,30 @@ struct PanelPlacementMenu: View {
                 .contentShape(Rectangle())
         }
         .accessibilityLabel(String(localized: "Panel Options"))
+    }
+
+    @ViewBuilder var items: some View {
+        if !additionalPanels.isEmpty {
+            Section(String(localized: "Panels")) {
+                ForEach(additionalPanels, id: \.id) { tab in
+                    Button(tab.title) { chrome.tap("panel.open", ["id": .string(tab.id)]) }
+                    .accessibilityIdentifier("cmd." + "panel.open")
+                }
+            }
+        }
+        if let mode {
+            Button(mode == .window ? String(localized: "Show as Sidebar") : String(localized: "Show as Window")) {
+                chrome.tap("sidebar.toggle", ["mode": .string(mode == .window ? "sidebar" : "window")])
+            }
+            .accessibilityIdentifier("cmd." + "sidebar.toggle")
+        }
+        option(.left, String(localized: "Move to Left Side"), symbol: .sidebar)
+        option(.right, String(localized: "Move to Right Side"), symbol: .sidebar)
+        option(.floating, String(localized: "Float Panel"), symbol: .externalDisplay)
+        if hasOverride {
+            Divider()
+            Button(String(localized: "Use Default Position")) { set(nil) }
+        }
     }
 
     private var hasOverride: Bool {
