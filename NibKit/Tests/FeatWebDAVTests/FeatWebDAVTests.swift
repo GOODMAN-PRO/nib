@@ -672,6 +672,28 @@ final class FeatWebDAVTests: XCTestCase {
         return (h, engine, FakeDAVServer.install())
     }
 
+    func testMirrorExcludesOnlyTheHandoffInbox() throws {
+        let root = DAVTest.tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        XCTAssertEqual(WebDAVSyncEngine.excludedTopLevel(root: root, documents: root), ["diagnostics"],
+                       "a failed listing cannot identify staging")
+        try DAVTest.write(root, "Inbox/Notes.nibnote/doc.00000008.json", "{}")
+        let handoff = WebDAVSyncEngine.excludedTopLevel(root: root, documents: root)
+        XCTAssertEqual(handoff, ["Inbox", "diagnostics"])
+        XCTAssertTrue(try LocalLibraryScanner.scan(root: root, excludedTopLevel: handoff).files.isEmpty)
+        XCTAssertEqual(WebDAVSyncEngine.excludedTopLevel(root: root, documents: root.appendingPathComponent("Other")), [])
+
+        for name in [".nibfolder.00000008.json", ".nibfolder.00000008 2.json"] {
+            try DAVTest.write(root, "Inbox/" + name, "damaged")
+            let owned = WebDAVSyncEngine.excludedTopLevel(root: root, documents: root)
+            XCTAssertEqual(owned, ["diagnostics"])
+            let scan = try LocalLibraryScanner.scan(root: root, excludedTopLevel: owned)
+            XCTAssertNotNil(scan.files["Inbox/Notes.nibnote/doc.00000008.json"])
+            XCTAssertNotNil(scan.files["Inbox/" + name])
+            try FileManager.default.removeItem(at: root.appendingPathComponent("Inbox/" + name))
+        }
+    }
+
     func testCommandsConform() async {
         let problems = await CommandConformance.check(features: [FeatWebDAVFeature.self])
         XCTAssertEqual(problems, [])

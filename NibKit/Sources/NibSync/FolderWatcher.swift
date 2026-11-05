@@ -40,6 +40,11 @@ enum SyncFiles {
     static func isPage(_ name: String) -> Bool { device(of: name, prefix: "", suffix: pageSuffix) != nil }
     /// A folder's style record: `.nibfolder.<8hex>.json` or a conflict copy of one.
     static func isFolderRecord(_ name: String) -> Bool { device(of: name, prefix: folderPrefix, suffix: jsonSuffix) != nil }
+    /// A recorded user folder named Inbox belongs to the library. A failed listing proves nothing.
+    static func isHandoffInbox(_ url: URL) -> Bool {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: url.path) else { return false }
+        return !names.contains(where: isFolderRecord)
+    }
     /// The library's synced settings of one device: `prefs.<8hex>.json` or a conflict copy of one.
     static func isPrefs(_ name: String) -> Bool { device(of: name, prefix: prefsPrefix, suffix: jsonSuffix) != nil }
 
@@ -415,7 +420,8 @@ struct FolderScanner {
                     continue
                 }
                 guard entry.values?.isDirectory == true else { continue }
-                if isRoot && skipInbox && name == SyncFiles.inboxName { continue }
+                if isRoot && skipInbox && name == SyncFiles.inboxName,
+                   SyncFiles.isHandoffInbox(entry.url) { continue }
                 let ext = entry.url.pathExtension.lowercased()
                 if SyncFiles.isPackageExtension(ext) {
                     let stamp = FileStamp(entry.values)

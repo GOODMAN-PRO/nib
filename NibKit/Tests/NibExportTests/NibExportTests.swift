@@ -260,6 +260,18 @@ final class NibExportTests: XCTestCase {
         }
     }
 
+    func testLegacyOmissionMessageFallsBackToPagesWithoutIDs() throws {
+        let json = #"{"document":"Notebook","asset":"missing.png","pages":["Notes (draft) (PRIVATEPAGEID)","Page 2"]}"#
+        let omission = try JSONDecoder().decode(ExportOmission.self, from: Data(json.utf8))
+        XCTAssertNil(omission.pageLabels)
+        let message = ExportOmission.message([omission])
+        XCTAssertTrue(message.contains("Notes (draft)"))
+        XCTAssertTrue(message.contains("Page 2"))
+        XCTAssertFalse(message.contains("PRIVATEPAGEID"))
+        XCTAssertFalse(message.contains("document records"))
+        XCTAssertEqual(omission.pages, ["Notes (draft) (PRIVATEPAGEID)", "Page 2"])
+    }
+
     /// The package holds the store's files: the head, one compressed page file per page with items on the exported
     /// layers (comments included), the assets, and the audio transcript.
     func testNibnotePackageHasTheStoreFormatWithAudioCommentsAndVisibleLayersOnly() async throws {

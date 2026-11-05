@@ -13,7 +13,13 @@ struct ExportOmission: Codable, Equatable {
     var pageLabels: [String]? = nil
 
     static func message(_ omissions: [Self]) -> String {
-        let pages = Set(omissions.flatMap { $0.pageLabels ?? [] }).sorted().joined(separator: ", ")
+        let labels = omissions.flatMap { omission in
+            omission.pageLabels ?? omission.pages.map { page in
+                guard page.hasSuffix(")"), let suffix = page.range(of: " (", options: .backwards) else { return page }
+                return String(page[..<suffix.lowerBound])
+            }
+        }
+        let pages = Set(labels).sorted().joined(separator: ", ")
         let count = omissions.count
         if pages.isEmpty {
             return String(localized: "Export otherwise complete. Unreadable assets omitted: \(count). Location: document records. See Export Report.txt in the archive.")

@@ -330,9 +330,14 @@ final class FeatAboutTests: XCTestCase {
         XCTAssertTrue(h.app.workspace.isLoaded(Fixtures.docID))
         let root = h.library.rootURL
         rig.container.write(root.appendingPathComponent("Fixture.nibnote/doc.00000007.json"))
+        let inbox = try h.library.createFolder(title: "Inbox", in: nil, style: nil)
+        try h.library.move(Fixtures.docID, to: inbox)
+        rig.container.write(root.appendingPathComponent("Inbox/.nibfolder.00000007.json"))
+        rig.container.write(root.appendingPathComponent("Inbox/Notes.nibnote/doc.00000007.json"))
         rig.container.write(root.appendingPathComponent(".nib-library/prefs.00000007.json"))
         rig.container.write(root.appendingPathComponent("notes.txt"))
         let expected = (h.library.allNodes() + h.library.trashedNodes()).filter { $0.kind == .document }.count
+        XCTAssertEqual(h.library.node(Fixtures.docID)?.parent, inbox, "documents inside Inbox count too")
 
         let out = try await h.run(CommandIDs.appDeleteAllData, ["includeLibrary": true]).decode(DeleteAllDataCommand.Output.self)
 
@@ -340,6 +345,7 @@ final class FeatAboutTests: XCTestCase {
         XCTAssertEqual(out.documents, expected)
         let fm = FileManager.default
         XCTAssertFalse(fm.fileExists(atPath: root.appendingPathComponent("Fixture.nibnote").path))
+        XCTAssertFalse(fm.fileExists(atPath: root.appendingPathComponent("Inbox/Notes.nibnote").path))
         XCTAssertFalse(fm.fileExists(atPath: root.appendingPathComponent(".nib-library").path))
         XCTAssertTrue(fm.fileExists(atPath: root.appendingPathComponent("notes.txt").path), "files Nib did not make stay")
         XCTAssertFalse(h.app.workspace.isLoaded(Fixtures.docID), "open documents leave memory first")
@@ -365,6 +371,30 @@ final class FeatAboutTests: XCTestCase {
     }
 
     // MARK: Plan and eraser
+
+    func testDeletionTreatsRecordedInboxAsLibraryContent() throws {
+        for includeLibrary in [false, true] {
+            for marker in [nil, ".nibfolder.00000007.json", ".nibfolder.00000007 2.json"] as [String?] {
+                let c = try TempContainer()
+                defer { try? FileManager.default.removeItem(at: c.root) }
+                let missing = DeletionPlanner.plan(includeLibrary: includeLibrary, libraryRoot: c.locations.documents,
+                                                   locations: c.locations)
+                XCTAssertTrue(missing.remove.isEmpty, "a failed listing cannot identify staging")
+                c.write("Documents/Inbox/Notes.nibnote/doc.00000007.json")
+                c.write("Documents/Inbox/notes.pdf")
+                if let marker { c.write("Documents/Inbox/" + marker) }
+                let plan = DeletionPlanner.plan(includeLibrary: includeLibrary, libraryRoot: c.locations.documents,
+                                                locations: c.locations)
+                XCTAssertEqual(plan.remove.contains { $0.lastPathComponent == "Inbox" }, marker == nil)
+                let report = DataEraser(fileManager: .default, coordinatesFiles: true).erase(plan)
+                XCTAssertEqual(report.failures, [])
+                XCTAssertEqual(c.exists("Documents/Inbox/Notes.nibnote"), marker != nil && !includeLibrary)
+                XCTAssertEqual(c.exists("Documents/Inbox/notes.pdf"), marker != nil,
+                               "a user's unrelated files survive even when the library is deleted")
+                if let marker { XCTAssertEqual(c.exists("Documents/Inbox/" + marker), !includeLibrary) }
+            }
+        }
+    }
 
     func testEraseWithoutLibraryKeepsLibraryDeviceIDAndPreferences() throws {
         let c = try TempContainer()

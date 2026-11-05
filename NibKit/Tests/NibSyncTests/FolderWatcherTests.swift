@@ -146,6 +146,47 @@ final class FolderWatcherTests: XCTestCase {
         XCTAssertTrue(withInbox.meta.keys.contains("Open.nibnote/doc.00000008.json"))
     }
 
+    func testLibraryScanSkipsOnlyTheHandoffInbox() throws {
+        let root = try temporaryFolder()
+        let inbox = root.appendingPathComponent("Inbox", isDirectory: true)
+        XCTAssertFalse(SyncFiles.isHandoffInbox(inbox), "a failed listing cannot identify staging")
+        try file(root, "Inbox/Notes.nibnote/doc.00000008.json")
+        let scanner = FolderScanner(device: "00000007", startsDownloads: false)
+        let handoff = scanner.scanLibrary(root: root, skipInbox: true, loaded: [], cache: [:], useCache: false).0
+        XCTAssertFalse(handoff.tree.contains("Inbox"))
+        XCTAssertTrue(handoff.meta.isEmpty)
+
+        // A damaged record or a provider conflict copy still identifies a user folder.
+        for name in [".nibfolder.00000008.json", ".nibfolder.00000008 2.json"] {
+            let record = try file(root, "Inbox/" + name, "damaged")
+            let owned = scanner.scanLibrary(root: root, skipInbox: true, loaded: [], cache: [:], useCache: false).0
+            XCTAssertTrue(owned.tree.contains("Inbox"))
+            XCTAssertTrue(owned.tree.contains("Inbox/Notes.nibnote"))
+            XCTAssertNotNil(owned.meta["Inbox/Notes.nibnote/doc.00000008.json"])
+            XCTAssertNotNil(owned.meta["Inbox/" + name])
+            try FileManager.default.removeItem(at: record)
+        }
+    }
+
+    func testLibraryCopyIncludesRecordedInboxAndRetainsFailedListings() throws {
+        let root = try temporaryFolder()
+        let other = try temporaryFolder("Other")
+        let inbox = root.appendingPathComponent("Inbox", isDirectory: true)
+        try file(root, "Inbox/shared.pdf")
+        XCTAssertFalse(LibraryCopier.topLevelItems(of: root, appDocuments: root).contains { $0.lastPathComponent == "Inbox" })
+        XCTAssertTrue(LibraryCopier.topLevelItems(of: root, appDocuments: other).contains { $0.lastPathComponent == "Inbox" })
+        try file(root, "Inbox/.nibfolder.00000007.json", "damaged")
+        let items = LibraryCopier.topLevelItems(of: root, appDocuments: root)
+        XCTAssertTrue(items.contains { $0.lastPathComponent == "Inbox" })
+        let copied = try LibraryCopier.copy(items, to: other) { _, _, _ in }
+        XCTAssertEqual(copied.items, ["Inbox"])
+        XCTAssertEqual(try Data(contentsOf: other.appendingPathComponent("Inbox/shared.pdf")), Data("{}".utf8))
+
+        try FileManager.default.removeItem(at: inbox)
+        try file(root, "Inbox", "not a directory")
+        XCTAssertTrue(LibraryCopier.topLevelItems(of: root, appDocuments: root).contains { $0.lastPathComponent == "Inbox" })
+    }
+
     func testPackageListingsAreReusedWhileTheDirectoryStampHolds() throws {
         let root = try temporaryFolder()
         try file(root, "K.nibnote/doc.00000008.json")

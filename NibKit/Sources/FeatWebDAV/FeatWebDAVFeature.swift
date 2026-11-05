@@ -376,11 +376,24 @@ final class WebDAVSyncEngine {
     }
 
     /// When the library is the app's own Documents folder, the system Inbox and diagnostics folders stay local.
-    static func excludedTopLevel(root: URL) -> Set<String> {
-        guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+    static func excludedTopLevel(root: URL,
+                                 documents: URL? = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first) -> Set<String> {
+        guard let documents = documents,
               documents.standardizedFileURL.resolvingSymlinksInPath().path
                 == root.standardizedFileURL.resolvingSymlinksInPath().path else { return [] }
-        return ["Inbox", "diagnostics"]
+        var excluded: Set<String> = ["diagnostics"]
+        if isHandoffInbox(root.appendingPathComponent("Inbox", isDirectory: true)) { excluded.insert("Inbox") }
+        return excluded
+    }
+
+    private static func isHandoffInbox(_ url: URL) -> Bool {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: url.path) else { return false }
+        // Features cannot import NibSync/NibLibrary. Match the catalog's folder records, including conflict copies.
+        return !names.contains { name in
+            guard name.hasPrefix(".nibfolder."), name.hasSuffix(".json") else { return false }
+            let body = name.dropFirst(".nibfolder.".count).dropLast(".json".count)
+            return body.count >= 8 && body.prefix(8).allSatisfy { ("0"..."9").contains($0) || ("a"..."f").contains($0) }
+        }
     }
 
     /// Uploads one file (webdav.put) to server-relative `components`; an existing file is only replaced with
