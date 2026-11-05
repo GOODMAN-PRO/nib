@@ -174,6 +174,23 @@ final class FeatElementsTests: XCTestCase {
     }
 
     /// Acceptance: a collection exported as .nibcollection (zip) imports back with the same elements.
+    func testImportingExportedPackKeepsTheReadOnlyPack() async throws {
+        let h = harness()
+        let fragment = try JSONValue.from(Self.box)
+        h.app.content.elementCollections.register(ElementCollectionDescriptor(id: "pack-x", title: "Pack", owner: "test") {
+            [ElementEntry(id: "box", title: "Box", fragment: fragment)]
+        })
+        let exported = try await h.run("element.export", ["collection": "pack-x"])
+        let asset = try XCTUnwrap(exported["asset"]?.stringValue)
+        let imported = try await h.run("element.import", ["url": .string(asset)])
+        let copy = try XCTUnwrap(imported["collection"]?.stringValue)
+        XCTAssertNotEqual(copy, "pack-x")
+        let list = try await h.run("element.collection.list")
+        let pack = try XCTUnwrap(list["collections"]?.arrayValue?.first { $0["id"] == "pack-x" })
+        XCTAssertEqual(pack["readOnly"], true)
+        XCTAssertEqual(try ElementCatalog(app: h.app).list(copy).elements.count, 1)
+    }
+
     func testCollectionExportImportRoundTrip() async throws {
         let h = harness()
         try await h.run("element.collection.create", ["title": "Revision", "id": "revision"])

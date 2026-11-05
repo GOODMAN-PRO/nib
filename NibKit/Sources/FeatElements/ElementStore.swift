@@ -483,8 +483,8 @@ final class ElementStore {
     }
 
     /// Adds an imported `.nibcollection` as a new collection (its own id when free, else a fresh one).
-    func importCollection(_ imported: ImportedCollection, fallbackTitle: String) throws -> (record: CollectionRecord, count: Int) {
-        let taken = Set(collectionIDs().map { $0.lowercased() })
+    func importCollection(_ imported: ImportedCollection, fallbackTitle: String, reservedIDs: [String] = []) throws -> (record: CollectionRecord, count: Int) {
+        let taken = Set((collectionIDs() + reservedIDs).map { $0.lowercased() })
         var id = NibID.make().raw
         if let wanted = imported.id, NibID.isValid(wanted), !taken.contains(wanted.lowercased()) { id = wanted }
         let rawTitle = (imported.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)

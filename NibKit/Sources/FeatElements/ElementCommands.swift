@@ -571,7 +571,7 @@ struct ElementImport: NibCommand {
         }
         let result = try await ElementIO.run { () -> (record: CollectionRecord, count: Int) in
             catalog.prepare()
-            return try store.importCollection(imported, fallbackTitle: fallback)
+            return try store.importCollection(imported, fallbackTitle: fallback, reservedIDs: catalog.plugins.map { $0.id })
         }
         ElementParams.changed(ctx, collection: result.record.id.raw)
         return Output(collection: result.record.id.raw, title: result.record.title, count: result.count)
