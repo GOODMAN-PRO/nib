@@ -8,6 +8,22 @@ import NibTesting
 
 @MainActor
 final class FeatDocChromeTests: XCTestCase {
+    func testTabBarIsRequestedForRemainingTabsBehindLibrary() {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        var documents: [DocumentID] = ["TAB_A", "TAB_B", "TAB_C"]
+        h.session.document = nil
+        documents.removeFirst()
+        let bar = UIView()
+        var requests = 0
+        let result = ShellChromePolicy.makeTabBar(openDocuments: documents) {
+            requests += 1
+            return bar
+        }
+        XCTAssertTrue(result === bar)
+        XCTAssertEqual(requests, 1)
+        XCTAssertNil(ShellChromePolicy.makeTabBar(openDocuments: []) { XCTFail("No tabs"); return bar })
+    }
+
     func testLibraryPanelIDsSurviveAdoptionWhileRemovedChromePanelsClose() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         let state = try chromeState(h)

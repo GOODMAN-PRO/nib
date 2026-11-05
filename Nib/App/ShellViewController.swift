@@ -2,6 +2,7 @@ import UIKit
 import SwiftUI
 import NibContracts
 import NibDesign
+import FeatDocChrome
 
 /// Root of every window. Owns the tab model and implements `SceneNavigator`; everything visible is provided by
 /// features through `app.ui.screens` (library, document chrome, settings, onboarding) with minimal fallbacks.
@@ -516,7 +517,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     private func refreshTabBar() {
         tabBar?.removeFromSuperview()
         tabBar = nil
-        if activeDocument != nil, let bar = app.ui.sceneHooks?.makeTabBar(self) {
+        if let bar = ShellChromePolicy.makeTabBar(openDocuments: openDocuments, make: { app.ui.sceneHooks?.makeTabBar(self) }) {
             view.addSubview(bar)
             tabBar = bar
         }
