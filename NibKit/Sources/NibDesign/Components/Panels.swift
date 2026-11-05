@@ -61,6 +61,11 @@ public struct NibPopoverPanel<Content: View>: View {
         .scrollBounceBehavior(.basedOnSize)
         .frame(width: min(width, viewport.width))
         .frame(height: min(contentHeight, maxHeight, NibMetrics.popoverMaxHeight, viewport.height))
+        // Fade the scrolling viewport, not its glass. The content's 16 pt bottom inset
+        // lets the final control scroll fully above the fade without changing scroll identity.
+        .nibFadeBottomEdge()
+        .scrollIndicators(.visible)
+        .scrollIndicatorsFlash(trigger: isPresented)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
         .accessibilityHidden(!isPresented)
@@ -145,6 +150,30 @@ public enum NibBudPlacement: Sendable {
         }
     }
 
+    /// Keep a nav-bar popover clear of a nearby palette, preserving its source's cross-axis alignment.
+    /// The source remains the animation anchor; this rect only reserves space for final placement.
+    func unobstructedAnchor(_ anchor: CGRect, size: CGSize, gap: CGFloat, in bounds: CGRect,
+                            avoiding obstacles: [CGRect]) -> CGRect {
+        var result = anchor
+        for obstacle in obstacles where NibGeometry.isUsable(obstacle) {
+            let available = availableSize(beside: result, gap: gap, in: bounds)
+            let fitted = CGSize(width: min(size.width, available.width), height: min(size.height, available.height))
+            let c = centre(size: fitted, beside: result, gap: gap, in: bounds)
+            let frame = CGRect(x: c.x - fitted.width / 2, y: c.y - fitted.height / 2,
+                               width: fitted.width, height: fitted.height)
+            guard frame.intersects(obstacle.insetBy(dx: -gap, dy: -gap)) else { continue }
+            switch self {
+            case .below, .above:
+                result = CGRect(x: result.minX, y: min(result.minY, obstacle.minY), width: result.width,
+                                height: max(result.maxY, obstacle.maxY) - min(result.minY, obstacle.minY))
+            case .leading, .trailing:
+                result = CGRect(x: min(result.minX, obstacle.minX), y: result.minY,
+                                width: max(result.maxX, obstacle.maxX) - min(result.minX, obstacle.minX), height: result.height)
+            }
+        }
+        return result
+    }
+
     /// Constrain the scrolling viewport before measuring it, choosing the larger side if necessary.
     func availableSize(beside anchor: CGRect, gap: CGFloat, in bounds: CGRect) -> CGSize {
         let anchor = NibGeometry.rect(anchor), gap = max(0, NibGeometry.finite(gap))
@@ -214,12 +243,15 @@ public struct NibBudPopover<Content: View>: View {
     public var body: some View {
         GeometryReader { proxy in
             let gap = sizeClass == .compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
-            let anchor = field?.anchorRect(source) ?? .zero
+            let sourceAnchor = field?.anchorRect(source) ?? .zero
             let frame = proxy.frame(in: NibLiquid.space)
             let safe = proxy.safeAreaInsets
             let bounds = CGRect(x: frame.minX + safe.leading, y: frame.minY + safe.top,
                                 width: max(0, frame.width - safe.leading - safe.trailing),
                                 height: max(0, frame.height - safe.top - safe.bottom))
+            let palettes = field?.worldAnchors.filter { $0.key.hasPrefix(NibPalettePresentation.anchorPrefix) }
+                .sorted { $0.key < $1.key }.map(\.value) ?? []
+            let anchor = placement.unobstructedAnchor(sourceAnchor, size: size, gap: gap, in: bounds, avoiding: palettes)
             let available = placement.availableSize(beside: anchor, gap: gap, in: bounds)
             let centre = placement.centre(size: size, beside: anchor, gap: gap, in: bounds)
             NibPopoverPanel(title: title, subtitle: subtitle, width: min(width, available.width),
@@ -454,12 +486,18 @@ struct NibSheetChrome: ViewModifier {
                 chrome(content)
             }
             .presentationSizing(.form.fitted(horizontal: true, vertical: true))
+            .scrollIndicators(.visible)
+            .scrollIndicatorsFlash(onAppear: true)
         } else {
             chrome(content)
+                .scrollIndicators(.visible)
+                .scrollIndicatorsFlash(onAppear: true)
         }
     }
 
     @ViewBuilder private func chrome(_ content: Content) -> some View {
+        // Sheets may contain bottom-pinned actions. Keep scroll cues on their scroll
+        // hosts; a root mask fades those actions and shared margins double local padding.
         if #available(iOS 26.0, *) {
             content
         } else {

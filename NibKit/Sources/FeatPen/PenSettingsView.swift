@@ -166,8 +166,7 @@ struct PenSettingsView: View {
             NibInspectorSection(String(localized: "Colour")) {
                 NibSwatchGrid(swatches: NibInk.allCases.map { NibSwatch(ink: $0) }, selection: model.swatch,
                               columns: typeSize.isAccessibilitySize ? 3 : 6)
-                ColorPicker(String(localized: "Custom…"), selection: model.customColour, supportsOpacity: false)
-                    .font(NibFont.body).foregroundStyle(NibColor.label).frame(minHeight: NibMetrics.hitTarget)
+                NibCustomColourPicker(String(localized: "Custom…"), selection: model.customColour)
                     .accessibilityLabel(String(localized: "Choose custom ink colour"))
             }
             slider(String(localized: "Pressure sensitivity"), key: PenSettings.pressure)
@@ -223,7 +222,7 @@ struct PenSettingsView: View {
                     action: {
                         model.set(PenSettings.style, style.rawValue)
                         model.app.perform(CommandIDs.toolSelect, ["tool": "pen"], session: session)
-                    }) { NibOptionGlyph(.pen) }
+                    }) { NibOptionGlyph(style.optionSymbol) }
                     .accessibilityLabel(style.title)
             }
             NibOptionTile(String(localized: "Pencil"), isSelected: session.tool == "pencil", action: {
@@ -258,6 +257,14 @@ struct PenOptionsBar: View {
 }
 
 extension PenStyle {
+    var optionSymbol: NibSymbol {
+        switch self {
+        case .fountain: return .fountainPen
+        case .ball: return .pen
+        case .brush: return .brushPen
+        }
+    }
+
     var shortTitle: String {
         switch self {
         case .fountain: return String(localized: "Fountain")

@@ -490,6 +490,16 @@ extension RGBA {
 
 // MARK: - Settings popover
 
+enum HighlighterColourSelection {
+    static func id(for colour: RGBA) -> String? {
+        NibHighlighter.allCases.first { $0.rgba.r == colour.r && $0.rgba.g == colour.g && $0.rgba.b == colour.b }?.rawValue
+    }
+
+    static func colour(for id: String?) -> RGBA? {
+        id.flatMap { NibHighlighter(rawValue: $0)?.rgba }
+    }
+}
+
 /// The highlighter's settings popover (DESIGN.md §14.3): six highlighters + Custom, thickness presets + slider,
 /// Straight line, Stabilisation, Draw and hold. Rendered inside the palette's `NibPopoverPanel`. Every change is a
 /// command (`preset.*` / `settings.set`), so plugins, the assistant and the bridge can make the same changes.
@@ -502,7 +512,7 @@ struct HighlighterSettingsView: View {
     @State private var straightLine: Bool
     @State private var stabilization: Double
     @State private var drawAndHold: Bool
-    @State private var pickingColour = false
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     init(app: NibApp, session: EditorSession) {
         self.app = app
@@ -517,17 +527,10 @@ struct HighlighterSettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
-            NibInspectorSection(String(localized: "Colour"),
-                                action: NibAction(String(localized: "Custom…")) { pickingColour = true }) {
-                HStack(spacing: 0) {
-                    ForEach(NibHighlighter.allCases, id: \.self) { h in
-                        NibPenSwatch(NibSwatch(highlighter: h),
-                                     isSelected: sameColour(h.rgba, presets.color)) {
-                            edit(.setColour(index: presets.selectedSwatch, color: h.rgba))
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            NibInspectorSection(String(localized: "Colour")) {
+                NibSwatchGrid(swatches: NibHighlighter.allCases.map { NibSwatch(highlighter: $0) },
+                              selection: colourSelection, columns: typeSize.isAccessibilitySize ? 3 : 6)
+                NibCustomColourPicker(String(localized: "Custom…"), selection: customColour)
             }
             NibStrokeWidthSlider(width: $widthMM, range: widthRange,
                                  presets: presets.widths.map(HighlighterUnits.millimetres))
@@ -551,12 +554,22 @@ struct HighlighterSettingsView: View {
         .onChange(of: drawAndHold) { _, on in commit(HighlighterSettings.drawAndHold, on) }
         .task(id: stabilization) { await commitStabilization() }
         .task(id: widthMM) { await commitWidth() }
-        .sheet(isPresented: $pickingColour) {
-            SystemColourPicker(initial: presets.color.uiColor, onPick: { picked in
-                edit(.setColour(index: presets.selectedSwatch, color: RGBA(picked).asHighlighter))
-            }, onDone: { pickingColour = false })
-            .presentationDetents([.medium, .large])
-        }
+    }
+
+    private var colourSelection: Binding<String?> {
+        Binding(get: {
+            HighlighterColourSelection.id(for: presets.color)
+        }, set: { id in
+            if let colour = HighlighterColourSelection.colour(for: id) {
+                edit(.setColour(index: presets.selectedSwatch, color: colour))
+            }
+        })
+    }
+
+    private var customColour: Binding<Color> {
+        Binding(get: { Color(uiColor: presets.color.uiColor) }, set: { colour in
+            edit(.setColour(index: presets.selectedSwatch, color: RGBA(UIColor(colour)).asHighlighter))
+        })
     }
 
     private var widthRange: ClosedRange<Double> {
@@ -569,8 +582,6 @@ struct HighlighterSettingsView: View {
         guard app.settings.get(key) != on else { return }
         app.perform(CommandIDs.settingsSet, ["name": .string(key.name), "value": .bool(on)], session: session)
     }
-
-    private func sameColour(_ a: RGBA, _ b: RGBA) -> Bool { a.r == b.r && a.g == b.g && a.b == b.b }
 
     private func edit(_ e: PresetEdit) {
         e.apply(to: &presets)

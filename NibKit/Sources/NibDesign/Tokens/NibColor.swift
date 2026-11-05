@@ -39,6 +39,16 @@ public enum NibUIColor {
     public static let background = UIColor.systemBackground
     public static let backgroundSecondary = UIColor.secondarySystemBackground
     public static let backgroundTertiary = UIColor.tertiarySystemBackground
+    /// Selected controls need a distinct opaque surface in dark chrome; tertiary background
+    /// and translucent fill3 are too close to the segmented track and Deep material there.
+    public static let selectedSegment = UIColor { traits in
+        (traits.userInterfaceStyle == .dark ? UIColor.systemGray2 : UIColor.tertiarySystemBackground)
+            .resolvedColor(with: traits)
+    }
+    public static let selectedCell = UIColor { traits in
+        (traits.userInterfaceStyle == .dark ? UIColor.systemGray2 : UIColor.tertiarySystemFill)
+            .resolvedColor(with: traits)
+    }
     public static let groupedBackground = UIColor.systemGroupedBackground
     public static let desk = UIColor.nib(0xE7E7EC, dark: 0x121214)
     public static let chromeOpaque = UIColor.nib(0xF4F4F6, dark: 0x2C2C2E)
@@ -97,6 +107,8 @@ public enum NibColor {
     public static let background = Color(uiColor: NibUIColor.background)
     public static let backgroundSecondary = Color(uiColor: NibUIColor.backgroundSecondary)
     public static let backgroundTertiary = Color(uiColor: NibUIColor.backgroundTertiary)
+    public static let selectedSegment = Color(uiColor: NibUIColor.selectedSegment)
+    public static let selectedCell = Color(uiColor: NibUIColor.selectedCell)
     public static let groupedBackground = Color(uiColor: NibUIColor.groupedBackground)
     public static let desk = Color(uiColor: NibUIColor.desk)
     public static let chromeOpaque = Color(uiColor: NibUIColor.chromeOpaque)

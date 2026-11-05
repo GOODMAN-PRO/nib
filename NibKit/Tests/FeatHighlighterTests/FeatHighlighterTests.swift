@@ -17,6 +17,19 @@ final class FeatHighlighterTests: XCTestCase {
 
     // MARK: Draw in Straight Line
 
+    func testColourGridMatchesRGBAndPreservesHighlightOpacity() {
+        for colour in NibHighlighter.allCases {
+            let rgba = colour.rgba
+            XCTAssertEqual(HighlighterColourSelection.id(for: rgba), colour.rawValue)
+            XCTAssertEqual(HighlighterColourSelection.id(for: RGBA(rgba.r, rgba.g, rgba.b)), colour.rawValue)
+            XCTAssertEqual(HighlighterColourSelection.colour(for: colour.rawValue), rgba)
+            XCTAssertEqual(HighlighterColourSelection.colour(for: colour.rawValue)?.a, RGBA.highlighterAlpha)
+        }
+        XCTAssertNil(HighlighterColourSelection.id(for: RGBA(0x12, 0x34, 0x56)))
+        XCTAssertNil(HighlighterColourSelection.colour(for: nil))
+        XCTAssertNil(HighlighterColourSelection.colour(for: "missing"))
+    }
+
     func testStraightLineIsTwoPointsWithTheEndpointsPreserved() {
         let out = HighlighterGeometry.straightened(wobbly)
         XCTAssertEqual(out.count, 2)

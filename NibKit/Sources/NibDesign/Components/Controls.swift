@@ -217,7 +217,7 @@ public struct NibStrokeWidthSlider: View {
 }
 
 /// v2: one thickness preset (DESIGN.md §13.3): a `label` dot in a 44 × 40 cell and hit target, the selected one
-/// on `fill3` (radius 12). The dots of a row are `NibMetrics.widthPresetDot(index)`: 5, 8, 12 pt. Every place that
+/// on `selectedCell` (radius 12). The dots of a row are `NibMetrics.widthPresetDot(index)`: 5, 8, 12 pt. Every place that
 /// offers a thickness (a tool's popover, the Pencil palette, the options bar) uses it, so a width looks the same.
 public struct NibWidthPresetButton: View {
     let diameter: CGFloat
@@ -255,7 +255,7 @@ public struct NibWidthPresetButton: View {
                 .fill(NibChromeColor(NibColor.label))
                 .frame(width: diameter, height: diameter)
                 .frame(width: NibMetrics.hitTarget, height: NibMetrics.hudHeight)
-                .background(NibChromeColor(isSelected ? NibColor.fill3 : Color.clear), in: shape)
+                .background(NibChromeColor(isSelected ? NibColor.selectedCell : Color.clear), in: shape)
                 .opacity(isEnabled ? 1 : NibOpacity.disabled)
                 .contentShape(Rectangle())
         }
@@ -271,7 +271,7 @@ public struct NibWidthPresetButton: View {
     }
 }
 
-/// Segmented control: fill3 track (radius 9, 2 pt inset, 32 pt visual), knob on backgroundTertiary (radius 7). Each
+/// Segmented control: fill3 track (radius 9, 2 pt inset, 32 pt visual), knob on selectedSegment (radius 7). Each
 /// segment's hit area is the full 44 pt height (the track is drawn inside it).
 public struct NibSegmentedControl<Value: Hashable>: View {
     @Binding var selection: Value
@@ -339,7 +339,7 @@ public struct NibSegmentedControl<Value: Hashable>: View {
             .frame(minWidth: NibMetrics.hitTarget, maxWidth: .infinity, minHeight: 28)
             .background {
                 if selected {
-                    shape.fill(NibColor.backgroundTertiary)
+                    shape.fill(NibColor.selectedSegment)
                         .nibElevation(.rest)
                         .matchedGeometryEffect(id: "knob", in: knob)
                 } else if vertical {

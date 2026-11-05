@@ -215,7 +215,7 @@ struct NibNoneSwatch: View {
 
 /// One choice in a popover grid (DESIGN.md §14.3: pen types in 4 × 52 pt cells, shape kinds, tape patterns, the
 /// palette's More grid): a glyph or small preview over a caption2 label, at least 52 pt tall; the selected one sits on
-/// `fill3` with the field radius (10). Lay them out in a `LazyVGrid` with 6 pt spacing.
+/// `selectedCell` with the field radius (10). Lay them out in a `LazyVGrid` with 6 pt spacing.
 public struct NibOptionTile<Preview: View>: View {
     let title: String
     let isSelected: Bool
@@ -243,7 +243,7 @@ public struct NibOptionTile<Preview: View>: View {
             .opacity(isEnabled ? 1 : NibOpacity.disabled)
             .padding(.horizontal, NibSpacing.xs)
             .frame(maxWidth: .infinity, minHeight: NibMetrics.optionTileHeight)
-            .background(isSelected ? NibColor.fill3 : Color.clear, in: shape)
+            .background(isSelected ? NibColor.selectedCell : Color.clear, in: shape)
             .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: shape))
@@ -261,6 +261,7 @@ public struct NibOptionGlyph: View {
     public var body: some View {
         Image(nib: symbol)
             .font(NibFont.glyph(.panel, size: 22))
+            .frame(width: NibSpacing.xxl, height: NibSpacing.xxl)
             .accessibilityHidden(true)
     }
 }

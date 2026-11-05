@@ -102,4 +102,20 @@ final class TokenContrastTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(contrast(NibUIColor.onAccent, on: NibUIColor.accent, over: whitePaper, dark: false), 4.5)
         XCTAssertGreaterThanOrEqual(contrast(NibUIColor.onAccent, on: NibUIColor.accent, over: blackInk, dark: true), 3)
     }
+
+    func testSelectedControlsRemainDistinctInDarkChromeAndKeepLightAppearance() {
+        let track = composite(NibUIColor.fill3, over: composite(NibUIColor.backgroundSecondary,
+                                                               over: blackInk, dark: true), dark: true)
+        for selected in [NibUIColor.selectedSegment, NibUIColor.selectedCell] {
+            let fill = composite(selected, over: track, dark: true)
+            XCTAssertGreaterThanOrEqual((luminance(fill) + 0.05) / (luminance(track) + 0.05), 2)
+            XCTAssertGreaterThanOrEqual(contrast(NibUIColor.label, on: selected, over: track, dark: true), 4.5)
+            XCTAssertEqual(resolve(selected, dark: true).1, 1)
+        }
+        let light = UITraitCollection(userInterfaceStyle: .light)
+        XCTAssertEqual(NibUIColor.selectedSegment.resolvedColor(with: light),
+                       NibUIColor.backgroundTertiary.resolvedColor(with: light))
+        XCTAssertEqual(NibUIColor.selectedCell.resolvedColor(with: light),
+                       NibUIColor.fill3.resolvedColor(with: light))
+    }
 }
