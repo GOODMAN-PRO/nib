@@ -6,6 +6,14 @@ import NibTesting
 import NibDesign
 @testable import FeatClipboard
 
+private final class FailingClipboardAssets: AssetStore {
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { throw NibError.notFound("asset") }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { nil }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { throw NibError.notFound("asset") }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { throw NibError.notFound("asset") }
+    func temporaryURL(_ ref: AssetRef) -> URL? { nil }
+}
+
 private final class VisibilityChangingRenderer: PageRenderer {
     let before: @MainActor () -> Void
     init(before: @escaping @MainActor () -> Void) { self.before = before }
@@ -189,6 +197,31 @@ final class FeatClipboardTests: XCTestCase {
         let second = try items(refs(try await h.run("item.duplicate", shape)), in: h)
         XCTAssertEqual(first.first?.shape?.frame.x ?? 0, 120, accuracy: 1e-9)
         XCTAssertEqual(second.first?.shape?.frame.x ?? 0, 140, accuracy: 1e-9)
+    }
+
+    func testCopyAndCutPreserveClipboardAndSourceWhenAssetReadFails() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        board.write([UTType.utf8PlainText.identifier: "previous clipboard"])
+        let generation = board.changeCount
+        let before = try h.snapshot()
+        h.app.services.assets = FailingClipboardAssets()
+        for command in [CommandIDs.clipboardCopy, CommandIDs.clipboardCut] {
+            do {
+                try await h.run(command, ["refs": [.string(page1 + "FIXTUREIMG01")]])
+                XCTFail("An incomplete fragment must not replace the clipboard")
+            } catch let error as NibError {
+                XCTAssertEqual(error.code, .notFound)
+            }
+            XCTAssertEqual(board.changeCount, generation)
+            XCTAssertEqual(board.strings, ["previous clipboard"])
+            XCTAssertEqual(try h.snapshot(), before)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        }
+        // A same-document duplicate refers to the existing asset and never needs to read its bytes.
+        let duplicate = try await h.run(CommandIDs.itemDuplicate, ["refs": [.string(page1 + "FIXTUREIMG01")]])
+        XCTAssertEqual(refs(duplicate).count, 1)
     }
 
     func testCutRemovesItemsFreesConnectorAndUndoes() async throws {
