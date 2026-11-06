@@ -126,3 +126,128 @@ No Swift build or simulator run is claimed. Reviewer/CI risks: SPI key delivery 
 | Native clear callers | Stall boundary / Native clear HID | Was the next Delete sent through HID, preserving historical stall-log searches? |
 
 Validation: `python Scripts/lint.py` passed with **0 errors, 25 warnings**; `git diff --check` passed. Reviewed changed Swift source, measuredQuery callers and per-test NibUI construction across all test classes, Chrome prefix callers and all ruler-confirmation callers. Compilation, simulator behavior and runtime savings remain for GitHub Actions on macOS. No app files, test assertions, test declarations, sleeps, skips or time allowances are changed.
+
+## Round 11b
+
+Merged integration at b20b2f22 (fast-forward). Read job 11a, Round 11a above, README, all four Round 10 parts, and the full R12 ink-colours, ink-tools and library findings/verdicts. Verifier corrections govern; app-side unknowns remain unknown. Windows has no Swift toolchain or simulator. Only NibUITests changes; no push.
+
+### H6 - horizontal row reveal
+
+Confirmed R12:ink-tools#0 against EraserFilterChips and NibScrollView: Tape starts at x=372.5 beyond the scroller's x=372 edge; its 16 pt cue lane is outside the viewport. Added a separate bounded horizontal helper: resolve the smallest containing ScrollView by the control or a named sibling, compare current target/row frames, drag along x with slow delivery and a 0.4 s endpoint hold, and require centre containment plus hittability. Eight moves maximum; repeated child-position signatures stop a stuck row. Physical frame direction handles either LTR or RTL without assuming which side owns the cue. A centred but covered control fails instead of an invented corrective gesture. Existing vertical reveal is unchanged. I4 will use this helper; CI must show horizontal movement, a visible Tape centre, and no changed chip selection from scrolling.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| EraserFiltersEraseOnlyEnabledPenPencilHighlighterAndTape | Horizontal reveal / Horizontal reveal failed | How many moves and seconds revealed the chip; which row/target geometry failed? |
+
+### H7 / L1 - commit the Files inline name
+
+Confirmed R12:library#0 and verdict: exact replacement passed, but Return at t=74.12 left DOC.inlineRenameField open through t=87.42 with the software keyboard. Why Return failed is unknown. Replace public typeText(Return) with one observed keyboard Return/Done key (Files process first, hosted picker keyboard second), then only if the editor remains, tap verified empty space in its containing browser collection. Each delivered route has a bounded field-disappearance wait. No app activation, repeated key or blind tile tap. The older Create-alert route retains its 12 s postcondition. Failure preserves the original message and first attaches XCUIScreen.main, then logs Files/hosted hierarchies and keyboard buttons. Both nameNewFilesFolder callers (Library external drop and saveSharedPNG) retain exact name replacement and downstream folder verification.
+
+R12:library#1 remains an environment limit: the next Library run should get past naming and reach **External drop setup requires iPad multitasking controls** again. The cross-app drop test, that message and all import/destination assertions remain unchanged; no simulated drop hook is substituted.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| ExternalFilesDropImportsIntoCurrentFolder; saveSharedPNG callers | Files rename key / Files rename commit | Which observed commit route ran, and did the editor disappear? |
+| Same, on failure | Files rename hierarchy / Files rename hosted hierarchy / Files rename keyboard buttons | What did Files and its keyboard actually expose after both routes failed? |
+
+### H8 / L2 - diagnose native menu delivery
+
+Confirmed R12:library#2's correction: Add to Favourites was fully visible, the action never ran and the menu never ended after the t=34.42 tap. Clipping and a test-support cause are not established; no reveal or retry is added. Library performTap now includes both Favourites rows in diagnostics and checks native card-menu closure within four seconds before any value poll. Context-open tracking also covers a native tree without a Menu/Preview marker. Shared nativeContextMenu logs every row's label, identifier, row frame and containing menu/list frame before delivery; its existing eight-second closure gate and submenu/outside-cancellation semantics remain. A surviving menu now throws **native menu row tap not delivered** with the captured facts. Library allows a same-named successor at a new frame only when it belongs to a native Alert/Sheet; a moved row alone is not closure. The shared native-menu transaction retains its existing successor-frame rule. No action is resent.
+
+Should locate the failure in FavouriteOpenAndUnstarUpdatesMembership instead of the twelve-second Star wait; it is a diagnostic change, not a proven fix. Next run must correlate Native menu row tap with app [Nib QA menu]/[Nib QA tap] action and recognizer logs, then either menu disappearance and all original favourite assertions, or immediate delivery failure after the bounded gate. Reviewed Pages and Insert native-menu paths, including Move submenus, Delete confirmations, Rename/Share successors and explicit outside cancellation.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| FavouriteOpenAndUnstarUpdatesMembership; Library card menus; shared nativeContextMenu callers | Native menu row tap / Native menu row tap not delivered | Which row identity and menu/row frames received the one tap, and did that menu end? |
+| FavouriteOpenAndUnstarUpdatesMembership | Library action first poll / Library action timeout | Were both Add and Remove Favourites rows available before delivery? |
+
+### I1 - retain contact at the swatch drop destination
+
+Confirmed R12:ink-colours#0 and correction against the raw test drag and PresetReorderButton's performDrop-only move: this run released seven milliseconds after destination activation and never performed the drop. Timing supports the dwell change but is not proof of the precise cancellation mechanism. RearrangeColoursDragPersistsOrderAndActiveColour now uses existing dragWithHold between slot centres (0.8 s lift, velocity 500, 1.5 s destination contact), as Insert/Pages do. All label-order, active-colour, reopen and drawing checks remain. Next run must show performDropWithItemCollection, dragEndedWithOperation:16 and the expected persisted order. A further cancellation needs app sessionDidUpdate/drop-point evidence, not another test retry.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| RearrangeColoursDragPersistsOrderAndActiveColour | System drag contact | Did the held system drag run before the unchanged order wait? |
+
+### I2 - close the picker through its real control or safe outside geometry
+
+Confirmed R12:ink-colours#1 and correction: the (24,24) fallback produced UIStatusBarTapAction; an earlier full tree did expose close at approximately (738,250). closeColourPicker now searches app-level close/Done buttons within the current picker surface before falling back. Outside candidates are beyond every popover's 8 pt inflation, at least 60 pt below the window/region top and 24 pt from other edges. The selected point remains logged and picker disappearance remains mandatory. Should unblock HighlighterCustomColourPersistsAndDrawsTranslucentInk and later closes in CustomColourValidHexUpdatesSlotAndInvalidHexIsRejected. CI must show the own close control or a safe point, no status-bar action, and actual picker disappearance. Outside-dismissability remains unproven.
+
+R12:ink-colours#2's holds=false correction is retained: the picker was hosted, never ready and invalidated, but the dismissal time/cause is unknown. waitForColourSliders still requires the picker and its Sliders; no warm-up or retry. The other job's [Nib QA picker] presenting-chain/lifecycle logs must explain any repeat of **Remote colour picker and Sliders must be ready**. No test workaround for a picker torn down by the host.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Custom/system colour-picker tests | Colour picker controls / Colour picker dismissal | Which own close control or safe outside point was used, with which surface frames? |
+
+### I3 - distinguish an unopened palette from a missing colour
+
+Confirmed R12:ink-colours#3's holds=false verdict against addColour/open and ColourEditor's Add a colour container: the first plus tap at t=56.32 produced no palette; the proposed hasWindow hand-over cause is unsupported. fillColourSlots now captures the plus frame, taps once, and waits at most four seconds for the palette container with its buttons before chooseColour. A missing palette throws **Add Colour opened no palette**, including plus geometry and raw QA state. Every slot count, original-prefix, capacity and digit-render assertion is unchanged. Covers AddColourPreservesExistingSlotsAndStopsAtTwelve and all five AddedColourDigits tests. CI must correlate a failure with app [Nib QA preset]/[Nib QA tap] logs; this is a precise failure boundary, not an app fix or extra tap.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| AddColourPreservesExistingSlotsAndStopsAtTwelve; AddedColourDigits tests | Add Colour opened no palette | Did the first plus tap produce any palette; what were its frame and QA state? |
+
+### I4 - resolve and reveal each eraser chip afresh
+
+Confirmed R12:ink-tools#0 and verdict against the four-upfront lookup and current horizontal chip row. EraserFiltersEraseOnlyEnabledPenPencilHighlighterAndTape now resolves each chip within the current Eraser popover and uses H6 with the Pen sibling to identify its row. No chip array survives a reopen; each activation can move either direction to the current target. Enable-first ordering, every isSelected assertion, all four exact item-count decrements and Undo restoration remain. CI must reach Tape through a held horizontal drag (rather than the old 13.3 s vertical search) and complete all four filter iterations. Offset reset on reopen is handled without relying on it.
+
+Diagnostics use H6's Horizontal reveal prefix for every chip, including zero-move hits. Runtime savings are unmeasured; successful coverage adds real horizontal navigation that the old failing path never completed.
+
+### I5 - go directly to Stabilisation
+
+Confirmed R12:ink-tools#1 and verdict against settings' default Fountain Pen lookup and PenSettingsView's lazy type grid. The pencil iteration opened scrolled at 83%, with Stabilisation visible but the tile unrealised, and spent 23.74 s failing to reveal an irrelevant top tile. PenAndPencilStabilisationChangesInkAndKeepsEndpoints now calls settings(tool, revealTop: false), as the existing highlighter stabilisation test does. All four slider changes, raster comparisons, endpoint coverage and Undo checks remain. CI must show four Stabilisation drags and no Fountain Pen search in this test, whether the app opens settings at the top or restores an offset. Estimated saving: roughly 20-40 s of the observed unnecessary pencil top traversals; not measured here.
+
+### I6 - stable Pencil detail binding and cheap successful toggles
+
+Confirmed R12:ink-tools#2's correction: the collection query depended on the lazy Switch between current tool and eraser row, which disappeared and let liveList re-rank onto the 220 pt sidebar. revealPencilPreference now identifies the wider detail collection adjacent to the stable Settings sidebar ScrollView (SettingsSidebar uses ScrollView/LazyVStack, not a collection), using the observed shared bottom edge and either left/right adjacency, then binds it from the unfiltered indexed query, independent of every lazy detail row. It supplies edge: .bottom and the typed name, verifies the pane is retained, and returns immediately for an already hittable preference. Both initial and reopened passes use the same helper. Ambiguous or missing detail geometry fails explicitly instead of falling back to generic ranking or scrolling the sidebar. The current recorded frames differ by only 0.5 pt at their shared edge; the geometry match allows 2 pt.
+
+Ink toggle no longer scans scrollPanels while its actual thumb is hittable. Shared setSwitch keeps its value check, nested-thumb route, optional reveal, exact eight-second value wait and failure overlap evidence; successful presses log only cheap label/frame facts. Overlap snapshots occur only for a non-hittable target or failed value change. Re-grepped shared callers in Chrome, Capture, Library and Ink; their defaults and required values remain. All hover/haptics off/on, reopen and no-mark assertions are retained.
+
+CI must show no sidebar drift, Pencil Form reveal timing below roughly 15 s, and quick Switch before press delivery. Estimated saving is about 30 s from two avoided sidebar detours plus up to 20 s of switch overhead per affected test (about 50 s/test); overlapping AX costs and the unexplained class-wide slowdown prevent a measured claim.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| PencilHoverSettingPersistsWithoutCreatingMarks; PencilHapticsPreferencePersistsWithoutMarks | Pencil detail anchor / Form reveal timing | Did a stable collection frame retain the detail scope, and how long did the bottom-directed reveal take? |
+| Shared setSwitch callers | Switch before press / Switch value failed | Was the thumb hittable before delivery; which overlaps existed only if delivery/value failed? |
+
+### I7 - split the long highlighter test and measure each colour cycle
+
+Confirmed R12:ink-tools#3's holds=false correction: the old test used 161 s of 180 s; this run reached Thickness at t=178.3 after colour cycles grew from approximately 16 s to 29 s. Neither app nor runner is established as the cause. Retained the existing test declaration as widths + all six colours, including every raster, undo and per-colour reopen-selection assertion. Moved the complete Thickness/Stabilisation/Draw and hold tail into testHighlighterThicknessStabilisationAndDrawHoldPersist with its own fixture and the same third width slot selected. It also explicitly checks Thickness persistence, alongside the original smoothing/switch checks and final draw. No allowance changes.
+
+Each colour iteration logs wall time on success or throw, with separate open settings, choose, both closes, draw preparation, draw (including visible-ink verification), undo and reopen (including persisted selection) timings. CI should report Ink +1 test, both halves within 180 s, and comparable timing series that locate any growing cost. The split removes roughly 20-30 s of tail work from the old test but adds fixture setup overall; it is not a slowdown fix and does not guarantee the widths/colours half fits a contended runner. Fixed-time process sampling remains CI-owned and outside this job.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| HighlighterWidthsColoursStabilisationAndDrawHoldPersist (widths/colours half) | Highlighter colour timing | Does time grow per iteration, and is it in settings open, choose, close, draw, undo or reopen? |
+
+### Final review and validation
+
+Re-read all changed Swift blocks and surrounding paths in NibUI, InkUITests and LibraryUITests, and checked NibTouchPaths.h's unchanged signatures. No Objective-C edits. Reviewed XCTest element/query/snapshot types, optional bindings, throwing/rethrowing closures, predicate placeholders and argument counts, gesture overloads, coordinate origins, bounded waits and string expressions. Current SettingsRootViewController confirms the sidebar is a ScrollView with a LazyVStack beside the detail List, separated by a divider; the frame binding does not assume a CollectionView sidebar. Source-review corrections were folded into their owning cluster commits: Files keyboard existence before descendant access and both process keyboard exclusion frames; explicit process names rather than an assumed application bundleIdentifier getter; card-menu-only closure checks (including Trash); and no acceptance of a merely moved Library row as a closed menu.
+
+Caller audit covered every class file. The existing vertical reveal implementation and every existing caller retain their behavior. H6 is opt-in from I4 only. nameNewFilesFolder still verifies exact replacement and serves both Library's external export and saveSharedPNG. setSwitch callers in Chrome, Capture, Library and Ink retain their values and failure checks. nativeContextMenu callers in Pages/Insert retain synthesized contacts, submenu traversal, same-named successor handling, outside cancellation and the existing eight-second closure gate; only the new evidence and failure wording change. Library's new four-second closure gate applies to known card rows, not App Menu/document More or arbitrary menu successors. dragWithHold and settings signatures are unchanged; only the named Ink call sites opt in. All colour-picker close callers keep the picker-gone wait, and no picker warm-up or Add Colour/native-row retry exists.
+
+Required checks: **python Scripts/lint.py: 0 errors, 25 existing warnings**; **git diff --check** and **git diff --check b20b2f22** pass. A Python UTF-8 source inventory against the merged base confirms all **598 existing test declarations** and every existing XCTAssert line remain, with **one new test (599 total)**; execution allowances and sleep/skip inventories are unchanged. Exactly four paths changed, all under NibUITests. Ten cluster commits have the exact required subject prefix and two-line attribution body. Worktree clean after committing; no push.
+
+No local Swift compilation or simulator execution is claimed. CI/reviewer focus: Files process versus hosted remote keyboard/tree and empty browser geometry; app-level remote picker close exposure; native menu/list ancestry and same-named confirmations; horizontal chip-scroll interception and stable row signatures; Pencil pane geometry/index retention as its lazy children change; and highlighter timing under contention. XCTest's synchronous AX calls retain their internal timeouts; outer predicate budgets cannot interrupt them. A menu frame absent from the returned tree is explicitly logged as unexposed rather than invented. Diagnostic snapshots can add latency.
+
+Estimated, unmeasured savings: I5 removes roughly **20-40 s** of needless top searches; I6 targets roughly **50 s per hover/haptics test** from sidebar detours and success-path switch diagnostics. The highlighter split moves roughly **20-30 s** to a fresh test but adds fixture setup overall; no suite-total speedup is claimed. All 11b clusters are implemented or explicitly explained. Remaining external work: the three unproven app/environment failures need their app QA logs; real Files-to-Nib Split View is still unavailable here, so L1 should next reach **External drop setup requires iPad multitasking controls**. The earlier 11a six-session Time Keeper budget limitation remains outside this job.
+
+### Review fixes - round 3 (2026-11-06)
+
+Reviewed only job 11b changes against their pre-11b base and the three supplied findings. These corrections supersede the affected I6, I7 and H8 notes above; job 11a and app sources are unchanged.
+
+1. **Clipped switch centre (major, superseded by round 4 below):** this round restricted the fast path using the native Popover count. That did not restore the check for Nib tool popovers, which expose labelled ScrollViews even when the native Popover count is zero. The major remained open until the explicit caller opt-out in round 4.
+2. **Native menu snapshot cost (minor):** nativeMenuRowFacts now searches snapshots of at most eight Menu elements and the exposed Preview element, stopping when it finds the row's ancestor. It never snapshots the whole application for these tap facts. Label, identifier, row frame and menu/list frame are still captured before delivery; absent ancestry remains explicitly unexposed. Library, Pages and Insert callers keep their existing tap routes, closure waits, successor handling and no-retry behavior. CI must verify scoped frame diagnostics and menu closure; no measured latency saving is claimed.
+3. **Unrequested Thickness persistence (minor):** removed only the equality assertion newly introduced by the highlighter split and discarded the now-unused return value. The Thickness drag still verifies a visible value change; original Stabilisation and Draw and hold persistence assertions and the final draw remain. CI must run both split tests under their unchanged allowances.
+
+Diagnostic prefixes remain unchanged: **Native menu row tap / Native menu row tap not delivered** now obtain ancestry from scoped snapshots. No new diagnostics, sleeps, retries, skipped tests or allowance changes. Re-read changed Swift blocks and inventoried all toggle/native-menu callers; the existing snapshot/query APIs, argument labels and optional bindings remain compatible.
+
+Validation: **python Scripts/lint.py: 0 errors, 25 existing warnings**; **git diff --check** passes. Only three NibUITests paths changed. Swift compilation and simulator execution remain unavailable on Windows and require GitHub Actions; scoped AX reads can still block internally, and Menu/Preview ancestry exposure must be confirmed there. One new review commit, no amendment or push.
+
+### Review fixes - round 4 (2026-11-06)
+
+**Clipped switch centre (major):** removed the native Popover-count bypass from Ink toggle. Run 42136488712 exposes the Draw and hold and Auto-deselect settings as labelled ScrollViews with popovers=0, so native element type cannot establish that no containing panel exists. Ordinary tool-setting toggles now reach the containing-panel inset-centre check and existing bounded reveal even when the thumb is hittable. Only the four hover/haptics off/on calls explicitly pass scroll: false, after revealPencilPreference succeeds. This supersedes I6's blanket hittability fast path and the ineffective round-3 fix; shared setSwitch remains unchanged.
+
+Reviewed every Ink toggle caller: all other callers retain scroll: true by default, including Draw and hold, Auto-deselect and other tool settings. Existing value, persistence and no-mark assertions, reveal bounds and allowances remain. No new diagnostics, sleeps, retries or test removals. CI must show edge-clipped tool switches revealed before Switch before press without dismissing their panels, plus passing hover/haptics off/on and reopen checks without redundant panel scans. No runtime saving is claimed.
+
+Validation: **python Scripts/lint.py: 0 errors, 25 existing warnings**; **git diff --check** passes. Re-read changed Swift control flow and call labels against the current helper signatures. Only InkUITests.swift and this review record changed, both within NibUITests; job 11a and app files are unchanged. Swift compilation and simulator execution require GitHub Actions on macOS. One new round-4 commit; no amendment or push.

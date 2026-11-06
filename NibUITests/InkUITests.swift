@@ -154,7 +154,10 @@ final class InkUITests: XCTestCase {
             // Tap the switch thumb itself; the row's centre can be plain text or clipped at a popover edge.
             let native = element.switches.firstMatch
             let target = native.exists ? native : element
-            for _ in 0..<4 where scroll {
+            for _ in 0..<4 {
+                // Only already-revealed Pencil preferences opt out. Tool popovers are
+                // labelled ScrollViews, so a zero native Popover count proves nothing.
+                if !scroll { break }
                 guard let panel = scrollPanels
                     .filter({ $0.switches.matching(NSPredicate(format: "label == %@", label)).count > 0 })
                     .min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else { break }
@@ -287,12 +290,18 @@ final class InkUITests: XCTestCase {
             }
             ui.logQA("Colour picker controls", controls(snapshot).joined(separator: "\n"))
         }
-        let close = surface.buttons.matching(NSPredicate(format: "label ==[c] 'close'")).firstMatch
-        let done = surface.buttons.matching(NSPredicate(format: "label ==[c] 'done'")).firstMatch
+        // Remote picker snapshots can omit a close button that the app-level tree exposes.
+        // Match its frame to this picker surface so background chrome cannot win.
+        let closes = ui.app.buttons.matching(NSPredicate(format: "label ==[c] 'close'"))
+        let dones = ui.app.buttons.matching(NSPredicate(format: "label ==[c] 'done'"))
         var dismissal: XCUIElement?
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            if close.exists && close.isHittable { dismissal = close; return true }
-            if done.exists && done.isHittable { dismissal = done; return true }
+            let panel = surface.frame
+            for query in [closes, dones] {
+                if let button = query.allElementsBoundByIndex.prefix(16).first(where: {
+                    panel.contains($0.frame) && $0.isEnabled && $0.isHittable
+                }) { dismissal = button; return true }
+            }
             return false
         }, object: nil)
         let foundControl = XCTWaiter.wait(for: [ready], timeout: isPopover ? 2 : 8) == .completed
@@ -311,16 +320,21 @@ final class InkUITests: XCTestCase {
             }
             let regionFrame = region.frame.intersection(window)
             guard !regionFrame.isNull, !regionFrame.isInfinite,
-                  regionFrame.width > 48, regionFrame.height > 48 else {
+                  regionFrame.width > 48, regionFrame.height > 84 else {
                 throw NibUI.Failure.message("Colour popover has no visible dismissal region")
             }
             let surfaces = ui.app.popovers.allElementsBoundByIndex.map(\.frame) + [panel]
-            let points = [CGPoint(x: regionFrame.minX + 24, y: regionFrame.minY + 24),
-                          CGPoint(x: regionFrame.maxX - 24, y: regionFrame.minY + 24),
+            let safeTop = max(regionFrame.minY + 60, window.minY + 60)
+            let middleY = max(safeTop, regionFrame.midY)
+            let points = [CGPoint(x: regionFrame.minX + 24, y: middleY),
+                          CGPoint(x: regionFrame.maxX - 24, y: middleY),
                           CGPoint(x: regionFrame.minX + 24, y: regionFrame.maxY - 24),
-                          CGPoint(x: regionFrame.maxX - 24, y: regionFrame.maxY - 24)]
+                          CGPoint(x: regionFrame.maxX - 24, y: regionFrame.maxY - 24),
+                          CGPoint(x: regionFrame.midX, y: safeTop)]
             guard let point = points.first(where: { point in
-                regionFrame.contains(point) && !surfaces.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
+                point.y >= safeTop && point.y <= regionFrame.maxY - 24
+                    && point.x >= regionFrame.minX + 24 && point.x <= regionFrame.maxX - 24
+                    && !surfaces.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
             }) else {
                 throw NibUI.Failure.message("Colour popover has no outside dismissal point")
             }
@@ -534,7 +548,7 @@ final class InkUITests: XCTestCase {
         for tool in ["pen", "pencil"] {
             var images: [Raster] = []
             for value: CGFloat in [0.01, 0.99] {
-                try settings(tool); _ = try slider("Stabilisation", to: value); closePopover()
+                try settings(tool, revealTop: false); _ = try slider("Stabilisation", to: value); closePopover()
                 let before = try ui.state(), blank = try raster()
                 let endpoints = [zigzag.first!, zigzag.last!].map {
                     CGRect(x: $0.x - 0.01, y: $0.y - 0.01, width: 0.02, height: 0.02)
@@ -635,6 +649,7 @@ final class InkUITests: XCTestCase {
     }
 
     func testHighlighterWidthsColoursStabilisationAndDrawHoldPersist() throws {
+        // Historical test name retained; the settings/persistence tail has its own fresh fixture below.
         try ui.selectTool("highlighter")
         var areas: [Int] = []
         for slot in 1...3 {
@@ -645,13 +660,36 @@ final class InkUITests: XCTestCase {
         XCTAssertLessThan(areas[0], areas[1], "8 pt < 14 pt highlight")
         XCTAssertLessThan(areas[1], areas[2], "14 pt < 20 pt highlight")
         for colour in ["Lemon", "Apricot", "Mint", "Sky", "Lilac", "Blush"] {
-            try settings("highlighter"); try chooseColour(colour); closePopover()
-            let before = try ui.state(), blank = try raster()
-            try draw(); _ = try visibleInk(after: blank); try undo(to: before)
-            try settings("highlighter")
-            XCTAssertTrue(try control(colour, type: .button).isSelected, "\(colour) must persist")
-            closePopover()
+            let iterationStart = ProcessInfo.processInfo.systemUptime
+            defer {
+                let seconds = ProcessInfo.processInfo.systemUptime - iterationStart
+                ui.logQA("Highlighter colour timing", "colour=\(colour) part=iteration seconds=\(seconds)")
+            }
+            func timed<T>(_ part: String, _ body: () throws -> T) rethrows -> T {
+                let started = ProcessInfo.processInfo.systemUptime
+                defer {
+                    let seconds = ProcessInfo.processInfo.systemUptime - started
+                    ui.logQA("Highlighter colour timing", "colour=\(colour) part=\(part) seconds=\(seconds)")
+                }
+                return try body()
+            }
+            try timed("open settings") { try settings("highlighter") }
+            try timed("choose") { try chooseColour(colour) }
+            timed("close after choose") { closePopover() }
+            let (before, blank) = try timed("prepare draw") { (try ui.state(), try raster()) }
+            try timed("draw") { try draw(); _ = try visibleInk(after: blank) }
+            try timed("undo") { try undo(to: before) }
+            try timed("reopen") {
+                try settings("highlighter")
+                XCTAssertTrue(try control(colour, type: .button).isSelected, "\(colour) must persist")
+            }
+            timed("close after reopen") { closePopover() }
         }
+    }
+
+    func testHighlighterThicknessStabilisationAndDrawHoldPersist() throws {
+        try ui.selectTool("highlighter")
+        try width(3)
         try settings("highlighter")
         _ = try slider("Thickness", to: 0.7)
         let smoothing = try slider("Stabilisation", to: 0.8)
@@ -873,7 +911,21 @@ final class InkUITests: XCTestCase {
     private func fillColourSlots() throws {
         let original = swatches.map(\.label)
         for count in original.count..<12 {
-            try tap("Add Colour"); try chooseColour(count % 2 == 0 ? "Vermilion" : "Moss")
+            let plus = try control("Add Colour", type: .button)
+            XCTAssertTrue(plus.isEnabled, "Add Colour must be enabled")
+            let plusFrame = plus.frame
+            plus.tap()
+            let palette = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == 'Add a colour'")).firstMatch
+            let opened = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                ui.hasVisibleFrame(palette) && palette.buttons.firstMatch.exists
+            }, object: nil)
+            guard XCTWaiter.wait(for: [opened], timeout: 4) == .completed else {
+                let facts = "plusFrame=\(plusFrame) slotCountBefore=\(count)"
+                let state = "qaState=\(String(describing: ui.probe.exists ? ui.probe.value : nil))"
+                ui.logQA("Add Colour opened no palette", facts + " " + state)
+                throw NibUI.Failure.message("Add Colour opened no palette: " + facts + " " + state)
+            }
+            try chooseColour(count % 2 == 0 ? "Vermilion" : "Moss")
             closePopover()
             try wait("Add Colour must append exactly one slot") { self.swatches.count == count + 1 }
             XCTAssertEqual(Array(swatches.prefix(original.count).map(\.label)), original)
@@ -928,7 +980,8 @@ final class InkUITests: XCTestCase {
         try swatchMenu("Rearrange Colours")
         let slots = ui.app.buttons.matching(identifier: "cmd.preset.removeSwatch")
         XCTAssertEqual(slots.count, original.count)
-        slots.element(boundBy: 0).press(forDuration: 0.8, thenDragTo: slots.element(boundBy: 2))
+        ui.dragWithHold(from: slots.element(boundBy: 0).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
+                        to: slots.element(boundBy: 2).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)))
         try tap("Done")
         let expected = [original[1], original[2], original[0]] + Array(original.dropFirst(3))
         try wait("Dragging a swatch must reorder the slots") { self.swatches.map(\.label) == expected }
@@ -1049,14 +1102,17 @@ final class InkUITests: XCTestCase {
         let mixed = try ui.state()
         XCTAssertEqual(mixed.itemCountOnPage, initial.itemCountOnPage + 4)
         try settings("eraser"); try tap("Whole stroke")
-        let chips = try labels.map { try control($0, type: .button, scroll: true) }
+        func revealChip(_ label: String) throws -> XCUIElement {
+            let eraser = ui.app.scrollViews.matching(NSPredicate(format: "label == 'Eraser'")).firstMatch
+            return try ui.revealInHorizontalRow(label, in: eraser, containing: "Pen")
+        }
         for (index, enabled) in labels.enumerated() {
             if index > 0 { try settings("eraser", alreadySelected: true, revealTop: false) }
             // Enable target first, so the last-enabled-filter guard is respected.
-            let target = chips[index]
+            let target = try revealChip(enabled)
             if !target.isSelected { target.tap() }
-            for (chipIndex, label) in labels.enumerated() where label != enabled {
-                let chip = chips[chipIndex]
+            for label in labels where label != enabled {
+                let chip = try revealChip(label)
                 if chip.isSelected { chip.tap() }
                 XCTAssertFalse(chip.isSelected)
             }
@@ -1454,23 +1510,46 @@ final class InkUITests: XCTestCase {
         try tap("Stylus"); try tap("Apple Pencil", scroll: true)
     }
 
-    private func revealPencilPreference(_ name: String) {
-        let detail = ui.app.collectionViews.containing(NSPredicate(
+    private func revealPencilPreference(_ name: String) throws {
+        let preference = ui.app.switches[name].firstMatch
+        if preference.exists && preference.isHittable { return }
+        // The 220 pt Settings sidebar remains realised while the wider detail list scrolls.
+        // Identify its adjacent detail pane by geometry, then bind the unfiltered collection
+        // query so no disappearing lazy detail row can change this query's membership.
+        let sidebar = ui.app.scrollViews.containing(NSPredicate(
             format: "elementType == %@ AND label == %@", NSNumber(value: XCUIElement.ElementType.button.rawValue),
-            "Switch between current tool and eraser")).firstMatch
-        ui.revealFormElement(in: detail) { self.ui.app.switches[name].firstMatch }
+            "Stylus")).firstMatch
+        guard sidebar.exists else { throw NibUI.Failure.message("Settings sidebar is unavailable while locating Apple Pencil detail") }
+        let sidebarFrame = sidebar.frame
+        let collections = ui.app.collectionViews.allElementsBoundByIndex
+        let panes = collections.filter { collection in
+            let frame = collection.frame
+            let adjacent = abs(frame.minX - sidebarFrame.maxX) <= 2 || abs(frame.maxX - sidebarFrame.minX) <= 2
+            return adjacent && frame.width > sidebarFrame.width && frame.height >= sidebarFrame.height
+                && abs(frame.maxY - sidebarFrame.maxY) <= 2
+        }
+        guard panes.count == 1, let detail = panes.first else {
+            throw NibUI.Failure.message("Apple Pencil detail frame is ambiguous: sidebar=\(sidebarFrame) candidates=\(panes.count)")
+        }
+        let detailFrame = detail.frame
+        ui.logQA("Pencil detail anchor", "preference=\(name) frame=\(detailFrame) sidebar=\(sidebarFrame) binding=collection index")
+        ui.revealFormElement(in: detail, edge: .bottom, named: name, type: .switch) { preference }
+        if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
+        guard detail.exists && detail.frame == detailFrame else {
+            throw NibUI.Failure.message("Apple Pencil detail pane changed while revealing \(name)")
+        }
     }
 
     func testPencilHoverSettingPersistsWithoutCreatingMarks() throws {
         let before = try ui.state()
         try pencilSettings()
-        revealPencilPreference("Show hover preview")
-        try toggle("Show hover preview", to: false)
-        try toggle("Show hover preview", to: true)
+        try revealPencilPreference("Show hover preview")
+        try toggle("Show hover preview", to: false, scroll: false)
+        try toggle("Show hover preview", to: true, scroll: false)
         try closePreferences()
         try assertNoNewInk(before)
         try pencilSettings()
-        revealPencilPreference("Show hover preview")
+        try revealPencilPreference("Show hover preview")
         XCTAssertEqual(try control("Show hover preview", type: .switch, scroll: true).value as? String, "1")
     }
 
@@ -1492,13 +1571,13 @@ final class InkUITests: XCTestCase {
     func testPencilHapticsPreferencePersistsWithoutMarks() throws {
         let before = try ui.state()
         try pencilSettings()
-        revealPencilPreference("Pencil haptics")
-        try toggle("Pencil haptics", to: false)
-        try toggle("Pencil haptics", to: true)
+        try revealPencilPreference("Pencil haptics")
+        try toggle("Pencil haptics", to: false, scroll: false)
+        try toggle("Pencil haptics", to: true, scroll: false)
         try closePreferences()
         try assertNoNewInk(before)
         try pencilSettings()
-        revealPencilPreference("Pencil haptics")
+        try revealPencilPreference("Pencil haptics")
         XCTAssertEqual(try control("Pencil haptics", type: .switch, scroll: true).value as? String, "1")
     }
 

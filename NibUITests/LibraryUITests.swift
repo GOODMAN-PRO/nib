@@ -10,6 +10,7 @@ final class LibraryUITests: XCTestCase {
     private let physics = "Physics — Motion"
     private let folder = "Semester Notes"
     private let rootDocuments = ["Concept map", "Lab report", "Motion flashcards", "Physics — Motion"]
+    private var cardMenuOpen = false
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -74,7 +75,8 @@ final class LibraryUITests: XCTestCase {
         try ui.timedAction("Library tap \(label)") { try self.performTap(label, file: file, line: line) }
     }
     private func performTap(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
-        let diagnose = ["Move to Trash", "Save to Files", "Move earlier", "Move later"].contains(label)
+        let favouriteRow = ["Add to Favourites", "Remove from Favourites"].contains(label)
+        let diagnose = favouriteRow || ["Move to Trash", "Save to Files", "Move earlier", "Move later"].contains(label)
         var firstPoll = true
         func candidate() -> XCUIElement? {
             if diagnose && firstPoll {
@@ -106,7 +108,10 @@ final class LibraryUITests: XCTestCase {
             throw error
         }
         guard let target = candidate() else { throw NibUI.Failure.message("Cannot activate \(label)") }
-        target.tap()
+        if cardMenuOpen || favouriteRow {
+            try ui.tapNativeMenuRow(target)
+            cardMenuOpen = false
+        } else { target.tap() }
     }
 
     private func library() throws {
@@ -137,10 +142,12 @@ final class LibraryUITests: XCTestCase {
         try visible(tile, "Context-menu target missing: \(title)")
         ui.timedAction("Library context menu \(title)") { tile.press(forDuration: 1) }
         try visible(button("Rename"), "Long press must open the item context menu")
+        cardMenuOpen = true
     }
 
     private func outside() {
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.07, dy: 0.10)).tap()
+        cardMenuOpen = false
     }
 
     private func cancelConfirmation() throws {
@@ -231,6 +238,7 @@ final class LibraryUITests: XCTestCase {
         // Press the labelled leading part of the row, clear of trailing swipe-action space.
         row.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).press(forDuration: 1)
         try visible(button("Recover"), "Trash long press must expose Recover")
+        cardMenuOpen = true
     }
 
     private func assertRootItems() throws {

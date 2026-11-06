@@ -213,9 +213,10 @@ final class NibUI {
                 hasNative = native.exists
                 target = hasNative ? native : element
             }
-            let facts = "row: " + elementFacts(element) + "\nthumb: " + elementFacts(target, includeOverlaps: true)
-            logQA("Switch before press", facts)
-            guard target.isEnabled && target.isHittable else {
+            let hittable = target.isHittable
+            logQA("Switch before press", "label=\(element.label) expected=\(expected) thumbFrame=\(target.frame) hittable=\(hittable)")
+            guard target.isEnabled && hittable else {
+                let facts = "row: " + elementFacts(element) + "\nthumb: " + elementFacts(target, includeOverlaps: !hittable)
                 throw Failure.message("Switch thumb must be enabled and visible\n" + facts)
             }
             target.coordinate(withNormalizedOffset: CGVector(dx: hasNative ? 0.5 : 0.92, dy: 0.5))
@@ -229,6 +230,67 @@ final class NibUI {
             logQA("Switch value failed", "expected=\(expected) " + facts)
             throw Failure.message("Switch must become \(enabled)\n" + facts)
         }
+    }
+
+    /// Reveal along the row's physical x axis. Frame-directed movement also works in RTL:
+    /// the cue lane is excluded by the scroller frame, wherever the trailing edge lies.
+    func revealInHorizontalRow(_ name: String, type: XCUIElement.ElementType = .button,
+                               in scope: XCUIElement? = nil, containing sibling: String? = nil) throws -> XCUIElement {
+        let started = ProcessInfo.processInfo.systemUptime
+        var moves = 0
+        var outcome = "failed"
+        defer {
+            let seconds = ProcessInfo.processInfo.systemUptime - started
+            logQA("Horizontal reveal", "target=\(name) moves=\(moves) seconds=\(seconds) outcome=\(outcome)")
+        }
+        let root = scope ?? app
+        let anchor = sibling ?? name
+        let rows = root.scrollViews.containing(NSPredicate(format: "label == %@ OR identifier == %@", anchor, anchor))
+        // Choose the innermost scroll view, not its enclosing vertical tool popover.
+        let candidates = rows.allElementsBoundByIndex.prefix(16).filter { hasVisibleFrame($0) }
+        guard let row = candidates.min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else {
+            throw Failure.message("Horizontal row missing for \(name), anchor=\(anchor)")
+        }
+        let target = row.descendants(matching: type).matching(NSPredicate(
+            format: "label == %@ OR identifier == %@", name, name)).firstMatch
+        func nodes(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
+            [node] + node.children.flatMap { nodes($0) }
+        }
+        var seen = Set<String>()
+        var facts = "target=\(name) anchor=\(anchor)"
+        for attempt in 0...8 {
+            guard row.exists, let snapshot = try? measuredSnapshot(row, named: "horizontal row " + anchor) else { break }
+            let viewport = snapshot.frame.intersection(root.frame).intersection(app.windows.firstMatch.frame)
+            guard !viewport.isNull, !viewport.isInfinite, viewport.width > 48, viewport.height > 8 else { break }
+            let children = nodes(snapshot)
+            guard let control = children.first(where: {
+                $0.elementType == type && ($0.label == name || $0.identifier == name)
+            }) else { break }
+            let centre = CGPoint(x: control.frame.midX, y: control.frame.midY)
+            facts = "target=\(name) control=\(control.frame) row=\(snapshot.frame) viewport=\(viewport)"
+            if viewport.insetBy(dx: 2, dy: 2).contains(centre), target.exists && target.isHittable {
+                outcome = "visible"
+                return target
+            }
+            let signature = children.filter { $0.elementType == .button || $0.elementType == .scrollBar }.map {
+                "\($0.identifier)|\($0.label)|\(($0.frame.minX - snapshot.frame.minX).rounded())|\($0.value ?? "")"
+            }.joined(separator: ";")
+            guard attempt < 8, seen.insert(signature).inserted else { break }
+            // An already centred but covered control is not a reason to scroll or tap again.
+            guard centre.x < viewport.minX + 2 || centre.x > viewport.maxX - 2 else { break }
+            let dragLeft = centre.x > viewport.midX
+            let travel = min(viewport.width * 0.6, max(24, abs(centre.x - viewport.midX)))
+            let startX = dragLeft ? viewport.maxX - 12 : viewport.minX + 12
+            let endX = startX + (dragLeft ? -travel : travel)
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            let appFrame = app.frame
+            let start = origin.withOffset(CGVector(dx: startX - appFrame.minX, dy: viewport.midY - appFrame.minY))
+            let end = origin.withOffset(CGVector(dx: endX - appFrame.minX, dy: viewport.midY - appFrame.minY))
+            start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.4)
+            moves += 1
+        }
+        logQA("Horizontal reveal failed", facts)
+        throw Failure.message("Horizontal row must reveal a hittable control: " + facts)
     }
 
     /// Reveals in the actual list: home only from a proven nonzero scroll position.
@@ -807,17 +869,76 @@ final class NibUI {
         let usesInlineEditor = inline.isHittable
         let field = usesInlineEditor ? inline : alertField
         try replaceNativeText(in: field, with: title)
+        func finished(_ route: String, timeout: TimeInterval) -> Bool {
+            let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !field.exists }, object: nil)
+            let result = XCTWaiter.wait(for: [gone], timeout: timeout) == .completed
+            logQA("Files rename commit", "route=\(route) fieldGone=\(result)")
+            return result
+        }
+        let files = XCUIApplication(bundleIdentifier: "com.apple.DocumentsApp")
         if usesInlineEditor {
-            field.typeText("\n")
+            // The remote Files picker can expose its keyboard under the host app tree.
+            // Prefer the Files process; never activate it and dismiss the current save picker.
+            let processes = files.state == .notRunning ? [app] : [files, app]
+            var commitKey: XCUIElement?
+            for process in processes {
+                let keyboard = process.keyboards.firstMatch
+                guard keyboard.exists else { continue }
+                let keys = keyboard.descendants(matching: .any).matching(NSPredicate(
+                    format: "label ==[c] 'Return' OR label ==[c] 'Done' OR identifier == 'Return' OR identifier == 'Done' OR label == %@", "\n"))
+                if let key = keys.allElementsBoundByIndex.prefix(16).first(where: { $0.isEnabled && $0.isHittable }) {
+                    commitKey = key; break
+                }
+            }
+            if let commitKey {
+                logQA("Files rename key", elementFacts(commitKey))
+                commitKey.tap()
+                if finished("keyboard Return/Done", timeout: 4) { return }
+            } else { logQA("Files rename key", "No hittable Return/Done in Files or its hosted keyboard") }
+            if !field.exists { return }
+            // End editing only on observed empty browser space, never on a tile or toolbar action.
+            let browser = app.collectionViews.containing(.textView, identifier: "DOC.inlineRenameField").firstMatch
+            if browser.exists, let snapshot = try? measuredSnapshot(browser, named: "Files rename browser") {
+                func occupied(_ node: XCUIElementSnapshot) -> [CGRect] {
+                    let interactive: [XCUIElement.ElementType] = [.cell, .button, .textView, .textField, .searchField, .keyboard]
+                    return (interactive.contains(node.elementType) ? [node.frame.insetBy(dx: -8, dy: -8)] : [])
+                        + node.children.flatMap { occupied($0) }
+                }
+                let frame = snapshot.frame.intersection(app.windows.firstMatch.frame).insetBy(dx: 24, dy: 24)
+                let keyboardFrames = processes.flatMap { $0.keyboards.allElementsBoundByIndex.map(\.frame) }
+                let blocked = occupied(snapshot) + keyboardFrames
+                let fractions: [CGFloat] = [0.85, 0.65, 0.45, 0.25, 0.10]
+                let points = fractions.flatMap { y in fractions.map { x in
+                    CGPoint(x: frame.minX + frame.width * x, y: frame.minY + frame.height * y)
+                } }
+                if !frame.isNull, frame.width > 0, frame.height > 0,
+                   let point = points.first(where: { point in !blocked.contains { $0.contains(point) } }) {
+                    logQA("Files rename commit", "route=empty browser point=\(point) browser=\(snapshot.frame)")
+                    app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+                        dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+                    if finished("empty browser", timeout: 4) { return }
+                }
+            }
         } else {
             let create = app.alerts.buttons["Create"]
             guard create.isHittable && create.isEnabled else { throw Failure.message("Files Create must be available") }
             create.tap()
+            if finished("alert Create", timeout: 12) { return }
         }
-        let finished = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !field.exists }, object: nil)
-        guard XCTWaiter.wait(for: [finished], timeout: 12) == .completed else {
-            throw Failure.message("Files must finish naming the new folder")
+        if !field.exists { return }
+        XCTContext.runActivity(named: "Files rename failure") { activity in
+            let shot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            shot.name = "Files inline rename full screen"; shot.lifetime = .keepAlways
+            activity.add(shot)
         }
+        logQA("Files rename hierarchy", files.state == .notRunning ? "Files process not running" : files.debugDescription)
+        logQA("Files rename hosted hierarchy", app.debugDescription)
+        let diagnosticProcesses: [(String, XCUIApplication)] = files.state == .notRunning
+            ? [("Nib hosted Files", app)] : [("com.apple.DocumentsApp", files), ("Nib hosted Files", app)]
+        for (name, process) in diagnosticProcesses {
+            logQA("Files rename keyboard buttons", "process=\(name) " + process.keyboards.buttons.debugDescription)
+        }
+        throw Failure.message("Files must finish naming the new folder")
     }
 
     /// Waits for the actual microphone prompt (or an already-authorized Recording HUD), then for system alerts to disappear.
@@ -2450,6 +2571,69 @@ final class NibUI {
         try synthesize(paths, duration: holdAtEnd ? duration * 2 : duration)
     }
 
+    /// Capture before delivery: a post-tap tree may already contain a successor sheet.
+    /// Inspect only native Menu/Preview subtrees; never fetch the whole app for tap facts.
+    func nativeMenuRowFacts(_ row: XCUIElement) -> String {
+        let frame = row.frame
+        let label = row.label
+        let identifier = row.identifier
+        let kind = row.elementType
+        var menuFrame: CGRect?
+        var menuKind = "unexposed"
+        let menus = Array(app.menus.allElementsBoundByIndex.prefix(8))
+        let preview = app.otherElements["Preview"].firstMatch
+        let scopes = menus + (preview.exists ? [preview] : [])
+        for scope in scopes {
+            guard let root = try? measuredSnapshot(scope, named: "native menu row ancestry") else { continue }
+            func ancestors(_ node: XCUIElementSnapshot, path: [XCUIElementSnapshot]) -> [XCUIElementSnapshot]? {
+                if node.elementType == kind && node.label == label && node.identifier == identifier && node.frame == frame {
+                    return path
+                }
+                for child in node.children {
+                    if let found = ancestors(child, path: path + [node]) { return found }
+                }
+                return nil
+            }
+            if let path = ancestors(root, path: []) {
+                let panel = path.last(where: { $0.elementType == .menu })
+                    ?? path.last(where: { [.scrollView, .collectionView, .table].contains($0.elementType) })
+                    ?? path.last(where: { $0.identifier == "Preview" || $0.label == "Preview" })
+                if let panel {
+                    menuFrame = panel.frame
+                    menuKind = "\(panel.elementType)"
+                    break
+                }
+            }
+        }
+        let identity = "label=\(label) identifier=\(identifier) rowFrame=\(frame)"
+        return identity + " menuFrame=\(String(describing: menuFrame)) menuKind=\(menuKind)"
+    }
+
+    /// One ordinary Library row tap, then require the native menu to end. Never retry.
+    func tapNativeMenuRow(_ row: XCUIElement) throws {
+        let frame = row.frame
+        let label = row.label
+        let facts = nativeMenuRowFacts(row)
+        logQA("Native menu row tap", facts)
+        row.tap()
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            guard !app.menus.firstMatch.exists, !app.otherElements["Preview"].firstMatch.exists else { return false }
+            if !row.exists || !row.isHittable { return true }
+            // A moved row alone is not proof of closure. Recognise a same-named native
+            // confirmation only inside its successor Alert/Sheet (e.g. Move to Trash).
+            guard row.frame != frame else { return false }
+            let predicate = NSPredicate(format: "label == %@", label)
+            let confirmations = app.alerts.buttons.matching(predicate).allElementsBoundByIndex
+                + app.sheets.buttons.matching(predicate).allElementsBoundByIndex
+            return confirmations.contains { $0.frame == row.frame && $0.isHittable }
+        }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 4) == .completed else {
+            logQA("Native menu row tap not delivered", facts)
+            recordDiagnostics("Native menu row tap not delivered", facts: facts, includeHierarchy: false)
+            throw Failure.message("native menu row tap not delivered: " + facts)
+        }
+    }
+
     /// Native context menus do not reliably let XCTest reach idle. Every menu contact is synthesized.
     /// A path includes submenu openers, e.g. ["Move", "Move Up"]. Never retry the opening press.
     func nativeContextMenu(_ element: XCUIElement, path: [String], at point: CGPoint = CGPoint(x: 0.5, y: 0.5),
@@ -2489,6 +2673,7 @@ final class NibUI {
         try pressWithoutIdle(at: CGPoint(x: frame.minX + frame.width * point.x,
                                          y: frame.minY + frame.height * point.y), duration: 0.8)
         var activated: [(item: XCUIElement, frame: CGRect)] = []
+        var tapFacts: [String] = []
         for name in path {
             var found: XCUIElement?
             let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
@@ -2519,6 +2704,9 @@ final class NibUI {
             activated.append((item, item.frame))
             logQA("Native menu item", "path=\(path) item=" + elementFacts(item))
             if let dismissAt { try pressWithoutIdle(at: dismissAt, duration: 0.05); break }
+            let facts = nativeMenuRowFacts(item)
+            tapFacts.append(facts)
+            logQA("Native menu row tap", facts)
             try tapWithoutIdle(item)
         }
         var previouslyGone = false
@@ -2535,6 +2723,11 @@ final class NibUI {
         }, object: nil)
         guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
             recordDiagnostics("Native menu dismissal failed")
+            if dismissAt == nil {
+                let facts = tapFacts.joined(separator: "\n")
+                logQA("Native menu row tap not delivered", facts)
+                throw Failure.message("native menu row tap not delivered: " + facts)
+            }
             throw Failure.message("Native menu must disappear before ordinary input: \(path)")
         }
         logQA("Native menu dismissed", "path=\(path) seconds=\(Date().timeIntervalSince(started))")
