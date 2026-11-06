@@ -462,7 +462,11 @@ final class PagesUITests: XCTestCase {
         try wait("C must nest under B at level three") { (try? self.entry("C")["parent"] as? String) == (try? self.entry("B")["id"] as? String) }
         try outlineMenu("D", "Nest in Previous Entry", move: true)
         try outlineMenu("D", "Nest in Previous Entry", move: true)
-        try require(label("D")).press(forDuration: 0.8); try tap("Move")
+        try ui.pressWithoutIdle(try require(label("D")), duration: 0.8)
+        try ui.tapWithoutIdle(try require(button("Move")))
+        try wait("Move submenu must be open before inspecting its depth limit") {
+            self.button("Move Out a Level").exists
+        }
         let tooDeep = button("Nest in Previous Entry")
         XCTAssertFalse(tooDeep.exists && tooDeep.isEnabled, "Outline must not offer a fourth nesting level")
         try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
