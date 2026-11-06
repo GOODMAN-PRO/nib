@@ -308,3 +308,11 @@ Confirmed selection#2 correction: activateLayer's containing-ScrollView poll con
 ### P1 - inspect outline depth without idle waits
 
 Confirmed pages-menus-outline#2: public press/tap with an open menu incurred the observed 60-second idle stall. Use pressWithoutIdle and tapWithoutIdle for D / Move, then query the submenu before retaining the exact disabled-or-absent fourth-level assertion and both Escape closures. All nesting, outdent, order and page-count assertions remain. H9 cuts repeated pre-press tree queries; H10 avoids interruption handling and existing clearNativeText already skips Select All/Delete for empty fields, so no new fixture creation route is introduced. CI must finish under 300 seconds without menu idle waits and with all five move transactions plus depth inspection.
+
+### P3 - unambiguous stack destination
+
+Confirmed pages-drag-photos#2 verdict: two items had system operation zero despite the app move proposal; cause unknown, including context-menu lifecycle timing. Keep the held drag and every reorder/relative-order/set/Undo assertion. Target thumbnail 4's image area at (0.5,0.4), assert clearance from both lifted frames and log those frames and the destination. No retry, lift-duration change or app workaround. Next run must compare proposal/lifecycle logs and show performDrop items=2 plus all original outcomes; otherwise cancellation remains an app/system investigation.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| SelectedThumbnailsDragAsOneStackAndUndoTogether | Page stack destination | Was the destination in the image area, well clear of both lifted cells? |

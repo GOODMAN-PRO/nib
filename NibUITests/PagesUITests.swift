@@ -274,7 +274,13 @@ final class PagesUITests: XCTestCase {
         let before = try ids()
         try pages(window: true); try beginSelection(); try tapThumb(1); try tapThumb(2)
         let source = try require(thumb(1)), target = try require(thumb(4))
-        try dragThumbnail(source, to: target, offset: CGVector(dx: 0.98, dy: 0.85))
+        let lifted = [source.frame, try require(thumb(2)).frame]
+        let targetFrame = target.frame
+        let destination = CGPoint(x: targetFrame.midX, y: targetFrame.minY + targetFrame.height * 0.4)
+        XCTAssertFalse(lifted.contains { $0.insetBy(dx: -16, dy: -16).contains(destination) },
+                       "Stack destination must be clear of both lifted cells")
+        ui.logQA("Page stack destination", "lifted=\(lifted) target=\(targetFrame) destination=\(destination)")
+        try dragThumbnail(source, to: target, offset: CGVector(dx: 0.5, dy: 0.4))
         try wait("Dragging a selection must reorder its stack") { (try? self.ids()) != before }
         let after = try ids(), first = try XCTUnwrap(try ids().firstIndex(of: before[0]))
         XCTAssertLessThan(first + 1, after.count)
