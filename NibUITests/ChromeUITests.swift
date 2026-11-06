@@ -807,6 +807,8 @@ final class ChromeUITests: XCTestCase {
 
     func testApplySavedLayoutRestoresReorderedToolsWithLassoFirst() throws {
         try open(); try customize()
+        // show() appends: establish Pen above Highlighter before exercising the real drag.
+        try tap("Hide Highlighter"); try tap("Show Highlighter")
         let handle = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Highlighter'")).firstMatch
         XCTAssertTrue(handle.waitForExistence(timeout: 5))
         let pen = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Fountain Pen'")).firstMatch
@@ -815,7 +817,16 @@ final class ChromeUITests: XCTestCase {
         XCTAssertTrue(row.exists, "Reorder destination must be the Pen row")
         try reorderHighlighterAbovePen(handle)
         try wait("Reordering must move Highlighter above Pen") {
-            self.query("Hide Highlighter").firstMatch.frame.minY < self.query("Hide Fountain Pen").firstMatch.frame.minY
+            let list = self.ui.app.collectionViews.containing(.button, identifier: "cmd.toolbar.setLayout").firstMatch
+            guard let root = try? self.ui.measuredSnapshot(list, named: "reordered toolbar rows") else { return false }
+            func row(_ node: XCUIElementSnapshot, named name: String) -> CGRect? {
+                if node.elementType == .button && node.label == name { return node.frame }
+                for child in node.children { if let found = row(child, named: name) { return found } }
+                return nil
+            }
+            guard let highlighter = row(root, named: "Hide Highlighter"),
+                  let pen = row(root, named: "Hide Fountain Pen") else { return false }
+            return highlighter.minY < pen.minY
         }
         try saveLayout("Reordered chrome")
         try tap("Reset Toolbar"); try tap("Reset Writing Tools")

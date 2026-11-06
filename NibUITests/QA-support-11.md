@@ -54,3 +54,11 @@ Confirmed R12:capture-and-probe#1 against chord and capture16Settings: the bound
 | --- | --- | --- |
 | Capture Settings / global chord callers | Chord undelivered retry / App key log activity | Was the log demonstrably unchanged after the bounded action wait, and did the single SPI resend arrive? |
 
+### C1 - establish the reorder precondition
+
+Confirmed R12:chrome-customise#3 correction and ToolbarCustomizationModel.show's append behavior. ApplySavedLayoutRestoresReorderedToolsWithLassoFirst now hides then shows Highlighter through the real controls, as its passing sibling does. The held drag remains. Its order wait compares both rows from one list snapshot instead of two Any queries. All save/reset/apply, lasso-first, handle, order and drawing assertions remain. CI must log Pen before Highlighter before the drag and Highlighter before Pen afterwards, then reach saved-layout restoration within the allowance; H1's savings are necessary for the tail.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Both reorder tests | Toolbar reorder before / after; slow query | Was the initial ordering non-vacuous, did the real drag reverse it, and was the order snapshot slow? |
+
