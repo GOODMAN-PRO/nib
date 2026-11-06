@@ -1116,6 +1116,57 @@ final class SelectionUITests: XCTestCase {
     // MARK: clipboard.externalDrag and selection.provenance
 
     func testExternalDragToSafariTransfersImageAndPreservesSource() throws {
+        try pasteImage()
+        let source = try ui.state()
+        XCTAssertEqual(source.selectionCount, 1)
+        let sourceItems = try copiedItems()
+        let sourceBytes = try JSONSerialization.data(withJSONObject: sourceItems, options: [.sortedKeys])
+        let beforeFact = try? ui.qaFact("dragSource") as? [String: Any]
+        let sequenceBefore = beforeFact?["sequence"] as? Int ?? 0
+        let lifted = try bounds()
+        let window = ui.app.windows.firstMatch.frame
+        let pages = ui.app.otherElements.matching(NSPredicate(format: "label MATCHES '^Page [0-9]+ of [0-9]+$'"))
+            .allElementsBoundByIndex.map(\.frame)
+        guard !pages.isEmpty else { throw NibUI.Failure.message("Drag cancellation requires observed page frames") }
+        let candidates = [CGPoint(x: window.midX, y: window.minY + 20),
+                          CGPoint(x: window.maxX - 24, y: window.midY),
+                          CGPoint(x: window.minX + 24, y: window.midY)]
+        let cancelledAt = try XCTUnwrap(candidates.first { point in
+            window.contains(point) && !lifted.contains(point)
+                && !pages.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
+        }, "Cancelled drag needs an in-window destination outside every page")
+        ui.logQA("External drag source contact", "lifted=\(lifted) cancel=\(cancelledAt) window=\(window) pages=\(pages) previousSequence=\(sequenceBefore)")
+        ui.dragWithHold(from: screen(centre(lifted)), to: screen(cancelledAt))
+        var fact = try XCTUnwrap(try ui.qaFact("dragSource") as? [String: Any], "QA fact dragSource must be an object")
+        let sequence = try XCTUnwrap(fact["sequence"] as? Int, "dragSource.sequence is missing")
+        XCTAssertGreaterThan(sequence, sequenceBefore, "System drag must publish a new sequence")
+        XCTAssertEqual(fact["items"] as? Int, 1)
+        let types = try XCTUnwrap(fact["types"] as? [String], "dragSource.types is missing")
+        XCTAssertTrue(types.contains(UTType.png.identifier), "Drag provider must advertise PNG")
+        XCTAssertTrue(types.contains(UTType.utf8PlainText.identifier), "Drag provider must advertise text")
+        XCTAssertEqual(fact["restricted"] as? Bool, false)
+        let preview = try XCTUnwrap(fact["preview"] as? [String: Any], "dragSource.preview is missing")
+        let width = try XCTUnwrap(preview["width"] as? Double)
+        let height = try XCTUnwrap(preview["height"] as? Double)
+        XCTAssertGreaterThan(width, 0); XCTAssertGreaterThan(height, 0)
+        XCTAssertTrue(width.isFinite && height.isFinite)
+        XCTAssertTrue(try XCTUnwrap(preview["x"] as? Double).isFinite)
+        XCTAssertTrue(try XCTUnwrap(preview["y"] as? Double).isFinite)
+        try wait("dragSource PNG must load within the bounded wait; QA fact dragSource is missing if unpublished", timeout: 8) {
+            guard let current = try? self.ui.qaFact("dragSource") as? [String: Any],
+                  current["sequence"] as? Int == sequence else { return false }
+            fact = current
+            return (current["pngBytes"] as? Int ?? 0) > 0
+        }
+        XCTAssertGreaterThan(try XCTUnwrap(fact["pngBytes"] as? Int), 0)
+        ui.logQA("External drag source fact", String(describing: fact))
+        try countsEqual(source)
+        XCTAssertEqual(try JSONSerialization.data(withJSONObject: copiedItems(), options: [.sortedKeys]), sourceBytes,
+                       "Cancelled system drag must preserve the complete source item")
+        let capability = ui.systemWindowControls()
+        guard capability.exists else {
+            throw XCTSkip("Device-only: side-by-side app window controls are missing; verified here: fresh one-item unrestricted drag with PNG/text types, positive preview and PNG bytes, unchanged source")
+        }
         // The dedicated simulator includes Safari, but not Notes. This local, offline HTML document
         // supplies an external editable drop target; no Nib model or command is injected.
         let safari = XCUIApplication(bundleIdentifier: "com.apple.mobilesafari")
@@ -1144,7 +1195,6 @@ final class SelectionUITests: XCTestCase {
         let editor = safari.descendants(matching: .any).matching(NSPredicate(format: "label == 'External drop target'")).firstMatch
         XCTAssertTrue(editor.waitForExistence(timeout: 15), "The external HTML fixture must load before testing drag/drop")
         ui.app.activate()
-        try pasteImage(); let source = try ui.state()
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         let windowMenu = ui.systemWindowControls()
         XCTAssertTrue(windowMenu.waitForExistence(timeout: 5), "Cross-app drag requires real system multitasking controls")

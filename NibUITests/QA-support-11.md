@@ -398,3 +398,27 @@ Confirmed current QAStateProbe publishes qa.externalDisplay from the connected e
 ### D2 - Files capability before preparation
 
 Confirmed library#1's simulator limitation and current 11b Files rename-commit route. First open the intended Semester Notes destination, verify its title/library state and existing Lecture notes card, then query systemWindowControls. Missing controls produce the explicit device-only skip before any export or Files picker. With controls, return to Documents and run the unchanged export/new-folder commit/import/persisted-destination sequence. CI should save the observed roughly 90 seconds of unusable Files preparation and report a skip; all real-device assertions remain.
+
+### S4 - verify drag source before device-only Safari transfer
+
+Confirmed selection#1 and current CanvasDragDrop: source advertises fragment/PNG/UTF-8 text, permits external dragging, and a destination outside page geometry is rejected. Before any Safari launch, paste/select one image, retain its real copied records/counts, start a held system drag and release inside Nib's window outside observed page frames. Require the companion job's lenient qa.dragSource object: sequence newer than the previous publication (zero if no prior session), one item, PNG/text, restricted=false, finite positive preview and nonempty PNG within eight seconds. Missing post-drag fact explicitly fails. Compare full source item JSON and counts after cancellation. Only then check systemWindowControls and skip if missing. The entire existing Safari receiving/drag-back/Undo path follows when available; source preparation is reused, not repeated.
+
+CI must prove Nib's half before reporting a skip. Preview publication and PNG loading are companion-app requirements absent from this merged base and intentionally not rebuilt here. Next run must show a new provider sequence and immutable source; the cancelled destination itself is an observed-geometry experiment and fails if it moves or imports anything.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| ExternalDragToSafariTransfersImageAndPreservesSource | External drag source contact / External drag source fact | Where did the local cancellation end, and what did the real drag delegate/provider publish? |
+
+### Final source and contract review
+
+All H9-H14, P1-P4, N1-N11, S1-S4 and D1-D2 clusters have changes or the evidence-bounded explanation above. Review corrections were folded into their owning cluster commits. Re-read the changed Swift paths and the unchanged NibTouchPaths.h/.m entry points; checked throwing closures, optional casts, predicate arguments, access and call labels across every class. The share process identity is evidenced by app.log's sharinguiservice bootstrap, not its similarly named XPC endpoint. Explicitly typed the mixed Photos scope list, avoided new same-scope optional rebinding and split the glyph array construction. No Objective-C file changed.
+
+Validation: python Scripts/lint.py reports **0 errors, 25 existing warnings**; git diff --check against integration passes. A Python source inventory preserves all **599 test declarations**, every executionTimeAllowance assignment and sleep-call count. The only replaced assertion lines correct connector point decoding while retaining the same count oracles. Four XCTSkip sites are reachable only from the seven named tests; the README lists each capability and prerequisite. Only eleven NibUITests paths changed. No push.
+
+Runtime estimates, not measurements: Outline avoids two approximately 60-second native-menu idle stalls; Sticky removes approximately 25-30 seconds; Tape removes approximately 37 seconds of Photos inventory; each Transcript avoids an approximately 25-second Settings revisit; Audio's skip-loop change nets approximately 6-13 seconds; Files avoids approximately 90 seconds of unsupported preparation. These are per-test estimates, not an aggregate speedup. New viewport snapshots, live Photos inventory, share-process checks and drag-source assertions add work. Replay and the formerly undiagnosed image stall still require CI timing evidence under unchanged allowances.
+
+No local Swift/XCTest compilation or simulator execution is possible here. Reviewer/CI priorities: runner text-event SPI availability, UIKit Tab traversal and lazy fields, nearest-scroll-view AX ancestry/cue geometry, remote share-header exposure, multiple scene probes, cancelled-drag geometry and the companion dragSource publication. The GIPHY, provider-shortcut, selected-chip, stack-drop and Save Style app changes remain owned by the companion jobs. Missing facts and failed simulator prerequisites fail before a device-only skip. No cluster is left unstarted or partially committed.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Capture test21Presentation and its three variants | Presentation device-only prerequisite | Did Share and Export open without Presenter Page before the external-display skip? |
