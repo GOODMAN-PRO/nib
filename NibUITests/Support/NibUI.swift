@@ -2572,6 +2572,7 @@ final class NibUI {
     }
 
     /// Capture before delivery: a post-tap tree may already contain a successor sheet.
+    /// Inspect only native Menu/Preview subtrees; never fetch the whole app for tap facts.
     func nativeMenuRowFacts(_ row: XCUIElement) -> String {
         let frame = row.frame
         let label = row.label
@@ -2579,7 +2580,11 @@ final class NibUI {
         let kind = row.elementType
         var menuFrame: CGRect?
         var menuKind = "unexposed"
-        if let root = try? measuredSnapshot(app, named: "native menu row ancestry") {
+        let menus = Array(app.menus.allElementsBoundByIndex.prefix(8))
+        let preview = app.otherElements["Preview"].firstMatch
+        let scopes = menus + (preview.exists ? [preview] : [])
+        for scope in scopes {
+            guard let root = try? measuredSnapshot(scope, named: "native menu row ancestry") else { continue }
             func ancestors(_ node: XCUIElementSnapshot, path: [XCUIElementSnapshot]) -> [XCUIElementSnapshot]? {
                 if node.elementType == kind && node.label == label && node.identifier == identifier && node.frame == frame {
                     return path
@@ -2593,7 +2598,11 @@ final class NibUI {
                 let panel = path.last(where: { $0.elementType == .menu })
                     ?? path.last(where: { [.scrollView, .collectionView, .table].contains($0.elementType) })
                     ?? path.last(where: { $0.identifier == "Preview" || $0.label == "Preview" })
-                if let panel { menuFrame = panel.frame; menuKind = "\(panel.elementType)" }
+                if let panel {
+                    menuFrame = panel.frame
+                    menuKind = "\(panel.elementType)"
+                    break
+                }
             }
         }
         let identity = "label=\(label) identifier=\(identifier) rowFrame=\(frame)"
