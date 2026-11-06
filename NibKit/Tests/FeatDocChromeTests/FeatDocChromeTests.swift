@@ -8,6 +8,27 @@ import NibTesting
 
 @MainActor
 final class FeatDocChromeTests: XCTestCase {
+    func testStatusSizingKeepsMenuIntrinsicAndCapsLongPill() {
+        for compact in [false, true] {
+            let menu = Menu { Button("Document") {} } label: {
+                Image(nib: .templates).frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+            }
+            .menuIndicator(.hidden)
+            .menuStyle(.button)
+            .buttonStyle(NibPressStyle(shape: Capsule()))
+            .modifier(NavStatusSizing(compact: compact))
+            let pill = Button(String(repeating: "Long bridge client ", count: 20)) {}
+                .modifier(NavStatusSizing(compact: compact))
+            let proposal = CGSize(width: 800, height: NibMetrics.hitTarget)
+            let menuSize = UIHostingController(rootView: menu).sizeThatFits(in: proposal)
+            let pillSize = UIHostingController(rootView: pill).sizeThatFits(in: proposal)
+            XCTAssertEqual(menuSize.width, NibMetrics.hitTarget, accuracy: 0.5)
+            XCTAssertEqual(pillSize.width, compact ? 120 : 160, accuracy: 0.5)
+            XCTAssertGreaterThanOrEqual(menuSize.height, NibMetrics.hitTarget)
+            XCTAssertGreaterThanOrEqual(pillSize.height, NibMetrics.hitTarget)
+        }
+    }
+
     func testLongStatusKeepsEssentialNavigationVisibleAndHittableAt393Points() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         let chrome = try makeWindow(h)

@@ -42,15 +42,17 @@ enum TabStripLayout {
         enabled && tabCount > 1
     }
 
-    /// The after-title Tabs menu measures the actual end of the leading bar, including title/status width.
+    /// Clear both the after-title Tabs menu and the measured leading bar, including any status padding.
     /// Use the trailing bar's final adaptive frame, including its padding; the fixed envelope is only a fallback
     /// before its first layout. The assistant sits outside that bar, so its space is already accounted for.
     static func documentSlot(control: CGRect, bounds: CGRect, compact: Bool, rightToLeft: Bool,
-                             trailingFrame: CGRect? = nil) -> CGRect {
+                             trailingFrame: CGRect? = nil, leadingFrame: CGRect? = nil) -> CGRect {
         let trailingWidth = compact
             ? 3 * NibMetrics.hitTarget + 2 * NibSpacing.xs
             : 7 * NibMetrics.hitTarget + separatorWidth + 2 * NibSpacing.xs + NibSpacing.l
-        let controlEdge = rightToLeft ? control.minX : control.maxX
+        let controlEdge = rightToLeft
+            ? min(control.minX, leadingFrame?.minX ?? control.minX)
+            : max(control.maxX, leadingFrame?.maxX ?? control.maxX)
         let start = rightToLeft
             ? (trailingFrame?.maxX ?? (bounds.minX + NibMetrics.chromeInset + trailingWidth)) + NibSpacing.l
             : controlEdge + NibSpacing.xs + NibSpacing.l
@@ -452,8 +454,9 @@ final class TabStripDocumentPresentation: ObservableObject {
         geometryObserver = NotificationCenter.default.addObserver(forName: NibBarGeometry.didChange,
                                                                   object: nil, queue: .main) { [weak self] note in
             Task { @MainActor in
-                guard let self, let view = self.controller?.viewIfLoaded,
-                      NibBarGeometry.isChange(note, for: "chrome.bar.trailing", in: view) else { return }
+                guard let self, let view = self.controller?.viewIfLoaded else { return }
+                guard NibBarGeometry.isChange(note, for: "chrome.bar.trailing", in: view)
+                    || NibBarGeometry.isChange(note, for: "chrome.bar.leading", in: view) else { return }
                 self.refreshGeometry()
             }
         }
@@ -501,7 +504,8 @@ final class TabStripDocumentPresentation: ObservableObject {
         let bounds = container.inset(by: view.safeAreaInsets)
         let value = TabStripLayout.documentSlot(control: anchor, bounds: bounds, compact: compact,
                                                rightToLeft: rightToLeft,
-                                               trailingFrame: NibBarGeometry.frame("chrome.bar.trailing", in: view))
+                                               trailingFrame: NibBarGeometry.frame("chrome.bar.trailing", in: view),
+                                               leadingFrame: NibBarGeometry.frame("chrome.bar.leading", in: view))
         if slot != value { slot = value }
     }
 

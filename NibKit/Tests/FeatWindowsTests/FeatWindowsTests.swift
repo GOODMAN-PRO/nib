@@ -1261,6 +1261,28 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertEqual(second.additionalSafeAreaInsets.top, 0)
     }
 
+    func testDocumentTabSlotClearsLeadingBarBeyondMenuInBothDirections() {
+        let bounds = CGRect(x: 24, y: 24, width: 1146, height: 780)
+        let menu = CGRect(x: 280, y: 32, width: 44, height: 44)
+        let leading = CGRect(x: 40, y: 32, width: 360, height: 44)
+        let trailing = CGRect(x: 920, y: 32, width: 234, height: 44)
+        func mirror(_ frame: CGRect) -> CGRect {
+            CGRect(x: bounds.minX + bounds.maxX - frame.maxX, y: frame.minY,
+                   width: frame.width, height: frame.height)
+        }
+        let ltr = TabStripLayout.documentSlot(control: menu, bounds: bounds, compact: false,
+            rightToLeft: false, trailingFrame: trailing, leadingFrame: leading)
+        XCTAssertEqual(ltr.minX, leading.maxX + NibSpacing.xs + NibSpacing.l)
+        let rtl = TabStripLayout.documentSlot(control: mirror(menu), bounds: bounds, compact: false,
+            rightToLeft: true, trailingFrame: mirror(trailing), leadingFrame: mirror(leading))
+        XCTAssertEqual(rtl, mirror(ltr))
+        // An earlier bar measurement must never pull the slot back over the menu itself.
+        let shortBar = CGRect(x: 40, y: 32, width: 200, height: 44)
+        let fallback = TabStripLayout.documentSlot(control: menu, bounds: bounds, compact: false,
+            rightToLeft: false, leadingFrame: shortBar)
+        XCTAssertEqual(fallback.minX, menu.maxX + NibSpacing.xs + NibSpacing.l)
+    }
+
     func testDocumentTabPlacementTracksTheMenuInFloatingContainerCoordinates() {
         let document = UIViewController()
         document.loadViewIfNeeded()
