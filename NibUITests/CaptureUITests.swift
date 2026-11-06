@@ -116,11 +116,50 @@ final class CaptureUITests: XCTestCase {
     }
 
     private func capture(_ number: Int, _ screen: String, state: @escaping (QAState) -> Bool) throws {
-        _ = try ui.waitForState(timeout: 15, state)
+        let deadline = ProcessInfo.processInfo.systemUptime + 15
+        let current = try ui.waitForState(timeout: 15, state)
+        // Canvas documents have pages; text documents and study sets do not. The deliberate
+        // failedRender fixture captures the error UI, whose tiles cannot become settled.
+        if current.screen == "document", current.pageCount > 0, current.fixtureScenario != "failedRender" {
+            try captureFact("canvasSettled", deadline: deadline, reason: "canvas did not settle") {
+                ($0 as? Bool) == true
+            }
+        }
         let stem = String(format: "%02d", number) + "-\(screen)-\(appearance)-\(orientation)"
         // XCTest waits for UI idleness before taking the full device screenshot.
         attach(XCTAttachment(screenshot: XCUIScreen.main.screenshot()), name: stem)
         attach(XCTAttachment(string: try XCTUnwrap(ui.probe.value as? String)), name: stem + "-qa-state")
+    }
+
+    /// Keep the state and rendering waits inside the capture's original budget. Missing facts
+    /// are unavailable observations, never success; preserve their exact error in ui.log.
+    private func captureFact(_ name: String, deadline: TimeInterval, reason: String,
+                             matches: @escaping (Any) -> Bool) throws {
+        let started = ProcessInfo.processInfo.systemUptime
+        var last = "QA fact is missing: " + name
+        func ready() -> Bool {
+            do {
+                let fact = try ui.qaFact(name)
+                last = String(describing: fact)
+                return matches(fact)
+            } catch { last = String(describing: error); return false }
+        }
+        do {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else {
+                _ = ready()
+                throw NibUI.Failure.message(reason)
+            }
+            try wait(reason, timeout: remaining, ready)
+            guard ProcessInfo.processInfo.systemUptime <= deadline else {
+                throw NibUI.Failure.message(reason)
+            }
+        } catch {
+            ui.logQA("Capture fact timeout", "fact=\(name) last=\(last) reason=\(reason)")
+            throw NibUI.Failure.message("\(reason); qa.\(name) last=\(last)")
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        ui.logQA("Capture fact ready", "fact=\(name) last=\(last) seconds=\(elapsed)")
     }
 
     private func libraryCapture(_ number: Int, _ screen: String) throws {

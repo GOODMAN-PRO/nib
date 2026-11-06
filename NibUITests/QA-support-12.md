@@ -13,3 +13,13 @@ Audited all openDocument callers in Canvas, Capture, Chrome, Create, Ink, Insert
 | Tests | Log prefix | Question answered |
 | --- | --- | --- |
 | All openDocument callers, especially Capture test18 and Library every-kind | Document editor mount | Which actual editor mounted, and how long after the tap did it become visible? |
+
+### G2 - rendered canvas content
+
+Confirmed V3:whiteboard#0 with the verifier correction: grey placeholders and the missing render gate are proven; whether the renderer regressed is UNKNOWN. New dark portrait waited 4.7 seconds versus old 3.8 and still showed placeholders, so faster capture alone cannot explain all variants. Current capture() only reads model state; all notebook routes, direct whiteboard capture and presentation/tabs pass through it. After that predicate it now requires qa.canvasSettled == true for page-bearing documents, sharing the original 15-second deadline rather than adding another allowance. The companion app owns the fact (every visible tile has real content and none pending); tests do not reconstruct it. Missing/malformed facts fail, with the last value/error and the named reason 'canvas did not settle' in ui.log.
+
+Text/study documents have no pages and retain their own content gates. The deliberate failedRender fixture is the explicit exception: capture33 must display the error, not await impossible successful rendering; its original scenario, failure-count and Try Again gates remain. The assistant's existing foreground contrast/geometry gate is retained unchanged. Should unblock capture18 and protect every page screenshot (04-14, 17, 21-22). Next CI must show true canvas facts before normal attachments, no normal attachment after a timeout, and the error fixture still captured. Compare app render timing before assigning a latency cause.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Every page-bearing Capture screenshot except intentional render error | Capture fact ready / Capture fact timeout | Did the app report settled tiles within the shared 15-second budget, or was the last fact false, malformed or missing? |
