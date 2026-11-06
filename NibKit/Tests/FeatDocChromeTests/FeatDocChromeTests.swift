@@ -85,8 +85,11 @@ final class FeatDocChromeTests: XCTestCase {
                     live: ChromeLiveState(chrome: chrome), geometry: geometry, model: ChromeDocumentModel(chrome: chrome))
                 let expectedEditor = root.currentLayout.editor
                 XCTAssertEqual(root.currentLayout.assistantBottom != nil, size.height >= size.width)
-                let host = UIHostingController(rootView: root.environment(\.colorScheme, scheme)
-                    .environment(\.accessibilityReduceMotion, true))
+                // The system's Reduce Motion value cannot be written into the environment; the design system has its own switch.
+                let reducedMotion = NibMotion.forcesReduced
+                NibMotion.forcesReduced = true
+                defer { NibMotion.forcesReduced = reducedMotion }
+                let host = UIHostingController(rootView: root.environment(\.colorScheme, scheme))
                 host.safeAreaRegions = []
                 let window = UIWindow(frame: CGRect(origin: .zero, size: size))
                 window.rootViewController = host
