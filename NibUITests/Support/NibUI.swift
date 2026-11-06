@@ -1727,25 +1727,29 @@ final class NibUI {
         // The title-bar confirm is a sibling of the inner Other labelled Photos (baseline
         // id=Add, label=Done), so inventory the app once and clip to the picker's observed frame.
         let bounds = selectionScope.frame
-        guard let snapshot = try? measuredSnapshot(app, named: "app snapshot") else {
-            throw Failure.message("Selected Photos picker has no button inventory")
-        }
+        let snapshot = try? measuredSnapshot(app, named: "Photos confirmation inventory")
         func buttons(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
             (node.elementType == .button ? [node] : []) + node.children.flatMap { buttons($0) }
         }
-        let inventory = buttons(snapshot).filter { button in
-            bounds.contains(CGPoint(x: button.frame.midX, y: button.frame.midY))
-        }
-        for button in inventory {
-            let identity = "label=\(button.label) id=\(button.identifier)"
-            logQA("Photos picker buttons", "\(identity) frame=\(button.frame) enabled=\(button.isEnabled)")
+        let snapshotCount = snapshot.map { buttons($0).count } ?? -1
+        logQA("Photos confirmation scope", "frame=\(bounds) pickerExists=\(picker.exists) snapshotButtons=\(snapshotCount)")
+        var inventory: [(label: String, identifier: String, frame: CGRect, isEnabled: Bool)] = []
+        let scopes: [(String, XCUIElement)] = picker.exists ? [("app", app), ("picker", picker)] : [("app", app)]
+        for (name, scope) in scopes {
+            for button in scope.buttons.allElementsBoundByIndex {
+                guard button.exists else { continue }
+                let record = (label: button.label, identifier: button.identifier,
+                              frame: button.frame, isEnabled: button.isEnabled)
+                logQA("Photos picker buttons", "scope=\(name) label=\(record.label) id=\(record.identifier) frame=\(record.frame) enabled=\(record.isEnabled)")
+                inventory.append(record)
+            }
         }
         // The evidenced iOS 26 checkmark is in the top-right title bar, above the Private Access
         // banner's Close button. Require an actual inventoried button in that region, never a guessed point.
         var candidates = inventory.filter { button in
             let f = button.frame
             let visible = !f.isEmpty && !f.isNull && !f.isInfinite && bounds.contains(CGPoint(x: f.midX, y: f.midY))
-            let excluded = ["close", "cancel", "back"].contains(button.label.lowercased())
+            let excluded = ["close", "cancel", "back", "learn more"].contains(button.label.lowercased())
             let titleBar = f.midX > bounds.maxX - 80 && f.midY < bounds.minY + 60
             let named = button.label == "Add" || button.label == "Done"
             return visible && button.isEnabled && !excluded && (titleBar || named)

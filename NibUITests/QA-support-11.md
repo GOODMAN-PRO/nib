@@ -288,3 +288,11 @@ Confirmed insert-menus-alerts-forms#2 correction: the failure tree has ShareShee
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | Collection export; audio sharing | Share sheet close / Share sheet close missing | Which real header received the tap, or which process tree lacked it? |
+
+### H13 / P2 - live Photos confirmation inventory
+
+Confirmed pages-drag-photos#0 correction: selection succeeded, snapshot-clipped inventory was empty, and debugDescription exposed buttons. The cause remains unknown. Log selectionScope frame, picker existence and total snapshot button count (minus one if unavailable), then inventory live app.buttons and picker.buttons with labels, identifiers and frames. Existing named/title-bar rule, actual-button requirement, duplicate-frame removal and picker-gone wait remain; Learn More is explicitly excluded. No coordinate fallback. Should let AddImageFromPhotosPreservesOriginalPages reach its unchanged page assertions or explain the inventory discrepancy. Next run must show one evidenced confirmation and disappearance.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| AddImageFromPhotosPreservesOriginalPages; multi-select Photos | Photos confirmation scope / Photos picker buttons / Photos picker confirm | Is the scope wrong, is the snapshot empty, and which live button satisfies the existing rule? |
