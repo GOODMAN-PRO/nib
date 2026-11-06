@@ -104,6 +104,17 @@ final class NibUI {
         logQA("slow query", timing + " " + tree)
     }
 
+    /// Fixture facts evolve independently of QAState. Missing facts fail explicitly;
+    /// extra keys and unrelated value shapes never affect the strict state decoder.
+    func qaFact(_ name: String) throws -> Any {
+        guard probe.exists, let raw = probe.value as? String,
+              let root = try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              let facts = root["qa"] as? [String: Any], let fact = facts[name], !(fact is NSNull) else {
+            throw Failure.message("QA fact is missing: " + name)
+        }
+        return fact
+    }
+
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
     enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards, tabsOverflow }
     enum FormEdge { case top, bottom, nearest }
@@ -174,26 +185,141 @@ final class NibUI {
         return actionable ? nil : candidates.first?.0
     }
 
+    /// Full vertical containment; horizontal strips retain the existing hittable result.
+    /// nil means geometry is unresolved, never permission to accept or drag the control.
+    private func controlFitsScroller(_ target: XCUIElement, in scope: XCUIElement?) -> Bool? {
+        guard let control = try? measuredSnapshot(target, named: "scroll control"),
+              let root = try? measuredSnapshot(scope ?? app, named: "scroll control ancestry") else {
+            logQA("Control containment unresolved", "target or ancestry snapshot unavailable")
+            return nil
+        }
+        var matches: [(node: XCUIElementSnapshot, ancestors: [XCUIElementSnapshot], window: CGRect)] = []
+        func find(_ node: XCUIElementSnapshot, ancestors: [XCUIElementSnapshot], window: CGRect) {
+            let clip = node.elementType == .window ? window.intersection(node.frame) : window
+            if node.elementType == control.elementType && node.identifier == control.identifier
+                && node.label == control.label { matches.append((node, ancestors, clip)) }
+            let next = node.elementType == .scrollView ? ancestors + [node] : ancestors
+            for child in node.children { find(child, ancestors: next, window: clip) }
+        }
+        find(root, ancestors: [], window: root.frame)
+        // Use identity across snapshots, then geometry entirely from the ancestry snapshot.
+        // A unique identity survives relayout; duplicate identities require an exact frame match.
+        let resolved = matches.count == 1 ? matches : matches.filter { $0.node.frame == control.frame }
+        guard resolved.count == 1, let match = resolved.first else {
+            let facts = "id=\(control.identifier) label=\(control.label) frame=\(control.frame)"
+            logQA("Control containment unresolved", facts + " identityMatches=\(matches.count) frameMatches=\(resolved.count)")
+            return nil
+        }
+        let ancestors = match.ancestors
+        let frames = [match.node.frame, match.window] + ancestors.map { $0.frame }
+        guard frames.allSatisfy({ !$0.isEmpty && !$0.isNull && !$0.isInfinite
+            && $0.minX.isFinite && $0.minY.isFinite && $0.maxX.isFinite && $0.maxY.isFinite }) else {
+            logQA("Control containment unresolved", "label=\(control.label) invalid frames=\(frames)")
+            return nil
+        }
+        guard let nearest = ancestors.last else { return true }
+        if isHorizontalOnlyScroller(nearest) { return true }
+        var viewport = nearest.frame.intersection(match.window)
+        for ancestor in ancestors.dropLast() { viewport = viewport.intersection(ancestor.frame) }
+        viewport = verticalCueViewport(nearest, viewport: viewport)
+        let fits = fitsVerticalViewport(match.node.frame, viewport: viewport)
+        if !fits {
+            logQA("Clipped control reveal", "label=\(control.label) target=\(match.node.frame) scroller=\(nearest.frame) viewport=\(viewport)")
+        }
+        return fits
+    }
+
+    private func fitsVerticalViewport(_ frame: CGRect, viewport: CGRect) -> Bool {
+        !frame.isEmpty && !viewport.isEmpty
+            && viewport.contains(CGPoint(x: frame.midX, y: frame.midY))
+            && frame.minY >= viewport.minY && frame.maxY <= viewport.maxY
+    }
+
+    private func isHorizontalOnlyScroller(_ scroller: XCUIElementSnapshot) -> Bool {
+        guard scroller.elementType == .scrollView else { return false }
+        var horizontal = false
+        var vertical = false
+        func visit(_ node: XCUIElementSnapshot) {
+            if node.elementType == .scrollBar {
+                horizontal = horizontal || node.label.hasPrefix("Horizontal scroll bar")
+                vertical = vertical || node.label.hasPrefix("Vertical scroll bar")
+                return
+            }
+            if !node.frame.isEmpty && !node.frame.isInfinite && !node.frame.isNull {
+                horizontal = horizontal || node.frame.minX < scroller.frame.minX - 1
+                    || node.frame.maxX > scroller.frame.maxX + 1
+                vertical = vertical || node.frame.minY < scroller.frame.minY - 1
+                    || node.frame.maxY > scroller.frame.maxY + 1
+            }
+            // A nested scroller's content belongs to its own axis, not this one's.
+            if [.scrollView, .table, .collectionView].contains(node.elementType) { return }
+            for child in node.children { visit(child) }
+        }
+        for child in scroller.children { visit(child) }
+        return horizontal && !vertical
+    }
+
+    private func verticalCueViewport(_ scroller: XCUIElementSnapshot, viewport: CGRect) -> CGRect {
+        func overflowsBelow(_ node: XCUIElementSnapshot) -> Bool {
+            if node.elementType != .scrollBar && node.frame.maxY > scroller.frame.maxY + 1 { return true }
+            return node.children.contains { overflowsBelow($0) }
+        }
+        // NibScrollView's cue occupies the overflowing bottom edge. At the end of
+        // content there is no clipped lower row to reserve. Native horizontal strips
+        // are handled explicitly by revealInHorizontalRow, never a vertical drag.
+        guard scroller.elementType == .scrollView, scroller.identifier != "nib.canvas",
+              scroller.children.contains(where: { overflowsBelow($0) }) else { return viewport }
+        return CGRect(x: viewport.minX, y: viewport.minY, width: viewport.width,
+                      height: max(0, min(viewport.maxY, scroller.frame.maxY - 16) - viewport.minY))
+    }
+
+    /// `fullyVisible` (with `scroll`) also requires the control's whole height inside its scroller's viewport, minus
+    /// the cue lane, and reveals it otherwise: XCTest calls a row hittable when only a sliver shows, and a tap on
+    /// the sliver does nothing (Fit Height to Text, run 42136488712). It is opt-in because the check costs two
+    /// snapshots, one of them of the whole scope: the ordinary lookup stays one query.
     func requireControl(_ name: String, type: XCUIElement.ElementType = .any,
                         scroll: Bool = false, timeout: TimeInterval = 3,
-                        in scope: XCUIElement? = nil, edge: FormEdge? = nil) throws -> XCUIElement {
-        if let found = findControl(name, type: type, in: scope) { return found }
+                        in scope: XCUIElement? = nil, edge: FormEdge? = nil,
+                        fullyVisible: Bool = false) throws -> XCUIElement {
+        if let found = findControl(name, type: type, in: scope) {
+            if !scroll || !fullyVisible { return found }
+            var fits = controlFitsScroller(found, in: scope)
+            if fits == nil {
+                let resolved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                    fits = controlFitsScroller(found, in: scope)
+                    return fits != nil
+                }, object: nil)
+                guard XCTWaiter.wait(for: [resolved], timeout: timeout) == .completed, fits != nil else {
+                    throw Failure.message("Control containment unresolved: \(name); no reveal attempted")
+                }
+            }
+            if fits == true { return found }
+        }
         if scroll {
             // Virtualized native rows do not exist until their collection view scrolls.
             // Preserve the typed editor/control priority once, then reuse the query while scrolling.
             let revealTarget = findControl(name, type: type, actionable: false, in: scope)
                 ?? (scope ?? app).descendants(matching: type).matching(NSPredicate(
                     format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
-            revealFormElement(in: scope, edge: edge, named: name, type: type) { revealTarget }
+            revealFormElement(in: scope, edge: edge, named: name, type: type, fullyVisible: fullyVisible) { revealTarget }
             if let failure = formRevealFailure { throw Failure.message(failure) }
-            if let found = findControl(name, type: type, in: scope) { return found }
         }
         var found: XCUIElement?
+        var unresolvedGeometry = false
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
             found = findControl(name, type: type, in: scope)
-            return found != nil
+            if let found {
+                if !scroll || !fullyVisible { return true }
+                let fits = controlFitsScroller(found, in: scope)
+                unresolvedGeometry = fits == nil
+                return fits == true
+            }
+            return false
         }, object: nil)
         guard XCTWaiter.wait(for: [ready], timeout: timeout) == .completed, let found else {
+            if unresolvedGeometry {
+                throw Failure.message("Control containment unresolved: \(name); see Control containment unresolved log")
+            }
             throw Failure.message("Missing hittable control: \(name)\n\(app.debugDescription)")
         }
         return found
@@ -532,7 +658,8 @@ final class NibUI {
                 clippedViewport = NibUITestScrollGeometry.viewport(
                     scroll: listFrame, window: window, obstructions: obstructions)
             }
-            guard let viewport = clippedViewport else { return }
+            guard let resolvedViewport = clippedViewport else { return }
+            let viewport = fullyVisible ? verticalCueViewport(snapshot, viewport: resolvedViewport) : resolvedViewport
             let element: XCUIElement
             if let identity {
                 element = list.descendants(matching: identity.elementType).matching(NSPredicate(
@@ -556,7 +683,7 @@ final class NibUI {
             let targetFrame = name != nil || identity != nil ? targetNode(snapshot)?.frame
                 : (element.exists ? element.frame : nil)
             if let targetFrame {
-                let inside = fullyVisible ? viewport.contains(targetFrame)
+                let inside = fullyVisible ? fitsVerticalViewport(targetFrame, viewport: viewport)
                     : viewport.contains(CGPoint(x: targetFrame.midX, y: targetFrame.midY))
                 if inside && element.isHittable { fullyRevealed = true; return }
             }
@@ -1686,25 +1813,29 @@ final class NibUI {
         // The title-bar confirm is a sibling of the inner Other labelled Photos (baseline
         // id=Add, label=Done), so inventory the app once and clip to the picker's observed frame.
         let bounds = selectionScope.frame
-        guard let snapshot = try? measuredSnapshot(app, named: "app snapshot") else {
-            throw Failure.message("Selected Photos picker has no button inventory")
-        }
+        let snapshot = try? measuredSnapshot(app, named: "Photos confirmation inventory")
         func buttons(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
             (node.elementType == .button ? [node] : []) + node.children.flatMap { buttons($0) }
         }
-        let inventory = buttons(snapshot).filter { button in
-            bounds.contains(CGPoint(x: button.frame.midX, y: button.frame.midY))
-        }
-        for button in inventory {
-            let identity = "label=\(button.label) id=\(button.identifier)"
-            logQA("Photos picker buttons", "\(identity) frame=\(button.frame) enabled=\(button.isEnabled)")
+        let snapshotCount = snapshot.map { buttons($0).count } ?? -1
+        logQA("Photos confirmation scope", "frame=\(bounds) pickerExists=\(picker.exists) snapshotButtons=\(snapshotCount)")
+        var inventory: [(label: String, identifier: String, frame: CGRect, isEnabled: Bool)] = []
+        let scopes: [(String, XCUIElement)] = picker.exists ? [("app", app), ("picker", picker)] : [("app", app)]
+        for (name, scope) in scopes {
+            for button in scope.buttons.allElementsBoundByIndex {
+                guard button.exists else { continue }
+                let record = (label: button.label, identifier: button.identifier,
+                              frame: button.frame, isEnabled: button.isEnabled)
+                logQA("Photos picker buttons", "scope=\(name) label=\(record.label) id=\(record.identifier) frame=\(record.frame) enabled=\(record.isEnabled)")
+                inventory.append(record)
+            }
         }
         // The evidenced iOS 26 checkmark is in the top-right title bar, above the Private Access
         // banner's Close button. Require an actual inventoried button in that region, never a guessed point.
         var candidates = inventory.filter { button in
             let f = button.frame
             let visible = !f.isEmpty && !f.isNull && !f.isInfinite && bounds.contains(CGPoint(x: f.midX, y: f.midY))
-            let excluded = ["close", "cancel", "back"].contains(button.label.lowercased())
+            let excluded = ["close", "cancel", "back", "learn more"].contains(button.label.lowercased())
             let titleBar = f.midX > bounds.maxX - 80 && f.midY < bounds.minY + 60
             let named = button.label == "Add" || button.label == "Done"
             return visible && button.isEnabled && !excluded && (titleBar || named)
@@ -2057,6 +2188,46 @@ final class NibUI {
         return last
     }
 
+    /// Opt-in for the native provider Form: reveal once, then let UIKit's keyboard
+    /// traversal bring successive editors into view. No form/model state is injected.
+    func fillNativeFormByKeyboard(_ values: [(String, String)]) throws -> XCUIElement {
+        guard let first = values.first else { throw Failure.message("Native form needs at least one field") }
+        let container = nativeFormContainer()
+        let initial = try requireControl(first.0, type: .textField, scroll: true, in: container)
+        try focusField(initial, in: container)
+        var last = initial
+        for (index, pair) in values.enumerated() {
+            let (name, text) = pair
+            let started = ProcessInfo.processInfo.systemUptime
+            defer { logQA("Native keyboard form field", "field=\(name) seconds=\(ProcessInfo.processInfo.systemUptime - started)") }
+            let field = app.textFields.matching(NSPredicate(
+                format: "label == %@ OR identifier == %@ OR placeholderValue == %@", name, name, name)).firstMatch
+            if index > 0 {
+                var reached = isKeyboardFocused(field, in: container)
+                for _ in 0..<8 where !reached {
+                    try sendHIDKey(0x2B)
+                    let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                        isKeyboardFocused(field, in: container)
+                    }, object: nil)
+                    reached = XCTWaiter.wait(for: [focused], timeout: 1) == .completed
+                }
+                guard reached else { throw Failure.message("Keyboard traversal did not focus " + name) }
+            }
+            guard let value = field.value as? String else { throw Failure.message("Unreadable native field: " + name) }
+            if value != text {
+                if !value.isEmpty && value != field.placeholderValue {
+                    try focusedKey("a", .command)
+                    try sendHIDKey(0x2A)
+                    try waitForNativeText(in: field, equals: "")
+                }
+                if !text.isEmpty { try focusedText(text) }
+            }
+            try waitForNativeText(in: field, equals: text)
+            last = field
+        }
+        return last
+    }
+
     /// A focused field under a floating keypad can be non-hittable and still be the correct typing target.
     func textEditor(_ name: String, timeout: TimeInterval = 8) throws -> XCUIElement {
         let container = nativeFormContainer()
@@ -2124,11 +2295,15 @@ final class NibUI {
                 }
             }
             let rawProbe = probe.value
+            let alertIsUp = app.alerts.firstMatch.exists
+            let deliveryRoute = alertIsUp ? "runner key SPI" : "XCUIElement.typeKey / HID control key"
             XCTContext.runActivity(named: "Native field key route") { activity in
-                let attachment = XCTAttachment(string: "route=XCUIElement.typeKey field=\(field.label) key=\(key) modifiers=\(modifiers.rawValue) probe=\(rawProbe ?? "missing")")
+                let attachment = XCTAttachment(string: "route=\(deliveryRoute) field=\(field.label) key=\(key) modifiers=\(modifiers.rawValue) probe=\(rawProbe ?? "missing")")
                 attachment.lifetime = .keepAlways; activity.add(attachment)
             }
-            if modifiers.isEmpty, let usage = hidUsage(forKey: key) {
+            if alertIsUp {
+                try sendHardwareKey(key, modifiers)
+            } else if modifiers.isEmpty, let usage = hidUsage(forKey: key) {
                 // XCUIElement.typeKey cannot produce Escape or Delete either (see hidUsage(forKey:)).
                 try sendHIDKey(usage)
             } else {
@@ -2183,13 +2358,36 @@ final class NibUI {
         try waitForNativeText(in: field, equals: "")
     }
 
+    /// Uses the runner's existing text-event SPI while an Alert is exposed. Unlike
+    /// XCUIElement.typeText, this never invokes XCTest's default interruption handler.
+    /// Route 3 types the complete string (including shifted punctuation and Unicode).
+    func typeNativeText(_ text: String, in field: XCUIElement) throws {
+        guard app.alerts.firstMatch.exists else { field.typeText(text); return }
+        logQA("Native alert text", "route=runner text SPI characters=\(text.count)")
+        if text == "\n" { try sendHIDKey(0x28); return }
+        try focusedText(text)
+    }
+
+    /// Caller has established the focused field; exact text is verified by the caller.
+    func focusedText(_ text: String) throws {
+        let delivered = XCTestExpectation(description: "Alert text delivered")
+        var failure: Error?
+        NibTouchPaths.sendKey(text, modifiers: 0, route: 3) { error in
+            failure = error; delivered.fulfill()
+        }
+        guard XCTWaiter.wait(for: [delivered], timeout: 10) == .completed else {
+            throw Failure.message("Alert text synthesis timed out")
+        }
+        if let failure { throw failure }
+    }
+
     /// Waits for exact replacement, including empty fields, after proving the old content is gone.
     func replaceNativeText(in field: XCUIElement, with text: String, container: XCUIElement? = nil) throws {
         let started = Date()
         defer { logQA("Native replacement duration", "seconds=\(Date().timeIntervalSince(started))") }
         try clearNativeText(in: field, container: container)
         if !text.isEmpty {
-            timedAction("Native replacement delivery (\(text.count) characters)") { field.typeText(text) }
+            try timedAction("Native replacement delivery (\(text.count) characters)") { try typeNativeText(text, in: field) }
         }
         try waitForNativeText(in: field, equals: text)
     }
@@ -2371,9 +2569,9 @@ final class NibUI {
         return fragment
     }
 
-    func selectTool(_ id: String) throws {
+    func selectTool(_ id: String, scopedOverflow: Bool = false) throws {
         // Reselecting toggles its options strip (or settings for a tool without a strip).
-        if try state().tool != id { try tapControl("tool." + id, overflow: ["tool.more"]) }
+        if try state().tool != id { try tapControl("tool." + id, overflow: ["tool.more"], scopedOverflow: scopedOverflow) }
         _ = try waitForState { $0.tool == id }
     }
 
@@ -2393,7 +2591,7 @@ final class NibUI {
         _ = try waitForState { $0.toolSettingsOpen == id }
     }
 
-    private func tapControl(_ id: String, overflow: [String], diagnostics: Bool = false) throws {
+    private func tapControl(_ id: String, overflow: [String], diagnostics: Bool = false, scopedOverflow: Bool = false) throws {
         func activate(_ control: XCUIElement) {
             if diagnostics { recordDiagnostics("Command tap resolved", facts: elementFacts(control, includeOverlaps: true)) }
             control.tap()
@@ -2415,6 +2613,14 @@ final class NibUI {
         for identifier in overflow {
             guard let menu = candidate(identifier) else { continue }
             menu.tap()
+            if scopedOverflow {
+                let title = identifier == "tool.more" ? "More tools" : "More"
+                let surface = app.scrollViews.matching(NSPredicate(format: "label == %@ OR identifier == %@", title, title)).firstMatch
+                let control = try requireControl(id, type: .button, scroll: true, in: surface)
+                activate(control)
+                try waitForMenuClosed(surface, named: title + " after " + id)
+                return
+            }
             let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
                 app.buttons.matching(identifier: id).firstMatch.exists
             }, object: nil)
@@ -2643,17 +2849,16 @@ final class NibUI {
         // Native menus may expose only buttons under Preview. Remember existing controls so
         // an app-wide fallback cannot mistake persistent Delete/Move chrome for a new item.
         var existingFrames: [String: [CGRect]] = [:]
-        for name in path {
-            var frames: [CGRect] = []
-            for kind in [XCUIElement.ElementType.button, .menuItem] {
-                let matches = app.descendants(matching: kind).matching(NSPredicate(
-                    format: "label == %@ OR identifier == %@", name, name))
-                for candidate in matches.allElementsBoundByIndex.prefix(16) {
-                    if hasVisibleFrame(candidate), candidate.isHittable { frames.append(candidate.frame) }
+        let before = try measuredSnapshot(app, named: "native menu pre-press inventory")
+        func inventory(_ node: XCUIElementSnapshot) {
+            if node.elementType == .button || node.elementType == .menuItem {
+                for name in path where node.label == name || node.identifier == name {
+                    if !node.frame.isEmpty { existingFrames[name, default: []].append(node.frame) }
                 }
             }
-            existingFrames[name] = frames
+            for child in node.children { inventory(child) }
         }
+        inventory(before)
         var previous: CGRect?
         var settled: CGRect?
         let stable = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
@@ -2672,7 +2877,8 @@ final class NibUI {
         logQA("Native menu opening", "path=\(path) frame=\(frame)")
         try pressWithoutIdle(at: CGPoint(x: frame.minX + frame.width * point.x,
                                          y: frame.minY + frame.height * point.y), duration: 0.8)
-        var activated: [(item: XCUIElement, frame: CGRect)] = []
+        var closingContainer: XCUIElement?
+        var lastAction: (item: XCUIElement, frame: CGRect)?
         var tapFacts: [String] = []
         for name in path {
             var found: XCUIElement?
@@ -2687,7 +2893,9 @@ final class NibUI {
                         for candidate in matches.allElementsBoundByIndex.prefix(16) {
                             guard hasVisibleFrame(candidate), candidate.isEnabled, candidate.isHittable else { continue }
                             if scope === app, existingFrames[name, default: []].contains(candidate.frame) { continue }
-                            found = candidate; return true
+                            found = candidate
+                            closingContainer = scope === app ? nil : scope
+                            return true
                         }
                     }
                 }
@@ -2701,25 +2909,28 @@ final class NibUI {
                 recordDiagnostics("Native menu missing", includeHierarchy: true)
                 throw Failure.message(message)
             }
-            activated.append((item, item.frame))
-            logQA("Native menu item", "path=\(path) item=" + elementFacts(item))
+            lastAction = (item, item.frame)
+            logQA("Native menu item", "path=\(path) label=\(item.label) frame=\(item.frame)")
+            if closingContainer == nil {
+                let menu = app.menus.firstMatch
+                if menu.exists { closingContainer = menu }
+            }
             if let dismissAt { try pressWithoutIdle(at: dismissAt, duration: 0.05); break }
             let facts = nativeMenuRowFacts(item)
             tapFacts.append(facts)
             logQA("Native menu row tap", facts)
             try tapWithoutIdle(item)
         }
-        var previouslyGone = false
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            let menuVisible = app.menus.firstMatch.exists || app.otherElements["Preview"].firstMatch.exists
-            let itemsGone = !menuVisible && activated.allSatisfy { action in
-                if !action.item.exists { return true }
-                // Lazy queries may now resolve to a same-named confirmation anywhere in the
-                // app, including an iPad popover or a SwiftUI form with no Sheet AX ancestor.
-                return action.item.frame != action.frame
+        // H9: accept the first absence of the resolved container within eight seconds.
+        // Callers separately verify the successor alert, form or state after this delivery check.
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            if let container = closingContainer { return !container.exists }
+            // Some native trees expose only the row. Keep the existing successor-frame
+            // rule there without three app-wide walks.
+            if let action = lastAction {
+                return !action.item.exists || action.item.frame != action.frame
             }
-            defer { previouslyGone = itemsGone }
-            return previouslyGone && itemsGone
+            return false
         }, object: nil)
         guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
             recordDiagnostics("Native menu dismissal failed")
@@ -2762,7 +2973,7 @@ final class NibUI {
         try synthesize(screenPaths: [[start.screenPoint, end.screenPoint]], duration: duration)
     }
 
-    private func pressWithoutIdle(at point: CGPoint, duration: TimeInterval) throws {
+    func pressWithoutIdle(at point: CGPoint, duration: TimeInterval) throws {
         let frame = app.frame
         let screen = app.coordinate(withNormalizedOffset: .zero)
             .withOffset(CGVector(dx: point.x - frame.minX, dy: point.y - frame.minY)).screenPoint
@@ -3080,6 +3291,35 @@ final class NibUI {
         logQA("Modal form closed", "frame=\(form.frame); form and dismissal cover gone")
     }
 
+    private func dismissSystemShareSheet() throws -> Bool {
+        let remote = XCUIApplication(bundleIdentifier: "com.apple.sharinguiservice")
+        let sources = remote.state == .notRunning ? [app] : [app, remote]
+        let surfaces = sources.flatMap { source in
+            [source.otherElements["ActivityListView"].firstMatch,
+             source.otherElements["ShareSheet.RemoteContainerView"].firstMatch]
+        }
+        let headers = sources.map { $0.buttons["header.closeButton"].firstMatch }
+        guard surfaces.contains(where: { $0.exists }) || headers.contains(where: { $0.exists }) else { return false }
+        var resolvedClose: XCUIElement?
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            resolvedClose = headers.first { $0.exists && $0.isEnabled && $0.isHittable }
+            return resolvedClose != nil
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 5) == .completed, let close = resolvedClose else {
+            logQA("Share sheet close missing", sources.map { $0.debugDescription }.joined(separator: "\n"))
+            throw Failure.message("System share sheet must expose header.closeButton")
+        }
+        logQA("Share sheet close", "label=\(close.label) frame=\(close.frame)")
+        try tapWithoutIdle(close)
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            !headers.contains { $0.exists } && !surfaces.contains { $0.exists }
+        }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
+            throw Failure.message("System share sheet must disappear after its Close control")
+        }
+        return true
+    }
+
     /// Only callers requiring a closed popover opt into the round-10 closure postconditions.
     /// A child share sheet can retain its parent's settings bud. Opt in by tool ID to close
     /// that identified bud through palette reselection after native surfaces have dismissed.
@@ -3088,8 +3328,17 @@ final class NibUI {
         // typed Sheet, run 41961796255), so the close control is looked up app-wide as before. A panel's own
         // close button counts only until something else was dismissed: after Audio's share sheet closes,
         // the loop must not go on to close the Audio panel behind it (D:controls-forms#9).
-        var dismissedSurface = false
+        var dismissedSurface = try dismissSystemShareSheet()
+        var shouldProbeShareSheet = false
         for _ in 0..<8 {
+            // Re-probe only after dismissing a covering surface that could reveal sharing.
+            if shouldProbeShareSheet {
+                shouldProbeShareSheet = false
+                if try dismissSystemShareSheet() {
+                    dismissedSurface = true
+                    continue
+                }
+            }
             if requireClosedPopover {
                 let form = presentedFormSnapshot()
                 if let form, let close = formCloseControl(form) {
@@ -3098,10 +3347,12 @@ final class NibUI {
                     close.tap()
                     try waitForFormClosed(form, cover: region)
                     dismissedSurface = true
+                    shouldProbeShareSheet = true
                     continue
                 }
                 if try dismissPresentedPopover(form: form) {
                     dismissedSurface = true
+                    shouldProbeShareSheet = true
                     continue
                 }
             }
@@ -3112,11 +3363,14 @@ final class NibUI {
             }
             if let close {
                 if close.identifier != "cmd.panel.close" { dismissedSurface = true }
+                shouldProbeShareSheet = close.identifier != "cmd.panel.close"
                 close.tap()
                 continue
             }
             if let sheet = app.sheets.allElementsBoundByIndex.first(where: { hasVisibleFrame($0) && $0.isHittable }) {
-                sheet.swipeDown(); continue
+                sheet.swipeDown()
+                shouldProbeShareSheet = true
+                continue
             }
             if !requireClosedPopover {
                 // A settings bud is not a native popover. Preserve the historical return for shared

@@ -857,7 +857,7 @@ final class InkUITests: XCTestCase {
         let selection = try ui.state().selectionCount
         hex.tap()
         try wait("HEX field must be editable with its keyboard before Select All") { hex.isHittable && self.ui.app.keyboards.firstMatch.exists }
-        try ui.clearNativeText(in: hex); hex.typeText("D03080")
+        try ui.clearNativeText(in: hex); try ui.typeNativeText("D03080", in: hex)
         try wait("HEX field must contain D03080 before closing") {
             (hex.value as? String)?.replacingOccurrences(of: "#", with: "").uppercased() == "D03080"
         }
@@ -876,7 +876,7 @@ final class InkUITests: XCTestCase {
         let invalid = try hexField()
         invalid.tap()
         try wait("Invalid HEX attempt must retain field focus") { invalid.isHittable && self.ui.app.keyboards.firstMatch.exists }
-        try ui.clearNativeText(in: invalid); invalid.typeText("ZZZZZZ")
+        try ui.clearNativeText(in: invalid); try ui.typeNativeText("ZZZZZZ", in: invalid)
         XCTAssertNotNil(invalid.value as? String, "Native HEX editor must still expose its value")
         XCTAssertEqual(try ui.state().selectionCount, selection, "Invalid HEX edit must not select document contents")
         traceSwatch("preset.setSwatch-invalid-before-close", field: invalid)

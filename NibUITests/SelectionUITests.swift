@@ -17,10 +17,10 @@ final class SelectionUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
-        ui.logIdleSelectors(for: String(describing: type(of: self)))
-        try ui.launchFixture()
-        try ui.openDocument("Physics — Motion")
-        _ = try ui.waitForState { $0.itemCountOnPage == 4 && $0.strokeCountOnPage == 1 }
+        step("idle selectors") { ui.logIdleSelectors(for: String(describing: type(of: self))) }
+        try step("launch fixture") { try ui.launchFixture() }
+        try step("open document") { try ui.openDocument("Physics — Motion") }
+        _ = try step("initial counts") { try ui.waitForState { $0.itemCountOnPage == 4 && $0.strokeCountOnPage == 1 } }
     }
 
     override func tearDownWithError() throws {
@@ -37,6 +37,13 @@ final class SelectionUITests: XCTestCase {
         }
         ui.app.terminate()
         self.ui = nil
+    }
+
+    private func step<T>(_ label: String, _ body: () throws -> T) rethrows -> T {
+        let started = ProcessInfo.processInfo.systemUptime
+        ui.logQA("Selection step begin", label)
+        defer { ui.logQA("Selection step timing", "step=\(label) seconds=\(ProcessInfo.processInfo.systemUptime - started)") }
+        return try body()
     }
 
     private func query(_ name: String, type: XCUIElement.ElementType = .any) -> XCUIElementQuery {
@@ -911,15 +918,22 @@ final class SelectionUITests: XCTestCase {
                 return CGPoint(x: x, y: y)
             }
         }
+        let crossbar = roundedStroke(CGPoint(x: 0.405, y: 0.633), CGPoint(x: 0.43, y: 0.630),
+                                     CGPoint(x: 0.46, y: 0.630), CGPoint(x: 0.49, y: 0.627))
+        // Retrace a nearby parallel line in the same stroke for a visible H crossbar.
+        let weightedCrossbar = crossbar + crossbar.reversed().map { CGPoint(x: $0.x, y: $0.y + 0.003) }
+        // One continuous I stroke: top serif, return to its centre, straight stem,
+        // then both halves of the bottom serif. No curved hook or extra stroke count.
+        var serifI = [CGPoint(x: 0.53, y: 0.52), CGPoint(x: 0.58, y: 0.52), CGPoint(x: 0.555, y: 0.52)]
+        serifI.append(contentsOf: roundedStroke(CGPoint(x: 0.555, y: 0.52), CGPoint(x: 0.555, y: 0.60),
+                                               CGPoint(x: 0.555, y: 0.67), CGPoint(x: 0.555, y: 0.75)))
+        serifI.append(contentsOf: [CGPoint(x: 0.53, y: 0.75), CGPoint(x: 0.58, y: 0.75)])
         let sourcePaths = [
-            roundedStroke(CGPoint(x: 0.415, y: 0.54), CGPoint(x: 0.403, y: 0.58),
-                          CGPoint(x: 0.413, y: 0.68), CGPoint(x: 0.41, y: 0.72)),
-            roundedStroke(CGPoint(x: 0.487, y: 0.54), CGPoint(x: 0.477, y: 0.59),
-                          CGPoint(x: 0.488, y: 0.68), CGPoint(x: 0.48, y: 0.72)),
-            roundedStroke(CGPoint(x: 0.40, y: 0.627), CGPoint(x: 0.43, y: 0.617),
-                          CGPoint(x: 0.47, y: 0.622), CGPoint(x: 0.50, y: 0.62)),
-            roundedStroke(CGPoint(x: 0.565, y: 0.54), CGPoint(x: 0.59, y: 0.535),
-                          CGPoint(x: 0.565, y: 0.715), CGPoint(x: 0.59, y: 0.72))
+            roundedStroke(CGPoint(x: 0.405, y: 0.52), CGPoint(x: 0.402, y: 0.59),
+                          CGPoint(x: 0.407, y: 0.68), CGPoint(x: 0.405, y: 0.75)),
+            roundedStroke(CGPoint(x: 0.49, y: 0.52), CGPoint(x: 0.487, y: 0.59),
+                          CGPoint(x: 0.493, y: 0.68), CGPoint(x: 0.49, y: 0.75)),
+            weightedCrossbar, serifI
         ]
         for path in sourcePaths { try draw(path) }
         try clear(); let source = try pixels(), before = try ui.state()
@@ -928,6 +942,7 @@ final class SelectionUITests: XCTestCase {
         let sourceItems = try copiedItems()
         try menu("Convert", "Text")
         let sourceRecognition = try control("Recognised text")
+        ui.logQA("Neaten recognised source", String(describing: sourceRecognition.value))
         ui.recordDiagnostics("Neaten source recognition and stroke geometry", facts: "recognition=\(String(describing: sourceRecognition.value)); records=\(sourceItems)", includeHierarchy: false)
         do {
             defer {
@@ -947,6 +962,7 @@ final class SelectionUITests: XCTestCase {
         let restyledItems = try copiedItems()
         try menu("Convert", "Text")
         let recognised = try control("Recognised text")
+        ui.logQA("Neaten recognised result", String(describing: recognised.value))
         ui.recordDiagnostics("Neaten result recognition and stroke geometry", facts: "recognition=\(String(describing: recognised.value)); records=\(restyledItems)", includeHierarchy: false)
         try wait("Restyled HI must retain its recognised meaning", timeout: 30) {
             let text = (recognised.value as? String ?? "").uppercased().filter { $0.isLetter }
@@ -1004,8 +1020,7 @@ final class SelectionUITests: XCTestCase {
         try key("l", [.command, .option]) {
             _ = try self.ui.waitForState(timeout: 8) { $0.openPanels.contains("layers") }
         }
-        let panel = ui.app.scrollViews.containing(.button, identifier: "Layer 1").firstMatch
-        let row = panel.buttons.matching(NSPredicate(format: "label == %@", "Layer \(number)")).firstMatch
+        let row = ui.app.buttons.matching(NSPredicate(format: "label == %@", "Layer \(number)")).firstMatch
         try wait("Layers panel must expose the target row") { row.exists && row.isHittable }
         try key(String(number), [.command, .option]) {
             try self.wait("Layer \(number) shortcut must mark its row active") {
@@ -1075,23 +1090,25 @@ final class SelectionUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 10) { !$0.openPanels.contains("pages.goToPage") && (original == nil || $0.page == original) }
     }
     private func crossPage(copy: Bool) throws {
-        try selectedInk(); let source = try ui.state()
-        try ui.pinchZoom(scale: 0.5)
-        let zoomed = try ui.waitForState(timeout: 10) { $0.zoom < source.zoom }
+        try step("draw source") { try draw() }
+        try step("select source") { try loop(count: 1) }
+        let source = try step("source state") { try ui.state() }
+        try step("pinch") { try ui.pinchZoom(scale: 0.5) }
+        let zoomed = try step("wait for zoom") { try ui.waitForState(timeout: 10) { $0.zoom < source.zoom } }
         XCTAssertGreaterThanOrEqual(zoomed.zoom, 0.499); XCTAssertLessThanOrEqual(zoomed.zoom, 8.001)
-        let page2 = ui.app.otherElements.matching(NSPredicate(format: "label == 'Page 2 of 4'")).allElementsBoundByIndex.first { $0.frame.height > 100 }
+        let page2 = step("adjacent page query") { ui.app.otherElements.matching(NSPredicate(format: "label == 'Page 2 of 4'")).allElementsBoundByIndex.first { $0.frame.height > 100 } }
         let target = try XCTUnwrap(page2, "Cross-page drag needs the adjacent page laid out")
         let visible = target.frame.intersection(ui.canvas.frame)
         XCTAssertGreaterThan(visible.height, 30, "Zoomed adjacent page must expose a real drop target")
-        drag(centre(try bounds()), centre(visible), modifiers: copy ? .option : [])
-        try goToPage(2)
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == 1 && $0.strokeCountOnPage == 1 }
-        try goToPage(1, original: source.page)
+        try step("cross-page drag") { drag(centre(try bounds()), centre(visible), modifiers: copy ? .option : []) }
+        try step("go to page 2") { try goToPage(2) }
+        _ = try step("destination counts") { try ui.waitForState(timeout: 10) { $0.itemCountOnPage == 1 && $0.strokeCountOnPage == 1 } }
+        try step("return to source") { try goToPage(1, original: source.page) }
         XCTAssertEqual(try ui.state().itemCountOnPage, source.itemCountOnPage - (copy ? 0 : 1))
-        try ui.tapCommand("edit.undo")
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == source.itemCountOnPage }
-        try goToPage(2)
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == 0 }
+        try step("linked undo") { try ui.tapCommand("edit.undo") }
+        _ = try step("undo counts") { try ui.waitForState(timeout: 10) { $0.itemCountOnPage == source.itemCountOnPage } }
+        try step("go to page 2") { try goToPage(2) }
+        _ = try step("empty destination") { try ui.waitForState(timeout: 10) { $0.itemCountOnPage == 0 } }
     }
     func testMoveAcrossPagesAndLinkedUndo() throws { try crossPage(copy: false) }
     func testCopyDragAcrossPagesKeepsSourceAndLinkedUndo() throws { try crossPage(copy: true) }
@@ -1099,6 +1116,57 @@ final class SelectionUITests: XCTestCase {
     // MARK: clipboard.externalDrag and selection.provenance
 
     func testExternalDragToSafariTransfersImageAndPreservesSource() throws {
+        try pasteImage()
+        let source = try ui.state()
+        XCTAssertEqual(source.selectionCount, 1)
+        let sourceItems = try copiedItems()
+        let sourceBytes = try JSONSerialization.data(withJSONObject: sourceItems, options: [.sortedKeys])
+        let beforeFact = try? ui.qaFact("dragSource") as? [String: Any]
+        let sequenceBefore = beforeFact?["sequence"] as? Int ?? 0
+        let lifted = try bounds()
+        let window = ui.app.windows.firstMatch.frame
+        let pages = ui.app.otherElements.matching(NSPredicate(format: "label MATCHES '^Page [0-9]+ of [0-9]+$'"))
+            .allElementsBoundByIndex.map(\.frame)
+        guard !pages.isEmpty else { throw NibUI.Failure.message("Drag cancellation requires observed page frames") }
+        let candidates = [CGPoint(x: window.midX, y: window.minY + 20),
+                          CGPoint(x: window.maxX - 24, y: window.midY),
+                          CGPoint(x: window.minX + 24, y: window.midY)]
+        let cancelledAt = try XCTUnwrap(candidates.first { point in
+            window.contains(point) && !lifted.contains(point)
+                && !pages.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
+        }, "Cancelled drag needs an in-window destination outside every page")
+        ui.logQA("External drag source contact", "lifted=\(lifted) cancel=\(cancelledAt) window=\(window) pages=\(pages) previousSequence=\(sequenceBefore)")
+        ui.dragWithHold(from: screen(centre(lifted)), to: screen(cancelledAt))
+        var fact = try XCTUnwrap(try ui.qaFact("dragSource") as? [String: Any], "QA fact dragSource must be an object")
+        let sequence = try XCTUnwrap(fact["sequence"] as? Int, "dragSource.sequence is missing")
+        XCTAssertGreaterThan(sequence, sequenceBefore, "System drag must publish a new sequence")
+        XCTAssertEqual(fact["items"] as? Int, 1)
+        let types = try XCTUnwrap(fact["types"] as? [String], "dragSource.types is missing")
+        XCTAssertTrue(types.contains(UTType.png.identifier), "Drag provider must advertise PNG")
+        XCTAssertTrue(types.contains(UTType.utf8PlainText.identifier), "Drag provider must advertise text")
+        XCTAssertEqual(fact["restricted"] as? Bool, false)
+        let preview = try XCTUnwrap(fact["preview"] as? [String: Any], "dragSource.preview is missing")
+        let width = try XCTUnwrap(preview["width"] as? Double)
+        let height = try XCTUnwrap(preview["height"] as? Double)
+        XCTAssertGreaterThan(width, 0); XCTAssertGreaterThan(height, 0)
+        XCTAssertTrue(width.isFinite && height.isFinite)
+        XCTAssertTrue(try XCTUnwrap(preview["x"] as? Double).isFinite)
+        XCTAssertTrue(try XCTUnwrap(preview["y"] as? Double).isFinite)
+        try wait("dragSource PNG must load within the bounded wait; QA fact dragSource is missing if unpublished", timeout: 8) {
+            guard let current = try? self.ui.qaFact("dragSource") as? [String: Any],
+                  current["sequence"] as? Int == sequence else { return false }
+            fact = current
+            return (current["pngBytes"] as? Int ?? 0) > 0
+        }
+        XCTAssertGreaterThan(try XCTUnwrap(fact["pngBytes"] as? Int), 0)
+        ui.logQA("External drag source fact", String(describing: fact))
+        try countsEqual(source)
+        XCTAssertEqual(try JSONSerialization.data(withJSONObject: copiedItems(), options: [.sortedKeys]), sourceBytes,
+                       "Cancelled system drag must preserve the complete source item")
+        let capability = ui.systemWindowControls()
+        guard capability.exists else {
+            throw XCTSkip("Device-only: side-by-side app window controls are missing; verified here: fresh one-item unrestricted drag with PNG/text types, positive preview and PNG bytes, unchanged source")
+        }
         // The dedicated simulator includes Safari, but not Notes. This local, offline HTML document
         // supplies an external editable drop target; no Nib model or command is injected.
         let safari = XCUIApplication(bundleIdentifier: "com.apple.mobilesafari")
@@ -1127,7 +1195,6 @@ final class SelectionUITests: XCTestCase {
         let editor = safari.descendants(matching: .any).matching(NSPredicate(format: "label == 'External drop target'")).firstMatch
         XCTAssertTrue(editor.waitForExistence(timeout: 15), "The external HTML fixture must load before testing drag/drop")
         ui.app.activate()
-        try pasteImage(); let source = try ui.state()
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         let windowMenu = ui.systemWindowControls()
         XCTAssertTrue(windowMenu.waitForExistence(timeout: 5), "Cross-app drag requires real system multitasking controls")
@@ -1169,11 +1236,12 @@ final class SelectionUITests: XCTestCase {
         preset.tap()
         try tap("Custom OpenAI-compatible", scroll: true)
         ui.recordDiagnostics("Provider custom preset selected", facts: ui.elementFacts(preset), includeHierarchy: false)
-        let lastField = try ui.fillNativeForm([("Name", "Selection fixture"),
+        let lastField = try ui.fillNativeFormByKeyboard([("Name", "Selection fixture"),
             ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider.port))/v1"),
             ("Chat model", "selection-fixture")])
         // Save through the native editor's shortcut while it still owns keyboard focus.
-        try ui.nativeKey("s", in: lastField)
+        ui.logQA("Provider save shortcut", "saveButtonExists=\(ui.app.buttons["Save provider"].exists)")
+        try ui.nativeKey("s", in: lastField, focusVerified: true)
         let saved = ui.app.staticTexts["Provider saved."].firstMatch
         try wait("Provider save must complete") { saved.exists }
         XCTAssertTrue(saved.waitForExistence(timeout: 10))

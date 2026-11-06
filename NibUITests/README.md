@@ -33,3 +33,18 @@ The transparent `nib.qa.state` accessibility element exists only in fixture mode
 Command controls use `cmd.<registered command ID>` and palette tools use `tool.<tool ID>`, including plugin contributions and overflow items. Multiple controls can share a command ID; narrow by label or ancestor when parameters differ. VoiceOver labels remain unchanged. `tapCommand` searches hittable controls, then document More (`menu.more`) and palette More (`tool.more`). Use `NibAction(command:)`, `.nibCommand(...)` (SwiftUI and native menus), or `.accessibilityIdentifier(...)` when adding a command control. Non-command navigation controls use `menu.*` / `sheet.dismiss`.
 
 Global shortcuts use runner-only `NibTouchPaths.typeKey` event synthesis, with bounded completion and runtime selector checks (unsupported SPI reports every pointer-path selector); native field shortcuts still use `XCUIElement.typeKey`. The optional `keyResponder` class name and `keyResponderIsText` probe fields verify UIKit focus independently of accessibility, and global chords reject text editing while retaining content invariants and caller postconditions. Each delivery attaches its route and modifiers; the runner log names the selected SPI selector.
+
+
+## Device-only steps
+
+These seven tests fail on any unmet simulator prerequisite, then use an observable capability check. Only a missing capability produces `XCTSkip("Device-only: ...; verified here: ...")`; CI reports skips separately from passes. A missing `qa` fact is a failure, never evidence that hardware is unavailable.
+
+| Test | Capability | What CI verifies | What remains for a device |
+| --- | --- | --- | --- |
+| PagesUITests.testDragPagesBetweenWindowsCopiesIntoDestination | System window controls for two Nib scenes side by side | Open in New Window adds a probe-bearing scene showing the source document | Arrange windows, drag pages, verify destination copies and unchanged source |
+| CaptureUITests.test21Presentation | qa.externalDisplay | Share and Export opens; Presenter Page is absent | Presenter Page, Stop Presenting and presentation capture |
+| CaptureUITests.test21PresentationLightLandscape | qa.externalDisplay | Same checks in light landscape | Same presentation route in light landscape |
+| CaptureUITests.test21PresentationDarkPortrait | qa.externalDisplay | Same checks in dark portrait | Same presentation route in dark portrait |
+| CaptureUITests.test21PresentationDarkLandscape | qa.externalDisplay | Same checks in dark landscape | Same presentation route in dark landscape |
+| LibraryUITests.testExternalFilesDropImportsIntoCurrentFolder | System window controls for Files beside Nib | Library shows Semester Notes and its existing document | Export fixture via Files, arrange Split View, import drop, verify destination and reopened page count |
+| SelectionUITests.testExternalDragToSafariTransfersImageAndPreservesSource | System window controls for Safari beside Nib | Cancelled in-window system drag publishes a new sequence, one item, PNG/text types, unrestricted provider, positive preview and PNG bytes; source records/counts unchanged | Safari accepts PNG, source survives, drag back imports, Undo restores counts |

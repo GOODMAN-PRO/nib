@@ -692,7 +692,7 @@ final class CanvasUITests: XCTestCase {
         try boardMenuTap("Rename")
         let field = try require("Board name")
         try ui.replaceNativeText(in: field, with: "Canvas navigation board")
-        field.typeText("\n")
+        try ui.typeNativeText("\n", in: field)
         _ = try require("Canvas navigation board")
         try ui.tapCommand("window.showLibrary")
         try open(whiteboard)

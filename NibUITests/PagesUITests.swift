@@ -274,7 +274,13 @@ final class PagesUITests: XCTestCase {
         let before = try ids()
         try pages(window: true); try beginSelection(); try tapThumb(1); try tapThumb(2)
         let source = try require(thumb(1)), target = try require(thumb(4))
-        try dragThumbnail(source, to: target, offset: CGVector(dx: 0.98, dy: 0.85))
+        let lifted = [source.frame, try require(thumb(2)).frame]
+        let targetFrame = target.frame
+        let destination = CGPoint(x: targetFrame.midX, y: targetFrame.minY + targetFrame.height * 0.4)
+        XCTAssertFalse(lifted.contains { $0.insetBy(dx: -16, dy: -16).contains(destination) },
+                       "Stack destination must be clear of both lifted cells")
+        ui.logQA("Page stack destination", "lifted=\(lifted) target=\(targetFrame) destination=\(destination)")
+        try dragThumbnail(source, to: target, offset: CGVector(dx: 0.5, dy: 0.4))
         try wait("Dragging a selection must reorder its stack") { (try? self.ids()) != before }
         let after = try ids(), first = try XCTUnwrap(try ids().firstIndex(of: before[0]))
         XCTAssertLessThan(first + 1, after.count)
@@ -326,15 +332,34 @@ final class PagesUITests: XCTestCase {
     func testDragPagesBetweenWindowsCopiesIntoDestination() throws {
         let sourceDoc = doc, before = try ids(), sourceKinds = try itemKinds(try ids()[0])
         let targetDoc = try documentID(titled: "Lecture notes")
+        func sceneEvidence() -> (count: Int, showsSource: Bool) {
+            var count = 0, showsSource = false
+            for window in ui.app.windows.allElementsBoundByIndex {
+                let probe = window.otherElements["nib.qa.state"].firstMatch
+                guard probe.exists, let raw = probe.value as? String,
+                      let root = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] else { continue }
+                count += 1
+                if root["document"] as? String == sourceDoc { showsSource = true }
+            }
+            return (count, showsSource)
+        }
+        let initialScenes = sceneEvidence().count
         // Open the source in a separate OS scene through the library's actual context menu.
         try ui.tapCommand("window.showLibrary")
         let card = ui.app.buttons.matching(identifier: "cmd.doc.open").matching(NSPredicate(format: "label BEGINSWITH %@", notebook)).firstMatch
         try require(card).press(forDuration: 0.8); try tap("Open in New Window")
         try wait("Open in New Window must expose the source document") { self.ui.app.buttons["cmd.sidebar.toggle"].exists }
-        ui.logWindowScenes("after Open in New Window, before Pages chord")
-        try pages()
-        // iPadOS windowing control places this scene beside the other Nib scene.
+        try wait("A new probe-bearing scene must show the source document") {
+            let evidence = sceneEvidence()
+            return evidence.count > initialScenes && evidence.showsSource
+        }
+        ui.logWindowScenes("after Open in New Window, before capability check")
+        // Check before arranging or preparing both thumbnail grids.
         let multitasking = ui.systemWindowControls()
+        guard multitasking.exists else {
+            throw XCTSkip("Device-only: side-by-side Nib window controls are missing; verified here: Open in New Window created another scene showing the source document")
+        }
+        try pages()
         try require(multitasking, "Window controls must allow arranging two Nib windows for page drag").tap()
         try tap("Split View", prefix: true)
         let other = XCUIApplication(bundleIdentifier: "com.apple.springboard").icons["Nib"].firstMatch
@@ -462,7 +487,11 @@ final class PagesUITests: XCTestCase {
         try wait("C must nest under B at level three") { (try? self.entry("C")["parent"] as? String) == (try? self.entry("B")["id"] as? String) }
         try outlineMenu("D", "Nest in Previous Entry", move: true)
         try outlineMenu("D", "Nest in Previous Entry", move: true)
-        try require(label("D")).press(forDuration: 0.8); try tap("Move")
+        try ui.pressWithoutIdle(try require(label("D")), duration: 0.8)
+        try ui.tapWithoutIdle(try require(button("Move")))
+        try wait("Move submenu must be open before inspecting its depth limit") {
+            self.button("Move Out a Level").exists
+        }
         let tooDeep = button("Nest in Previous Entry")
         XCTAssertFalse(tooDeep.exists && tooDeep.isEnabled, "Outline must not offer a fourth nesting level")
         try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }

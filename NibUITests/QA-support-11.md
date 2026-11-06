@@ -251,3 +251,213 @@ Validation: **python Scripts/lint.py: 0 errors, 25 existing warnings**; **git di
 Reviewed every Ink toggle caller: all other callers retain scroll: true by default, including Draw and hold, Auto-deselect and other tool settings. Existing value, persistence and no-mark assertions, reveal bounds and allowances remain. No new diagnostics, sleeps, retries or test removals. CI must show edge-clipped tool switches revealed before Switch before press without dismissing their panels, plus passing hover/haptics off/on and reopen checks without redundant panel scans. No runtime saving is claimed.
 
 Validation: **python Scripts/lint.py: 0 errors, 25 existing warnings**; **git diff --check** passes. Re-read changed Swift control flow and call labels against the current helper signatures. Only InkUITests.swift and this review record changed, both within NibUITests; job 11a and app files are unchanged. Swift compilation and simulator execution require GitHub Actions on macOS. One new round-4 commit; no amendment or push.
+
+
+## Round 11c
+
+Merged integration 923759cf cleanly. Read prompts 11a/11b, prior support records and all six assigned R12 families including verdicts. Current source wins; only NibUITests changes. No local Swift compiler or simulator.
+
+### H9 - cheap native-menu closure
+
+Confirmed pages-menus-outline#0 correction and insert-menus-alerts-forms#0: the Templates/Comment/Rename successor already appeared while AX walks exhausted the eight-second double-pass gate. Capture the menu/Preview scope before the final tap and accept its first absent observation. Trees without either retain the last-row disappearance/successor-frame check. The timeout remains eight seconds; callers still verify their own result. Also replaces P1's repeated pre-press live control inventory with one snapshot and removes per-item global counts. All Pages/Insert nativeContextMenu paths, submenu and outside cancellation callers were inspected. Next CI must log menu dismissed and reach Templates, Rename and Comment postconditions; no app export stall is claimed.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Pages/Insert native-menu callers | Native menu pre-press inventory / Native menu dismissed / Native menu row tap | Did a scoped closure observation finish within eight seconds after the single tap? |
+
+### H10 / P2 / N1 - alert-safe replacement and Return
+
+Confirmed pages-menus-outline#1 and insert-menus-alerts-forms#1. HID Delete is already present. Existing NibTouchPaths.sendKey route 3 directly synthesizes text with modifiers reset and supports shifted/Unicode characters without XCUIElement's interruption check; reuse it instead of introducing a second character map or pasteboard dependency. Return in an exposed Alert uses HID 0x28. Native modified keys also use the existing runner route in an Alert. Exact waitForNativeText remains. Audited every typeText: Canvas board Return, Insert author/GIPHY Return, Create's generic replacement and Ink colour fields now use the alert-aware helper; ordinary canvas text, assistant/comment composers, search and foreign Safari keep public typing. Files no longer has a public Return after 11b. No cancellation-handler workaround. Next CI must complete both Outline tests and collection rename without a default Cancel; H9 separately covers audio/comment menu successors.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Alert replacement / board and author Return / colour fields | Native alert text | Was text delivered by runner SPI rather than interruption-monitored input? |
+
+### H11 / N1 - clipped controls
+
+Confirmed insert-controls#4 and correction against requireControl's hittable early return and NibScrollView's 16-point bottom cue. scroll:true now requires full target containment in its nearest snapshot ancestor ScrollView intersected with outer scrollers/window, reserving the overflowing bottom cue edge. A clipped match logs its frames and enters the existing bounded fullyVisible reveal; post-reveal/poll checks use the same requirement. Non-scroll callers are unchanged. Full reveal applies the same cue geometry. Horizontal strips retain H6's explicit path. This should unblock Fit Height to Text; CI must show a fully contained row before the unchanged false-value wait. AX ancestry/viewport exposure needs runtime verification; no canvas fall-through cause is asserted.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| TextBoxStyleAndAutosizePersist; scroll:true callers | Clipped control reveal | Which target/scroller/cue viewport rejected a partly visible control? |
+
+### H12 / N1 - close system sharing before popover checks
+
+Confirmed insert-menus-alerts-forms#2 correction: the failure tree has ShareSheet.RemoteContainerView and header.closeButton; the defect is strict-popover ordering, not an absent Close label. app.log bootstraps osservice<com.apple.sharinguiservice>; com.apple.sharing.sharesheet is its XPC endpoint, not the process identity. dismissSheets now resolves the sharinguiservice application when running plus the hosted app tree, taps the sheet's own header close, and waits for its header/surfaces to disappear before checking other popovers. Missing header fails with both available trees; no guessed outside contact. Audio's underlying panel remains protected by dismissedSurface. Should unblock collection export/import-cancel and audio export. Next CI must show sheet closure, retained parent handling, then the original import/cancel assertions. Remote bundle/tree visibility remains CI-only.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Collection export; audio sharing | Share sheet close / Share sheet close missing | Which real header received the tap, or which process tree lacked it? |
+
+### H13 / P2 - live Photos confirmation inventory
+
+Confirmed pages-drag-photos#0 correction: selection succeeded, snapshot-clipped inventory was empty, and debugDescription exposed buttons. The cause remains unknown. Log selectionScope frame, picker existence and total snapshot button count (minus one if unavailable), then inventory live app.buttons and picker.buttons with labels, identifiers and frames. Existing named/title-bar rule, actual-button requirement, duplicate-frame removal and picker-gone wait remain; Learn More is explicitly excluded. No coordinate fallback. Should let AddImageFromPhotosPreservesOriginalPages reach its unchanged page assertions or explain the inventory discrepancy. Next run must show one evidenced confirmation and disappearance.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| AddImageFromPhotosPreservesOriginalPages; multi-select Photos | Photos confirmation scope / Photos picker buttons / Photos picker confirm | Is the scope wrong, is the snapshot empty, and which live button satisfies the existing rule? |
+
+### H14 / S2 - direct control polls and step timing
+
+Confirmed selection#2 correction: activateLayer's containing-ScrollView poll consumed 45 seconds; host-wide slowdown is unproven. Poll Layer N directly after the existing panel-state wait, retaining selected/Active value and closure checks. Audited containing queries across all classes: Insert's commentEditor had another repeatedly evaluated containing query and now polls/rebinds the typed editor directly; other containing queries perform one-time discovery rather than polling. Selection setup and crossPage steps log wall time including launch, document open, drawing, selection, zoom, destination query/drag, navigation and undo/count waits. Should unblock MoveObjectsToLayer and locate MoveAcross's 53-second startup. CI must correlate timings with the new eight-second silence samples before assigning app versus host cause.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| MoveAcrossPagesAndLinkedUndo; Selection setup/cross-page sibling | Selection step begin / Selection step timing | Which action, including work before the first key, consumed the time? |
+
+### P1 - inspect outline depth without idle waits
+
+Confirmed pages-menus-outline#2: public press/tap with an open menu incurred the observed 60-second idle stall. Use pressWithoutIdle and tapWithoutIdle for D / Move, then query the submenu before retaining the exact disabled-or-absent fourth-level assertion and both Escape closures. All nesting, outdent, order and page-count assertions remain. H9 cuts repeated pre-press tree queries; H10 avoids interruption handling and existing clearNativeText already skips Select All/Delete for empty fields, so no new fixture creation route is introduced. CI must finish under 300 seconds without menu idle waits and with all five move transactions plus depth inspection.
+
+### P3 - unambiguous stack destination
+
+Confirmed pages-drag-photos#2 verdict: two items had system operation zero despite the app move proposal; cause unknown, including context-menu lifecycle timing. Keep the held drag and every reorder/relative-order/set/Undo assertion. Target thumbnail 4's image area at (0.5,0.4), assert clearance from both lifted frames and log those frames and the destination. No retry, lift-duration change or app workaround. Next run must compare proposal/lifecycle logs and show performDrop items=2 plus all original outcomes; otherwise cancellation remains an app/system investigation.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| SelectedThumbnailsDragAsOneStackAndUndoTogether | Page stack destination | Was the destination in the image area, well clear of both lifted cells? |
+
+### N2 - Save Style touch diagnostic
+
+Confirmed insert-menus-alerts-forms#3 verdict: touch reached canvas, but window coordinates/presentation state were unknown. Immediately before delivery read Save Style's current frame, log its centre and send that exact point via existing runner touch synthesis. Exposed the existing point overload internally; no gesture implementation change. Original alert/name/style/default assertions remain. This is the verifier's experiment, not a claimed fix. CI must compare Save Style touch and Interface/Touch path conversion with the app's window-touch and prompt-guard logs.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| NamedStyleAndDefaultAffectNewText | Save Style touch | Which fresh frame and exact interface point was sent to the runner? |
+
+### N3 - audio settings and playback budget
+
+Confirmed insert-controls#0 correction: final playback lasted 31 ms with both options enabled; silence versus noise processing is inferred. Retain both enabled-option assertions, turn both options off and verify their absence before the final Play/Pause. Shorten skip loops using the already verified scrubbed position minus the first ten-second skip and the recorded duration: floor + one deliberately crosses each endpoint once. Every seek/endpoint/speed/close assertion remains. For the observed 31-second clip this removes three menu/action pairs and adds two; estimated net saving 6-13 seconds, not measured. CI must reach Close Player with sustained settings-off playback under 300 seconds.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| AudioPlayPauseSeekSkipSettingsAndClose | Audio settings-off playback | Were both processing options off before the final Play/Pause? |
+
+### N4 - collection strip
+
+Confirmed insert-controls#1 against ElementsCollectionBar and the vertical My Objects reveal. Use 11b H6 within Elements, anchored by Stickers, for the chip tap after reopen. The app owns selected-chip scrolling; the test still taps and verifies the actual saved/deleted element. CI must log Horizontal reveal and finish all source/reuse/delete checks.
+
+### N5 - GIPHY readiness
+
+Confirmed insert-controls#2: reveal ran while the network-dependent row did not exist. The companion app job supplies immediate fixture failure; wait boundedly for the actual Try Again button before reveal/tap. Query-retention and key removal remain. CI must expose it within about one second without network activity or an absent-row drag.
+
+### N6 - retained Tape scroll
+
+Confirmed insert-controls#3: History at y290 was above the restored y476 viewport. Request scroll:true before History. No app reset assumption; every pattern/width/straightness/orientation/history assertion remains. CI must reveal History then reach Clear History and the second drawing checks.
+
+### N7 - connector point encoding
+
+Confirmed insert-controls#5 against Geometry.Point's unkeyed [x,y] encoding. All three bends casts now use [[Double]]. Original count-one, changed geometry, Remove Bends and Undo count assertions are unchanged. CI must progress past the old nil dictionary-array cast and exercise the remaining bend edits.
+
+### N8 / S1 - provider setup and shortcut evidence
+
+Confirmed insert-providers-timeouts#0/#1 and selection#0: Command-S was unclaimed; lazy-row causation is inferred. Retain Command-S for the companion app shortcut fix and log Save provider existence immediately before sending it. Provider forms opt into a new keyboard batch: one initial Name reveal, field-specific focus checked after bounded HID Tab traversal, exact values read, Select All/Delete only for nonempty differing values, runner SPI typing and exact waitForNativeText for every field. ProviderEditorView source establishes Name/Base URL/API key/Chat model/Transcription ordering; intervening fields are traversed without editing. Each target allows at most eight Tabs with one-second focus waits, then fails explicitly. Shared fillNativeForm defaults/callers are unchanged. Transcript config enables Cloud transcription before AI within the same Settings visit, removing reopen/dismiss work. No seeded storage or shortcut fallback.
+
+Should unblock NativeDiagram, both Transcript tests and AssistantAttribution. CI must show every exact field, Provider saved, transcript/assistant original assertions and setup below the observed 116-171 seconds. Estimate: one Settings reopen saves about 25 seconds; reduced focus/reveal/clear work is unmeasured. Native Tab focus/automatic scroll and runner text SPI need macOS compilation/runtime verification; failure cannot silently type into another field.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Provider-dependent Insert/Selection tests | Native keyboard form field / Provider save shortcut / Insert provider setup | How long did verified field entry take, and was Save realised when Command-S was sent? |
+
+### N9 - Replay contact follows settled page geometry
+
+Confirmed insert-providers-timeouts#2 against the banner's 28-point offset change and CanvasAccessibility: strokes have no individual AX element, while their page has a transformed frame. Record the stroke midpoint relative to that page at drawing time; after recording/replay layouts, reuse settledCanvasPoint's two-read frame/offset/zoom gate and derive the contact from the current page frame. Require it inside the visible page, then retain selectionCount==1, timestamp seek, ink and zoom assertions. Ordinary text/sticky callers retain their clipped-centre behavior. No stale screen fraction, layout offset constant or app workaround. CI must show the two geometry logs separated by banner removal and successful lasso selection. Replay's pixel/closure costs remain subject to the unchanged allowance; no assertion was removed for budget.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| ReplayModesAndSeekFromRealTimestampedInk | Replay recording geometry / Replay settled contact | Did the contact follow the page's current transform after the banner disappeared? |
+
+### N10 - remove measured diagnostic/interruption cost
+
+Confirmed insert-providers-timeouts#3/#4: Sticky completed all assertions in 190.5 seconds with seven 3.2-4.7-second interruption blocks; Tape Photos spent about 37 seconds inventorying assets. The permission monitor now uses one predicate instead of enumerating all buttons; Sticky explicitly removes its unneeded monitor and dismisses each colour popover through the existing runner touch route at the same outside point, bypassing the default interruption path as well. All seven colours, uniqueness/text/source/author checks remain together. Removed diagnostics:true from the three diagnosed photoAsset calls; selection and failure diagnostics remain. CI must fit Sticky under 180 seconds and Tape near 140 seconds; estimated savings about 25-30 and 37 seconds respectively, unmeasured. No split is justified until these measured costs are removed and CI rechecks.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| StickySevenColoursAndSelectedOnlyRecolour | Sticky colour timing | What remains of colour delivery/copy time without interruption handling? |
+
+### N11 - scoped image queries, undiagnosed stall
+
+Confirmed insert-providers-timeouts#5 verdict: slow AX bursts consumed about 62 of 205 seconds; no evidence identifies host versus app. ImagePaste opts into scoped tool-overflow lookup inside More tools and Paste lookup inside Insert Image (current ImageMenuController uses NibPopoverPanel with that title). All persistence/aspect/asset assertions remain. Other selectTool/image callers retain defaults. This reduces tree exposure, not a proven stall cure. CI now samples the app after eight seconds of log silence (at most once per 150 seconds); the next run must correlate samples and existing slow query logs before assigning a cause.
+
+### S3 - unambiguous HI source
+
+Confirmed selection#3: Vision returned IH; the screenshot showed a hairline H crossbar and hooked I. Keep four strokes and both exact HI assertions. Enlarge the pair vertically, reduce the gap, retrace the H crossbar with a small parallel offset in one stroke, and draw a straight I with top/bottom serifs in one continuous stroke. Added direct recognised-string logs alongside existing geometry evidence. This is the requested input experiment, not a claim to fix Vision ordering; the renderer is not mirrored. CI must recognise HI before neaten, retain HI afterwards and pass exact Undo/source checks. If still unstable, an app-owned deterministic recogniser requires a separate decision; no assertion relaxation here.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| NeatenHandwritingChangesInkAndUndoRestoresMeaningfulSource | Neaten recognised source / Neaten recognised result | What text did Vision expose before and after neaten with the clearer four-stroke pair? |
+
+### P4 - two-window capability boundary
+
+Confirmed pages-drag-photos#1. Retain Open in New Window and the original sidebar readiness check; additionally require more probe-bearing windows than before and a source-document probe, using lenient per-window JSON. Only then query existing systemWindowControls and skip when absent, before Pages/Split View preparation. With controls, the complete two-window drag and copy/source assertions remain. Added the device-only coverage table and a lenient qaFact accessor for the remaining capability tests; missing facts throw explicitly. CI must report a skip after proven second-scene creation, never a pass for cross-window transfer.
+
+### D1 - external-display captures
+
+Confirmed current QAStateProbe publishes qa.externalDisplay from the connected external-display scene role and Presenter Page is capability-gated. The four presentation methods use a throwing variant entry point so XCTest receives XCTSkip; ordinary variants keep their existing diagnostic/XCTFail wrapper. Require the actual Share and Export menu with content, read the lenient Boolean fact, assert Presenter Page absent and only then skip when false. A missing/malformed fact or unexpected control fails. When true, the original Presenter Page, Stop Presenting and capture route remains. CI must count four device-only skips with the prerequisite screenshot; a device must deliver the original captures.
+
+### D2 - Files capability before preparation
+
+Confirmed library#1's simulator limitation and current 11b Files rename-commit route. First open the intended Semester Notes destination, verify its title/library state and existing Lecture notes card, then query systemWindowControls. Missing controls produce the explicit device-only skip before any export or Files picker. With controls, return to Documents and run the unchanged export/new-folder commit/import/persisted-destination sequence. CI should save the observed roughly 90 seconds of unusable Files preparation and report a skip; all real-device assertions remain.
+
+### S4 - verify drag source before device-only Safari transfer
+
+Confirmed selection#1 and current CanvasDragDrop: source advertises fragment/PNG/UTF-8 text, permits external dragging, and a destination outside page geometry is rejected. Before any Safari launch, paste/select one image, retain its real copied records/counts, start a held system drag and release inside Nib's window outside observed page frames. Require the companion job's lenient qa.dragSource object: sequence newer than the previous publication (zero if no prior session), one item, PNG/text, restricted=false, finite positive preview and nonempty PNG within eight seconds. Missing post-drag fact explicitly fails. Compare full source item JSON and counts after cancellation. Only then check systemWindowControls and skip if missing. The entire existing Safari receiving/drag-back/Undo path follows when available; source preparation is reused, not repeated.
+
+CI must prove Nib's half before reporting a skip. Preview publication and PNG loading are companion-app requirements absent from this merged base and intentionally not rebuilt here. Next run must show a new provider sequence and immutable source; the cancelled destination itself is an observed-geometry experiment and fails if it moves or imports anything.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| ExternalDragToSafariTransfersImageAndPreservesSource | External drag source contact / External drag source fact | Where did the local cancellation end, and what did the real drag delegate/provider publish? |
+
+### Final source and contract review
+
+All H9-H14, P1-P4, N1-N11, S1-S4 and D1-D2 clusters have changes or the evidence-bounded explanation above. Review corrections were folded into their owning cluster commits. Re-read the changed Swift paths and the unchanged NibTouchPaths.h/.m entry points; checked throwing closures, optional casts, predicate arguments, access and call labels across every class. The share process identity is evidenced by app.log's sharinguiservice bootstrap, not its similarly named XPC endpoint. Explicitly typed the mixed Photos scope list, avoided new same-scope optional rebinding and split the glyph array construction. No Objective-C file changed.
+
+Validation: python Scripts/lint.py reports **0 errors, 25 existing warnings**; git diff --check against integration passes. A Python source inventory preserves all **599 test declarations**, every executionTimeAllowance assignment and sleep-call count. The only replaced assertion lines correct connector point decoding while retaining the same count oracles. Four XCTSkip sites are reachable only from the seven named tests; the README lists each capability and prerequisite. Only eleven NibUITests paths changed. No push.
+
+Runtime estimates, not measurements: Outline avoids two approximately 60-second native-menu idle stalls; Sticky removes approximately 25-30 seconds; Tape removes approximately 37 seconds of Photos inventory; each Transcript avoids an approximately 25-second Settings revisit; Audio's skip-loop change nets approximately 6-13 seconds; Files avoids approximately 90 seconds of unsupported preparation. These are per-test estimates, not an aggregate speedup. New viewport snapshots, live Photos inventory, share-process checks and drag-source assertions add work. Replay and the formerly undiagnosed image stall still require CI timing evidence under unchanged allowances.
+
+No local Swift/XCTest compilation or simulator execution is possible here. Reviewer/CI priorities: runner text-event SPI availability, UIKit Tab traversal and lazy fields, nearest-scroll-view AX ancestry/cue geometry, remote share-header exposure, multiple scene probes, cancelled-drag geometry and the companion dragSource publication. The GIPHY, provider-shortcut, selected-chip, stack-drop and Save Style app changes remain owned by the companion jobs. Missing facts and failed simulator prerequisites fail before a device-only skip. No cluster is left unstarted or partially committed.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Capture test21Presentation and its three variants | Presentation device-only prerequisite | Did Share and Export open without Presenter Page before the external-display skip? |
+
+### Review fixes - round 6 (2026-11-06)
+
+Confirmed the four review findings against job 11c and the shared-helper callers across all test classes. Changes remain confined to NibUITests; jobs 11a/11b and app code are not revised.
+
+- H11: requireControl's containment guard and fullyVisible reveal now require full vertical extent plus the horizontal centre inside the viewport. A nearest scroller with horizontal-only scrollbar/content-overflow evidence retains the already-hittable result; nested scroller content does not establish its parent's axis. Missing snapshots or an unmatched target between snapshots also retain that result instead of forcing a vertical reveal. The bottom cue and vertical clipping guard remain. CI must reach horizontal swatches/chips without vertical reveal failures while still fully revealing Fit Height to Text.
+- H12: probe system sharing once before the dismissal loop; re-arm only after closing a form, popover, non-panel close control or native sheet that could reveal it. Closing the share sheet itself or an app panel does not trigger another probe. Preserve share closure verification and protection of Audio behind it. Query savings depend on the dismissal path and are not measured locally.
+- H9: require two consecutive absent observations of the bound menu container (or the existing row fallback), resetting the count on presence. Each poll retains the single-container check and the unchanged eight-second bound. CI must show settled dismissal before the next ordinary input without restoring tree-wide polling.
+- D1: catch presentation variant errors, attach the same unreachable text/app hierarchy and diagnostic screenshot as ordinary variants for non-XCTSkip errors, then rethrow every error. The four presentation skips and all prerequisite/capability checks remain unchanged; CI must retain evidence for genuine failures and count only the authorized device-only skips.
+
+Validation: python Scripts/lint.py reports **0 errors, 25 existing warnings**; git diff --check passes. Reviewed the changed Swift signatures, closure state and shared callers. No Swift toolchain or simulator is available here; compilation, AX axis exposure, dismissal timing and capture attachments require GitHub Actions verification.
+
+### Review fixes - round 7 (2026-11-06)
+
+Confirmed the two majors against H9/H11, R12 pages-menus-outline#0 and insert-menus-alerts-forms#0 (including the verifier corrections), and insert-controls#4. These corrections supersede round 6's two-observation gate and unknown-geometry acceptance. Only test support and this log change.
+
+- H9 (major): accept the first absent observation of the menu container resolved before the tap. Retain the single-container query, row fallback, eight-second wait and callers' successor-state assertions. No tap retry or second observation is added. CI must reach the template form, Audio Rename alert and comment composer even when one AX evaluation takes about seven seconds.
+- H11 (major): containment now has three results: contained, clipped and unresolved. Resolve the target by type/identifier/label in the ancestry snapshot; a unique identity survives relayout, while duplicate identities require one exact frame match. Target, window and scroller geometry then come from that same snapshot. Failed snapshots, unmatched/ambiguous identity or invalid frames return unresolved and log why. Before revealing an already-hittable control, retry unresolved geometry within the caller's existing timeout and fail explicitly if it remains unresolved, without a drag. The final readiness poll likewise cannot accept unknown geometry. Proven clipping retains the full vertical extent, horizontal centre, cue lane and existing reveal path; observed horizontal-only strips retain their prior behavior. CI must reveal Fit Height to Text before its value assertion and show explicit containment diagnostics if geometry cannot be resolved.
+- Oversized rows (minor): no change requested or made to the containment policy. If CI reports a new Missing hittable control failure, inspect Clipped control reveal first; a row taller than its viewport still cannot satisfy full containment.
+- Share-sheet probe cost (minor): retained the current probe. No evidence justifies adding a sheet/popover precondition that could miss an out-of-process surface.
+
+| Diagnostic | Log prefix | Question answered |
+| --- | --- | --- |
+| scroll:true lookup with unavailable geometry | Control containment unresolved | Did snapshot acquisition fail, did identity/frame matching fail, or were frames invalid before accepting or revealing the control? |
+| Proven vertical clipping | Clipped control reveal | What target, nearest scroller and clipped viewport from the same snapshot require reveal? |
+
+Caller audit: requireControl signatures/defaults remain compatible across Canvas, Capture, Chrome, Ink, Insert, Selection and internal provider/tool paths. Non-scrolling lookups are unchanged. Re-read Pages and Insert nativeContextMenu callers; successor alert/form, content and state checks remain intact. No test body, assertion, allowance, sleep, capability check or XCTSkip site changes; all seven authorized device-only boundaries remain as before. No app file changes.
+
+Validation: python Scripts/lint.py reports **0 errors, 25 warnings**; git diff --check passes. Static review covers optional Bool handling, snapshot tuple types, closure state, predicate return paths and bounded waits. No Swift compiler or simulator is available on Windows; CI must verify compilation, relayout/duplicate-identity behavior and runtime costs. XCTest synchronous snapshot calls can exceed an outer wait's deadline; no runtime pass or speedup is claimed.
+
+### Round 11c, integrator's change after review (6 Nov 2026)
+
+H11 as committed made `requireControl(scroll: true)` take two snapshots on every call, one of the whole scope, for
+about seventy callers; the last review kept that as a major finding (the slow-query pattern this round removes
+elsewhere). The containment check is now opt-in: `requireControl(..., scroll: true, fullyVisible: true)`. Without
+`fullyVisible` the lookup is what it was before 11c (the first hittable match, a reveal only when there is none).
+`InsertUITests.toggle` opts in, because a switch row at the bottom of a popover is the proven case
+(R12:insert-controls#4, Fit Height to Text). A caller that meets the same symptom (a tap on a hittable control that
+does nothing, the control's frame crossing its scroller's lower edge) should opt in too.
