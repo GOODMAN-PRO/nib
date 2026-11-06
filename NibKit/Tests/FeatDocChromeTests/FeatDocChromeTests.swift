@@ -1597,7 +1597,7 @@ final class FeatDocChromeTests: XCTestCase {
         let pages = panel("sidebar.pages", .sidebarTab)
         let tabs = [pages, outline]
         for tab in tabs { h.app.ui.panels.register(tab) }
-        chrome.state.params[outline.id] = ["entry": "keep-me"]
+        chrome.state.open(outline.id, at: .left, params: ["entry": "keep-me"])
         for side in [SidebarSide.left, .right] {
             for mode in [SidebarMode.sidebar, .window] {
                 let view = SidebarPanelView(chrome: chrome, side: side, tabs: tabs, selected: outline,
@@ -1621,8 +1621,9 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(menu.addingActions(to: nonObject).params, nonObject.params)
         var plugin = panel("plugin.navigator", .sidebarTab)
         plugin.providesHeader = true
-        chrome.state.params[plugin.id] = ["plugin": "keep-me"]
-        let pluginView = SidebarPanelView(chrome: chrome, side: .left, tabs: [pages, plugin],
+        h.app.ui.panels.register(plugin)
+        chrome.state.open(plugin.id, at: .right, params: ["plugin": "keep-me"])
+        let pluginView = SidebarPanelView(chrome: chrome, side: .right, tabs: [pages, plugin],
             selected: plugin, mode: .sidebar, presentation: .sidebar)
         XCTAssertEqual(pluginView.panelContext.params, ["plugin": "keep-me"])
         let float = try XCTUnwrap(menu.actions.first { $0.id == "floating" })
