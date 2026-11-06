@@ -32,6 +32,14 @@ enum TabStripLayout {
         var hidden: [Int]
         var tabWidth: CGFloat
         var dropletWidth: CGFloat
+        var activeTab: Int? = nil
+        var activeWidth: CGFloat? = nil
+        /// In the smallest single-capsule slot, +N takes the close button's place; Close remains in its menu.
+        var overflowInActiveTab = false
+
+        func width(for index: Int) -> CGFloat {
+            index == activeTab ? (activeWidth ?? tabWidth) : tabWidth
+        }
     }
 
     static func tabWidths(compact: Bool) -> ClosedRange<CGFloat> { compact ? 96...180 : 120...220 }
@@ -42,15 +50,20 @@ enum TabStripLayout {
         enabled && tabCount > 1
     }
 
-    /// The after-title Tabs menu measures the actual end of the leading bar, including title/status width.
+    /// Clear both the after-title Tabs menu and the measured leading bar, including any status padding.
     /// Use the trailing bar's final adaptive frame, including its padding; the fixed envelope is only a fallback
     /// before its first layout. The assistant sits outside that bar, so its space is already accounted for.
     static func documentSlot(control: CGRect, bounds: CGRect, compact: Bool, rightToLeft: Bool,
-                             trailingFrame: CGRect? = nil) -> CGRect {
+                             trailingFrame: CGRect? = nil, leadingFrame: CGRect? = nil) -> CGRect {
+        // Bar markers exist before their first layout. A zero leading edge collapses the RTL slot.
+        let leadingFrame = leadingFrame.flatMap { usableBarFrame($0) ? $0 : nil }
+        let trailingFrame = trailingFrame.flatMap { usableBarFrame($0) ? $0 : nil }
         let trailingWidth = compact
             ? 3 * NibMetrics.hitTarget + 2 * NibSpacing.xs
             : 7 * NibMetrics.hitTarget + separatorWidth + 2 * NibSpacing.xs + NibSpacing.l
-        let controlEdge = rightToLeft ? control.minX : control.maxX
+        let controlEdge = rightToLeft
+            ? min(control.minX, leadingFrame?.minX ?? control.minX)
+            : max(control.maxX, leadingFrame?.maxX ?? control.maxX)
         let start = rightToLeft
             ? (trailingFrame?.maxX ?? (bounds.minX + NibMetrics.chromeInset + trailingWidth)) + NibSpacing.l
             : controlEdge + NibSpacing.xs + NibSpacing.l
@@ -59,6 +72,11 @@ enum TabStripLayout {
             : (trailingFrame?.minX ?? (bounds.maxX - NibMetrics.chromeInset - trailingWidth)) - NibSpacing.l
         return CGRect(x: start, y: control.midY - stripHeight / 2,
                       width: max(0, end - start), height: stripHeight)
+    }
+
+    private static func usableBarFrame(_ frame: CGRect) -> Bool {
+        !frame.isNull && !frame.isInfinite && frame.origin.x.isFinite && frame.origin.y.isFinite
+            && frame.width.isFinite && frame.height.isFinite && frame.width > 0 && frame.height > 0
     }
 
     /// Document chrome already supplies Library and the Tabs menu. Spend only the measured gap on capsules;
@@ -70,14 +88,32 @@ enum TabStripLayout {
         // A long title truncates inside the largest capsule instead of hiding the entire strip.
         let minimum = min(widths.upperBound,
                           max(widths.lowerBound, activeTitleWidth > 0 ? activeTitleWidth + NibSpacing.m + NibMetrics.hitTarget : 0))
-        var slots = min(max(0, count), maxTabs, Int(available / minimum))
-        if slots == 0, count > 0, available >= widths.lowerBound { slots = 1 }
+        // Size class describes the window, not this gap. Use the existing narrow capsule floor to
+        // count slots even on portrait iPad; restore the regular 120 pt floor whenever they all fit.
+        // A lone capsule still needs the size-class minimum (and keeps its title-based preference).
+        let narrowMinimum = tabWidths(compact: true).lowerBound
+        var slots = available < widths.lowerBound ? 0
+            : min(max(0, count), maxTabs, Int(available / narrowMinimum))
+        let hasOverflow = slots < count
+        if hasOverflow, slots > 0 {
+            slots = max(1, min(slots, Int(max(0, available - NibMetrics.hitTarget) / narrowMinimum)))
+        }
         var shown = Array(0..<slots)
         if let active, active >= slots, active < count, slots > 0 { shown[slots - 1] = active }
         let hidden = (0..<max(0, count)).filter { !shown.contains($0) }
-        let tabWidth = slots == 0 ? 0 : min(max(widths.upperBound, minimum), available / CGFloat(slots))
+        let inlineOverflow = hasOverflow && slots == 1 && available < widths.lowerBound + NibMetrics.hitTarget
+        let overflow = hasOverflow && !inlineOverflow && slots > 0 ? NibMetrics.hitTarget : 0
+        let room = max(0, available - overflow)
+        let slotMinimum = slots > 1 ? min(widths.lowerBound, room / CGFloat(slots)) : widths.lowerBound
+        let activeTab = active.flatMap { shown.contains($0) ? $0 : nil } ?? shown.last
+        let activeWidth = slots == 0 ? 0 : min(widths.upperBound,
+            max(minimum, room / CGFloat(slots)), room - CGFloat(slots - 1) * slotMinimum)
+        let tabWidth = slots <= 1 ? activeWidth
+            : min(widths.upperBound, max(slotMinimum, (room - activeWidth) / CGFloat(slots - 1)))
+        let capsules = slots == 0 ? 0 : activeWidth + CGFloat(slots - 1) * tabWidth
         return Plan(shown: shown, hidden: hidden, tabWidth: tabWidth,
-                    dropletWidth: slots == 0 ? 0 : 2 * inset + CGFloat(slots) * tabWidth)
+                    dropletWidth: slots == 0 ? 0 : 2 * inset + capsules + overflow,
+                    activeTab: activeTab, activeWidth: activeWidth, overflowInActiveTab: inlineOverflow)
     }
 
     static func plan(count: Int, active: Int?, width: CGFloat) -> Plan {
@@ -273,10 +309,15 @@ struct TabStripView: View {
             }
             ForEach(plan.shown, id: \.self) { index in
                 TabCapsule(tab: model.tabs[index], count: model.tabs.count, isSelected: model.selectedIndex == index,
-                           width: plan.tabWidth, model: model)
+                           width: plan.width(for: index), model: model,
+                           overflowCount: plan.overflowInActiveTab && index == plan.activeTab ? plan.hidden.count : 0)
             }
-            if documentPlan == nil, !plan.hidden.isEmpty {
-                overflowMenu(plan.hidden)
+            if !plan.hidden.isEmpty, !plan.overflowInActiveTab {
+                if documentPlan == nil {
+                    overflowMenu(plan.hidden)
+                } else {
+                    DocumentTabsOverflow(model: model, count: plan.hidden.count)
+                }
             }
         }
         .padding(.horizontal, TabStripLayout.inset)
@@ -315,6 +356,7 @@ struct TabCapsule: View {
     let isSelected: Bool
     let width: CGFloat
     let model: TabStripModel
+    var overflowCount = 0
 
     /// Display only: the shell owns the keys. ⌘9 selects the last tab, not the ninth.
     static func shortcutHint(index: Int, count: Int) -> KeyboardShortcut? {
@@ -353,7 +395,9 @@ struct TabCapsule: View {
                 }
             }
             .accessibilityShowsLargeContentViewer { Text(tab.title) }
-            if isSelected {
+            if overflowCount > 0 {
+                DocumentTabsOverflow(model: model, count: overflowCount)
+            } else if isSelected {
                 NibIconButton(.xmark, label: String(localized: "Close Tab"), size: .bar) { model.close(tab) }
                     .frame(width: NibMetrics.hitTarget, height: TabStripLayout.tabHeight)
             }
@@ -452,8 +496,9 @@ final class TabStripDocumentPresentation: ObservableObject {
         geometryObserver = NotificationCenter.default.addObserver(forName: NibBarGeometry.didChange,
                                                                   object: nil, queue: .main) { [weak self] note in
             Task { @MainActor in
-                guard let self, let view = self.controller?.viewIfLoaded,
-                      NibBarGeometry.isChange(note, for: "chrome.bar.trailing", in: view) else { return }
+                guard let self, let view = self.controller?.viewIfLoaded else { return }
+                guard NibBarGeometry.isChange(note, for: "chrome.bar.trailing", in: view)
+                    || NibBarGeometry.isChange(note, for: "chrome.bar.leading", in: view) else { return }
                 self.refreshGeometry()
             }
         }
@@ -501,7 +546,8 @@ final class TabStripDocumentPresentation: ObservableObject {
         let bounds = container.inset(by: view.safeAreaInsets)
         let value = TabStripLayout.documentSlot(control: anchor, bounds: bounds, compact: compact,
                                                rightToLeft: rightToLeft,
-                                               trailingFrame: NibBarGeometry.frame("chrome.bar.trailing", in: view))
+                                               trailingFrame: NibBarGeometry.frame("chrome.bar.trailing", in: view),
+                                               leadingFrame: NibBarGeometry.frame("chrome.bar.leading", in: view))
         if slot != value { slot = value }
     }
 
@@ -562,20 +608,7 @@ struct DocumentTabsMenu: View {
 
     var body: some View {
         Menu {
-            Button(String(localized: "Library")) { model.showLibrary() }
-            ForEach(model.tabs) { tab in
-                Button { model.select(tab.index) } label: {
-                    if tab.index == model.selectedIndex {
-                        Label { Text(tab.title) } icon: { Image(nib: .checkmark) }
-                    } else {
-                        Text(tab.title)
-                    }
-                }
-            }
-            if let active = model.tabs.first(where: { $0.index == model.selectedIndex }) {
-                Divider()
-                TabMenu(items: model.menuItems(active)) { model.run($0, on: active) }
-            }
+            DocumentTabsMenuItems(model: model)
         } label: {
             Image(nib: .templates)
                 .font(NibFont.glyph(.bar))
@@ -609,6 +642,50 @@ struct DocumentTabsMenu: View {
             }
             .allowsHitTesting(false)
         }
+    }
+}
+
+/// Both document entry points expose the same commands and the same complete list of open documents.
+struct DocumentTabsMenuItems: View {
+    @ObservedObject var model: TabStripModel
+
+    var body: some View {
+        Button(String(localized: "Library")) { model.showLibrary() }
+        ForEach(model.tabs) { tab in
+            Button { model.select(tab.index) } label: {
+                if tab.index == model.selectedIndex {
+                    Label { Text(tab.title) } icon: { Image(nib: .checkmark) }
+                } else {
+                    Text(tab.title)
+                }
+            }
+        }
+        if let active = model.tabs.first(where: { $0.index == model.selectedIndex }) {
+            Divider()
+            TabMenu(items: model.menuItems(active)) { model.run($0, on: active) }
+        }
+    }
+}
+
+struct DocumentTabsOverflow: View {
+    @ObservedObject var model: TabStripModel
+    let count: Int
+
+    var body: some View {
+        Menu { DocumentTabsMenuItems(model: model) } label: {
+            Text(String(localized: "+\(count)"))
+                .font(NibFont.button)
+                .foregroundStyle(NibColor.label)
+                .lineLimit(1)
+                .frame(width: NibMetrics.hitTarget, height: TabStripLayout.tabHeight)
+                .contentShape(Rectangle().inset(by: -TabStripLayout.hitOutset))
+        }
+        .menuIndicator(.hidden)
+        .menuStyle(.button)
+        .buttonStyle(NibPressStyle(shape: Capsule()))
+        .frame(width: NibMetrics.hitTarget, height: TabStripLayout.tabHeight)
+        .accessibilityLabel(String(localized: "\(count) more open documents"))
+        .accessibilityIdentifier("windows.tabs.overflow")
     }
 }
 

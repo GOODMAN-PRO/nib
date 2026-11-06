@@ -371,10 +371,7 @@ struct NavBarView: View {
                 .nibCommand(chrome.app.ui.toolbar.get(item.id)?.command)
                 .font(NibFont.caption1)
                 .foregroundStyle(NibColor.label)
-                .lineLimit(1)
-                .frame(minWidth: NibMetrics.hitTarget, maxWidth: compact ? 120 : 160,
-                       minHeight: NibMetrics.hitTarget)
-                .clipped()
+                .modifier(NavStatusSizing(compact: compact))
                 .disabled(!(chrome.app.ui.toolbar.get(item.id)?.isEnabled?(chrome.session) ?? true))
         }
     }
@@ -498,6 +495,24 @@ struct NavBarView: View {
 
     private func toggle(_ menu: ChromeMenu) {
         openMenu = openMenu == menu ? nil : menu
+    }
+}
+
+/// Keep menus at their intrinsic width while bounding long status pills. The outer fixed size prevents
+/// the flexible frame itself from accepting surplus space offered by the bar's HStack.
+struct NavStatusSizing: ViewModifier {
+    let compact: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .lineLimit(1)
+            .frame(maxWidth: compact ? 120 : 160)
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(minWidth: NibMetrics.hitTarget, maxWidth: compact ? 120 : 160,
+                   minHeight: NibMetrics.hitTarget)
+            .contentShape(.interaction, Rectangle())
+            .clipped()
+            .fixedSize(horizontal: true, vertical: false)
     }
 }
 

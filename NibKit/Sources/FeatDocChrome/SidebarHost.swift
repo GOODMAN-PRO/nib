@@ -4,7 +4,8 @@ import NibDesign
 
 /// One sidebar side (D-065, D-117, D-136): a readable selected title, primary labelled navigation, one overflow
 /// for other panels and presentation controls, and Close. The caller supplies the Deep panel or compact sheet.
-/// Self-headed panels keep host placement actions beside the tabs, without a second header.
+/// Outline, which draws its own header, receives the host's placement actions in its context for its header menu;
+/// other self-headed panels keep the host's menu beside the tabs.
 /// The assistant is a standalone panel without navigation tabs.
 struct SidebarPanelView: View {
     let chrome: ChromeWindow
@@ -23,7 +24,9 @@ struct SidebarPanelView: View {
                 HStack(spacing: 0) {
                     tabStrip.frame(maxWidth: .infinity)
                         .contextMenu { placementMenu.items }
-                    if !chrome.drawsHeader(selected) { placementMenu }
+                    // A self-headed panel that does not take the placement actions into its own header menu
+                    // (Transcript, plugin panels) keeps the host's menu beside the tabs, as before.
+                    if !chrome.drawsHeader(selected) && !hostsOwnPlacementMenu { placementMenu }
                 }
             }
             Rectangle()
@@ -32,7 +35,7 @@ struct SidebarPanelView: View {
             if chrome.drawsHeader(selected) {
                 header
             }
-            selected.makeView(chrome.panelContext(selected.id, presentation: presentation))
+            selected.makeView(panelContext)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .id(selected.id)
         }
@@ -53,13 +56,24 @@ struct SidebarPanelView: View {
                            mode: showsModeToggle ? mode : nil, additionalPanels: tabs)
     }
 
+    /// ponytail: Outline is the one self-headed panel whose own header menu hosts the placement actions, so the host
+    /// names it here. A descriptor flag when a second panel does the same.
+    private var hostsOwnPlacementMenu: Bool { selected.providesHeader && selected.id == "outline.tab" }
+
+    var panelContext: PanelContext {
+        let context = chrome.panelContext(selected.id, presentation: presentation)
+        // Outline consumes this private handoff. Do not inject it into plugin panel parameters.
+        return hostsOwnPlacementMenu ? placementMenu.addingActions(to: context) : context
+    }
+
     /// Pages, Outline and Bookmarks remain labelled; secondary panels live in the header's single menu.
     @ViewBuilder
     private var tabStrip: some View {
         let primary = SidebarNavigation.primary(tabs)
         if primary.count > 1 {
             NibSegmentedControl(selection: selection, options: primary.map { $0.id },
-                                sizing: chrome.drawsHeader(selected) ? .fitting : .compactFitting) { id in
+                                sizing: chrome.drawsHeader(selected) || hostsOwnPlacementMenu
+                                    ? .fitting : .compactFitting) { id in
                 primary.first(where: { $0.id == id })?.title ?? id
             }
             .padding(.horizontal, NibSpacing.xs)
@@ -96,45 +110,88 @@ struct PanelPlacementMenu: View {
     }
 
     @ViewBuilder var items: some View {
+        let actions = self.actions
         if !additionalPanels.isEmpty {
             Section(String(localized: "Panels")) {
-                ForEach(additionalPanels, id: \.id) { tab in
-                    Button(tab.title) { chrome.tap("panel.open", ["id": .string(tab.id)]) }
-                    .accessibilityIdentifier("cmd." + "panel.open")
-                }
+                ForEach(actions.filter(\.isPanel)) { action in entry(action) }
             }
+        }
+        ForEach(actions.filter { !$0.isPanel }) { action in
+            if action.id == "default" { Divider() }
+            entry(action)
+        }
+    }
+
+    /// The same command data drives the host menu and a self-headed panel. PanelContext.params is the
+    /// existing cross-module handoff; keep the private host payload separate from panel.open parameters.
+    func addingActions(to context: PanelContext) -> PanelContext {
+        var result = context
+        guard var params = context.params.objectValue else { return context }
+        params["chrome.panelOptions"] = .array(actions.map(\.json))
+        result.params = .object(params)
+        return result
+    }
+
+    var actions: [PanelPlacementAction] {
+        var result = additionalPanels.map { tab in
+            PanelPlacementAction(id: tab.id, title: tab.title, command: "panel.open",
+                                 params: ["id": .string(tab.id)], isPanel: true)
         }
         if let mode {
-            Button(mode == .window ? String(localized: "Show as Sidebar") : String(localized: "Show as Window")) {
-                chrome.tap("sidebar.toggle", ["mode": .string(mode == .window ? "sidebar" : "window")])
-            }
-            .accessibilityIdentifier("cmd." + "sidebar.toggle")
+            result.append(PanelPlacementAction(id: "mode",
+                title: mode == .window ? String(localized: "Show as Sidebar") : String(localized: "Show as Window"),
+                command: "sidebar.toggle", params: ["mode": .string(mode == .window ? "sidebar" : "window")]))
         }
-        option(.left, String(localized: "Move to Left Side"), symbol: .sidebar)
-        option(.right, String(localized: "Move to Right Side"), symbol: .sidebar)
-        option(.floating, String(localized: "Float Panel"), symbol: .externalDisplay)
+        result.append(option(.left, String(localized: "Move to Left Side"), symbol: .sidebar))
+        result.append(option(.right, String(localized: "Move to Right Side"), symbol: .sidebar))
+        result.append(option(.floating, String(localized: "Float Panel"), symbol: .externalDisplay))
         if hasOverride {
-            Divider()
-            Button(String(localized: "Use Default Position")) { set(nil) }
+            result.append(PanelPlacementAction(id: "default", title: String(localized: "Use Default Position"),
+                command: "settings.set", params: placementParams(nil)))
         }
+        return result
     }
 
     private var hasOverride: Bool {
         chrome.app.settings.json(ChromeSettings.placementName(panel.id)) != nil
     }
 
-    private func option(_ spot: PanelSpot, _ title: String, symbol: NibSymbol) -> some View {
-        Button {
-            set(spot.rawValue)
-        } label: {
-            Label { Text(title) } icon: { Image(nib: symbol) }
+    private func entry(_ action: PanelPlacementAction) -> some View {
+        Button { chrome.tap(action.command, action.params) } label: {
+            if let symbol = action.symbol {
+                Label { Text(action.title) } icon: { Image(nib: symbol) }
+            } else {
+                Text(action.title)
+            }
         }
-        .disabled(current == spot)
+        .disabled(!action.isEnabled)
+        .accessibilityIdentifier("cmd." + action.command)
     }
 
-    private func set(_ value: String?) {
+    private func option(_ spot: PanelSpot, _ title: String, symbol: NibSymbol) -> PanelPlacementAction {
+        PanelPlacementAction(id: spot.rawValue, title: title, command: "settings.set",
+                             params: placementParams(spot.rawValue), symbol: symbol, isEnabled: current != spot)
+    }
+
+    private func placementParams(_ value: String?) -> JSONValue {
         let json: JSONValue = value.map { JSONValue.string($0) } ?? .null
-        chrome.tap("settings.set", ["name": .string(ChromeSettings.placementName(panel.id)), "value": json])
+        return ["name": .string(ChromeSettings.placementName(panel.id)), "value": json]
+    }
+}
+
+struct PanelPlacementAction: Identifiable {
+    let id: String
+    let title: String
+    let command: String
+    let params: JSONValue
+    var symbol: NibSymbol? = nil
+    var isEnabled = true
+    var isPanel = false
+
+    var json: JSONValue {
+        ["id": .string(id), "title": .string(title), "command": .string(command), "params": params,
+         "symbol": symbol.map { .string($0.name) } ?? .null,
+         "enabled": .bool(isEnabled), "panel": .bool(isPanel)]
     }
 }
 

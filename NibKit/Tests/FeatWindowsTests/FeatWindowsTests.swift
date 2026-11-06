@@ -1261,6 +1261,28 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertEqual(second.additionalSafeAreaInsets.top, 0)
     }
 
+    func testDocumentTabSlotClearsLeadingBarBeyondMenuInBothDirections() {
+        let bounds = CGRect(x: 24, y: 24, width: 1146, height: 780)
+        let menu = CGRect(x: 280, y: 32, width: 44, height: 44)
+        let leading = CGRect(x: 40, y: 32, width: 360, height: 44)
+        let trailing = CGRect(x: 920, y: 32, width: 234, height: 44)
+        func mirror(_ frame: CGRect) -> CGRect {
+            CGRect(x: bounds.minX + bounds.maxX - frame.maxX, y: frame.minY,
+                   width: frame.width, height: frame.height)
+        }
+        let ltr = TabStripLayout.documentSlot(control: menu, bounds: bounds, compact: false,
+            rightToLeft: false, trailingFrame: trailing, leadingFrame: leading)
+        XCTAssertEqual(ltr.minX, leading.maxX + NibSpacing.xs + NibSpacing.l)
+        let rtl = TabStripLayout.documentSlot(control: mirror(menu), bounds: bounds, compact: false,
+            rightToLeft: true, trailingFrame: mirror(trailing), leadingFrame: mirror(leading))
+        XCTAssertEqual(rtl, mirror(ltr))
+        // An earlier bar measurement must never pull the slot back over the menu itself.
+        let shortBar = CGRect(x: 40, y: 32, width: 200, height: 44)
+        let fallback = TabStripLayout.documentSlot(control: menu, bounds: bounds, compact: false,
+            rightToLeft: false, leadingFrame: shortBar)
+        XCTAssertEqual(fallback.minX, menu.maxX + NibSpacing.xs + NibSpacing.l)
+    }
+
     func testDocumentTabPlacementTracksTheMenuInFloatingContainerCoordinates() {
         let document = UIViewController()
         document.loadViewIfNeeded()
@@ -1427,7 +1449,7 @@ final class FeatWindowsTests: XCTestCase {
         }
     }
 
-    func testDocumentTabsReserveMeasuredActionsAndTheFullActiveTitle() {
+    func testDocumentTabsReserveMeasuredActionsWithoutChargingEveryTabForActiveTitle() {
         let bounds = CGRect(x: 0, y: 0, width: 834, height: 1194)
         let menu = CGRect(x: 228, y: 32, width: 44, height: 44)
         let trailing = CGRect(x: 630, y: 32, width: 188, height: 44)
@@ -1436,9 +1458,10 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertEqual(trailing.minX - slot.maxX, NibMetrics.minimumRestingGap)
         let plan = TabStripLayout.documentPlan(count: 3, active: 2, width: slot.width,
                                                compact: false, activeTitleWidth: 130)
-        XCTAssertTrue(plan.shown.contains(2))
-        XCTAssertLessThan(plan.shown.count, 3)
-        XCTAssertGreaterThanOrEqual(plan.tabWidth, 130 + NibSpacing.m + NibMetrics.hitTarget)
+        XCTAssertEqual(plan.shown, [0, 1, 2])
+        XCTAssertTrue(plan.hidden.isEmpty)
+        XCTAssertEqual(plan.tabWidth, (slot.width - 2 * TabStripLayout.inset) / 3, accuracy: 0.001)
+        XCTAssertEqual(plan.width(for: 2), plan.tabWidth, accuracy: 0.001)
         XCTAssertLessThanOrEqual(plan.dropletWidth, slot.width)
     }
 
@@ -1448,9 +1471,10 @@ final class FeatWindowsTests: XCTestCase {
             let width = 2 * maximum + 2 * TabStripLayout.inset
             let plan = TabStripLayout.documentPlan(count: 4, active: 3, width: width,
                                                    compact: compact, activeTitleWidth: 1200)
-            XCTAssertEqual(plan.shown, [0, 3])
-            XCTAssertEqual(plan.hidden, [1, 2])
-            XCTAssertEqual(plan.tabWidth, maximum)
+            XCTAssertEqual(plan.shown, compact ? [0, 1, 3] : [0, 1, 2, 3])
+            XCTAssertEqual(plan.hidden, compact ? [2] : [])
+            XCTAssertEqual(plan.tabWidth, compact ? 96 : 110)
+            XCTAssertGreaterThanOrEqual(plan.width(for: 3), plan.tabWidth)
             XCTAssertLessThanOrEqual(plan.dropletWidth, width)
         }
     }
@@ -1464,10 +1488,103 @@ final class FeatWindowsTests: XCTestCase {
                                                        compact: compact, activeTitleWidth: 1200)
                 XCTAssertEqual(plan.shown, [3])
                 XCTAssertEqual(plan.hidden, [0, 1, 2])
-                XCTAssertEqual(plan.tabWidth, available)
+                let inlineOverflow = available < widths.lowerBound + NibMetrics.hitTarget
+                XCTAssertEqual(plan.overflowInActiveTab, inlineOverflow)
+                XCTAssertEqual(plan.width(for: 3), available - (inlineOverflow ? 0 : NibMetrics.hitTarget))
                 XCTAssertEqual(plan.dropletWidth, width)
             }
         }
+    }
+
+    func testThreeDocumentTabsFit322PointsInARegularWidthWindow() {
+        // The latest acceptance is the strip width, including insets, even when compact is false.
+        let narrow = TabStripLayout.documentPlan(count: 3, active: 2, width: 322,
+                                                compact: false, activeTitleWidth: 125)
+        XCTAssertEqual(narrow.shown, [0, 1, 2])
+        XCTAssertTrue(narrow.hidden.isEmpty)
+        XCTAssertEqual(narrow.tabWidth, 106, accuracy: 0.001)
+        XCTAssertEqual(narrow.width(for: 2), 106, accuracy: 0.001)
+        XCTAssertEqual(narrow.dropletWidth, 322, accuracy: 0.001)
+        // The verifier's corrected portrait gap after C1 holds all three, even after title measurement.
+        let portrait = TabStripLayout.documentPlan(count: 3, active: 2, width: 390,
+                                                  compact: false, activeTitleWidth: 125)
+        XCTAssertEqual(portrait.shown, [0, 1, 2])
+        XCTAssertTrue(portrait.hidden.isEmpty)
+        XCTAssertEqual(portrait.tabWidth, 120)
+        XCTAssertEqual(portrait.width(for: 2), 146)
+        XCTAssertEqual(portrait.dropletWidth, 390)
+        let compact = TabStripLayout.documentPlan(count: 3, active: 2, width: 322,
+                                                 compact: true, activeTitleWidth: 125)
+        XCTAssertEqual(compact.shown, [0, 1, 2])
+        XCTAssertTrue(compact.hidden.isEmpty)
+    }
+
+    func testDocumentTabPlansStayWithinTheirSlotAcrossNarrowSizingTransitions() {
+        for compact in [false, true] {
+            for count in 1...9 {
+                var previousCount = 0
+                for width in stride(from: CGFloat(0), through: 800, by: 1) {
+                    let plan = TabStripLayout.documentPlan(count: count, active: count - 1,
+                        width: width, compact: compact, activeTitleWidth: 300)
+                    XCTAssertLessThanOrEqual(plan.dropletWidth, width + 0.001)
+                    XCTAssertGreaterThanOrEqual(plan.shown.count, previousCount)
+                    XCTAssertEqual(Set(plan.shown + plan.hidden), Set(0..<count))
+                    if !plan.shown.isEmpty {
+                        XCTAssertEqual(plan.shown.last, count - 1)
+                        for index in plan.shown {
+                            XCTAssertGreaterThanOrEqual(plan.width(for: index), 96)
+                        }
+                        let overflow = !plan.hidden.isEmpty && !plan.overflowInActiveTab ? NibMetrics.hitTarget : 0
+                        XCTAssertEqual(plan.dropletWidth,
+                            plan.shown.reduce(2 * TabStripLayout.inset + overflow) { $0 + plan.width(for: $1) },
+                            accuracy: 0.001)
+                    }
+                    previousCount = plan.shown.count
+                }
+            }
+        }
+    }
+
+    func testUnlaidOutBarMarkersUseTheSlotFallbackInBothDirections() {
+        let bounds = CGRect(x: 0, y: 0, width: 1194, height: 834)
+        for rightToLeft in [false, true] {
+            let control = CGRect(x: rightToLeft ? 842 : 308, y: 32, width: 44, height: 44)
+            let fallback = TabStripLayout.documentSlot(control: control, bounds: bounds,
+                compact: false, rightToLeft: rightToLeft)
+            XCTAssertGreaterThan(fallback.width, 0)
+            for marker in [CGRect.zero, CGRect(x: 10, y: 32, width: 44, height: 0)] {
+                let slot = TabStripLayout.documentSlot(control: control, bounds: bounds,
+                    compact: false, rightToLeft: rightToLeft, trailingFrame: marker, leadingFrame: marker)
+                XCTAssertEqual(slot, fallback)
+            }
+        }
+    }
+
+    func testSingleLongDocumentTitleUsesAvailableWidthUpToTheCap() {
+        for compact in [false, true] {
+            let widths = TabStripLayout.tabWidths(compact: compact)
+            for available in [widths.lowerBound, widths.upperBound, CGFloat(500)] {
+                let plan = TabStripLayout.documentPlan(count: 1, active: 0,
+                    width: available + 2 * TabStripLayout.inset, compact: compact, activeTitleWidth: 300)
+                XCTAssertEqual(plan.shown, [0])
+                XCTAssertTrue(plan.hidden.isEmpty)
+                XCTAssertEqual(plan.width(for: 0), min(available, widths.upperBound))
+                XCTAssertEqual(plan.dropletWidth, plan.width(for: 0) + 2 * TabStripLayout.inset)
+            }
+        }
+    }
+
+    func testFiveDocumentTabsReserveOverflowAndSwapActiveIntoLastVisibleSlot() {
+        let width: CGFloat = 3 * 120 + NibMetrics.hitTarget + 2 * TabStripLayout.inset
+        let plan = TabStripLayout.documentPlan(count: 5, active: 4, width: width,
+                                              compact: false, activeTitleWidth: 300)
+        XCTAssertEqual(plan.shown, [0, 1, 4])
+        XCTAssertEqual(plan.hidden, [2, 3]) // The trailing control displays +2.
+        XCTAssertFalse(plan.overflowInActiveTab)
+        XCTAssertEqual(plan.width(for: 4), 120)
+        XCTAssertEqual(plan.dropletWidth, width)
+        XCTAssertEqual(plan.dropletWidth - plan.shown.reduce(0) { $0 + plan.width(for: $1) },
+                       NibMetrics.hitTarget + 2 * TabStripLayout.inset)
     }
 
     func testDocumentTabsFitOnlyTheSpaceBetweenTheBars() {
