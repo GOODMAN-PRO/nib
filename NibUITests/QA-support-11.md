@@ -149,3 +149,14 @@ R12:library#1 remains an environment limit: the next Library run should get past
 | --- | --- | --- |
 | ExternalFilesDropImportsIntoCurrentFolder; saveSharedPNG callers | Files rename key / Files rename commit | Which observed commit route ran, and did the editor disappear? |
 | Same, on failure | Files rename hierarchy / Files rename hosted hierarchy / Files rename keyboard buttons | What did Files and its keyboard actually expose after both routes failed? |
+
+### H8 / L2 - diagnose native menu delivery
+
+Confirmed R12:library#2's correction: Add to Favourites was fully visible, the action never ran and the menu never ended after the t=34.42 tap. Clipping and a test-support cause are not established; no reveal or retry is added. Library performTap now includes both Favourites rows in diagnostics and checks native card-menu closure within four seconds before any value poll. Context-open tracking also covers a native tree without a Menu/Preview marker. Shared nativeContextMenu logs every row's label, identifier, row frame and containing menu/list frame before delivery; its existing eight-second closure gate and submenu/outside-cancellation semantics remain. A surviving menu now throws **native menu row tap not delivered** with the captured facts. Library allows a same-named successor at a new frame only when it belongs to a native Alert/Sheet; a moved row alone is not closure. The shared native-menu transaction retains its existing successor-frame rule. No action is resent.
+
+Should locate the failure in FavouriteOpenAndUnstarUpdatesMembership instead of the twelve-second Star wait; it is a diagnostic change, not a proven fix. Next run must correlate Native menu row tap with app [Nib QA menu]/[Nib QA tap] action and recognizer logs, then either menu disappearance and all original favourite assertions, or immediate delivery failure after the bounded gate. Reviewed Pages and Insert native-menu paths, including Move submenus, Delete confirmations, Rename/Share successors and explicit outside cancellation.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| FavouriteOpenAndUnstarUpdatesMembership; Library card menus; shared nativeContextMenu callers | Native menu row tap / Native menu row tap not delivered | Which row identity and menu/row frames received the one tap, and did that menu end? |
+| FavouriteOpenAndUnstarUpdatesMembership | Library action first poll / Library action timeout | Were both Add and Remove Favourites rows available before delivery? |

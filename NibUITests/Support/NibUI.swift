@@ -2570,6 +2570,60 @@ final class NibUI {
         try synthesize(paths, duration: holdAtEnd ? duration * 2 : duration)
     }
 
+    /// Capture before delivery: a post-tap tree may already contain a successor sheet.
+    func nativeMenuRowFacts(_ row: XCUIElement) -> String {
+        let frame = row.frame
+        let label = row.label
+        let identifier = row.identifier
+        let kind = row.elementType
+        var menuFrame: CGRect?
+        var menuKind = "unexposed"
+        if let root = try? measuredSnapshot(app, named: "native menu row ancestry") {
+            func ancestors(_ node: XCUIElementSnapshot, path: [XCUIElementSnapshot]) -> [XCUIElementSnapshot]? {
+                if node.elementType == kind && node.label == label && node.identifier == identifier && node.frame == frame {
+                    return path
+                }
+                for child in node.children {
+                    if let found = ancestors(child, path: path + [node]) { return found }
+                }
+                return nil
+            }
+            if let path = ancestors(root, path: []) {
+                let panel = path.last(where: { $0.elementType == .menu })
+                    ?? path.last(where: { [.scrollView, .collectionView, .table].contains($0.elementType) })
+                    ?? path.last(where: { $0.identifier == "Preview" || $0.label == "Preview" })
+                if let panel { menuFrame = panel.frame; menuKind = "\(panel.elementType)" }
+            }
+        }
+        let identity = "label=\(label) identifier=\(identifier) rowFrame=\(frame)"
+        return identity + " menuFrame=\(String(describing: menuFrame)) menuKind=\(menuKind)"
+    }
+
+    /// One ordinary Library row tap, then require the native menu to end. Never retry.
+    func tapNativeMenuRow(_ row: XCUIElement) throws {
+        let frame = row.frame
+        let label = row.label
+        let facts = nativeMenuRowFacts(row)
+        logQA("Native menu row tap", facts)
+        row.tap()
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            guard !app.menus.firstMatch.exists, !app.otherElements["Preview"].firstMatch.exists else { return false }
+            if !row.exists || !row.isHittable { return true }
+            // A moved row alone is not proof of closure. Recognise a same-named native
+            // confirmation only inside its successor Alert/Sheet (e.g. Move to Trash).
+            guard row.frame != frame else { return false }
+            let predicate = NSPredicate(format: "label == %@", label)
+            let confirmations = app.alerts.buttons.matching(predicate).allElementsBoundByIndex
+                + app.sheets.buttons.matching(predicate).allElementsBoundByIndex
+            return confirmations.contains { $0.frame == row.frame && $0.isHittable }
+        }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 4) == .completed else {
+            logQA("Native menu row tap not delivered", facts)
+            recordDiagnostics("Native menu row tap not delivered", facts: facts, includeHierarchy: false)
+            throw Failure.message("native menu row tap not delivered: " + facts)
+        }
+    }
+
     /// Native context menus do not reliably let XCTest reach idle. Every menu contact is synthesized.
     /// A path includes submenu openers, e.g. ["Move", "Move Up"]. Never retry the opening press.
     func nativeContextMenu(_ element: XCUIElement, path: [String], at point: CGPoint = CGPoint(x: 0.5, y: 0.5),
@@ -2609,6 +2663,7 @@ final class NibUI {
         try pressWithoutIdle(at: CGPoint(x: frame.minX + frame.width * point.x,
                                          y: frame.minY + frame.height * point.y), duration: 0.8)
         var activated: [(item: XCUIElement, frame: CGRect)] = []
+        var tapFacts: [String] = []
         for name in path {
             var found: XCUIElement?
             let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
@@ -2639,6 +2694,9 @@ final class NibUI {
             activated.append((item, item.frame))
             logQA("Native menu item", "path=\(path) item=" + elementFacts(item))
             if let dismissAt { try pressWithoutIdle(at: dismissAt, duration: 0.05); break }
+            let facts = nativeMenuRowFacts(item)
+            tapFacts.append(facts)
+            logQA("Native menu row tap", facts)
             try tapWithoutIdle(item)
         }
         var previouslyGone = false
@@ -2655,6 +2713,11 @@ final class NibUI {
         }, object: nil)
         guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
             recordDiagnostics("Native menu dismissal failed")
+            if dismissAt == nil {
+                let facts = tapFacts.joined(separator: "\n")
+                logQA("Native menu row tap not delivered", facts)
+                throw Failure.message("native menu row tap not delivered: " + facts)
+            }
             throw Failure.message("Native menu must disappear before ordinary input: \(path)")
         }
         logQA("Native menu dismissed", "path=\(path) seconds=\(Date().timeIntervalSince(started))")
