@@ -75,23 +75,27 @@ enum UnseenComputation {
 /// written only by `collab.markSeen` (PresenceCommands.swift).
 @MainActor
 final class UnseenTracker {
-    unowned let app: NibApp
+    weak var app: NibApp?
     private(set) var docs: [DocumentID: [PageID: PageUnseen]] = [:]
     private var scanned = Set<DocumentID>()
     /// Parsed marks ("collabpresence.seen.…"); dropped whenever a mark is written.
     private var marks: [String: Rev?] = [:]
     private var settingsObserver: NSObjectProtocol?
 
-    init(app: NibApp) {
+    init(app: NibApp?) {
         self.app = app
-        settingsObserver = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings,
+        settingsObserver = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app?.settings,
                                                                   queue: nil) { [weak self] note in
             guard let name = note.userInfo?["name"] as? String, name.hasPrefix(PresenceSettings.seenPrefix) else { return }
             CollabSession.onMain { self?.marks[name] = nil }
         }
     }
 
-    var me: UInt32 { app.clock.device }
+    deinit {
+        if let settingsObserver { NotificationCenter.default.removeObserver(settingsObserver) }
+    }
+
+    var me: UInt32 { app?.clock.device ?? 0 }
 
     // MARK: Marks
 
@@ -100,7 +104,7 @@ final class UnseenTracker {
 
     private func mark(_ name: String) -> Rev? {
         if let cached = marks[name] { return cached }
-        let rev = app.settings.json(name)?.stringValue.flatMap { Rev(string: $0) }
+        let rev = app?.settings.json(name)?.stringValue.flatMap { Rev(string: $0) }
         marks[name] = .some(rev)
         return rev
     }
@@ -121,7 +125,7 @@ final class UnseenTracker {
 
     /// Documents with a baseline.
     var trackedDocuments: [DocumentID] {
-        app.settings.names(prefix: PresenceSettings.seenPrefix).compactMap { name -> DocumentID? in
+        (app?.settings.names(prefix: PresenceSettings.seenPrefix) ?? []).compactMap { name -> DocumentID? in
             let rest = name.dropFirst(PresenceSettings.seenPrefix.count)
             guard !rest.isEmpty, !rest.contains(".") else { return nil }
             return DocumentID(String(rest))
@@ -147,7 +151,7 @@ final class UnseenTracker {
     /// The first page in document order with unseen changes.
     func firstPage(_ doc: DocumentID) -> PageID? {
         guard let pages = docs[doc], !pages.isEmpty else { return nil }
-        let order = (try? app.workspace.peekContent(doc))?.livePages.map(\.id) ?? []
+        let order = (try? app?.workspace.peekContent(doc))?.livePages.map(\.id) ?? []
         return order.first { pages[$0]?.isEmpty == false } ?? pages.first { !$0.value.isEmpty }?.key
     }
 
@@ -202,6 +206,7 @@ final class UnseenTracker {
     /// Finds what changed in a tracked document while it was closed: pages in memory item by item, the others by
     /// their newest revision (one change each, since which items is unknown without loading them).
     func scan(_ doc: DocumentID, now: TimeInterval = Date().timeIntervalSince1970) {
+        guard let app else { return }
         scanned.insert(doc)
         guard isTracked(doc), !(app.services.lock?.isLocked(doc) ?? false),
               let content = try? app.workspace.peekContent(doc) else { return }
@@ -316,7 +321,7 @@ enum SharedList {
 /// Decoded shared records are cached until the session or library changes. Disk scans run from the panel's task.
 @MainActor
 final class SharedPanelModel: ObservableObject {
-    private unowned let hub: PresenceHub
+    private weak var hub: PresenceHub?
     private var records: [CollabSharedDocument]?
     @Published private(set) var revision = 0
     @Published private(set) var entries: [SharedEntry] = []
@@ -329,10 +334,11 @@ final class SharedPanelModel: ObservableObject {
     }
 
     func refresh(scan: Bool) {
+        guard let hub, let app = hub.app else { entries = []; return }
         let records = self.records ?? hub.hooks?.sharedDocuments ?? []
         self.records = records
         if scan { for record in records { hub.unseen.scanIfNeeded(record.local) } }
-        let library = hub.app.services.library
+        let library = app.services.library
         let next = SharedList.make(records, node: { library?.node($0) }, liveDoc: hub.hooks?.session?.doc,
                                    unseen: { [unseen = hub.unseen] in unseen.count($0) })
         if next != entries { entries = next }

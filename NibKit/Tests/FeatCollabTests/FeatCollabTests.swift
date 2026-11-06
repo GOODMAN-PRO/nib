@@ -14,6 +14,7 @@ final class CollabPair {
     let hostTransport: InMemoryCollabTransport
     let guestTransport: InMemoryCollabTransport
     static let guestID = "00000008"
+    var stepTimeout: TimeInterval = 10
 
     init(guestFixtures: Bool = true) {
         host = Harness(features: [FeatCollabFeature.self], deviceID: 7)
@@ -38,31 +39,42 @@ final class CollabPair {
 
     /// Shares FIXTUREDOC01 and returns the join code.
     func share(role: String = "edit") async throws -> String {
-        let r = try await host.run("collab.host", ["doc": "doc:FIXTUREDOC01", "role": .string(role)])
+        let r = try await bounded("share fixture document") {
+            try await self.host.run("collab.host", ["doc": "doc:FIXTUREDOC01", "role": .string(role)])
+        }
         return try XCTUnwrap(r["code"]?.stringValue)
     }
 
     /// Starts `collab.join` on the guest, which waits until the host decides.
     func startJoin(_ code: String, on h: Harness? = nil) -> Task<JSONValue, Error> {
         let joiner = h ?? guest
-        return Task { @MainActor in try await joiner.run("collab.join", ["code": .string(code)]) }
+        return Task { @MainActor in
+            try await self.bounded("join and catch up guest", guest: CollabService.of(joiner.app)) {
+                try await joiner.run("collab.join", ["code": .string(code)])
+            }
+        }
     }
 
     /// Joins and lets the guest in.
     @discardableResult
     func join(_ code: String) async throws -> JSONValue {
         let task = startJoin(code)
+        defer { task.cancel() }
         try await waitForRequest()
-        try await host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        try await host.runBounded("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
         return try await task.value
     }
 
     func waitForRequest(count: Int = 1) async throws {
-        for _ in 0..<500 {
-            if hostService.state.pending.count >= count { return }
-            await Task.yield()
+        let deadline = Date().addingTimeInterval(5)
+        while hostService.state.pending.count < count {
+            guard Date() < deadline else {
+                XCTFail("Timed out waiting for host to receive join request")
+                guestService.leave(); hostService.leave()
+                throw CollabTestTimeout(step: "host receives join request")
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
         }
-        XCTFail("the host never saw the join request")
     }
 
     static func stroke(_ id: String, x: Float) -> Item {
@@ -87,8 +99,9 @@ final class CollabPair {
         CollabService.of(h.app)?.formatVersion = format
         let pending = hostService.state.pending.count
         let task = startJoin(code, on: h)
+        defer { task.cancel() }
         try await waitForRequest(count: pending + 1)
-        try await host.run("collab.approve", ["participant": .string(String(format: "%08x", deviceID)), "allow": true])
+        try await host.runBounded("collab.approve", ["participant": .string(String(format: "%08x", deviceID)), "allow": true])
         _ = try await task.value
         return (h, transport)
     }
@@ -128,6 +141,8 @@ final class InterruptedCollabTransport: CollabTransport {
     var failedCount = 0
     var minimumSendInterval: TimeInterval = 0
     var shouldThrottle: (() -> Bool)?
+    /// A deliberate wire drop before bandwidth accounting (for protocol compatibility tests).
+    var dropFrame: ((Data) -> Bool)?
     private var lastSend = Date.distantPast
     init(_ base: InMemoryCollabTransport) { self.base = base }
     var id: String { base.id }
@@ -154,6 +169,7 @@ final class InterruptedCollabTransport: CollabTransport {
     }
     func join(code: String, displayName: String) async throws { try await base.join(code: code, displayName: displayName) }
     func send(_ data: Data, to peers: [CollabPeer]?) throws {
+        if dropFrame?(data) == true { return }
         if shouldThrottle?() == true, Date().timeIntervalSince(lastSend) < minimumSendInterval {
             throw NibError(.timeout, "Relay queue is full", hint: "relay-busy")
         }
@@ -258,26 +274,26 @@ final class FeatCollabTests: XCTestCase {
 
         // Host → guest, without touching the guest's undo stack (remote changes are never recorded).
         let guestUndo = pair.guest.undoDepth(Fixtures.docID)
-        try await pair.host.insert([CollabPair.stroke("HOSTSTROKE01", x: 100)])
+        try await pair.host.insertBounded([CollabPair.stroke("HOSTSTROKE01", x: 100)])
         XCTAssertTrue(CollabPair.hasItem(pair.guest, "HOSTSTROKE01"))
         XCTAssertEqual(pair.guest.undoDepth(Fixtures.docID), guestUndo)
 
         // Guest → host.
-        try await pair.guest.insert([CollabPair.stroke("GUESTSTROK01", x: 200)], page: Fixtures.page2)
+        try await pair.guest.insertBounded([CollabPair.stroke("GUESTSTROK01", x: 200)], page: Fixtures.page2)
         XCTAssertTrue(CollabPair.hasItem(pair.host, "GUESTSTROK01", page: Fixtures.page2))
 
         // The same text box edited on both devices: last writer wins everywhere.
         var mine = try pair.host.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
         mine.text?.text = RichText(plain: "Edited by Ada")
-        try await pair.host.insert([mine])
+        try await pair.host.insertBounded([mine])
         var theirs = try pair.guest.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
         theirs.text?.text = RichText(plain: "Edited by Ben")
-        try await pair.guest.insert([theirs])
+        try await pair.guest.insertBounded([theirs])
         let merged = try pair.host.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
         XCTAssertEqual(merged.text?.text.plainText, "Edited by Ben")
 
         // Undo is a local change like any other: it streams to the guest.
-        try await pair.host.insert([CollabPair.stroke("UNDOSTROKE01", x: 150)])
+        try await pair.host.insertBounded([CollabPair.stroke("UNDOSTROKE01", x: 150)])
         XCTAssertTrue(CollabPair.hasItem(pair.guest, "UNDOSTROKE01"))
         XCTAssertTrue(pair.host.app.bus.undo(Fixtures.docID))
         XCTAssertFalse(CollabPair.hasItem(pair.guest, "UNDOSTROKE01"))
@@ -300,7 +316,7 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertEqual(try pair.host.snapshot(), try pair.guest.snapshot(doc))
 
         // Live edits keep flowing into the received copy (behind the document's files, which the digest found missing).
-        try await pair.host.insert([CollabPair.stroke("AFTERJOIN001", x: 60)])
+        try await pair.host.insertBounded([CollabPair.stroke("AFTERJOIN001", x: 60)])
         try await waitUntil { CollabPair.hasItem(pair.guest, "AFTERJOIN001", doc: doc) }
         // The copy is remembered, so a later session with the same document reuses it.
         XCTAssertEqual(pair.guestService.localDocument(for: Fixtures.docID), doc)
@@ -320,14 +336,14 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.state, .away)
 
         // Both sides keep working meanwhile.
-        try await pair.host.insert([CollabPair.stroke("WHILEAWAY001", x: 40)])
-        try await pair.guest.insert([CollabPair.stroke("OFFLINEEDIT1", x: 80)], page: Fixtures.page2)
+        try await pair.host.insertBounded([CollabPair.stroke("WHILEAWAY001", x: 40)])
+        try await pair.guest.insertBounded([CollabPair.stroke("OFFLINEEDIT1", x: 80)], page: Fixtures.page2)
         XCTAssertFalse(CollabPair.hasItem(pair.guest, "WHILEAWAY001"))
         XCTAssertFalse(CollabPair.hasItem(pair.host, "OFFLINEEDIT1", page: Fixtures.page2))
         XCTAssertEqual(pair.guestService.session?.hasUnsentChanges, true)
 
         // Back in the foreground: re-join with the same code, no second approval, snapshot diff both ways.
-        await pair.guestService.resumeAfterSuspend()
+        try await pair.bounded("guest foreground resume") { await pair.guestService.resumeAfterSuspend() }
         XCTAssertEqual(pair.guestService.session?.phase, .active)
         XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.state, .active)
         XCTAssertTrue(pair.hostService.state.pending.isEmpty)
@@ -336,8 +352,73 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertEqual(try pair.host.snapshot(), try pair.guest.snapshot())
 
         // And live streaming resumes.
-        try await pair.guest.insert([CollabPair.stroke("AFTERRESUME1", x: 120)])
+        try await pair.guest.insertBounded([CollabPair.stroke("AFTERRESUME1", x: 120)])
         XCTAssertTrue(CollabPair.hasItem(pair.host, "AFTERRESUME1"))
+    }
+
+    func testDetachedSessionWorkReceivesCancellation() async {
+        let stopped = expectation(description: "detached session work was cancelled")
+        let task = Task {
+            do {
+                _ = try await CollabWork.value(of: Task.detached { () async throws -> Int in
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                    return 1
+                })
+                XCTFail("cancelled file work completed normally")
+            } catch is CancellationError {
+                stopped.fulfill()
+            } catch {
+                XCTFail("unexpected cancellation result: \(error)")
+            }
+        }
+        task.cancel()
+        await fulfillment(of: [stopped], timeout: 1)
+    }
+
+    func testPendingRejoinDoesNotKeepItsServiceAlive() async throws {
+        var pair: CollabPair? = CollabPair()
+        // Harness makes its app shared. Move that strong root away before starting delayed work.
+        _ = Harness(fixtures: false)
+        weak var app = pair!.guest.app
+        let code = try await pair!.share()
+        try await pair!.join(code)
+        pair!.guestService.timing.rejoinTimeout = 0.08
+        weak var service = pair!.guestService
+        weak var session = service?.session
+        let transport = pair!.guestTransport
+        pair!.hostTransport.leave()
+        try await waitUntil(timeout: 1) { session?.joinInProgress == true }
+        XCTAssertTrue(session?.joinInProgress == true)
+        pair = nil
+        try await waitUntil(timeout: 1) { app == nil && service == nil && session == nil }
+        XCTAssertNil(app, "the shared app must not retain the guest fixture")
+        XCTAssertNil(service, "the retry task must not own its service across the admission wait")
+        XCTAssertNil(session)
+        XCTAssertNil(transport.onMessage)
+        XCTAssertNil(transport.onPeersChanged)
+        // Cross the old timeout: a queued timer/failure must not touch the destroyed app.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(transport.peers.isEmpty)
+    }
+
+    func testLeavingDuringRejoinCancelsWaitAndRetryWithoutLosingTheCopy() async throws {
+        let pair = CollabPair()
+        defer { pair.guestService.leave(); pair.hostService.leave() }
+        let code = try await pair.share()
+        try await pair.join(code)
+        let session = try XCTUnwrap(pair.guestService.session)
+        pair.guestService.timing.rejoinTimeout = 0.08
+        pair.hostTransport.leave()
+        try await waitUntil(timeout: 1) { session.joinInProgress }
+        pair.guestService.leave()
+        try await waitUntil(timeout: 1) { !session.joinInProgress }
+        let sent = pair.guestTransport.sent.count
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(session.isClosed)
+        XCTAssertNil(pair.guestService.session)
+        XCTAssertEqual(pair.guestTransport.sent.count, sent, "a cancelled attempt must not retry")
+        XCTAssertNil(pair.guestService.state.message, "late failure must not replace the user's leave")
+        XCTAssertNotNil(pair.guest.library.node(Fixtures.docID))
     }
 
     func testLostHostEndsInFolderSyncFallback() async throws {
@@ -354,11 +435,60 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertNotNil(pair.guest.library.node(Fixtures.docID))
     }
 
+    func testExhaustedForegroundResumeStartsUncancelledFolderSync() async throws {
+        let pair = CollabPair()
+        let watchdog = Task { @MainActor in
+            do { try await Task.sleep(nanoseconds: 20_000_000_000) }
+            catch { return }
+            XCTFail("foreground resume exceeded its 20-second deadline")
+            pair.guestService.leave()
+            pair.hostService.leave()
+        }
+        defer {
+            watchdog.cancel()
+            pair.guestService.leave()
+            pair.hostService.leave()
+        }
+        pair.guestService.timing.approvalTimeout = 1
+        pair.guestService.timing.rejoinTimeout = 0.1
+        let code = try await pair.share()
+        try await pair.join(code)
+        let session = try XCTUnwrap(pair.guestService.session)
+        let synced = expectation(description: "folder sync runs after exhausted foreground resume")
+        var syncCalls = 0
+        var syncWasCancelled: Bool?
+        var syncCompleted = false
+        pair.guest.app.commands.register(CommandDescriptor(id: CommandIDs.syncNow, title: "Sync",
+            summary: "Test folder-sync fallback.", effect: .library, target: .library)) { _, _ in
+            syncCalls += 1
+            syncWasCancelled = Task.isCancelled
+            defer { synced.fulfill() }
+            // Model cancellation-aware I/O rather than only checking that the handler was entered.
+            try await Task.sleep(nanoseconds: 1_000_000)
+            syncCompleted = true
+            return [:]
+        }
+        // Park the peer-loss retry so only foreground resume can exhaust the attempts.
+        pair.guestService.timing.retryDelays = [60]
+        pair.guestService.didEnterBackground()
+        pair.hostTransport.leave()
+        pair.guestService.timing.retryDelays = []
+        try await pair.bounded("guest foreground resume") { await pair.guestService.resumeAfterSuspend() }
+        await fulfillment(of: [synced], timeout: 5)
+        XCTAssertEqual(syncCalls, 1)
+        XCTAssertEqual(syncWasCancelled, false)
+        XCTAssertTrue(syncCompleted)
+        XCTAssertTrue(session.isClosed)
+        XCTAssertNil(pair.guestService.session)
+        XCTAssertTrue(pair.guestService.state.message?.contains("folder sync") == true)
+        XCTAssertNotNil(pair.guest.library.node(Fixtures.docID))
+    }
+
     func testHostEndingTheSessionDisconnectsEveryone() async throws {
         let pair = CollabPair()
         let code = try await pair.share()
         try await pair.join(code)
-        let ended = try await pair.host.run("collab.leave")
+        let ended = try await pair.host.runBounded("collab.leave")
         XCTAssertEqual(ended["ended"]?.boolValue, true)
         XCTAssertNil(pair.guestService.session)
         XCTAssertEqual(pair.guestService.state.message, "The host ended the live session.")
@@ -372,7 +502,7 @@ final class FeatCollabTests: XCTestCase {
         let join = pair.startJoin(code)
         try await pair.waitForRequest()
         let sessionID = try XCTUnwrap(pair.hostService.session?.id)
-        let roster = try await pair.host.run("collab.participants")
+        let roster = try await pair.host.runBounded("collab.participants")
         let people = try XCTUnwrap(roster["participants"]?.arrayValue)
         XCTAssertEqual(people.count, 2)
         XCTAssertEqual(people.last?["state"]?.stringValue, "pending")
@@ -381,13 +511,13 @@ final class FeatCollabTests: XCTestCase {
         try forgePatch(pair, session: sessionID, item: CollabPair.stroke("FORGED000001", x: 10))
         XCTAssertFalse(CollabPair.hasItem(pair.host, "FORGED000001"))
 
-        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        try await pair.host.runBounded("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
         let joined = try await join.value
         XCTAssertEqual(joined["role"]?.stringValue, "view")
 
         // View only: the guest's own edit commands are refused, from any caller.
         do {
-            try await pair.guest.insert([CollabPair.stroke("VIEWEREDIT01", x: 30)])
+            try await pair.guest.insertBounded([CollabPair.stroke("VIEWEREDIT01", x: 30)])
             XCTFail("a viewer edited the shared document")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .permissionDenied)
@@ -399,26 +529,26 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertFalse(CollabPair.hasItem(pair.host, "FORGED000002"))
 
         // The host lets them edit: enforced on the next edit.
-        try await pair.host.run("collab.setRole", ["participant": "Ben", "role": "edit"])
-        try await pair.guest.insert([CollabPair.stroke("EDITORSTRK01", x: 40)])
+        try await pair.host.runBounded("collab.setRole", ["participant": "Ben", "role": "edit"])
+        try await pair.guest.insertBounded([CollabPair.stroke("EDITORSTRK01", x: 40)])
         XCTAssertTrue(CollabPair.hasItem(pair.host, "EDITORSTRK01"))
 
         // And back to view only.
-        try await pair.host.run("collab.setRole", ["participant": .string(CollabPair.guestID), "role": "view"])
+        try await pair.host.runBounded("collab.setRole", ["participant": .string(CollabPair.guestID), "role": "view"])
         do {
-            try await pair.guest.insert([CollabPair.stroke("VIEWEREDIT02", x: 30)])
+            try await pair.guest.insertBounded([CollabPair.stroke("VIEWEREDIT02", x: 30)])
             XCTFail("a viewer edited the shared document")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .permissionDenied)
         }
 
         // Removed: disconnected, and asking again with the code is refused.
-        try await pair.host.run("collab.revoke", ["participant": .string(CollabPair.guestID)])
+        try await pair.host.runBounded("collab.revoke", ["participant": .string(CollabPair.guestID)])
         XCTAssertNil(pair.guestService.session)
-        let after = try await pair.guest.run("collab.participants")
+        let after = try await pair.guest.runBounded("collab.participants")
         XCTAssertEqual(after["active"]?.boolValue, false)
         do {
-            _ = try await pair.guest.run("collab.join", ["code": .string(code)])
+            _ = try await pair.guest.runBounded("collab.join", ["code": .string(code)])
             XCTFail("a removed participant joined again")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .userDenied)
@@ -426,12 +556,44 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertEqual(pair.hostService.state.admitted.count, 1)
     }
 
+    func testToastApprovalsDoNotCancelOtherParticipants() async throws {
+        let harness = Harness(features: [FeatCollabFeature.self])
+        let service = try XCTUnwrap(CollabService.of(harness.app))
+        var started: [String] = []
+        var completed: [String] = []
+        var releaseFirst = false
+        defer { releaseFirst = true }
+        // Hold the first command across an await, as admission I/O can, while another toast is tapped.
+        harness.app.commands.register(CollabApproveCommand.descriptor) { params, _ in
+            let participant = try XCTUnwrap(params["participant"]?.stringValue)
+            started.append(participant)
+            if participant == "first" {
+                for _ in 0..<200 {
+                    if releaseFirst { break }
+                    try await Task.sleep(nanoseconds: 5_000_000)
+                }
+                XCTAssertTrue(releaseFirst, "first approval was not released within its deadline")
+            }
+            try Task.checkCancellation()
+            completed.append(participant)
+            return [:]
+        }
+        service.approveFromToast("first")
+        try await waitUntil(timeout: 1) { started.contains("first") }
+        service.approveFromToast("second")
+        try await waitUntil(timeout: 1) { completed.contains("second") }
+        releaseFirst = true
+        try await waitUntil(timeout: 1) { completed.contains("first") }
+        XCTAssertEqual(Set(completed), Set(["first", "second"]), "both approval commands must finish")
+        XCTAssertEqual(started.count, 2)
+    }
+
     func testDeclinedJoinerIsToldNo() async throws {
         let pair = CollabPair()
         let code = try await pair.share()
         let join = pair.startJoin(code)
         try await pair.waitForRequest()
-        let answer = try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": false])
+        let answer = try await pair.host.runBounded("collab.approve", ["participant": .string(CollabPair.guestID), "allow": false])
         XCTAssertEqual(answer["state"]?.stringValue, "declined")
         do {
             _ = try await join.value
@@ -448,13 +610,13 @@ final class FeatCollabTests: XCTestCase {
         let code = try await pair.share()
         try await pair.join(code)
         do {
-            _ = try await pair.guest.run("collab.revoke", ["participant": "00000007"])
+            _ = try await pair.guest.runBounded("collab.revoke", ["participant": "00000007"])
             XCTFail("a guest removed the host")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .permissionDenied)
         }
         do {
-            _ = try await pair.host.run("collab.setRole", ["participant": "nobody", "role": "view"])
+            _ = try await pair.host.runBounded("collab.setRole", ["participant": "nobody", "role": "view"])
             XCTFail("an unknown participant changed role")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .notFound)
@@ -472,7 +634,7 @@ final class FeatCollabTests: XCTestCase {
         let third = Harness(features: [FeatCollabFeature.self], deviceID: 9)
         CollabPair.prepare(third, transport: InMemoryCollabTransport(hub: pair.hub, peerID: "peer-third"), name: "Cy")
         do {
-            _ = try await third.run("collab.join", ["code": .string(code)])
+            _ = try await third.runBounded("collab.join", ["code": .string(code)])
             XCTFail("joined past the cap")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .unavailable)
@@ -487,7 +649,7 @@ final class FeatCollabTests: XCTestCase {
         small.maxPeers = 2
         CollabPair.prepare(fourth, transport: small, name: "Di")
         do {
-            _ = try await fourth.run("collab.join", ["code": .string(code)])
+            _ = try await fourth.runBounded("collab.join", ["code": .string(code)])
             XCTFail("joined a full room")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .unavailable)
@@ -501,7 +663,7 @@ final class FeatCollabTests: XCTestCase {
         CollabPair.prepare(h, transport: InMemoryCollabTransport(hub: InMemoryCollabTransport.Hub()), name: "Ada")
         h.app.services.lock = FakeLockService(locked: [Fixtures.docID])
         do {
-            _ = try await h.run("collab.host", ["doc": "doc:FIXTUREDOC01"])
+            _ = try await h.runBounded("collab.host", ["doc": "doc:FIXTUREDOC01"])
             XCTFail("hosted a locked document")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .locked)
@@ -521,7 +683,7 @@ final class FeatCollabTests: XCTestCase {
             }
             return .null
         }
-        try await pair.host.run(lockID)
+        try await pair.host.runBounded(lockID)
         XCTAssertNil(pair.hostService.session)
         XCTAssertNil(pair.guestService.session)
         XCTAssertEqual(try pair.guest.app.workspace.content(Fixtures.docID).meta.locked, false)
@@ -570,14 +732,14 @@ final class FeatCollabTests: XCTestCase {
 
         // The guest turns to page 2: everyone sees it in the roster.
         pair.guest.session.page = Fixtures.page2
-        let roster = try await pair.host.run("collab.participants")
+        let roster = try await pair.host.runBounded("collab.participants")
         let ben = roster["participants"]?.arrayValue?.first { $0["id"]?.stringValue == CollabPair.guestID }
         XCTAssertEqual(ben?["page"]?.stringValue, "page:FIXTUREDOC01/FIXTUREPG002")
         XCTAssertEqual(roster["side"]?.stringValue, "host")
         XCTAssertEqual(roster["code"]?.stringValue, code)
 
         // Remote changes carry their pages (unseen badges).
-        try await pair.guest.insert([CollabPair.stroke("UNSEEN000001", x: 50)], page: Fixtures.page2)
+        try await pair.guest.insertBounded([CollabPair.stroke("UNSEEN000001", x: 50)], page: Fixtures.page2)
         XCTAssertTrue(changedPages.contains(Fixtures.page2))
 
         // Presence payloads travel through the host.
@@ -595,24 +757,24 @@ final class FeatCollabTests: XCTestCase {
     func testCommandsWithoutASession() async throws {
         let h = Harness(features: [FeatCollabFeature.self])
         CollabPair.prepare(h, transport: InMemoryCollabTransport(hub: InMemoryCollabTransport.Hub()), name: "Ada")
-        let roster = try await h.run("collab.participants")
+        let roster = try await h.runBounded("collab.participants")
         XCTAssertEqual(roster["active"]?.boolValue, false)
-        let left = try await h.run("collab.leave")
+        let left = try await h.runBounded("collab.leave")
         XCTAssertEqual(left["left"]?.boolValue, false)
         do {
-            _ = try await h.run("collab.approve", ["participant": "00000008", "allow": true])
+            _ = try await h.runBounded("collab.approve", ["participant": "00000008", "allow": true])
             XCTFail("approved without a session")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .notFound)
         }
         do {
-            _ = try await h.run("collab.join", ["code": "not a code"])
+            _ = try await h.runBounded("collab.join", ["code": "not a code"])
             XCTFail("joined with a bad code")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .invalidParams)
         }
         do {
-            _ = try await h.run("collab.host", ["doc": "doc:FIXTUREDOC01", "transport": "relay"])
+            _ = try await h.runBounded("collab.host", ["doc": "doc:FIXTUREDOC01", "transport": "relay"])
             XCTFail("hosted over a relay that is not installed")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .unavailable)
@@ -623,7 +785,7 @@ final class FeatCollabTests: XCTestCase {
         let pair = CollabPair()
         pair.host.confirmer.decision = .deny
         do {
-            _ = try await pair.host.run("collab.host", ["doc": "doc:FIXTUREDOC01"], as: .ai("chat"))
+            _ = try await pair.host.runBounded("collab.host", ["doc": "doc:FIXTUREDOC01"], as: .ai("chat"))
             XCTFail("the assistant shared a document without asking")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .userDenied)
@@ -654,14 +816,14 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertEqual(NibSnapshot.images(hud, size: CGSize(width: 360, height: 40)).count, 3)
         XCTAssertNotNil(NibSnapshot.image(hud, size: CGSize(width: 360, height: 40), variant: .largeText))
         XCTAssertLessThanOrEqual(NibSnapshot.fittingSize(hud, width: 360, variant: .largeText).height, 40.5)
-        try await pair.host.run("collab.approve", ["participant": "00000009", "allow": false])
+        try await pair.host.runBounded("collab.approve", ["participant": "00000009", "allow": false])
         _ = try? await second.value
         // At AX3 the panel keeps to the wide panel width (420 pt) and grows downwards.
         let fit = NibSnapshot.fittingSize(ShareLivePanel(service: pair.hostService, context: hostContext), width: 420,
                                           variant: .largeText)
         XCTAssertLessThanOrEqual(fit.width, 420.5)
 
-        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        try await pair.host.runBounded("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
         _ = try await join.value
         let guestContext = PanelContext(app: pair.guest.app, session: pair.guest.session, navigator: nil, dismiss: {})
         XCTAssertEqual(NibSnapshot.images(ShareLivePanel(service: pair.guestService, context: guestContext), size: panel).count, 3)
@@ -671,8 +833,10 @@ final class FeatCollabTests: XCTestCase {
                                           size: CGSize(width: 540, height: 620)).count, 3)
     }
 
-    func testConformance() async {
-        let problems = await CommandConformance.check(features: [FeatCollabFeature.self])
+    func testConformance() async throws {
+        let problems = try await withCollabDeadline("collaboration command conformance") {
+            await CommandConformance.check(features: [FeatCollabFeature.self])
+        }
         XCTAssertEqual(problems, [])
     }
 
@@ -687,12 +851,12 @@ final class FeatCollabTests: XCTestCase {
         try await pair.waitForRequest()
         let session = try XCTUnwrap(pair.guestService.session)
         do {
-            _ = try await pair.guest.run("collab.join", ["code": .string(code)])
+            _ = try await pair.guest.runBounded("collab.join", ["code": .string(code)])
             XCTFail("a duplicate join must be refused")
         } catch { XCTAssertEqual(NibError.wrap(error).code, .conflict) }
         XCTAssertTrue(pair.guestService.session === session)
         XCTAssertFalse(session.isClosed)
-        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        try await pair.host.runBounded("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
         _ = try await first.value
         XCTAssertEqual(session.phase, .active)
         XCTAssertFalse(session.joinInProgress)
@@ -709,7 +873,7 @@ final class FeatCollabTests: XCTestCase {
             let join = pair.startJoin(code)
             defer { join.cancel(); pair.guestService.leave(); pair.hostService.leave() }
             try await waitUntil { !pair.hostService.state.pending.isEmpty }
-            try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+            try await pair.host.runBounded("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
             _ = try await join.value
             XCTAssertEqual(pair.guestService.session?.phase, .active)
             XCTAssertEqual(transport.broadcastSends, 1)
@@ -717,7 +881,7 @@ final class FeatCollabTests: XCTestCase {
             pair.guestService.didEnterBackground()
             pair.guestTransport.leave()
             transport.busyRemaining = busy ? 2 : 0
-            await pair.guestService.resumeAfterSuspend()
+            try await pair.bounded("guest foreground resume") { await pair.guestService.resumeAfterSuspend() }
             XCTAssertEqual(pair.guestService.session?.phase, .active)
             XCTAssertEqual(transport.broadcastSends, 2)
         }
@@ -733,7 +897,7 @@ final class FeatCollabTests: XCTestCase {
         try await pair.waitForRequest()
         transport.peerName = "Updated name"
         transport.busyRemaining = 2
-        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": false])
+        try await pair.host.runBounded("collab.approve", ["participant": .string(CollabPair.guestID), "allow": false])
         do {
             _ = try await join.value
             XCTFail("a denied guest must not join")
@@ -754,7 +918,7 @@ final class FeatCollabTests: XCTestCase {
         let start = pair.hostTransport.sent.count
         transport.busyRemaining = 2
         XCTAssertEqual(pair.hostService.session?.sendPresence(["test": "queued"], to: CollabPair.guestID), true)
-        try await pair.host.insert([CollabPair.stroke("ORDERED00001", x: 90)])
+        try await pair.host.insertBounded([CollabPair.stroke("ORDERED00001", x: 90)])
         try await waitUntil { CollabPair.hasItem(pair.guest, "ORDERED00001") }
         let kinds = try CollabPair.kinds(Array(pair.hostTransport.sent.dropFirst(start)))
         XCTAssertEqual(kinds.filter { $0 == .presence || $0 == .patch }, [.presence, .patch])
@@ -771,12 +935,12 @@ final class FeatCollabTests: XCTestCase {
             transport.failAt = [transport.accepted + offset]
             let bytes = Data(repeating: 7, count: 128_000)
             let ref = try pair.host.assets.put(bytes, ext: "png", doc: Fixtures.docID)
-            try await pair.host.insert([CollabPair.image("FAILBLOB0001", asset: ref)])
+            try await pair.host.insertBounded([CollabPair.image("FAILBLOB0001", asset: ref)])
             try await waitUntil { transport.failedCount == 1 }
             XCTAssertEqual(pair.hostService.session?.phase, .active)
             XCTAssertEqual(pair.hostService.session?.hasUnsentChanges, true)
             XCTAssertEqual(try pair.host.assets.data(ref, doc: Fixtures.docID), bytes)
-            try await pair.host.insert([CollabPair.stroke("AFTERFAIL001", x: 90)])
+            try await pair.host.insertBounded([CollabPair.stroke("AFTERFAIL001", x: 90)])
             try await waitUntil { CollabPair.hasItem(pair.guest, "AFTERFAIL001") }
         }
     }
@@ -792,7 +956,7 @@ final class FeatCollabTests: XCTestCase {
         transport.busyAt = Set([0, 7, 41, 109, 207].map { transport.accepted + $0 })
         let bytes = Data(repeating: 0xA7, count: 20 * 1024 * 1024)
         let ref = try pair.host.assets.put(bytes, ext: "png", doc: Fixtures.docID)
-        try await pair.host.insert([CollabPair.image("LARGERELAY01", asset: ref)])
+        try await pair.host.insertBounded([CollabPair.image("LARGERELAY01", asset: ref)])
         try await waitUntil(timeout: 20) { CollabPair.hasItem(pair.guest, "LARGERELAY01") }
         XCTAssertEqual(try pair.guest.assets.data(ref, doc: Fixtures.docID), bytes)
         XCTAssertEqual(transport.busyCount, 5)
@@ -813,7 +977,7 @@ final class FeatCollabTests: XCTestCase {
         transport.alwaysBusy = true
         let bytes = Data(repeating: 7, count: 128_000)
         let ref = try pair.host.assets.put(bytes, ext: "png", doc: Fixtures.docID)
-        try await pair.host.insert([CollabPair.image("CANCELRELAY1", asset: ref)])
+        try await pair.host.insertBounded([CollabPair.image("CANCELRELAY1", asset: ref)])
         try await waitUntil { transport.busyCount > 0 }
         pair.hostService.leave()
         let attempts = transport.busyCount
@@ -833,7 +997,7 @@ final class FeatCollabTests: XCTestCase {
         // A guest adds an image: the host ends up with the record and the bytes, and relays both to everyone else.
         let photo = Data("a photo Ben took \(UUID().uuidString)".utf8)
         let ref = try pair.guest.assets.put(photo, ext: "png", doc: Fixtures.docID)
-        try await pair.guest.insert([CollabPair.image("GUESTIMAGE01", asset: ref)])
+        try await pair.guest.insertBounded([CollabPair.image("GUESTIMAGE01", asset: ref)])
         try await waitUntil {
             CollabPair.hasItem(pair.host, "GUESTIMAGE01") && (try? pair.host.assets.data(ref, doc: Fixtures.docID)) == photo
         }
@@ -844,7 +1008,7 @@ final class FeatCollabTests: XCTestCase {
         // The host's own image reaches the guests the same way, bytes ahead of the record.
         let scan = Data("the host's scan \(UUID().uuidString)".utf8)
         let scanRef = try pair.host.assets.put(scan, ext: "jpg", doc: Fixtures.docID)
-        try await pair.host.insert([CollabPair.image("HOSTIMAGE001", asset: scanRef)], page: Fixtures.page2)
+        try await pair.host.insertBounded([CollabPair.image("HOSTIMAGE001", asset: scanRef)], page: Fixtures.page2)
         try await waitUntil {
             CollabPair.hasItem(pair.guest, "HOSTIMAGE001", page: Fixtures.page2)
                 && (try? pair.guest.assets.data(scanRef, doc: Fixtures.docID)) == scan
@@ -900,7 +1064,7 @@ final class FeatCollabTests: XCTestCase {
         let code = try await pair.share()
         let join = pair.startJoin(code)
         try await pair.waitForRequest()
-        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        try await pair.host.runBounded("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
         do {
             _ = try await join.value
             XCTFail("joined with a locked copy")
@@ -913,7 +1077,7 @@ final class FeatCollabTests: XCTestCase {
         // The host carries on without it, and nothing it sends reaches the locked copy.
         XCTAssertNotNil(pair.hostService.session)
         XCTAssertEqual(pair.hostService.state.admitted.count, 1)
-        try await pair.host.insert([CollabPair.stroke("NOTINLOCKED1", x: 70)])
+        try await pair.host.insertBounded([CollabPair.stroke("NOTINLOCKED1", x: 70)])
         XCTAssertFalse(CollabPair.hasItem(pair.guest, "NOTINLOCKED1"))
     }
 
@@ -931,7 +1095,7 @@ final class FeatCollabTests: XCTestCase {
             }
             return .null
         }
-        try await pair.guest.run(lockID)
+        try await pair.guest.runBounded(lockID)
         XCTAssertNil(pair.guestService.session)
         XCTAssertEqual(pair.guestService.state.message, "Your copy is locked, so you left the live session.")
         // The host's session runs on, and the lock (device-local) never reached it.
@@ -954,7 +1118,7 @@ final class FeatCollabTests: XCTestCase {
         transport.hostFailures = 2
         transport.leave()
         pair.hostService.didEnterBackground()
-        await pair.hostService.resumeAfterSuspend()
+        try await pair.bounded("host foreground resume") { await pair.hostService.resumeAfterSuspend() }
         XCTAssertEqual(transport.hostAttempts, 4, "initial host plus three resume attempts")
         XCTAssertTrue(pair.hostService.session === original)
         XCTAssertFalse(original.isClosed)
@@ -973,7 +1137,7 @@ final class FeatCollabTests: XCTestCase {
         transport.hostFailures = 3
         transport.leave()
         pair.hostService.didEnterBackground()
-        await pair.hostService.resumeAfterSuspend()
+        try await pair.bounded("host foreground resume") { await pair.hostService.resumeAfterSuspend() }
         XCTAssertEqual(transport.hostAttempts, 4)
         XCTAssertNil(pair.hostService.session)
         XCTAssertNotNil(pair.hostService.state.message)
@@ -990,12 +1154,12 @@ final class FeatCollabTests: XCTestCase {
         pair.hostService.didEnterBackground()
         pair.hostTransport.leave()
         XCTAssertEqual(pair.guestService.session?.phase, .reconnecting)
-        try await pair.host.insert([CollabPair.stroke("HOSTAWAY0001", x: 90)])
+        try await pair.host.insertBounded([CollabPair.stroke("HOSTAWAY0001", x: 90)])
         XCTAssertEqual(pair.hostService.session?.phase, .active)
         XCTAssertEqual(pair.hostService.session?.hasUnsentChanges, true)
 
         // Back in the foreground the host advertises again, and the guest re-joins with its secret.
-        await pair.hostService.resumeAfterSuspend()
+        try await pair.bounded("host foreground resume") { await pair.hostService.resumeAfterSuspend() }
         try await waitUntil {
             pair.guestService.session?.phase == .active
                 && pair.guestService.session?.joinInProgress == false
@@ -1003,7 +1167,7 @@ final class FeatCollabTests: XCTestCase {
         }
         XCTAssertTrue(pair.hostService.state.pending.isEmpty)
         XCTAssertTrue(CollabPair.hasItem(pair.guest, "HOSTAWAY0001"))
-        try await pair.guest.insert([CollabPair.stroke("GUESTBACK001", x: 110)])
+        try await pair.guest.insertBounded([CollabPair.stroke("GUESTBACK001", x: 110)])
         XCTAssertTrue(CollabPair.hasItem(pair.host, "GUESTBACK001"))
     }
 
@@ -1026,11 +1190,11 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.state, .away)
 
         // The same code again: back in without a second approval, and editing.
-        let rejoined = try await pair.guest.run("collab.join", ["code": .string(code)])
+        let rejoined = try await pair.guest.runBounded("collab.join", ["code": .string(code)])
         XCTAssertEqual(rejoined["role"]?.stringValue, "edit")
         XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.state, .active)
         XCTAssertTrue(pair.hostService.state.pending.isEmpty)
-        try await pair.guest.insert([CollabPair.stroke("RELAUNCHED01", x: 130)])
+        try await pair.guest.insertBounded([CollabPair.stroke("RELAUNCHED01", x: 130)])
         XCTAssertTrue(CollabPair.hasItem(pair.host, "RELAUNCHED01"))
 
         // Without the secret the host is asked again, instead of the device being refused for good.
@@ -1040,7 +1204,7 @@ final class FeatCollabTests: XCTestCase {
         let join = pair.startJoin(code)
         try await pair.waitForRequest()
         XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.state, .pending)
-        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        try await pair.host.runBounded("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
         _ = try await join.value
         XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.state, .active)
     }
@@ -1058,7 +1222,7 @@ final class FeatCollabTests: XCTestCase {
 
         // Its edits are refused on its device, and a patch it sends anyway never lands.
         do {
-            try await pair.guest.insert([CollabPair.stroke("OLDEREDIT001", x: 30)])
+            try await pair.guest.insertBounded([CollabPair.stroke("OLDEREDIT001", x: 30)])
             XCTFail("an older Nib edited the shared document")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .permissionDenied)
@@ -1066,7 +1230,7 @@ final class FeatCollabTests: XCTestCase {
         try forgePatch(pair, session: sessionID, item: CollabPair.stroke("FORGEDOLD001", x: 20))
         XCTAssertFalse(CollabPair.hasItem(pair.host, "FORGEDOLD001"))
         do {
-            _ = try await pair.host.run("collab.setRole", ["participant": .string(CollabPair.guestID), "role": "edit"])
+            _ = try await pair.host.runBounded("collab.setRole", ["participant": .string(CollabPair.guestID), "role": "edit"])
             XCTFail("an older Nib was made an editor")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .unsupported)
@@ -1075,10 +1239,10 @@ final class FeatCollabTests: XCTestCase {
         // Updated and back: the role the host chose returns.
         pair.guestService.formatVersion = NibFormat.version
         pair.guestTransport.leave()
-        await pair.guestService.resumeAfterSuspend()
+        try await pair.bounded("guest foreground resume") { await pair.guestService.resumeAfterSuspend() }
         XCTAssertEqual(pair.guestService.session?.myRole, .edit)
         XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.needsUpdate, false)
-        try await pair.guest.insert([CollabPair.stroke("UPDATEDEDIT1", x: 40)])
+        try await pair.guest.insertBounded([CollabPair.stroke("UPDATEDEDIT1", x: 40)])
         XCTAssertTrue(CollabPair.hasItem(pair.host, "UPDATEDEDIT1"))
 
         // Someone with a newer Nib arrives: the others can only view until they update; when it leaves, they edit.
@@ -1086,7 +1250,7 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertEqual(pair.hostService.session?.participants["00000009"]?.role, .edit)
         XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.role, .view)
         XCTAssertEqual(pair.guestService.session?.myRole, .view)
-        try await newer.run("collab.leave")
+        try await newer.runBounded("collab.leave")
         XCTAssertEqual(pair.guestService.session?.myRole, .edit)
         XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.needsUpdate, false)
     }
@@ -1111,7 +1275,7 @@ final class FeatCollabTests: XCTestCase {
             }
             return .null
         }
-        try await pair.host.run(markID)
+        try await pair.host.runBounded(markID)
         try hostLibrary.writePackage(Fixtures.docID, app: pair.host.app)
 
         let code = try await pair.share()
@@ -1129,7 +1293,7 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertEqual(try pair.host.app.workspace.content(Fixtures.docID).meta.sourceBookmark, Data([1, 2, 3]))
 
         // Live edits flow into the received copy.
-        try await pair.host.insert([CollabPair.stroke("PACKAGELIVE1", x: 50)])
+        try await pair.host.insertBounded([CollabPair.stroke("PACKAGELIVE1", x: 50)])
         try await waitUntil { CollabPair.hasItem(pair.guest, "PACKAGELIVE1", doc: doc) }
     }
 
@@ -1157,7 +1321,7 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertGreaterThan(frames.count, 1)
         for frame in frames { try pair.guestTransport.send(frame, to: nil) }
         XCTAssertFalse(CollabPair.hasItem(pair.host, "PREADMIT0000"))
-        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        try await pair.host.runBounded("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
         _ = try await join.value
         XCTAssertFalse(CollabPair.hasItem(pair.host, "PREADMIT0000"))
     }
@@ -1177,12 +1341,14 @@ final class FeatCollabTests: XCTestCase {
 
     // MARK: Helpers
 
-    private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {
+    private func waitUntil(timeout: TimeInterval = 5, step: String = #function,
+                           file: StaticString = #filePath, line: UInt = #line,
+                           _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while !condition() {
             guard Date() < deadline else {
-                XCTFail("timed out")
-                return
+                XCTFail("Timed out waiting in \(step)", file: file, line: line)
+                throw CollabTestTimeout(step: step)
             }
             try await Task.sleep(nanoseconds: 20_000_000)
         }

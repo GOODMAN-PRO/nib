@@ -247,7 +247,7 @@ final class PresenceHub: ObservableObject {
         return hub
     }
 
-    unowned let app: NibApp
+    weak var app: NibApp?
     let environment: PresenceEnvironment
     var notifier: PresenceNotifier
     var timing = PresenceTiming()
@@ -278,6 +278,7 @@ final class PresenceHub: ObservableObject {
     /// While in the background: changes per shared document for the notification, and when Nib left.
     private var awayChanges: [DocumentID: (count: Int, names: [String])] = [:]
     private var leftAt: TimeInterval?
+    private var commandTasks: [UUID: Task<Void, Never>] = [:]
     private var seenTask: Task<Void, Never>?
     private var seenTarget: (doc: DocumentID, page: PageID)?
     private var returnTask: Task<Void, Never>?
@@ -293,6 +294,15 @@ final class PresenceHub: ObservableObject {
         self.notifier = notifier
     }
 
+    deinit {
+        seenTask?.cancel()
+        returnTask?.cancel()
+        for task in commandTasks.values { task.cancel() }
+        for subscription in subscriptions { subscription.cancel() }
+        for observer in lifecycle { NotificationCenter.default.removeObserver(observer) }
+        if let settingsObserver { NotificationCenter.default.removeObserver(settingsObserver) }
+    }
+
     func now() -> TimeInterval { clock() }
 
     var isConnected: Bool { hooks != nil }
@@ -303,7 +313,7 @@ final class PresenceHub: ObservableObject {
     /// Settings › Collaboration › Show Live Cursors (read once, then on change: the canvas asks every frame).
     var showsCursors: Bool {
         if let cached = cursorsSetting { return cached }
-        let value = app.settings.get(PresenceSettings.cursors)
+        let value = app?.settings.get(PresenceSettings.cursors) ?? false
         cursorsSetting = value
         return value
     }
@@ -311,6 +321,7 @@ final class PresenceHub: ObservableObject {
     // MARK: Wiring
 
     func connect(_ hooks: CollabHooks) {
+        guard let app else { return }
         guard self.hooks == nil else { return }
         self.hooks = hooks
         hookToken = hooks.observe { [weak self] event in self?.handle(event) }
@@ -333,7 +344,7 @@ final class PresenceHub: ObservableObject {
                     self.cursorsSetting = nil
                     self.renderAll(animated: false)
                 } else if name == PresenceSettings.notifications.name,
-                          self.app.settings.get(PresenceSettings.notifications) {
+                          self.app?.settings.get(PresenceSettings.notifications) == true {
                     self.notifier.enableNotifications()
                 } else if name.hasPrefix(CollabSharedStore.prefix) {
                     self.sharedModel.changed(recordsChanged: true)
@@ -458,6 +469,7 @@ final class PresenceHub: ObservableObject {
     /// S-102: while Nib is in the background (alive only while it records audio), collaborators' changes become one
     /// local notification per document; the badges wait for the return either way.
     private func remoteChanges(from pid: String, doc: DocumentID, summary: ChangeSummary, pages: Set<PageID>) {
+        guard let app else { return }
         guard !environment.isAppActive, summary.count > 0 else { return }
         let name = hooks?.participants.first { $0.id == pid }?.name ?? ""
         var entry = awayChanges[doc] ?? (count: 0, names: [])
@@ -472,6 +484,7 @@ final class PresenceHub: ObservableObject {
     // MARK: App events
 
     private func handleEvent(_ e: NibEvent) {
+        guard let app else { return }
         switch e.type {
         case NibEventType.pageChanged, NibEventType.sessionDocument, NibEventType.sessionActivated:
             let session = e.payload?["session"]?.stringValue.flatMap { app.services.sessions.session(NibID($0)) }
@@ -495,6 +508,7 @@ final class PresenceHub: ObservableObject {
     /// A window's page, document or activation changed: tell the others where this device looks, notice a follower
     /// leaving the leader's page, and start the dwell that marks the page seen.
     private func viewChanged(_ session: EditorSession?) {
+        guard let app else { return }
         if let s = session ?? app.services.sessions.active {
             follow.localViewChanged(s)
             if s === presenceSession() { sendViewport(s) }
@@ -512,6 +526,7 @@ final class PresenceHub: ObservableObject {
     }
 
     private func selectionChanged(_ session: EditorSession?) {
+        guard let app else { return }
         guard state.live, let doc = state.doc, let s = session ?? app.services.sessions.active, s === presenceSession()
         else { return }
         let sel = s.selection
@@ -561,6 +576,7 @@ final class PresenceHub: ObservableObject {
     /// The window whose view this device shares: the active one when it shows the shared document, else the first
     /// that does.
     func presenceSession() -> EditorSession? {
+        guard let app else { return nil }
         guard let doc = sharedDoc else { return nil }
         let sessions = app.services.sessions
         if let active = sessions.active, active.document == doc { return active }
@@ -623,6 +639,7 @@ final class PresenceHub: ObservableObject {
 
     /// Opens the shared document at `page` when no window shows it (following from the library).
     func openShared(_ doc: DocumentID, page: PageID?) {
+        guard let app else { return }
         var params: [String: JSONValue] = ["doc": .string(NodeRef.document(doc).description)]
         if let page = page { params["page"] = .string(NodeRef.page(doc, page).description) }
         if app.commands.entry(CommandIDs.docOpen) != nil {
@@ -672,6 +689,7 @@ final class PresenceHub: ObservableObject {
     }
 
     private func announceUnseen(_ doc: DocumentID, count: Int) {
+        guard let app else { return }
         let message = PresenceText.sinceYouLeft(count)
         lastNotice = message
         guard let host = app.ui.activeNavigator?.floatingHost else { return }
@@ -680,6 +698,7 @@ final class PresenceHub: ObservableObject {
 
     /// Goes to the first page with unseen changes (Show on the toast).
     func showUnseen(_ doc: DocumentID) {
+        guard let app else { return }
         guard let page = unseen.firstPage(doc) else { return }
         let window = app.services.sessions.active
         if window?.document == doc, app.commands.entry(CommandIDs.viewGoToPage) != nil {
@@ -693,6 +712,7 @@ final class PresenceHub: ObservableObject {
 
     /// The page the user looks at is marked seen after a short dwell (so flicking through pages clears nothing).
     func scheduleSeenCheck() {
+        guard let app else { return }
         guard environment.isAppActive, let s = app.services.sessions.active, let doc = s.document, let page = s.page,
               unseen.isTracked(doc), unseen.hasUnseen(doc, page: page) else {
             seenTask?.cancel()
@@ -709,7 +729,7 @@ final class PresenceHub: ObservableObject {
             guard let self = self, !Task.isCancelled else { return }
             self.seenTask = nil
             self.seenTarget = nil
-            guard let s = self.app.services.sessions.active, s.document == doc, s.page == page,
+            guard let s = self.app?.services.sessions.active, s.document == doc, s.page == page,
                   self.environment.isAppActive, self.unseen.hasUnseen(doc, page: page) else { return }
             self.markSeenQuietly([NodeRef.page(doc, page).description], session: s)
         }
@@ -722,10 +742,12 @@ final class PresenceHub: ObservableObject {
 
     /// Runs `collab.markSeen` as the user without a toast (the dwell and the baseline are not user actions).
     private func markSeenQuietly(_ refs: [String], session: EditorSession?) {
+        guard let app else { return }
         let params: JSONValue = ["pages": .array(refs.map { .string($0) })]
         let bus = app.bus
         let log = self.log
-        Task { @MainActor in
+        let task = Task { @MainActor in
+            guard !Task.isCancelled else { return }
             do {
                 _ = try await bus.execute(Invocation(command: CommandIDs.collabMarkSeen, params: params,
                                                      principal: .user, session: session))
@@ -733,6 +755,7 @@ final class PresenceHub: ObservableObject {
                 log.error("collab: mark as seen failed: \(NibError.wrap(error).message, privacy: .public)")
             }
         }
+        track(task)
     }
 
     func unseenChanged() {
@@ -743,6 +766,7 @@ final class PresenceHub: ObservableObject {
     // MARK: State for the UI
 
     func refreshState() {
+        guard let app else { return }
         var next = PresenceUIState()
         if let info = hooks?.session, info.phase == .active, let doc = info.doc {
             next.live = true
@@ -789,8 +813,9 @@ final class PresenceHub: ObservableObject {
 
     /// Runs a command as the user from overlays and panels; a failure becomes a toast.
     func run(_ command: String, _ params: JSONValue = [:], session: EditorSession?) {
-        let app = self.app
-        Task { @MainActor [weak self] in
+        guard let app else { return }
+        let task = Task { @MainActor [weak self, weak app] in
+            guard let app, !Task.isCancelled else { return }
             do {
                 _ = try await app.bus.execute(Invocation(command: command, params: params, principal: .user,
                                                          session: session))
@@ -800,11 +825,21 @@ final class PresenceHub: ObservableObject {
                 self?.notice(e.message)
             }
         }
+        track(task)
+    }
+
+    private func track(_ task: Task<Void, Never>) {
+        let token = UUID()
+        commandTasks[token] = task
+        Task { [weak self] in
+            await task.value
+            self?.commandTasks[token] = nil
+        }
     }
 
     func notice(_ message: String) {
         lastNotice = message
-        app.ui.activeNavigator?.floatingHost?.postToast(message)
+        app?.ui.activeNavigator?.floatingHost?.postToast(message)
     }
 
     /// VoiceOver hears what changed without a toast (following stopped because the user moved away).

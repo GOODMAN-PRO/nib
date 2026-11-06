@@ -361,15 +361,16 @@ extension CollabService {
                                           at: Date().timeIntervalSince1970, code: code, secret: secret,
                                           transport: session?.transportKey ?? sharedRecord(remote)?.transport)
         guard let json = try? JSONValue.from(record) else { return }
-        app.settings.setJSON(CollabSharedStore.prefix + remote.raw, json)
+        app?.settings.setJSON(CollabSharedStore.prefix + remote.raw, json)
     }
 
     func sharedRecord(_ remote: DocumentID) -> CollabSharedDocument? {
-        app.settings.json(CollabSharedStore.prefix + remote.raw).flatMap { try? $0.decode(CollabSharedDocument.self) }
+        app?.settings.json(CollabSharedStore.prefix + remote.raw).flatMap { try? $0.decode(CollabSharedDocument.self) }
     }
 
     func sharedDocuments() -> [CollabSharedDocument] {
-        app.settings.names(prefix: CollabSharedStore.prefix)
+        guard let app else { return [] }
+        return app.settings.names(prefix: CollabSharedStore.prefix)
             .compactMap { app.settings.json($0).flatMap { try? $0.decode(CollabSharedDocument.self) } }
             .sorted { $0.at > $1.at }
     }
@@ -388,21 +389,24 @@ extension CollabService {
     /// checked against its `blob` header and unpacked off the main actor).
     func importSnapshot(_ s: CollabMessage.Snapshot, blob: CollabMessage.Blob?, file: URL?,
                         author: String) async throws -> DocumentID {
-        guard let library = app.services.library else { throw NibError.unavailable("the library") }
+        guard let app, let library = app.services.library else { throw NibError.unavailable("the library") }
         let folder = try sharedFolder(library)
         switch s.format {
         case .package:
             guard let file = file, let blob = blob else {
                 throw NibError.invalid(String(localized: "The shared document arrived empty."))
             }
-            let package = try await Task.detached(priority: .userInitiated) { () throws -> URL in
+            let package = try await CollabWork.value(of: Task.detached(priority: .userInitiated) { () throws -> URL in
+                try Task.checkCancellation()
                 let (bytes, sha) = try CollabBlobIO.digest(of: file)
                 guard bytes == blob.bytes, sha == blob.sha256.lowercased() else {
                     throw NibError.invalid(String(localized: "The shared document arrived damaged."))
                 }
                 return try CollabPackageIO.unzip(file: file)
-            }.value
+            })
             defer { try? FileManager.default.removeItem(at: CollabPackageIO.scratchFolder(of: package)) }
+            try Task.checkCancellation()
+            guard session?.isClosed == false else { throw CancellationError() }
             let local = try library.importPackage(at: package, into: folder)
             keepReceivedMetaLocal(local)
             return local
@@ -424,7 +428,7 @@ extension CollabService {
     /// A received package keeps none of the host's device-local meta (favourite, lock, where it was trashed from, its
     /// source file). Written as bookkeeping from this device: never recorded for undo and never sent.
     func keepReceivedMetaLocal(_ doc: DocumentID) {
-        guard let meta = try? app.workspace.content(doc).meta else { return }
+        guard let app, let meta = try? app.workspace.content(doc).meta else { return }
         var clean = CollabSession.receivedMeta(meta)
         clean.id = doc
         guard clean != meta else { return }

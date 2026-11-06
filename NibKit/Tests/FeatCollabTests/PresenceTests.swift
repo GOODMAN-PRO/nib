@@ -47,7 +47,7 @@ final class PresencePair {
 
     /// Ada shares the fixture notebook; Ben asks to join and is let in.
     func start() async throws {
-        let r = try await host.run("collab.host", ["doc": "doc:FIXTUREDOC01"])
+        let r = try await host.runBounded("collab.host", ["doc": "doc:FIXTUREDOC01"])
         let code = try XCTUnwrap(r["code"]?.stringValue)
         try await join(guest, code: code, id: PresencePair.guestID)
         try await presenceWait("both see each other") {
@@ -61,9 +61,17 @@ final class PresencePair {
     func join(_ h: Harness, code: String, id: String) async throws {
         let service = CollabService.of(host.app)!
         let pending = service.state.pending.count
-        let task = Task { @MainActor in try await h.run("collab.join", ["code": .string(code)]) }
+        let task = Task { @MainActor in
+            try await withCollabDeadline("presence guest admission and catch-up",
+                cleanup: { [weak service, weak guest = CollabService.of(h.app)] in
+                    guest?.leave(); service?.leave()
+                }) {
+                try await h.run("collab.join", ["code": .string(code)])
+            }
+        }
+        defer { task.cancel() }
         try await presenceWait("the host sees the request") { service.state.pending.count > pending }
-        try await host.run("collab.approve", ["participant": .string(id), "allow": true])
+        try await host.runBounded("collab.approve", ["participant": .string(id), "allow": true])
         _ = try await task.value
     }
 
@@ -86,15 +94,51 @@ final class PresencePair {
 @MainActor
 func presenceWait(_ what: String, file: StaticString = #filePath, line: UInt = #line,
                _ condition: () -> Bool) async throws {
-    for _ in 0..<600 {
+    let deadline = Date().addingTimeInterval(3)
+    while Date() < deadline {
         if condition() { return }
         try await Task.sleep(nanoseconds: 5_000_000)
     }
     XCTFail("timed out waiting until \(what)", file: file, line: line)
+    throw CollabTestTimeout(step: what)
 }
 
 @MainActor
 final class PresenceTests: XCTestCase {
+    func testPresenceHelpersAndDelayedSummarySurviveOwnerTeardown() async throws {
+        var harness: Harness? = Harness(features: PresencePair.features)
+        // Release NibApp.shared's ownership before scheduling the delayed summary.
+        _ = Harness(fixtures: false)
+        weak var app = harness!.app
+        weak var service = CollabService.of(harness!.app)
+        var hub: PresenceHub? = PresenceHub.of(harness!.app)
+        weak var releasedHub = hub
+        let follow = try XCTUnwrap(hub).follow
+        let shared = try XCTUnwrap(hub).sharedModel
+        let unseen = try XCTUnwrap(hub).unseen
+        hub?.timing.returnSummaryDelay = 0.02
+        hub?.didEnterBackground()
+        hub?.didBecomeActive()
+        harness = nil
+        XCTAssertNil(app, "the shared app must not retain the presence fixture")
+        XCTAssertNil(service)
+        // A retained panel/hub can outlive its app; a delayed summary must find no app to update.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        hub?.refreshState()
+        shared.refresh(scan: true)
+        unseen.scan(Fixtures.docID)
+        XCTAssertTrue(shared.entries.isEmpty)
+        hub = nil
+        XCTAssertNil(releasedHub, "retained helpers must not own their hub")
+        // Retained helper objects must also tolerate the hub disappearing.
+        follow.follow("departed")
+        XCTAssertFalse(follow.setLeading(true))
+        XCTAssertNil(follow.targetSession())
+        shared.refresh(scan: true)
+        XCTAssertTrue(shared.entries.isEmpty)
+        XCTAssertTrue(unseen.trackedDocuments.isEmpty)
+    }
+
     private let doc = Fixtures.docID
     private var page1Ref: String { NodeRef.page(Fixtures.docID, Fixtures.page1).description }
     private var page2Ref: String { NodeRef.page(Fixtures.docID, Fixtures.page2).description }
@@ -287,7 +331,7 @@ final class PresenceTests: XCTestCase {
         persistence.didChange(doc, head: content, pages: [Fixtures.page2: [item]])
         h.app.workspace.evictPages(doc, keeping: [])
         XCTAssertNil(h.app.workspace.contentRevision(doc, page: Fixtures.page2))
-        try await h.run("collab.markSeen", ["pages": ["doc:FIXTUREDOC01"]])
+        try await h.runBounded("collab.markSeen", ["pages": ["doc:FIXTUREDOC01"]])
         let expected = max(content.pages.map { $0.rev.effective() }.max() ?? .zero, item.rev)
         XCTAssertEqual(hub.unseen.baseline(doc), expected)
         XCTAssertTrue(UnseenComputation.isUnseen(Rev(wallMs: expected.wallMs, counter: expected.counter + 1, device: 7),
@@ -298,7 +342,7 @@ final class PresenceTests: XCTestCase {
         item.rev = future
         persistence.didChange(doc, head: content, pages: [Fixtures.page2: [item]])
         h.app.workspace.evictPages(doc, keeping: [])
-        try await h.run("collab.markSeen", ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"]])
+        try await h.runBounded("collab.markSeen", ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"]])
         XCTAssertLessThan(try XCTUnwrap(hub.unseen.lastSeen(doc, page: Fixtures.page2)).wallMs, future.wallMs)
         XCTAssertEqual(UnseenComputation.newest(nil, items: [item]), future.effective())
     }
@@ -319,7 +363,7 @@ final class PresenceTests: XCTestCase {
         XCTAssertEqual(tracker.count(doc), 0, "sharing starts with nothing unseen")
 
         // Ada writes on page 2 while Ben looks at page 1.
-        try await pair.host.insert([PresencePair.stroke("ADASTROKE001", x: 100)], page: Fixtures.page2)
+        try await pair.host.insertBounded([PresencePair.stroke("ADASTROKE001", x: 100)], page: Fixtures.page2)
         try await presenceWait("the change is unseen") { tracker.count(self.doc) == 1 }
         XCTAssertEqual(tracker.unseenPages(doc), [Fixtures.page2])
         XCTAssertTrue(tracker.hasUnseen(doc, page: Fixtures.page2))
@@ -334,7 +378,7 @@ final class PresenceTests: XCTestCase {
         XCTAssertEqual(attachment.drawnDots, [Fixtures.page2])
 
         // Mark as Seen clears it, and the mark survives a rescan.
-        let r = try await pair.guest.run("collab.markSeen", ["pages": [.string(page2Ref)]])
+        let r = try await pair.guest.runBounded("collab.markSeen", ["pages": [.string(page2Ref)]])
         XCTAssertEqual(r["cleared"]?.arrayValue, [.string(page2Ref)])
         XCTAssertEqual(r["changes"]?.intValue, 1)
         XCTAssertEqual(r["remaining"]?.intValue, 0)
@@ -346,31 +390,31 @@ final class PresenceTests: XCTestCase {
         XCTAssertTrue(attachment.drawnDots.isEmpty)
 
         // A later change is unseen again; the whole document can be marked at once.
-        try await pair.host.insert([PresencePair.stroke("ADASTROKE002", x: 200)], page: Fixtures.page2)
+        try await pair.host.insertBounded([PresencePair.stroke("ADASTROKE002", x: 200)], page: Fixtures.page2)
         try await presenceWait("the second change is unseen") { tracker.count(self.doc) == 1 }
-        try await pair.guest.run("collab.markSeen", ["pages": ["doc:FIXTUREDOC01"]])
+        try await pair.guest.runBounded("collab.markSeen", ["pages": ["doc:FIXTUREDOC01"]])
         XCTAssertEqual(tracker.count(doc), 0)
         XCTAssertTrue(pair.guest.app.settings.names(prefix: UnseenTracker.docKey(doc) + ".").isEmpty,
                       "a document mark replaces the page marks")
 
         // Ben's own edit of an item Ada changed clears it too.
-        try await pair.host.insert([PresencePair.stroke("ADASTROKE003", x: 300)], page: Fixtures.page2)
+        try await pair.host.insertBounded([PresencePair.stroke("ADASTROKE003", x: 300)], page: Fixtures.page2)
         try await presenceWait("the third change is unseen") { tracker.count(self.doc) == 1 }
         var mine = try pair.guest.app.workspace.item(doc, page: Fixtures.page2, id: "ADASTROKE003")
         mine.locked = true
-        try await pair.guest.insert([mine], page: Fixtures.page2)
+        try await pair.guest.insertBounded([mine], page: Fixtures.page2)
         XCTAssertEqual(tracker.count(doc), 0)
 
         // Bad refs are refused with a path.
         do {
-            try await pair.guest.run("collab.markSeen", ["pages": ["folder:FIXTUREFLD01"]])
+            try await pair.guest.runBounded("collab.markSeen", ["pages": ["folder:FIXTUREFLD01"]])
             XCTFail("a folder is not a page")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .invalidParams)
             XCTAssertEqual(e.path, "$.pages[0]")
         }
         do {
-            try await pair.guest.run("collab.markSeen", ["pages": ["page:FIXTUREDOC01/NOSUCHPAGE01"]])
+            try await pair.guest.runBounded("collab.markSeen", ["pages": ["page:FIXTUREDOC01/NOSUCHPAGE01"]])
             XCTFail("an unknown page")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .notFound)
@@ -382,13 +426,13 @@ final class PresenceTests: XCTestCase {
         let pair = PresencePair()
         pair.guestHub.timing.seenDwell = 0
         try await pair.start()
-        try await pair.host.insert([PresencePair.stroke("ADASTROKE001", x: 100)], page: Fixtures.page2)
+        try await pair.host.insertBounded([PresencePair.stroke("ADASTROKE001", x: 100)], page: Fixtures.page2)
         try await presenceWait("page 2 is unseen") { pair.guestHub.unseen.hasUnseen(self.doc, page: Fixtures.page2) }
         pair.guest.session.page = Fixtures.page2
         try await presenceWait("looking at page 2 marks it seen") { pair.guestHub.unseen.count(self.doc) == 0 }
         XCTAssertNotNil(pair.guest.app.settings.json(UnseenTracker.pageKey(doc, Fixtures.page2)))
         // A change on the page being looked at is seen as it arrives.
-        try await pair.host.insert([PresencePair.stroke("ADASTROKE002", x: 200)], page: Fixtures.page2)
+        try await pair.host.insertBounded([PresencePair.stroke("ADASTROKE002", x: 200)], page: Fixtures.page2)
         try await presenceWait("seen at once") { pair.guestHub.unseen.count(self.doc) == 0 }
     }
 
@@ -401,14 +445,14 @@ final class PresenceTests: XCTestCase {
 
         hub.didEnterBackground()
         env.isAppActive = false
-        try await pair.host.insert([PresencePair.stroke("ADASTROKE001", x: 100)], page: Fixtures.page2)
+        try await pair.host.insertBounded([PresencePair.stroke("ADASTROKE001", x: 100)], page: Fixtures.page2)
         try await presenceWait("the change arrived") { hub.unseen.count(self.doc) == 1 }
         XCTAssertTrue(notifier.posts.isEmpty, "without background audio the app would be suspended: no notification")
 
         pair.guest.app.events.emit(AudioRecordingPayload(clip: "audio:FIXTUREDOC01/FIXTUREAUD01", state: "recording",
                                                          duration: 3))
         XCTAssertTrue(hub.isRecording)
-        try await pair.host.insert([PresencePair.stroke("ADASTROKE002", x: 200), PresencePair.stroke("ADASTROKE003", x: 250)],
+        try await pair.host.insertBounded([PresencePair.stroke("ADASTROKE002", x: 200), PresencePair.stroke("ADASTROKE003", x: 250)],
                                    page: Fixtures.page2)
         try await presenceWait("a notification") { !notifier.posts.isEmpty }
         let post = try XCTUnwrap(notifier.posts.last)
@@ -486,7 +530,7 @@ final class PresenceTests: XCTestCase {
         }
 
         // When Ben leaves, Ada's side forgets him and his session state.
-        try await pair.guest.run("collab.leave")
+        try await pair.guest.runBounded("collab.leave")
         try await presenceWait("Ada is alone") { pair.hostHub.state.others.isEmpty }
         XCTAssertTrue(pair.guestHub.presence.people.isEmpty)
         XCTAssertFalse(pair.guestHub.state.live)
@@ -497,7 +541,7 @@ final class PresenceTests: XCTestCase {
         try await pair.start()
         let ben = pair.guestHub
 
-        let r = try await pair.guest.run("collab.follow", ["participant": .string(PresencePair.hostID)])
+        let r = try await pair.guest.runBounded("collab.follow", ["participant": .string(PresencePair.hostID)])
         XCTAssertEqual(r["following"]?.stringValue, PresencePair.hostID)
         XCTAssertEqual(r["name"]?.stringValue, "Ada")
         XCTAssertEqual(ben.state.following, PresencePair.hostID)
@@ -518,28 +562,28 @@ final class PresenceTests: XCTestCase {
         XCTAssertEqual(pair.guest.session.page, Fixtures.page1, "no longer following")
 
         // By name, then stop with no participant.
-        try await pair.guest.run("collab.follow", ["participant": "ada"])
+        try await pair.guest.runBounded("collab.follow", ["participant": "ada"])
         XCTAssertEqual(ben.state.following, PresencePair.hostID)
         try await presenceWait("caught up") { pair.guest.session.page == Fixtures.page2 }
-        let stopped = try await pair.guest.run("collab.follow", [:])
+        let stopped = try await pair.guest.runBounded("collab.follow", [:])
         XCTAssertNil(stopped["following"]?.stringValue)
         XCTAssertNil(ben.state.following)
         XCTAssertFalse(ben.showsFollowHUD(in: pair.guest.session))
 
         // Mistakes say what to do.
         await assertThrows(.invalidParams) {
-            _ = try await pair.guest.run("collab.follow", ["participant": .string(PresencePair.guestID)])
+            _ = try await pair.guest.runBounded("collab.follow", ["participant": .string(PresencePair.guestID)])
         }
-        await assertThrows(.notFound) { _ = try await pair.guest.run("collab.follow", ["participant": "Nobody"]) }
+        await assertThrows(.notFound) { _ = try await pair.guest.runBounded("collab.follow", ["participant": "Nobody"]) }
         let alone = Harness(features: PresencePair.features, deviceID: 11)
-        await assertThrows(.notFound) { _ = try await alone.run("collab.follow", ["participant": "00000007"]) }
-        await assertThrows(.notFound) { _ = try await alone.run("collab.followMe", ["on": true]) }
+        await assertThrows(.notFound) { _ = try await alone.runBounded("collab.follow", ["participant": "00000007"]) }
+        await assertThrows(.notFound) { _ = try await alone.runBounded("collab.followMe", ["on": true]) }
     }
 
     func testFollowMeLeadsEveryoneIncludingLateJoiners() async throws {
         let pair = PresencePair()
         try await pair.start()
-        let r = try await pair.host.run("collab.followMe", ["on": true])
+        let r = try await pair.host.runBounded("collab.followMe", ["on": true])
         XCTAssertEqual(r["on"]?.boolValue, true)
         XCTAssertEqual(r["participants"]?.intValue, 1)
         XCTAssertTrue(pair.hostHub.state.leading)
@@ -556,7 +600,7 @@ final class PresenceTests: XCTestCase {
         try await presenceWait("Cy follows Ada") { cyHub.state.following == PresencePair.hostID }
         try await presenceWait("Cy is on page 2") { cy.session.page == Fixtures.page2 }
 
-        try await pair.host.run("collab.followMe", ["on": false])
+        try await pair.host.runBounded("collab.followMe", ["on": false])
         try await presenceWait("everyone is let go") {
             pair.guestHub.state.following == nil && cyHub.state.following == nil
         }
@@ -571,7 +615,7 @@ final class PresenceTests: XCTestCase {
         try await pair.start()
         pair.host.session.selection = Selection(doc: doc, page: Fixtures.page1, items: [Fixtures.strokeID],
                                                 bounds: Rect(x: 10, y: 10, width: 100, height: 100))
-        try await pair.host.run("collab.followMe", ["on": true])
+        try await pair.host.runBounded("collab.followMe", ["on": true])
         try await presenceWait("guest follows and sees the lasso") {
             pair.guestHub.state.following == PresencePair.hostID &&
                 pair.guestHub.presence.people[PresencePair.hostID]?.lasso != nil
@@ -582,10 +626,13 @@ final class PresenceTests: XCTestCase {
         let transport = try XCTUnwrap(pair.guest.app.services.get(ServiceKeys.collabMultipeer,
                                                                   as: InMemoryCollabTransport.self))
         transport.leave()
-        try await pair.host.run("collab.followMe", ["on": false])
+        try await pair.host.runBounded("collab.followMe", ["on": false])
         pair.host.session.selection = Selection()
         XCTAssertNotNil(pair.guestHub.presence.people[PresencePair.hostID]?.lasso, "the clearing message was missed")
-        await service.resumeAfterSuspend()
+        try await withCollabDeadline("presence foreground resume",
+            cleanup: { [weak service, weak host = CollabService.of(pair.host.app)] in
+                service?.leave(); host?.leave()
+            }) { await service.resumeAfterSuspend() }
         try await presenceWait("guest rejoins and receives the current viewport") {
             pair.guestHub.state.live && pair.guestHub.presence.people[PresencePair.hostID]?.viewport != nil
         }
@@ -596,7 +643,7 @@ final class PresenceTests: XCTestCase {
     func testRejoiningFormerLeaderDoesNotTakeLeadershipBack() async throws {
         let pair = PresencePair()
         try await pair.start()
-        try await pair.guest.run("collab.followMe", ["on": true])
+        try await pair.guest.runBounded("collab.followMe", ["on": true])
         try await presenceWait("host follows guest") { pair.hostHub.state.following == PresencePair.guestID }
         let service = try XCTUnwrap(CollabService.of(pair.guest.app))
         service.timing.retryDelays = [60]
@@ -604,8 +651,11 @@ final class PresenceTests: XCTestCase {
         let transport = try XCTUnwrap(pair.guest.app.services.get(ServiceKeys.collabMultipeer,
                                                                   as: InMemoryCollabTransport.self))
         transport.leave()
-        try await pair.host.run("collab.followMe", ["on": true])
-        await service.resumeAfterSuspend()
+        try await pair.host.runBounded("collab.followMe", ["on": true])
+        try await withCollabDeadline("presence foreground resume",
+            cleanup: { [weak service, weak host = CollabService.of(pair.host.app)] in
+                service?.leave(); host?.leave()
+            }) { await service.resumeAfterSuspend() }
         try await presenceWait("returning guest follows the new leader") {
             pair.guestHub.state.following == PresencePair.hostID
         }
@@ -624,9 +674,9 @@ final class PresenceTests: XCTestCase {
                 pair.guestHub.state.following == PresencePair.hostID
         }
         XCTAssertNil(pair.hostHub.state.following)
-        try await pair.host.run("collab.followMe", ["on": false])
-        try await pair.host.run("collab.setRole", ["participant": .string(PresencePair.guestID), "role": "view"])
-        await assertThrows(.permissionDenied) { _ = try await pair.guest.run("collab.followMe", ["on": true]) }
+        try await pair.host.runBounded("collab.followMe", ["on": false])
+        try await pair.host.runBounded("collab.setRole", ["participant": .string(PresencePair.guestID), "role": "view"])
+        await assertThrows(.permissionDenied) { _ = try await pair.guest.runBounded("collab.followMe", ["on": true]) }
         pair.hostHub.follow.remoteFollowMe(on: true, from: PresencePair.guestID)
         XCTAssertNil(pair.hostHub.state.following, "inbound viewer messages cannot lead either")
     }
@@ -638,18 +688,18 @@ final class PresenceTests: XCTestCase {
         let relay = InMemoryCollabTransport.Hub()
         pair.host.app.services.set(InMemoryCollabTransport(hub: relay, peerID: "relay-host"), for: ServiceKeys.collabRelay)
         pair.guest.app.services.set(InMemoryCollabTransport(hub: relay, peerID: "relay-guest"), for: ServiceKeys.collabRelay)
-        let hosted = try await pair.host.run("collab.host", ["doc": "doc:FIXTUREDOC01", "transport": "relay"])
+        let hosted = try await pair.host.runBounded("collab.host", ["doc": "doc:FIXTUREDOC01", "transport": "relay"])
         let code = try XCTUnwrap(hosted["code"]?.stringValue)
-        let joining = Task { try await pair.guest.run("collab.join", ["code": .string(code), "transport": "relay"]) }
+        let joining = Task { try await pair.guest.runBounded("collab.join", ["code": .string(code), "transport": "relay"]) }
         let hostService = try XCTUnwrap(CollabService.of(pair.host.app))
         try await presenceWait("relay join request") { !hostService.state.pending.isEmpty }
-        try await pair.host.run("collab.approve", ["participant": .string(PresencePair.guestID), "allow": true])
+        try await pair.host.runBounded("collab.approve", ["participant": .string(PresencePair.guestID), "allow": true])
         _ = try await joining.value
         let guestService = try XCTUnwrap(CollabService.of(pair.guest.app))
         let saved = try XCTUnwrap(guestService.sharedDocuments().first)
         XCTAssertEqual(saved.transport, "relay")
         // A new service reads the persisted record, independent of the old session's in-memory transport.
-        try await pair.guest.run("collab.leave")
+        try await pair.guest.runBounded("collab.leave")
         let fresh = CollabService(app: pair.guest.app, hooks: try XCTUnwrap(CollabHooks.of(pair.guest.app)), notifier: SilentCollabNotifier())
         let restored = try XCTUnwrap(fresh.sharedDocuments().first)
         XCTAssertEqual(restored.transport, "relay")
@@ -681,7 +731,7 @@ final class PresenceTests: XCTestCase {
         XCTAssertEqual(received.first?.isHost, false)
         XCTAssertEqual(received.first?.code, CollabService.of(pair.host.app)?.state.session?.code)
 
-        try await pair.host.insert([PresencePair.stroke("ADASTROKE001", x: 100)], page: Fixtures.page2)
+        try await pair.host.insertBounded([PresencePair.stroke("ADASTROKE001", x: 100)], page: Fixtures.page2)
         try await presenceWait("the Shared tab counts it") { pair.guestHub.sharedEntries().first?.unseen == 1 }
 
         // Pure list rules: trashed and missing copies drop out, one entry per document, live first then newest.
@@ -728,7 +778,7 @@ final class PresenceTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(app.ui.menus.get(PresenceIDs.followMenuPrefix + "1")).isVisible(menu))
         let markAll = try XCTUnwrap(app.ui.menus.get(PresenceIDs.markAllSeenMenu))
         XCTAssertFalse(markAll.isVisible(menu))
-        try await pair.host.insert([PresencePair.stroke("ADASTROKE001", x: 100)], page: Fixtures.page2)
+        try await pair.host.insertBounded([PresencePair.stroke("ADASTROKE001", x: 100)], page: Fixtures.page2)
         try await presenceWait("unseen") { pair.guestHub.unseen.count(self.doc) == 1 }
         XCTAssertTrue(markAll.isVisible(menu))
         let thumbnail = MenuContext(app: app, session: pair.guest.session, doc: doc, page: Fixtures.page2)
@@ -736,7 +786,7 @@ final class PresenceTests: XCTestCase {
         XCTAssertTrue(pageItem.isVisible(thumbnail))
         XCTAssertEqual(pageItem.params(thumbnail)["pages"]?.arrayValue, [.string(page2Ref)])
 
-        try await pair.guest.run("collab.follow", ["participant": .string(PresencePair.hostID)])
+        try await pair.guest.runBounded("collab.follow", ["participant": .string(PresencePair.hostID)])
         XCTAssertTrue(app.ui.visibleChromeOverlays(context).map(\.id).contains(PresenceIDs.followOverlay))
         let compact = ChromeContext(app: app, session: pair.guest.session, kind: .notebook, isCompact: true)
         XCTAssertTrue(app.ui.visibleChromeOverlays(compact).map(\.id).contains(PresenceIDs.followOverlayCompact))
@@ -755,8 +805,10 @@ final class PresenceTests: XCTestCase {
         }
     }
 
-    func testCommandsPassConformance() async {
-        let problems = await CommandConformance.check(features: PresencePair.features, owners: [FeatCollabPresenceFeature.id])
+    func testCommandsPassConformance() async throws {
+        let problems = try await withCollabDeadline("presence command conformance") {
+            await CommandConformance.check(features: PresencePair.features, owners: [FeatCollabPresenceFeature.id])
+        }
         XCTAssertEqual(problems, [])
         let h = Harness(features: PresencePair.features)
         for id in ["collab.follow", "collab.followMe", "collab.markSeen"] {
