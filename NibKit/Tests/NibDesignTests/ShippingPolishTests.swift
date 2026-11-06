@@ -1,6 +1,7 @@
 import XCTest
 import SwiftUI
 import UIKit
+import NibContracts
 import NibTesting
 @testable import NibDesign
 
@@ -98,6 +99,73 @@ final class ShippingPolishTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(off.width, 44)
             XCTAssertGreaterThanOrEqual(off.height, 44)
             XCTAssertGreaterThan(on.width, off.width, "Selected filters include a checkmark")
+        }
+    }
+
+    func testAdjacentPaperTilesKeepWhiteFacesSelectionRingsAndVerticalShadows() throws {
+        // Match the paper grid's 12 pt gap and the cover strip's 16 pt gap.
+        for (tileSize, gap) in [(NibMetrics.paperTileSize, NibSpacing.m),
+                                (NibMetrics.coverStripSize, NibSpacing.l)] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                let origin = CGPoint(x: 32, y: 32)
+                let face = CGRect(origin: origin, size: tileSize)
+                let canvas = CGSize(width: tileSize.width * 2 + gap + 64, height: tileSize.height + 96)
+                func capture(neighbour: Bool, selected: Bool) throws -> UIImage {
+                    let row = HStack(alignment: .top, spacing: gap) {
+                        NibPaperTile(name: "A", isSelected: selected, size: tileSize, action: {}) { Color.white }
+                        NibPaperTile(name: "B", isSelected: false, size: tileSize, action: {}) { Color.white }
+                            .opacity(neighbour ? 1 : 0)
+                    }
+                    .fixedSize()
+                    .padding(.leading, origin.x)
+                    .padding(.top, origin.y)
+                    .frame(width: canvas.width, height: canvas.height, alignment: .topLeading)
+                    // Neutral backing makes black vertical shadows measurable in both appearances.
+                    .background(Color(white: 0.5))
+                    return try XCTUnwrap(NibSnapshot.image(row, size: canvas, variant: variant))
+                }
+                let alone = try capture(neighbour: false, selected: false)
+                let adjacent = try capture(neighbour: true, selected: false)
+                let selected = try capture(neighbour: true, selected: true)
+                let diagnostic = "variant=\(variant), tile=\(tileSize), gap=\(gap)"
+                for (name, image) in [("alone", alone), ("adjacent", adjacent), ("selected", selected)] {
+                    let attachment = XCTAttachment(image: image)
+                    attachment.name = "Paper-shadow-\(variant.rawValue)-\(Int(tileSize.width))-\(name)"
+                    attachment.lifetime = .keepAlways
+                    add(attachment)
+                }
+                func pixel(_ image: UIImage, _ point: CGPoint) throws -> RGBA {
+                    try XCTUnwrap(NibSnapshot.pixel(image, at: point), diagnostic)
+                }
+                func difference(_ a: RGBA, _ b: RGBA) -> Int {
+                    max(abs(Int(a.r) - Int(b.r)), abs(Int(a.g) - Int(b.g)), abs(Int(a.b) - Int(b.b)))
+                }
+                // The later (right) tile draws on top of the preceding face. Removing its
+                // horizontal shadow mask darkens this strip, especially with dark elevation.
+                for inset in [CGFloat(1), 3, 6] {
+                    for fraction in [CGFloat(0.3), 0.5, 0.7] {
+                        let point = CGPoint(x: face.maxX - inset, y: face.minY + face.height * fraction)
+                        let reference = try pixel(alone, point)
+                        XCTAssertGreaterThan(min(reference.r, reference.g, reference.b), 250, diagnostic)
+                        for image in [adjacent, selected] {
+                            XCTAssertLessThanOrEqual(difference(try pixel(image, point), reference), 1,
+                                                     "A right neighbour must not shade the white face; \(diagnostic)")
+                        }
+                    }
+                }
+                // The ring is outside the face on BOTH sides, including beside the neighbour.
+                for x in [face.minX - 2, face.maxX + 2] {
+                    let point = CGPoint(x: x, y: face.midY)
+                    XCTAssertGreaterThan(difference(try pixel(selected, point), try pixel(adjacent, point)), 30,
+                                         "The selection ring must remain visible outside the shadow mask; \(diagnostic)")
+                }
+                // Below the page, away from the centred caption: clipping all shadow overflow
+                // would also stop the lateral spill, but would wrongly remove the paper's lift.
+                let below = try pixel(adjacent, CGPoint(x: face.minX + face.width / 4, y: face.maxY + 12))
+                let background = try pixel(adjacent, CGPoint(x: 1, y: 1))
+                XCTAssertGreaterThan(Int(background.r) - Int(below.r), 2,
+                                     "Vertical paper elevation must survive; \(diagnostic)")
+            }
         }
     }
 

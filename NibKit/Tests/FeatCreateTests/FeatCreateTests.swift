@@ -2255,7 +2255,7 @@ final class FeatCreateTests: XCTestCase {
                 let fadeHeight = NibSpacing.xxl
                 XCTAssertGreaterThan(fadeViewport.height, fadeHeight + NibSpacing.xs, diagnostics)
                 let sampleX = captureViewport.midX
-                for distance in [fadeHeight + NibSpacing.xs, fadeHeight, fadeHeight / 2, 1] {
+                for distance in [fadeHeight + NibSpacing.xs, fadeHeight, 20, fadeHeight / 2, 1] {
                     let point = CGPoint(x: sampleX, y: captureViewport.maxY - distance)
                     XCTAssertTrue(host.view.bounds.contains(point), diagnostics)
                     XCTAssertTrue(captureInk.contains(point), "The fade samples must lie over ink; \(diagnostics)")
@@ -2277,11 +2277,18 @@ final class FeatCreateTests: XCTestCase {
                 }
                 let solid = try contrast(at: fadeHeight + NibSpacing.xs)
                 let fadeStart = try contrast(at: fadeHeight)
+                let extendedBand = try contrast(at: 20)
                 let fadeMiddle = try contrast(at: fadeHeight / 2)
                 let fadeEnd = try contrast(at: 1)
                 XCTAssertGreaterThan(solid, 100, "The scrolling content must actually render; \(diagnostics)")
                 XCTAssertEqual(Double(fadeStart), Double(solid), accuracy: 20,
                                "Only the final 24 pt of this form should fade; \(diagnostics)")
+                // At 20 pt a 24 pt ramp has 5/6 coverage; the old 16 pt ramp is fully opaque.
+                // Allow colour-space conversion/rounding, but never accept the opaque result.
+                let extendedBandRatio = Double(extendedBand) / Double(max(solid, 1))
+                XCTAssertGreaterThan(extendedBandRatio, 0.5, diagnostics)
+                XCTAssertLessThan(extendedBandRatio, 0.97,
+                                  "The newly faded 16–24 pt band must lose contrast; \(diagnostics)")
                 XCTAssertGreaterThan(fadeStart, fadeMiddle, diagnostics)
                 XCTAssertGreaterThan(fadeMiddle, fadeEnd, diagnostics)
                 XCTAssertLessThan(fadeEnd, solid / 4, diagnostics)

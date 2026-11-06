@@ -107,31 +107,36 @@ final class PaletteSettingsScrollTests: XCTestCase {
                 let pencil = try XCTUnwrap(scroll(in: host.view))
                 XCTAssertFalse(pencil === pen, "A different tool must not inherit the previous scroller")
                 XCTAssertEqual(pencil.contentOffset.y + pencil.adjustedContentInset.top, 0, accuracy: 1)
-                // UIKit can extend the native scroll host into automatic safe-area insets.
-                // Its bounds are not the unobscured SwiftUI viewport. This fixture has no
-                // NibDropletContainer/ClusterLayer, so fallback paint padding cannot enlarge it.
+                // The reported 536 pt native height remains unexplained. This fixture has no
+                // NibDropletContainer/ClusterLayer, so its fallback paint is not involved.
+                // Automatic hosting insets are a hypothesis, not a code-proven diagnosis.
                 // The surface owns the 520 pt cap; overflowing NibScrollView reserves 16 pt
                 // of that surface for its cue. Check that stronger guarantee after insets.
                 let surface = try XCTUnwrap(field.anchorRect("palette.settings"))
                 let inset = pencil.adjustedContentInset
                 let visibleHeight = pencil.bounds.height - inset.top - inset.bottom
-                let diagnostic = [
-                    "window=\(size), scheme=\(scheme), surface=\(surface)",
-                    "bounds=\(pencil.bounds), inset=\(pencil.contentInset), adjusted=\(inset)",
-                    "safeArea=\(pencil.safeAreaInsets), hostSafeArea=\(host.view.safeAreaInsets)"
-                ].joined(separator: "; ")
+                func viewportDiagnostic() -> String {
+                    let currentSurface = field.anchorRect("palette.settings")
+                    return [
+                        "window=\(size), scheme=\(scheme), surface=\(String(describing: currentSurface))",
+                        "bounds=\(pencil.bounds), inset=\(pencil.contentInset), adjusted=\(pencil.adjustedContentInset)",
+                        "safeArea=\(pencil.safeAreaInsets), hostSafeArea=\(host.view.safeAreaInsets)"
+                    ].joined(separator: "; ")
+                }
+                let diagnostic = viewportDiagnostic()
                 XCTAssertLessThanOrEqual(surface.height, NibMetrics.popoverMaxHeight + 0.5, diagnostic)
                 XCTAssertGreaterThan(visibleHeight, 0, diagnostic)
                 XCTAssertLessThanOrEqual(visibleHeight, surface.height - NibSpacing.l + 0.5, diagnostic)
 
-                // Isolate automatic hosting insets on the same simulator and window sizes.
-                // With them removed even the raw native bounds must fit below the cue.
+                // Experiment: disable automatic hosting insets on the same simulator/window.
+                // If the 504 pt bound still fails, inspect BOTH sets of measurements before
+                // changing product code; elapsed settling time does not prove the hypothesis.
                 host.safeAreaRegions = []
                 try await settle()
                 XCTAssertTrue(scroll(in: host.view) === pencil)
                 XCTAssertLessThanOrEqual(pencil.bounds.height,
                                          NibMetrics.popoverMaxHeight - NibSpacing.l + 0.5,
-                                         "Inset-free native viewport: \(diagnostic)")
+                                         "Before disabling hosting insets: \(diagnostic); after: \(viewportDiagnostic())")
             }
         }
     }
