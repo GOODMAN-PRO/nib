@@ -647,6 +647,7 @@ final class InkUITests: XCTestCase {
     }
 
     func testHighlighterWidthsColoursStabilisationAndDrawHoldPersist() throws {
+        // Historical test name retained; the settings/persistence tail has its own fresh fixture below.
         try ui.selectTool("highlighter")
         var areas: [Int] = []
         for slot in 1...3 {
@@ -657,18 +658,42 @@ final class InkUITests: XCTestCase {
         XCTAssertLessThan(areas[0], areas[1], "8 pt < 14 pt highlight")
         XCTAssertLessThan(areas[1], areas[2], "14 pt < 20 pt highlight")
         for colour in ["Lemon", "Apricot", "Mint", "Sky", "Lilac", "Blush"] {
-            try settings("highlighter"); try chooseColour(colour); closePopover()
-            let before = try ui.state(), blank = try raster()
-            try draw(); _ = try visibleInk(after: blank); try undo(to: before)
-            try settings("highlighter")
-            XCTAssertTrue(try control(colour, type: .button).isSelected, "\(colour) must persist")
-            closePopover()
+            let iterationStart = ProcessInfo.processInfo.systemUptime
+            defer {
+                let seconds = ProcessInfo.processInfo.systemUptime - iterationStart
+                ui.logQA("Highlighter colour timing", "colour=\(colour) part=iteration seconds=\(seconds)")
+            }
+            func timed<T>(_ part: String, _ body: () throws -> T) rethrows -> T {
+                let started = ProcessInfo.processInfo.systemUptime
+                defer {
+                    let seconds = ProcessInfo.processInfo.systemUptime - started
+                    ui.logQA("Highlighter colour timing", "colour=\(colour) part=\(part) seconds=\(seconds)")
+                }
+                return try body()
+            }
+            try timed("open settings") { try settings("highlighter") }
+            try timed("choose") { try chooseColour(colour) }
+            timed("close after choose") { closePopover() }
+            let (before, blank) = try timed("prepare draw") { (try ui.state(), try raster()) }
+            try timed("draw") { try draw(); _ = try visibleInk(after: blank) }
+            try timed("undo") { try undo(to: before) }
+            try timed("reopen") {
+                try settings("highlighter")
+                XCTAssertTrue(try control(colour, type: .button).isSelected, "\(colour) must persist")
+            }
+            timed("close after reopen") { closePopover() }
         }
+    }
+
+    func testHighlighterThicknessStabilisationAndDrawHoldPersist() throws {
+        try ui.selectTool("highlighter")
+        try width(3)
         try settings("highlighter")
-        _ = try slider("Thickness", to: 0.7)
+        let thickness = try slider("Thickness", to: 0.7)
         let smoothing = try slider("Stabilisation", to: 0.8)
         try toggle("Draw and hold", to: false); closePopover()
         try settings("highlighter")
+        XCTAssertEqual(String(describing: try control("Thickness", type: .slider, scroll: true).value), thickness)
         XCTAssertEqual(String(describing: try control("Stabilisation", type: .slider, scroll: true).value), smoothing)
         XCTAssertEqual(try control("Draw and hold", type: .switch, scroll: true).value as? String, "0")
         closePopover(); try draw()
