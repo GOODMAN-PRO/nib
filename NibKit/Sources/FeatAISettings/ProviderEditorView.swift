@@ -175,6 +175,19 @@ enum ProviderValidation {
     }
 }
 
+/// Shared by the visible rows and the form's always-mounted keyboard actions.
+enum ProviderEditorAction {
+    case save, testConnection
+
+    func isEnabled(busy: Bool, clean: Bool, hasSavedProvider: Bool) -> Bool {
+        guard !busy else { return false }
+        switch self {
+        case .save: return true
+        case .testConnection: return clean && hasSavedProvider
+        }
+    }
+}
+
 @MainActor
 struct ProviderEditorView: View {
     let app: NibApp
@@ -206,6 +219,27 @@ struct ProviderEditorView: View {
         return ProviderValidation.warnsAboutHTTP(url, hasKey: !key.isEmpty || (!replaceKey && hasCredentials))
     }
     private var clean: Bool { (try? draft.config()) == savedConfig && key.isEmpty && !replaceKey }
+    private func isEnabled(_ action: ProviderEditorAction) -> Bool {
+        action.isEnabled(busy: busy, clean: clean, hasSavedProvider: savedConfig != nil)
+    }
+
+    // A Form realises its rows lazily. These controls live with the form, even while its action rows are off screen.
+    // Shortcut registration with hit testing disabled still needs a device/UI run. If it fails, remove
+    // allowsHitTesting(false); do not add hidden(), which would remove the shortcuts.
+    private var keyboardActions: some View {
+        Group {
+            Button(String(localized: "Save provider")) { save() }
+                .keyboardShortcut("s", modifiers: .command)
+                .disabled(!isEnabled(.save))
+            Button(String(localized: "Test connection")) { runConnection(modelsOnly: false) }
+                .keyboardShortcut("t", modifiers: [.command, .shift])
+                .disabled(!isEnabled(.testConnection))
+        }
+        .frame(width: 0, height: 0)
+        .clipped()
+        .accessibilityHidden(true)
+        .allowsHitTesting(false)
+    }
 
     var body: some View {
         Form {
@@ -269,12 +303,10 @@ struct ProviderEditorView: View {
             } header: { AISettingsHeader(String(localized: "Extra headers")) }
               footer: { Text(String(localized: "Use non-secret headers only. Credentials always belong in the API key field.")) }
             Section {
-                NibButton(String(localized: "Save provider"), symbol: .checkmark, kind: .primary,
-                          shortcut: KeyboardShortcut("s", modifiers: .command)) { save() }
-                    .disabled(busy)
-                NibButton(String(localized: "Test connection"), symbol: .network,
-                          shortcut: KeyboardShortcut("t", modifiers: [.command, .shift])) { runConnection(modelsOnly: false) }
-                    .disabled(busy || !clean || savedConfig == nil)
+                NibButton(String(localized: "Save provider"), symbol: .checkmark, kind: .primary) { save() }
+                    .disabled(!isEnabled(.save))
+                NibButton(String(localized: "Test connection"), symbol: .network) { runConnection(modelsOnly: false) }
+                    .disabled(!isEnabled(.testConnection))
                 if busy { ProgressView().accessibilityLabel(String(localized: "Contacting provider")) }
                 if let message {
                     if failed { NibBanner(message, style: .warning) }
@@ -297,6 +329,7 @@ struct ProviderEditorView: View {
         .font(NibFont.body)
         .scrollContentBackground(.hidden)
         .background(NibColor.groupedBackground)
+        .background { keyboardActions }
         .navigationTitle(savedConfig?.name ?? String(localized: "Add provider"))
         .onChange(of: message) { _, value in
             if let value, UIAccessibility.isVoiceOverRunning { UIAccessibility.post(notification: .announcement, argument: value) }
@@ -312,9 +345,17 @@ struct ProviderEditorView: View {
         }
     }
     private func save() {
+        guard isEnabled(.save) else { return }
+        #if DEBUG
+        NSLog("%@", "[Nib QA provider] save started")
+        #endif
         busy = true; message = nil
         operation = Task { @MainActor in
             defer { busy = false }
+            #if DEBUG
+            var result = "cancelled"
+            defer { NSLog("%@", "[Nib QA provider] save finished result=\(result)") }
+            #endif
             do {
                 let config = try draft.config()
                 guard let runtime = app.services.get(ProviderSettingsRuntime.serviceKey, as: ProviderSettingsRuntime.self) else {
@@ -326,11 +367,20 @@ struct ProviderEditorView: View {
                 hasCredentials = row.hasCredentials; credentialsMissing = row.credentialsMissing
                 key = ""; replaceKey = false
                 message = String(localized: "Provider saved."); failed = false
+                #if DEBUG
+                result = "success"
+                #endif
             } catch is CancellationError { }
-              catch { message = NibError.wrap(error).message; failed = true }
+              catch {
+                message = NibError.wrap(error).message; failed = true
+                #if DEBUG
+                result = "failure"
+                #endif
+            }
         }
     }
     private func runConnection(modelsOnly: Bool) {
+        guard isEnabled(.testConnection) else { return }
         busy = true; message = nil
         operation = Task { @MainActor in
             defer { busy = false }

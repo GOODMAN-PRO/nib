@@ -19,6 +19,36 @@ struct CanvasDragContext {
     let refs: [String]
 }
 
+/// Values observed through the same provider API a receiving app uses, never a second export path.
+struct CanvasDragSourceFact {
+    let sequence: Int
+    let items: Int
+    let types: [String]
+    let restricted: Bool
+    var preview: CGRect?
+    var pngBytes: Int?
+
+    @MainActor
+    init(sequence: Int, items: [UIDragItem], restricted: Bool) {
+        self.sequence = sequence
+        self.items = items.count
+        self.types = items.first?.itemProvider.registeredTypeIdentifiers ?? []
+        self.restricted = restricted
+    }
+
+    var json: JSONValue {
+        let registeredTypes: JSONValue = .array(types.map { JSONValue.string($0) })
+        let png: JSONValue = pngBytes.map { JSONValue.number(Double($0)) } ?? .null
+        let target: JSONValue = preview.map { rect in
+            .object(["x": .number(Double(rect.minX)), "y": .number(Double(rect.minY)),
+                     "width": .number(Double(rect.width)), "height": .number(Double(rect.height))])
+        } ?? .null
+        return ["sequence": .number(Double(sequence)), "items": .number(Double(items)),
+                "types": registeredTypes, "restricted": .bool(restricted),
+                "preview": target, "pngBytes": png]
+    }
+}
+
 /// Drags the selection out to other windows and apps (Nib fragment, PNG and recognised text; handwriting goes as
 /// text first) and takes drops of Nib fragments, images, text and files onto the canvas. One per canvas host.
 @MainActor
@@ -34,6 +64,9 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
     private var drop: UIDropInteraction?
     private var highlight: UIView?
     private var highlightedPage: PageID?
+    private static var qaSequence = 0
+    private var qaDragSession: ObjectIdentifier?
+    private var qaDragFact: CanvasDragSourceFact?
     /// Recognised text of the current ink-only selection, prepared when the selection changes so a drag can offer
     /// text before the picture (handwriting dragged into another app lands as text).
     private struct SelectionKey: Equatable {
@@ -87,6 +120,8 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
         recognitionTask = nil
         recognized = nil
         lastSelection = nil
+        qaDragFact = nil
+        qaDragSession = nil
         self.host = nil
     }
 
@@ -95,6 +130,29 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
     }
 
     // MARK: Drag source
+
+    private func publishDragFact() {
+        guard NibUITestMode.isEnabled, let host, let fact = qaDragFact else { return }
+        host.session.toolOptions["nib.qa.dragSource"] = fact.json
+    }
+
+    private func recordDrag(_ items: [UIDragItem], session: UIDragSession, restricted: Bool) {
+        guard NibUITestMode.isEnabled else { return }
+        Self.qaSequence += 1
+        let sequence = Self.qaSequence
+        qaDragSession = ObjectIdentifier(session)
+        qaDragFact = CanvasDragSourceFact(sequence: sequence, items: items, restricted: restricted)
+        publishDragFact()
+        guard let provider = items.first?.itemProvider else { return }
+        _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.png.identifier) { [weak self] data, _ in
+            let count = data?.count
+            Task { @MainActor [weak self] in
+                guard let self, self.qaDragFact?.sequence == sequence else { return }
+                self.qaDragFact?.pngBytes = count
+                self.publishDragFact()
+            }
+        }
+    }
 
     /// The selection under `location` (view points) when a drag may start there.
     func dragSource(at location: CGPoint, host: CanvasHost) -> DragSource? {
@@ -285,6 +343,10 @@ extension CanvasDragDrop: UIDragInteractionDelegate {
         session.localContext = source.context
         let item = UIDragItem(itemProvider: itemProvider(source, host: host))
         item.localObject = source.context.refs
+        if NibUITestMode.isEnabled {
+            let restricted = dragInteraction(interaction, sessionIsRestrictedToDraggingApplication: session)
+            recordDrag([item], session: session, restricted: restricted)
+        }
         return [item]
     }
 
@@ -300,6 +362,10 @@ extension CanvasDragDrop: UIDragInteractionDelegate {
         view.frame = CGRect(origin: .zero, size: rect.size)
         let parameters = UIDragPreviewParameters()
         parameters.visiblePath = UIBezierPath(roundedRect: view.bounds, cornerRadius: NibRadius.tile)
+        if NibUITestMode.isEnabled, qaDragSession == ObjectIdentifier(session) {
+            qaDragFact?.preview = host.canvasView.convert(rect, to: host.canvasView.window)
+            publishDragFact()
+        }
         return UITargetedDragPreview(view: view, parameters: parameters,
                                      target: UIDragPreviewTarget(container: host.canvasView, center: CGPoint(x: rect.midX, y: rect.midY)))
     }

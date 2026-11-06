@@ -1034,19 +1034,38 @@ struct ElementCell: View {
 /// The collections along the bottom: a scroller of filter chips, New Collection, and the collection menu.
 struct ElementsCollectionBar: View {
     @ObservedObject var model: ElementsModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Also changes when the catalogue arrives after the bar first appears.
+    var scrollTarget: String? { model.currentCollection?.id }
+
+    private func revealSelection(_ proxy: ScrollViewProxy) {
+        guard let id = scrollTarget else { return }
+        if reduceMotion || NibMotion.forcesReduced {
+            proxy.scrollTo(id, anchor: .center)
+        } else {
+            NibMotion.animate(NibMotion.glide) { proxy.scrollTo(id, anchor: .center) }
+        }
+    }
 
     var body: some View {
         HStack(spacing: NibSpacing.xs) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: NibSpacing.s) {
-                    ForEach(model.collections) { c in
-                        NibChip(c.title, style: .filter(isSelected: c.id == model.current), action: { model.select(c.id) })
-                            .accessibilityAddTraits(c.id == model.current ? .isSelected : [])
-                            .accessibilityValue(ElementCopy.count(c.count))
+            ScrollViewReader { proxy in
+                NibScrollView(.horizontal) {
+                    HStack(spacing: NibSpacing.s) {
+                        ForEach(model.collections) { c in
+                            NibChip(c.title, style: .filter(isSelected: c.id == model.current), action: { model.select(c.id) })
+                                .accessibilityAddTraits(c.id == model.current ? .isSelected : [])
+                                .accessibilityValue(ElementCopy.count(c.count))
+                                .id(c.id)
+                        }
                     }
+                    .padding(.vertical, NibSpacing.s) // Keep 44 pt hit areas inside the scroller, beside its cue lane.
                 }
-                .padding(.vertical, NibSpacing.s)                 // the chips' 44 pt hit areas stay inside the scroller
+                .onAppear { revealSelection(proxy) }
+                .onChange(of: scrollTarget) { _, _ in revealSelection(proxy) }
             }
+            .fixedSize(horizontal: false, vertical: true)
             NibIconButton(.plus, label: String(localized: "New Collection"), size: .panel) { model.ask(.newCollection) }
             Menu {
                 if let c = model.currentCollection {

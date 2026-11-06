@@ -965,6 +965,23 @@ final class FeatElementsTests: XCTestCase {
 
     // MARK: GIPHY
 
+    func testCollectionBarTargetsTheSelectedChipAfterLoadingAndCreating() async throws {
+        let h = harness()
+        let model = ElementsModel(app: h.app, session: h.session)
+        let bar = ElementsCollectionBar(model: model)
+        XCTAssertNil(bar.scrollTarget)
+        await model.start()
+        defer { model.stop() }
+        XCTAssertEqual(bar.scrollTarget, model.current)
+        model.select(StarterElements.planner)
+        XCTAssertEqual(bar.scrollTarget, StarterElements.planner)
+        _ = try await h.run("element.collection.create", ["id": "new-collection", "title": "New collection"])
+        await model.reload()
+        model.select("new-collection")
+        XCTAssertEqual(bar.scrollTarget, "new-collection")
+        XCTAssertEqual(ElementsCollectionBar(model: model).scrollTarget, "new-collection", "Reopening keeps the selected target")
+    }
+
     /// The starter grid used to push the collection bar below the tool panel's 520 pt viewport.
     /// Measure real SwiftUI content with both optional footer actions, not a duplicate layout formula.
     func testStickerCatalogueLeavesRoomForCollectionControlsWithSelection() async throws {
@@ -1175,6 +1192,28 @@ final class FeatElementsTests: XCTestCase {
      ],
      "pagination": {"total_count": 42, "count": 2, "offset": 20}}
     """#
+
+    func testRuntimeUsesImmediateOfflineTransportOnlyForUITestFixtures() async throws {
+        XCTAssertTrue(ElementsRuntime.transport(uiTestMode: false) is URLSessionGiphyTransport)
+        let transport = ElementsRuntime.transport(uiTestMode: true)
+        XCTAssertTrue(transport is OfflineGiphyTransport)
+        XCTAssertEqual(ElementsRuntime().giphy.transport is OfflineGiphyTransport, NibUITestMode.isEnabled)
+        let request = try XCTUnwrap(GiphyClient.request(query: "cat", key: "fixture", kind: .gifs, limit: 1, offset: 0))
+        do {
+            _ = try await transport.data(for: request)
+            XCTFail("The fixture must fail without a network request")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .notConnectedToInternet)
+        }
+        let client = GiphyClient(transport: transport, key: { "fixture" })
+        do {
+            _ = try await client.search("cat", kind: .gifs, limit: 1, offset: 0)
+            XCTFail("The client must show its retryable connection failure")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .unavailable)
+            XCTAssertEqual(error.message, String(localized: "GIPHY could not be reached"))
+        }
+    }
 
     func testGiphySearchUsesTheUsersKeyAndParsesReplies() async throws {
         let transport = FakeGiphyTransport()

@@ -917,7 +917,44 @@ final class FeatClipboardTests: XCTestCase {
         XCTAssertEqual(broken["source"], "empty")
     }
 
-    /// A drag dropped back on its own canvas moves the selection: same page = item.transform, other page = item.moveToPage.
+    func testDragSourceFactDescribesTheProviderAndLoadedPNG() async throws {
+        let h = Harness(features: [FeatClipboardFeature.self])
+        h.app.services.renderer = FakeRenderer()
+        let host = FakeCanvasHost(h)
+        let image = try items([page1 + "FIXTUREIMG01"], in: h)[0]
+        let context = CanvasDragContext(host: ObjectIdentifier(host), doc: Fixtures.docID, page: Fixtures.page1,
+                                        start: image.bounds.center, bounds: image.bounds, refs: [page1 + "FIXTUREIMG01"])
+        let source = CanvasDragDrop.DragSource(context: context, items: [image])
+        let provider = CanvasDragDrop().itemProvider(source, host: host)
+        let dragItems = [UIDragItem(itemProvider: provider)]
+        var fact = CanvasDragSourceFact(sequence: 7, items: dragItems, restricted: false)
+        XCTAssertEqual(fact.json["sequence"], .number(7))
+        XCTAssertEqual(fact.json["items"], .number(1))
+        XCTAssertEqual(fact.json["types"], .array([NibFragment.typeIdentifier, UTType.png.identifier, UTType.utf8PlainText.identifier].map { .string($0) }))
+        XCTAssertEqual(fact.json["restricted"], .bool(false))
+        XCTAssertEqual(fact.json["preview"], .null)
+        XCTAssertEqual(fact.json["pngBytes"], .null)
+        let loaded = expectation(description: "receiver loads PNG")
+        _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.png.identifier) { data, error in
+            Task { @MainActor in
+                XCTAssertNil(error)
+                do {
+                    let bytes = try XCTUnwrap(data)
+                    XCTAssertNotNil(UIImage(data: bytes))
+                    var loadedFact = CanvasDragSourceFact(sequence: 7, items: dragItems, restricted: false)
+                    loadedFact.pngBytes = bytes.count
+                    XCTAssertGreaterThan(bytes.count, 0)
+                    XCTAssertEqual(loadedFact.json["pngBytes"], .number(Double(bytes.count)))
+                } catch { XCTFail("PNG load failed: \(error)") }
+                loaded.fulfill()
+            }
+        }
+        await fulfillment(of: [loaded], timeout: 2)
+        fact.preview = CGRect(x: 12, y: 24, width: 80, height: 60)
+        XCTAssertEqual(fact.json["preview"], ["x": 12, "y": 24, "width": 80, "height": 60])
+        XCTAssertEqual(CanvasDragSourceFact(sequence: 8, items: dragItems, restricted: false).json["sequence"], 8)
+    }
+
     func testDragProviderLoadsEachAssetLazilyOffMain() async throws {
         let h = Harness(features: [FeatClipboardFeature.self])
         let host = FakeCanvasHost(h)
@@ -1021,6 +1058,7 @@ final class FeatClipboardTests: XCTestCase {
         XCTAssertEqual(calls, 2)
     }
 
+    /// A drag dropped back on its own canvas moves the selection: same page = item.transform, other page = item.moveToPage.
     func testOwnDragDropRouting() {
         let source = CanvasDragContext(host: ObjectIdentifier(self), doc: Fixtures.docID, page: Fixtures.page1,
                                        start: Point(150, 240), bounds: Rect(x: 100, y: 200, width: 120, height: 90),

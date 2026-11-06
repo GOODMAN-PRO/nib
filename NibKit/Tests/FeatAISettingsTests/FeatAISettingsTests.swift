@@ -13,6 +13,18 @@ private final class StartupSecretStore: SecretStore {
 
 @MainActor
 final class FeatAISettingsTests: XCTestCase {
+    func testProviderKeyboardActionsUseTheSameAvailabilityAsTheRows() {
+        for busy in [false, true] {
+            for clean in [false, true] {
+                for saved in [false, true] {
+                    XCTAssertEqual(ProviderEditorAction.save.isEnabled(busy: busy, clean: clean, hasSavedProvider: saved), !busy)
+                    XCTAssertEqual(ProviderEditorAction.testConnection.isEnabled(busy: busy, clean: clean, hasSavedProvider: saved),
+                                   !busy && clean && saved)
+                }
+            }
+        }
+    }
+
     func testStartCompletesWithoutAccessingKeychain() async {
         let h = Harness()
         let previous = Keychain.store
