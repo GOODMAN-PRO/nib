@@ -11,7 +11,7 @@ private final class PresetTestNavigator: SceneNavigator {
     let session: EditorSession
     var openDocuments: [DocumentID] { [] }
     var activeDocument: DocumentID? { session.document }
-    var rootViewController: UIViewController? { nil }
+    var rootViewController: UIViewController?
     var presented: [UIViewController] = []
     var onPresent: ((UIViewController) -> Void)?
 
@@ -36,6 +36,14 @@ private struct PresetPopoverTestHost: View {
         NibPopoverPanel(title: popover.title) { popover.content }
             .budsFrom(popover.source, isPresented: popover.isPresented, instant: true)
     }
+}
+
+@MainActor
+private final class PickerPresenterTestController: UIViewController {
+    var nextPresented: UIViewController?
+    var leaving = false
+    override var presentedViewController: UIViewController? { nextPresented }
+    override var isBeingDismissed: Bool { leaving }
 }
 
 /// Paints `rect` (page points) in `colour` over white, for the requested region; `scaleFactor` makes it answer with a
@@ -943,6 +951,36 @@ final class FeatPresetsTests: XCTestCase {
         XCTAssertEqual(presets(h, "highlighter"), ToolPresets.defaults(for: "highlighter"))
         await assertInvalid(h, "preset.setSwatch", ["tool": "pen", "index": 0, "color": "#ZZZZZZ"], path: "$.color")
         XCTAssertEqual(presets(h, "pen").color, custom)
+    }
+
+    func testPickerPresenterChoosesOnlyTheStayingPrefix() {
+        XCTAssertNil(PresetPresenter.stayingPresenterIndex(dismissing: []))
+        XCTAssertEqual(PresetPresenter.stayingPresenterIndex(dismissing: [false]), 0)
+        XCTAssertEqual(PresetPresenter.stayingPresenterIndex(dismissing: [false, false]), 1)
+        XCTAssertEqual(PresetPresenter.stayingPresenterIndex(dismissing: [false, true]), 0)
+        XCTAssertEqual(PresetPresenter.stayingPresenterIndex(dismissing: [false, false, true]), 1)
+        XCTAssertEqual(PresetPresenter.stayingPresenterIndex(dismissing: [false, true, false]), 0)
+        XCTAssertNil(PresetPresenter.stayingPresenterIndex(dismissing: [true, false]))
+    }
+
+    func testPickerWaitsForDismissalToUnlinkBeforeCallingNavigator() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let navigator = PresetTestNavigator(session: h.session)
+        let root = PickerPresenterTestController()
+        let leaving = PickerPresenterTestController()
+        leaving.leaving = true
+        root.nextPresented = leaving
+        navigator.rootViewController = root
+        h.app.ui.activeNavigator = navigator
+        let picker = UIViewController()
+        PresetPresenter.present(picker, app: h.app, session: h.session)
+        XCTAssertTrue(navigator.presented.isEmpty, "A missing coordinator must not present on a departing controller")
+        root.nextPresented = nil
+        for _ in 0..<50 where navigator.presented.isEmpty {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(navigator.presented.count, 1)
+        XCTAssertTrue(navigator.presented.first === picker)
     }
 
     func testLocalSwatchDragCommitsOnceAndKeepsActiveColourAfterDone() async throws {

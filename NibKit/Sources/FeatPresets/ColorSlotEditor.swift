@@ -267,6 +267,10 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
     private var lastPickerSelection: RGBA?
     private var committed: RGBA?
     private var finished = false
+    #if DEBUG
+    private var presentedAt = ProcessInfo.processInfo.systemUptime
+    private var elapsedMilliseconds: Int { Int((ProcessInfo.processInfo.systemUptime - presentedAt) * 1_000) }
+    #endif
 
     init(initial: RGBA, commitsOnFinishOnly: Bool, onPick: @escaping @MainActor (RGBA) -> Void) {
         self.committed = initial
@@ -312,6 +316,9 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
     }
 
     func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
+        #if DEBUG
+        NSLog("%@", "[Nib QA picker] delegate didFinish elapsedMs=\(elapsedMilliseconds) dismissing=\(viewController.isBeingDismissed)")
+        #endif
         viewController.viewIfLoaded?.endEditing(true)
         let finalSelection = PresetColour.rgba(viewController.selectedColor)
         // HEX editing can settle after the last selection callback. A previous
@@ -321,6 +328,9 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
     }
 
     func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        #if DEBUG
+        NSLog("%@", "[Nib QA picker] delegate didDismiss elapsedMs=\(elapsedMilliseconds) presentation=\(type(of: presentationController))")
+        #endif
         if let picker = presentationController.presentedViewController as? UIColorPickerViewController {
             colorPickerViewControllerDidFinish(picker)
         } else {
@@ -345,32 +355,116 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
 /// iPad windows side by side are both foreground-active).
 @MainActor
 enum PresetPresenter {
+    /// The first departing controller takes its entire presented subtree with it.
+    /// Entries include the root. Nil means even the root is leaving.
+    static func stayingPresenterIndex(dismissing: [Bool]) -> Int? {
+        let end = dismissing.firstIndex(of: true) ?? dismissing.count
+        return end > 0 ? end - 1 : nil
+    }
+
     static func present(_ viewController: UIViewController, app: NibApp, session: EditorSession) {
-        if let navigator = app.ui.activeNavigator, navigator.session === session {
-            // A colour command may arrive while UIKit retracts the swatch's
-            // context menu. Present only after that transition has released its
-            // controller; otherwise UIKit silently drops the picker presentation.
-            let root = navigator.rootViewController
-            var top = root
-            while let presented = top?.presentedViewController { top = presented }
-            var didPresent = false
-            let presentOnce = {
-                guard !didPresent else { return }
-                didPresent = true
-                navigator.presentModal(viewController)
+        let navigator = app.ui.activeNavigator.flatMap { $0.session === session ? $0 : nil }
+        let root = navigator?.rootViewController ?? (session.editor as? UIViewController)
+            ?? session.editor?.canvasHost?.canvasView.window?.rootViewController
+        var waited = Set<ObjectIdentifier>()
+        var didPresent = false
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+
+        func attempt() {
+            guard !didPresent else { return }
+            var chain: [UIViewController] = []
+            var next = root
+            while let controller = next {
+                chain.append(controller)
+                next = controller.presentedViewController
             }
-            if let transition = top?.transitionCoordinator ?? root?.transitionCoordinator {
-                // A coordinator may still exist after it stops accepting animations.
-                // In that case UIKit does not promise our completion will run.
-                let accepted = transition.animate(alongsideTransition: nil) { _ in presentOnce() }
-                if !accepted { presentOnce() }
-            } else {
-                presentOnce()
+            let dismissing = chain.map { controller in
+                if controller.isBeingDismissed { return true }
+                guard let transition = controller.transitionCoordinator ?? controller.presentingViewController?.transitionCoordinator,
+                      let presenter = controller.presentingViewController else { return false }
+                return transition.viewController(forKey: .from) === controller
+                    && transition.viewController(forKey: .to) === presenter
             }
-            return
+            #if DEBUG
+            for (index, controller) in chain.enumerated() {
+                let flags = "isBeingDismissed=\(controller.isBeingDismissed) leaving=\(dismissing[index]) coordinator=\(controller.transitionCoordinator != nil)"
+                NSLog("%@", "[Nib QA picker] chain[\(index)] class=\(type(of: controller)) \(flags)")
+            }
+            #endif
+            let staying = stayingPresenterIndex(dismissing: dismissing)
+            let transition = chain.reversed().compactMap(\.transitionCoordinator).first
+            if let transition, waited.insert(ObjectIdentifier(transition)).inserted {
+                // The completion is the animation boundary, not a promise that UIKit
+                // has already unlinked the departing controller. Re-read next turn.
+                let accepted = transition.animate(alongsideTransition: nil) { _ in
+                    DispatchQueue.main.async { attempt() }
+                }
+                #if DEBUG
+                NSLog("%@", "[Nib QA picker] transition completion accepted=\(accepted)")
+                #endif
+                if accepted { return }
+            }
+            if !chain.isEmpty && staying != chain.count - 1 {
+                guard ProcessInfo.processInfo.systemUptime < deadline else {
+                    NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                        userInfo: ["command": "preset.setSwatch", "error": NibError(.unavailable,
+                            String(localized: "The colour picker could not open. Please try again."))])
+                    return
+                }
+                // A coordinator can reject a late registration. Never fall through
+                // to the navigator's unfiltered walk until dismissal is finished.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { attempt() }
+                return
+            }
+            didPresent = true
+            #if DEBUG
+            if let coordinator = (viewController as? UIColorPickerViewController)?.delegate as? SystemColourPicker {
+                coordinator.markPresentationStarted()
+            }
+            // Unhosted package tests record the native controller without loading
+            // its remote view. Only attach the lifecycle probe in a live window.
+            if root?.viewIfLoaded?.window != nil {
+                let probe = PickerLifecycleProbe()
+                viewController.addChild(probe)
+                viewController.view.addSubview(probe.view)
+                probe.didMove(toParent: viewController)
+            }
+            NSLog("%@", "[Nib QA picker] present root=\(String(describing: root.map { type(of: $0) })) presenter=\(String(describing: chain.last.map { type(of: $0) })) navigator=\(navigator != nil)")
+            #endif
+            if let navigator { navigator.presentModal(viewController) }
+            else { chain.last?.present(viewController, animated: true) }
         }
-        var top = (session.editor as? UIViewController) ?? session.editor?.canvasHost?.canvasView.window?.rootViewController
-        while let presented = top?.presentedViewController { top = presented }
-        top?.present(viewController, animated: true)
+        attempt()
     }
 }
+
+#if DEBUG
+extension SystemColourPicker {
+    fileprivate func markPresentationStarted() { presentedAt = ProcessInfo.processInfo.systemUptime }
+}
+
+/// Observe programmatic/ancestor dismissals too: UIKit does not send the adaptive
+/// dismissal delegate callback for those. Keep the concrete system picker intact.
+private final class PickerLifecycleProbe: UIViewController {
+    private let started = ProcessInfo.processInfo.systemUptime
+    override func loadView() {
+        view = UIView(frame: .zero)
+        view.isUserInteractionEnabled = false
+    }
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        let presenter = parent?.presentingViewController.map { String(describing: type(of: $0)) } ?? "nil"
+        NSLog("%@", "[Nib QA picker] presentation completed presenter=\(presenter) elapsedMs=\(Int((ProcessInfo.processInfo.systemUptime - started) * 1_000))")
+    }
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        var controller = parent
+        while let current = controller {
+            let flags = "dismissing=\(current.isBeingDismissed) coordinator=\(current.transitionCoordinator != nil)"
+            NSLog("%@", "[Nib QA picker] willDisappear class=\(type(of: current)) \(flags) elapsedMs=\(Int((ProcessInfo.processInfo.systemUptime - started) * 1_000))")
+            controller = current.presentingViewController
+        }
+        NSLog("%@", "[Nib QA picker] disappearance stack=\(Thread.callStackSymbols.prefix(16).joined(separator: " | "))")
+    }
+}
+#endif
