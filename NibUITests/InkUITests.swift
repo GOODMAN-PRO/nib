@@ -154,7 +154,8 @@ final class InkUITests: XCTestCase {
             // Tap the switch thumb itself; the row's centre can be plain text or clipped at a popover edge.
             let native = element.switches.firstMatch
             let target = native.exists ? native : element
-            for _ in 0..<4 where scroll {
+            for _ in 0..<4 {
+                if !scroll || target.isHittable { break }
                 guard let panel = scrollPanels
                     .filter({ $0.switches.matching(NSPredicate(format: "label == %@", label)).count > 0 })
                     .min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else { break }
@@ -1483,23 +1484,46 @@ final class InkUITests: XCTestCase {
         try tap("Stylus"); try tap("Apple Pencil", scroll: true)
     }
 
-    private func revealPencilPreference(_ name: String) {
-        let detail = ui.app.collectionViews.containing(NSPredicate(
+    private func revealPencilPreference(_ name: String) throws {
+        let preference = ui.app.switches[name].firstMatch
+        if preference.exists && preference.isHittable { return }
+        // The 220 pt Settings sidebar remains realised while the wider detail list scrolls.
+        // Identify its adjacent detail pane by geometry, then bind the unfiltered collection
+        // query so no disappearing lazy detail row can change this query's membership.
+        let sidebar = ui.app.scrollViews.containing(NSPredicate(
             format: "elementType == %@ AND label == %@", NSNumber(value: XCUIElement.ElementType.button.rawValue),
-            "Switch between current tool and eraser")).firstMatch
-        ui.revealFormElement(in: detail) { self.ui.app.switches[name].firstMatch }
+            "Stylus")).firstMatch
+        guard sidebar.exists else { throw NibUI.Failure.message("Settings sidebar is unavailable while locating Apple Pencil detail") }
+        let sidebarFrame = sidebar.frame
+        let collections = ui.app.collectionViews.allElementsBoundByIndex
+        let panes = collections.filter { collection in
+            let frame = collection.frame
+            let adjacent = abs(frame.minX - sidebarFrame.maxX) <= 2 || abs(frame.maxX - sidebarFrame.minX) <= 2
+            return adjacent && frame.width > sidebarFrame.width && frame.height >= sidebarFrame.height
+                && abs(frame.maxY - sidebarFrame.maxY) <= 2
+        }
+        guard panes.count == 1, let detail = panes.first else {
+            throw NibUI.Failure.message("Apple Pencil detail frame is ambiguous: sidebar=\(sidebarFrame) candidates=\(panes.count)")
+        }
+        let detailFrame = detail.frame
+        ui.logQA("Pencil detail anchor", "preference=\(name) frame=\(detailFrame) sidebar=\(sidebarFrame) binding=collection index")
+        ui.revealFormElement(in: detail, edge: .bottom, named: name, type: .switch) { preference }
+        if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
+        guard detail.exists && detail.frame == detailFrame else {
+            throw NibUI.Failure.message("Apple Pencil detail pane changed while revealing \(name)")
+        }
     }
 
     func testPencilHoverSettingPersistsWithoutCreatingMarks() throws {
         let before = try ui.state()
         try pencilSettings()
-        revealPencilPreference("Show hover preview")
+        try revealPencilPreference("Show hover preview")
         try toggle("Show hover preview", to: false)
         try toggle("Show hover preview", to: true)
         try closePreferences()
         try assertNoNewInk(before)
         try pencilSettings()
-        revealPencilPreference("Show hover preview")
+        try revealPencilPreference("Show hover preview")
         XCTAssertEqual(try control("Show hover preview", type: .switch, scroll: true).value as? String, "1")
     }
 
@@ -1521,13 +1545,13 @@ final class InkUITests: XCTestCase {
     func testPencilHapticsPreferencePersistsWithoutMarks() throws {
         let before = try ui.state()
         try pencilSettings()
-        revealPencilPreference("Pencil haptics")
+        try revealPencilPreference("Pencil haptics")
         try toggle("Pencil haptics", to: false)
         try toggle("Pencil haptics", to: true)
         try closePreferences()
         try assertNoNewInk(before)
         try pencilSettings()
-        revealPencilPreference("Pencil haptics")
+        try revealPencilPreference("Pencil haptics")
         XCTAssertEqual(try control("Pencil haptics", type: .switch, scroll: true).value as? String, "1")
     }
 

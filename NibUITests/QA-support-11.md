@@ -196,3 +196,16 @@ Diagnostics use H6's Horizontal reveal prefix for every chip, including zero-mov
 ### I5 - go directly to Stabilisation
 
 Confirmed R12:ink-tools#1 and verdict against settings' default Fountain Pen lookup and PenSettingsView's lazy type grid. The pencil iteration opened scrolled at 83%, with Stabilisation visible but the tile unrealised, and spent 23.74 s failing to reveal an irrelevant top tile. PenAndPencilStabilisationChangesInkAndKeepsEndpoints now calls settings(tool, revealTop: false), as the existing highlighter stabilisation test does. All four slider changes, raster comparisons, endpoint coverage and Undo checks remain. CI must show four Stabilisation drags and no Fountain Pen search in this test, whether the app opens settings at the top or restores an offset. Estimated saving: roughly 20-40 s of the observed unnecessary pencil top traversals; not measured here.
+
+### I6 - stable Pencil detail binding and cheap successful toggles
+
+Confirmed R12:ink-tools#2's correction: the collection query depended on the lazy Switch between current tool and eraser row, which disappeared and let liveList re-rank onto the 220 pt sidebar. revealPencilPreference now identifies the wider detail collection adjacent to the stable Settings sidebar ScrollView (SettingsSidebar uses ScrollView/LazyVStack, not a collection), using the observed shared bottom edge and either left/right adjacency, then binds it from the unfiltered indexed query, independent of every lazy detail row. It supplies edge: .bottom and the typed name, verifies the pane is retained, and returns immediately for an already hittable preference. Both initial and reopened passes use the same helper. Ambiguous or missing detail geometry fails explicitly instead of falling back to generic ranking or scrolling the sidebar. The current recorded frames differ by only 0.5 pt at their shared edge; the geometry match allows 2 pt.
+
+Ink toggle no longer scans scrollPanels while its actual thumb is hittable. Shared setSwitch keeps its value check, nested-thumb route, optional reveal, exact eight-second value wait and failure overlap evidence; successful presses log only cheap label/frame facts. Overlap snapshots occur only for a non-hittable target or failed value change. Re-grepped shared callers in Chrome, Capture, Library and Ink; their defaults and required values remain. All hover/haptics off/on, reopen and no-mark assertions are retained.
+
+CI must show no sidebar drift, Pencil Form reveal timing below roughly 15 s, and quick Switch before press delivery. Estimated saving is about 30 s from two avoided sidebar detours plus up to 20 s of switch overhead per affected test (about 50 s/test); overlapping AX costs and the unexplained class-wide slowdown prevent a measured claim.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| PencilHoverSettingPersistsWithoutCreatingMarks; PencilHapticsPreferencePersistsWithoutMarks | Pencil detail anchor / Form reveal timing | Did a stable collection frame retain the detail scope, and how long did the bottom-directed reveal take? |
+| Shared setSwitch callers | Switch before press / Switch value failed | Was the thumb hittable before delivery; which overlaps existed only if delivery/value failed? |

@@ -213,9 +213,10 @@ final class NibUI {
                 hasNative = native.exists
                 target = hasNative ? native : element
             }
-            let facts = "row: " + elementFacts(element) + "\nthumb: " + elementFacts(target, includeOverlaps: true)
-            logQA("Switch before press", facts)
-            guard target.isEnabled && target.isHittable else {
+            let hittable = target.isHittable
+            logQA("Switch before press", "label=\(element.label) expected=\(expected) thumbFrame=\(target.frame) hittable=\(hittable)")
+            guard target.isEnabled && hittable else {
+                let facts = "row: " + elementFacts(element) + "\nthumb: " + elementFacts(target, includeOverlaps: !hittable)
                 throw Failure.message("Switch thumb must be enabled and visible\n" + facts)
             }
             target.coordinate(withNormalizedOffset: CGVector(dx: hasNative ? 0.5 : 0.92, dy: 0.5))
