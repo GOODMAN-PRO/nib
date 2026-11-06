@@ -3146,6 +3146,35 @@ final class NibUI {
         logQA("Modal form closed", "frame=\(form.frame); form and dismissal cover gone")
     }
 
+    private func dismissSystemShareSheet() throws -> Bool {
+        let remote = XCUIApplication(bundleIdentifier: "com.apple.sharinguiservice")
+        let sources = remote.state == .notRunning ? [app] : [app, remote]
+        let surfaces = sources.flatMap { source in
+            [source.otherElements["ActivityListView"].firstMatch,
+             source.otherElements["ShareSheet.RemoteContainerView"].firstMatch]
+        }
+        let headers = sources.map { $0.buttons["header.closeButton"].firstMatch }
+        guard surfaces.contains(where: { $0.exists }) || headers.contains(where: { $0.exists }) else { return false }
+        var resolvedClose: XCUIElement?
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            resolvedClose = headers.first { $0.exists && $0.isEnabled && $0.isHittable }
+            return resolvedClose != nil
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 5) == .completed, let close = resolvedClose else {
+            logQA("Share sheet close missing", sources.map { $0.debugDescription }.joined(separator: "\n"))
+            throw Failure.message("System share sheet must expose header.closeButton")
+        }
+        logQA("Share sheet close", "label=\(close.label) frame=\(close.frame)")
+        try tapWithoutIdle(close)
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            !headers.contains { $0.exists } && !surfaces.contains { $0.exists }
+        }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
+            throw Failure.message("System share sheet must disappear after its Close control")
+        }
+        return true
+    }
+
     /// Only callers requiring a closed popover opt into the round-10 closure postconditions.
     /// A child share sheet can retain its parent's settings bud. Opt in by tool ID to close
     /// that identified bud through palette reselection after native surfaces have dismissed.
@@ -3156,6 +3185,10 @@ final class NibUI {
         // the loop must not go on to close the Audio panel behind it (D:controls-forms#9).
         var dismissedSurface = false
         for _ in 0..<8 {
+            if try dismissSystemShareSheet() {
+                dismissedSurface = true
+                continue
+            }
             if requireClosedPopover {
                 let form = presentedFormSnapshot()
                 if let form, let close = formCloseControl(form) {

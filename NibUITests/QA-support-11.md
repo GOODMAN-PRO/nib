@@ -280,3 +280,11 @@ Confirmed insert-controls#4 and correction against requireControl's hittable ear
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | TextBoxStyleAndAutosizePersist; scroll:true callers | Clipped control reveal | Which target/scroller/cue viewport rejected a partly visible control? |
+
+### H12 / N1 - close system sharing before popover checks
+
+Confirmed insert-menus-alerts-forms#2 correction: the failure tree has ShareSheet.RemoteContainerView and header.closeButton; the defect is strict-popover ordering, not an absent Close label. app.log bootstraps osservice<com.apple.sharinguiservice>; com.apple.sharing.sharesheet is its XPC endpoint, not the process identity. dismissSheets now resolves the sharinguiservice application when running plus the hosted app tree, taps the sheet's own header close, and waits for its header/surfaces to disappear before checking other popovers. Missing header fails with both available trees; no guessed outside contact. Audio's underlying panel remains protected by dismissedSurface. Should unblock collection export/import-cancel and audio export. Next CI must show sheet closure, retained parent handling, then the original import/cancel assertions. Remote bundle/tree visibility remains CI-only.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Collection export; audio sharing | Share sheet close / Share sheet close missing | Which real header received the tap, or which process tree lacked it? |
