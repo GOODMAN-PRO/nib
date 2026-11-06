@@ -1283,6 +1283,9 @@ final class ChromeUITests: XCTestCase {
             return snapshot.isSelected
         }
         XCTAssertTrue(chip.isSelected)
+        let nameField = ui.app.textFields["Timer name"].firstMatch
+        ui.revealFormElement(named: "Timer name", type: .textField, fullyVisible: true) { nameField }
+        if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
         try replace("Timer name", "Preset countdown"); try tap("Start Timer")
         try ui.handleAuthorizationAlerts(waitForCountdown: { self.clockValue.exists })
         try wait("Preset countdown must run") { self.clockValue.exists }
@@ -1302,9 +1305,10 @@ final class ChromeUITests: XCTestCase {
         try wait("Resume must advance countdown") { self.clockValue.label != paused }
         try tap("Stop and Save"); try timeKeeper()
         _ = try reachable("Chrome countdown")
-        try tap("cmd.panel.close")
         try timer("1:00", name: "Discarded countdown")
         try timeKeeper(); try tap("Discard Session"); try tap("Discard Session")
+        // Discard returns to empty setup: establish valid input before expecting enabled Start.
+        try replace("Duration", "1:00")
         _ = try reachable("Start Timer")
         XCTAssertFalse(query("Discarded countdown").firstMatch.exists, "Discarded session must not enter history")
     }

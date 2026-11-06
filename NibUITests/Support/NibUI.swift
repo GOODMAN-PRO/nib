@@ -230,8 +230,14 @@ final class NibUI {
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
     func revealFormElement(in form: XCUIElement? = nil, edge: FormEdge? = nil,
                            named name: String? = nil, type: XCUIElement.ElementType = .any,
-                           target: () -> XCUIElement) {
+                           fullyVisible: Bool = false, target: () -> XCUIElement) {
         formRevealFailure = nil
+        var fullyRevealed = false
+        defer {
+            if fullyVisible && !fullyRevealed && formRevealFailure == nil {
+                formRevealFailure = "Full viewport reveal did not reach " + (name ?? "native field")
+            }
+        }
         let revealStarted = Date()
         var moves = 0
         defer { logQA("Form reveal timing", "moves=\(moves) seconds=\(Date().timeIntervalSince(revealStarted))") }
@@ -478,8 +484,11 @@ final class NibUI {
             }
             let targetFrame = name != nil || identity != nil ? targetNode(snapshot)?.frame
                 : (element.exists ? element.frame : nil)
-            if let targetFrame, viewport.contains(CGPoint(x: targetFrame.midX, y: targetFrame.midY)),
-               element.isHittable { return }
+            if let targetFrame {
+                let inside = fullyVisible ? viewport.contains(targetFrame)
+                    : viewport.contains(CGPoint(x: targetFrame.midX, y: targetFrame.midY))
+                if inside && element.isHittable { fullyRevealed = true; return }
+            }
             let top = formTopPosition(snapshot)
             if homing, top.atTop != false {
                 homing = false
