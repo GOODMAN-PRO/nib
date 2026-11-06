@@ -884,7 +884,21 @@ final class InkUITests: XCTestCase {
     private func fillColourSlots() throws {
         let original = swatches.map(\.label)
         for count in original.count..<12 {
-            try tap("Add Colour"); try chooseColour(count % 2 == 0 ? "Vermilion" : "Moss")
+            let plus = try control("Add Colour", type: .button)
+            XCTAssertTrue(plus.isEnabled, "Add Colour must be enabled")
+            let plusFrame = plus.frame
+            plus.tap()
+            let palette = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == 'Add a colour'")).firstMatch
+            let opened = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                ui.hasVisibleFrame(palette) && palette.buttons.firstMatch.exists
+            }, object: nil)
+            guard XCTWaiter.wait(for: [opened], timeout: 4) == .completed else {
+                let facts = "plusFrame=\(plusFrame) slotCountBefore=\(count)"
+                let state = "qaState=\(String(describing: ui.probe.exists ? ui.probe.value : nil))"
+                ui.logQA("Add Colour opened no palette", facts + " " + state)
+                throw NibUI.Failure.message("Add Colour opened no palette: " + facts + " " + state)
+            }
+            try chooseColour(count % 2 == 0 ? "Vermilion" : "Moss")
             closePopover()
             try wait("Add Colour must append exactly one slot") { self.swatches.count == count + 1 }
             XCTAssertEqual(Array(swatches.prefix(original.count).map(\.label)), original)

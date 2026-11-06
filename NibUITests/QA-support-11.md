@@ -178,3 +178,11 @@ R12:ink-colours#2's holds=false correction is retained: the picker was hosted, n
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | Custom/system colour-picker tests | Colour picker controls / Colour picker dismissal | Which own close control or safe outside point was used, with which surface frames? |
+
+### I3 - distinguish an unopened palette from a missing colour
+
+Confirmed R12:ink-colours#3's holds=false verdict against addColour/open and ColourEditor's Add a colour container: the first plus tap at t=56.32 produced no palette; the proposed hasWindow hand-over cause is unsupported. fillColourSlots now captures the plus frame, taps once, and waits at most four seconds for the palette container with its buttons before chooseColour. A missing palette throws **Add Colour opened no palette**, including plus geometry and raw QA state. Every slot count, original-prefix, capacity and digit-render assertion is unchanged. Covers AddColourPreservesExistingSlotsAndStopsAtTwelve and all five AddedColourDigits tests. CI must correlate a failure with app [Nib QA preset]/[Nib QA tap] logs; this is a precise failure boundary, not an app fix or extra tap.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| AddColourPreservesExistingSlotsAndStopsAtTwelve; AddedColourDigits tests | Add Colour opened no palette | Did the first plus tap produce any palette; what were its frame and QA state? |
