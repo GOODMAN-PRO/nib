@@ -223,9 +223,10 @@ struct ProviderEditorView: View {
         action.isEnabled(busy: busy, clean: clean, hasSavedProvider: savedConfig != nil)
     }
 
-    // A Form realises its rows lazily. These controls live with the form, even while its action rows are off screen.
-    // Shortcut registration with hit testing disabled still needs a device/UI run. If it fails, remove
-    // allowsHitTesting(false); do not add hidden(), which would remove the shortcuts.
+    // A Form realises its rows lazily. These controls live with the form, so the shortcuts exist while its action
+    // rows are off screen (the rows carry the same shortcuts and the key hints). Whether a shortcut registers with
+    // hit testing disabled still needs a UI run: if it does not, remove allowsHitTesting(false); never add
+    // hidden(), which removes shortcuts.
     private var keyboardActions: some View {
         Group {
             Button(String(localized: "Save provider")) { save() }
@@ -303,9 +304,14 @@ struct ProviderEditorView: View {
             } header: { AISettingsHeader(String(localized: "Extra headers")) }
               footer: { Text(String(localized: "Use non-secret headers only. Credentials always belong in the API key field.")) }
             Section {
-                NibButton(String(localized: "Save provider"), symbol: .checkmark, kind: .primary) { save() }
+                // The rows keep their shortcuts for the key hints and as the route that always worked while they
+                // are on screen; SwiftUI runs the first control it finds for a shortcut, and save() and
+                // runConnection refuse a second call while busy.
+                NibButton(String(localized: "Save provider"), symbol: .checkmark, kind: .primary,
+                          shortcut: KeyboardShortcut("s", modifiers: .command)) { save() }
                     .disabled(!isEnabled(.save))
-                NibButton(String(localized: "Test connection"), symbol: .network) { runConnection(modelsOnly: false) }
+                NibButton(String(localized: "Test connection"), symbol: .network,
+                          shortcut: KeyboardShortcut("t", modifiers: [.command, .shift])) { runConnection(modelsOnly: false) }
                     .disabled(!isEnabled(.testConnection))
                 if busy { ProgressView().accessibilityLabel(String(localized: "Contacting provider")) }
                 if let message {

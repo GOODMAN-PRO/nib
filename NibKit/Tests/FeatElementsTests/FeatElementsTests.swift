@@ -129,6 +129,8 @@ final class FeatElementsTests: XCTestCase {
     }
 
     func testInsertRejectsAnIDClaimedWhileLoading() async throws {
+        // The deadlines are the test's own and generous: on a loaded CI runner the loader's hop back to the main
+        // actor took longer than two seconds once (package run 42162539282). They bound a hang, not the speed.
         let h = harness()
         let loading = expectation(description: "Fragment load started")
         let finished = expectation(description: "Insertion finished")
@@ -137,7 +139,7 @@ final class FeatElementsTests: XCTestCase {
         let fragment = try JSONValue.from(Self.box)
         h.app.content.elementCollections.register(ElementCollectionDescriptor(id: "race-pack", title: "Race", owner: "test") {
             loading.fulfill()
-            guard gate.wait(timeout: .now() + 5) == .success else { throw NibError.unavailable("test gate") }
+            guard gate.wait(timeout: .now() + 30) == .success else { throw NibError.unavailable("test gate") }
             return [ElementEntry(id: "box", title: "Box", fragment: fragment)]
         })
         var failure: NibError?
@@ -148,14 +150,14 @@ final class FeatElementsTests: XCTestCase {
                     "collection": "race-pack", "element": "box", "ids": ["CLAIMED"]])
             } catch { failure = NibError.wrap(error) }
         }
-        await fulfillment(of: [loading], timeout: 2)
+        await fulfillment(of: [loading], timeout: 20)
         var claimed = Self.box.items[0]
         claimed.id = "CLAIMED"
         claimed.rev = h.app.clock.tick()
         h.app.bus.applyRemote(DocumentPatch(doc: Fixtures.docID, items: [Fixtures.page2.raw: [claimed]]), origin: "test")
         let before = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: claimed.id)
         gate.signal()
-        await fulfillment(of: [finished], timeout: 2)
+        await fulfillment(of: [finished], timeout: 20)
         XCTAssertEqual(failure?.code, .conflict)
         XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: claimed.id), before)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
