@@ -391,6 +391,12 @@ final class CanvasUITests: XCTestCase {
         try ui.twoFingerScroll(from: CGPoint(x: 0.8, y: 0.5), to: CGPoint(x: 0.2, y: 0.5))
         _ = try ui.waitForState { $0.page != before.page }
         _ = try page(2)
+    }
+
+    func testVerticalSinglePageLayoutPersistsAfterHorizontal() throws {
+        try open()
+        // Preserve the original transition; fixture-default Vertical alone would be vacuous.
+        try setDirection("Horizontal")
         try setDirection("Vertical")
         try go(1)
         XCTAssertEqual(try page(1).frame.midX, try page(2).frame.midX, accuracy: 2, "Vertical pages must share one column")
@@ -1102,17 +1108,19 @@ final class CanvasUITests: XCTestCase {
         try tap("Board 1")
         let before = try ui.state()
         try tap("Export")
-        _ = try require("Close export options")
+        let export = ui.app.alerts["Share & Export"].firstMatch
+        let close = export.buttons.matching(NSPredicate(format: "identifier == %@ AND label == %@", "xmark", "Close")).firstMatch
+        XCTAssertTrue(close.waitForExistence(timeout: 8), "Share & Export must expose its scoped Close control")
         for (title, value) in [("Board 1", "Selected"), ("Board 2", "Not selected")] {
             let choice = ui.app.buttons.matching(NSPredicate(format: "label == %@ AND value == %@", title, value)).firstMatch
             XCTAssertTrue(choice.waitForExistence(timeout: 5), "Export must honor board scope: \(title) \(value)")
         }
-        try tap("Close export options")
+        XCTAssertTrue(close.isEnabled && close.isHittable)
+        close.tap()
         // The floating host can retain a dismissed panel's accessibility representation.
         // Cancellation promises dismissal, not deallocation of that representation.
         eventually("Cancel must close export options") {
-            !self.ui.app.buttons.matching(NSPredicate(format: "label == %@", "Close export options"))
-                .allElementsBoundByIndex.contains { $0.isHittable }
+            !close.exists || !close.isHittable
         }
         unchanged(before, try ui.state())
     }
