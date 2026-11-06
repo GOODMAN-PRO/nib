@@ -272,3 +272,11 @@ Confirmed pages-menus-outline#1 and insert-menus-alerts-forms#1. HID Delete is a
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | Alert replacement / board and author Return / colour fields | Native alert text | Was text delivered by runner SPI rather than interruption-monitored input? |
+
+### H11 / N1 - clipped controls
+
+Confirmed insert-controls#4 and correction against requireControl's hittable early return and NibScrollView's 16-point bottom cue. scroll:true now requires full target containment in its nearest snapshot ancestor ScrollView intersected with outer scrollers/window, reserving the overflowing bottom cue edge. A clipped match logs its frames and enters the existing bounded fullyVisible reveal; post-reveal/poll checks use the same requirement. Non-scroll callers are unchanged. Full reveal applies the same cue geometry. Horizontal strips retain H6's explicit path. This should unblock Fit Height to Text; CI must show a fully contained row before the unchanged false-value wait. AX ancestry/viewport exposure needs runtime verification; no canvas fall-through cause is asserted.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| TextBoxStyleAndAutosizePersist; scroll:true callers | Clipped control reveal | Which target/scroller/cue viewport rejected a partly visible control? |

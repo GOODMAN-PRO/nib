@@ -174,24 +174,64 @@ final class NibUI {
         return actionable ? nil : candidates.first?.0
     }
 
+    /// Full containment in the nearest enclosing scroller, not merely a window sliver.
+    private func controlFitsScroller(_ target: XCUIElement, in scope: XCUIElement?) -> Bool {
+        guard let control = try? measuredSnapshot(target, named: "scroll control"),
+              let root = try? measuredSnapshot(scope ?? app, named: "scroll control ancestry") else { return false }
+        func find(_ node: XCUIElementSnapshot, ancestors: [XCUIElementSnapshot]) -> [XCUIElementSnapshot]? {
+            if node.elementType == control.elementType && node.identifier == control.identifier
+                && node.label == control.label && node.frame == control.frame { return ancestors }
+            let next = node.elementType == .scrollView ? ancestors + [node] : ancestors
+            for child in node.children { if let result = find(child, ancestors: next) { return result } }
+            return nil
+        }
+        guard let ancestors = find(root, ancestors: []) else { return false }
+        guard let nearest = ancestors.last else { return true }
+        var viewport = nearest.frame.intersection(app.windows.firstMatch.frame)
+        for ancestor in ancestors.dropLast() { viewport = viewport.intersection(ancestor.frame) }
+        viewport = verticalCueViewport(nearest, viewport: viewport)
+        let fits = !control.frame.isEmpty && viewport.contains(control.frame)
+        if !fits {
+            logQA("Clipped control reveal", "label=\(control.label) target=\(control.frame) scroller=\(nearest.frame) viewport=\(viewport)")
+        }
+        return fits
+    }
+
+    private func verticalCueViewport(_ scroller: XCUIElementSnapshot, viewport: CGRect) -> CGRect {
+        func overflowsBelow(_ node: XCUIElementSnapshot) -> Bool {
+            if node.elementType != .scrollBar && node.frame.maxY > scroller.frame.maxY + 1 { return true }
+            return node.children.contains { overflowsBelow($0) }
+        }
+        // NibScrollView's cue occupies the overflowing bottom edge. At the end of
+        // content there is no clipped lower row to reserve. Native horizontal strips
+        // are handled explicitly by revealInHorizontalRow, never a vertical drag.
+        guard scroller.elementType == .scrollView, scroller.identifier != "nib.canvas",
+              scroller.children.contains(where: { overflowsBelow($0) }) else { return viewport }
+        return CGRect(x: viewport.minX, y: viewport.minY, width: viewport.width,
+                      height: max(0, min(viewport.maxY, scroller.frame.maxY - 16) - viewport.minY))
+    }
+
     func requireControl(_ name: String, type: XCUIElement.ElementType = .any,
                         scroll: Bool = false, timeout: TimeInterval = 3,
                         in scope: XCUIElement? = nil, edge: FormEdge? = nil) throws -> XCUIElement {
-        if let found = findControl(name, type: type, in: scope) { return found }
+        if let found = findControl(name, type: type, in: scope),
+           !scroll || controlFitsScroller(found, in: scope) { return found }
         if scroll {
             // Virtualized native rows do not exist until their collection view scrolls.
             // Preserve the typed editor/control priority once, then reuse the query while scrolling.
             let revealTarget = findControl(name, type: type, actionable: false, in: scope)
                 ?? (scope ?? app).descendants(matching: type).matching(NSPredicate(
                     format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
-            revealFormElement(in: scope, edge: edge, named: name, type: type) { revealTarget }
+            revealFormElement(in: scope, edge: edge, named: name, type: type, fullyVisible: true) { revealTarget }
             if let failure = formRevealFailure { throw Failure.message(failure) }
-            if let found = findControl(name, type: type, in: scope) { return found }
+            if let found = findControl(name, type: type, in: scope),
+               controlFitsScroller(found, in: scope) { return found }
         }
         var found: XCUIElement?
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
             found = findControl(name, type: type, in: scope)
-            return found != nil
+            if let found { return !scroll || controlFitsScroller(found, in: scope) }
+            return false
         }, object: nil)
         guard XCTWaiter.wait(for: [ready], timeout: timeout) == .completed, let found else {
             throw Failure.message("Missing hittable control: \(name)\n\(app.debugDescription)")
@@ -532,7 +572,8 @@ final class NibUI {
                 clippedViewport = NibUITestScrollGeometry.viewport(
                     scroll: listFrame, window: window, obstructions: obstructions)
             }
-            guard let viewport = clippedViewport else { return }
+            guard let resolvedViewport = clippedViewport else { return }
+            let viewport = fullyVisible ? verticalCueViewport(snapshot, viewport: resolvedViewport) : resolvedViewport
             let element: XCUIElement
             if let identity {
                 element = list.descendants(matching: identity.elementType).matching(NSPredicate(
