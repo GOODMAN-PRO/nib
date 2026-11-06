@@ -264,3 +264,11 @@ Confirmed pages-menus-outline#0 correction and insert-menus-alerts-forms#0: the 
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | Pages/Insert native-menu callers | Native menu pre-press inventory / Native menu dismissed / Native menu row tap | Did a scoped closure observation finish within eight seconds after the single tap? |
+
+### H10 / P2 / N1 - alert-safe replacement and Return
+
+Confirmed pages-menus-outline#1 and insert-menus-alerts-forms#1. HID Delete is already present. Existing NibTouchPaths.sendKey route 3 directly synthesizes text with modifiers reset and supports shifted/Unicode characters without XCUIElement's interruption check; reuse it instead of introducing a second character map or pasteboard dependency. Return in an exposed Alert uses HID 0x28. Native modified keys also use the existing runner route in an Alert. Exact waitForNativeText remains. Audited every typeText: Canvas board Return, Insert author/GIPHY Return, Create's generic replacement and Ink colour fields now use the alert-aware helper; ordinary canvas text, assistant/comment composers, search and foreign Safari keep public typing. Files no longer has a public Return after 11b. No cancellation-handler workaround. Next CI must complete both Outline tests and collection rename without a default Cancel; H9 separately covers audio/comment menu successors.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Alert replacement / board and author Return / colour fields | Native alert text | Was text delivered by runner SPI rather than interruption-monitored input? |

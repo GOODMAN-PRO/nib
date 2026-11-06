@@ -2124,11 +2124,15 @@ final class NibUI {
                 }
             }
             let rawProbe = probe.value
+            let alertIsUp = app.alerts.firstMatch.exists
+            let deliveryRoute = alertIsUp ? "runner key SPI" : "XCUIElement.typeKey / HID control key"
             XCTContext.runActivity(named: "Native field key route") { activity in
-                let attachment = XCTAttachment(string: "route=XCUIElement.typeKey field=\(field.label) key=\(key) modifiers=\(modifiers.rawValue) probe=\(rawProbe ?? "missing")")
+                let attachment = XCTAttachment(string: "route=\(deliveryRoute) field=\(field.label) key=\(key) modifiers=\(modifiers.rawValue) probe=\(rawProbe ?? "missing")")
                 attachment.lifetime = .keepAlways; activity.add(attachment)
             }
-            if modifiers.isEmpty, let usage = hidUsage(forKey: key) {
+            if alertIsUp {
+                try sendHardwareKey(key, modifiers)
+            } else if modifiers.isEmpty, let usage = hidUsage(forKey: key) {
                 // XCUIElement.typeKey cannot produce Escape or Delete either (see hidUsage(forKey:)).
                 try sendHIDKey(usage)
             } else {
@@ -2183,13 +2187,31 @@ final class NibUI {
         try waitForNativeText(in: field, equals: "")
     }
 
+    /// Uses the runner's existing text-event SPI while an Alert is exposed. Unlike
+    /// XCUIElement.typeText, this never invokes XCTest's default interruption handler.
+    /// Route 3 types the complete string (including shifted punctuation and Unicode).
+    func typeNativeText(_ text: String, in field: XCUIElement) throws {
+        guard app.alerts.firstMatch.exists else { field.typeText(text); return }
+        logQA("Native alert text", "route=runner text SPI characters=\(text.count)")
+        if text == "\n" { try sendHIDKey(0x28); return }
+        let delivered = XCTestExpectation(description: "Alert text delivered")
+        var failure: Error?
+        NibTouchPaths.sendKey(text, modifiers: 0, route: 3) { error in
+            failure = error; delivered.fulfill()
+        }
+        guard XCTWaiter.wait(for: [delivered], timeout: 10) == .completed else {
+            throw Failure.message("Alert text synthesis timed out")
+        }
+        if let failure { throw failure }
+    }
+
     /// Waits for exact replacement, including empty fields, after proving the old content is gone.
     func replaceNativeText(in field: XCUIElement, with text: String, container: XCUIElement? = nil) throws {
         let started = Date()
         defer { logQA("Native replacement duration", "seconds=\(Date().timeIntervalSince(started))") }
         try clearNativeText(in: field, container: container)
         if !text.isEmpty {
-            timedAction("Native replacement delivery (\(text.count) characters)") { field.typeText(text) }
+            try timedAction("Native replacement delivery (\(text.count) characters)") { try typeNativeText(text, in: field) }
         }
         try waitForNativeText(in: field, equals: text)
     }

@@ -1117,7 +1117,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertTrue(query("Remove Key").firstMatch.waitForExistence(timeout: 8))
         try ui.dismissSheets(requireClosedPopover: true); try elements(); try tap("GIFs")
         let search = try ui.fillNativeForm([("Search GIPHY", "physics")])
-        search.typeText("\n")
+        try ui.typeNativeText("\n", in: search)
         try tap("Try Again", scroll: true)
         XCTAssertEqual(search.value as? String, "physics")
         outside(); try ui.chord(",", .command) { _ = try self.settingsControl("Editing", scroll: false, timeout: 3) }
@@ -1133,7 +1133,7 @@ final class InsertUITests: XCTestCase {
         // hit its keys until input is submitted, rather than dismissing the popover.
         let author = try control("Author name on new notes", .textField, scroll: true)
         try replace(author, with: "UI Author")
-        author.typeText("\n")
+        try ui.typeNativeText("\n", in: author)
         try wait("Submitting the author name must dismiss the keyboard") { !self.ui.app.keyboards.firstMatch.isHittable }
         outside(); ui.coordinate(point).tap()
         let editor = try control("Sticky note", .textView)
