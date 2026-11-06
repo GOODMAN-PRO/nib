@@ -97,6 +97,39 @@ final class SearchLayoutTests: XCTestCase {
         XCTAssertEqual(creations, 1, "A reconstructed view must retain the StateObject's publisher")
         XCTAssertEqual(subscriptions, 1, "Body evaluation must not replay the upstream initial value")
     }
+
+    func testFallbackBoundsPublisherFollowsSessionIdentity() async throws {
+        executionTimeAllowance = 60
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let second = EditorSession()
+        let subject = CurrentValueSubject<CGRect?, Never>(nil)
+        var creations: [ObjectIdentifier] = []
+        var cancellations: [ObjectIdentifier] = []
+        let factory: @MainActor (EditorSession) -> AnyPublisher<CGRect?, Never> = { session in
+            let identity = ObjectIdentifier(session)
+            creations.append(identity)
+            return subject.handleEvents(receiveCancel: { cancellations.append(identity) }).eraseToAnyPublisher()
+        }
+        h.app.services.set(factory as AnyObject, for: "libraryui.searchContentBounds")
+        let fallback = try XCTUnwrap(h.app.ui.chromeOverlays.get("searchui.libraryFallback"))
+        let host = UIHostingController(rootView: fallback.makeView(ChromeContext(app: h.app, session: h.session)))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 834))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        for session in [h.session, h.session, second, second] {
+            host.rootView = fallback.makeView(ChromeContext(app: h.app, session: session))
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            for _ in 0..<10 { await Task.yield() }
+        }
+        XCTAssertEqual(creations, [ObjectIdentifier(h.session), ObjectIdentifier(second)],
+            "Retain the publisher within a session, and recreate it when the host changes sessions")
+        XCTAssertEqual(cancellations, [ObjectIdentifier(h.session)],
+            "The old session must stop supplying library bounds")
+    }
 }
 
 @MainActor

@@ -117,6 +117,7 @@ struct LibrarySearchOverlay: View {
             LibrarySearchView(app: app, session: session, state: state)
         } else {
             LibrarySearchFloatingContent(app: app, session: session, state: state)
+                .id(ObjectIdentifier(session))
         }
     }
 }

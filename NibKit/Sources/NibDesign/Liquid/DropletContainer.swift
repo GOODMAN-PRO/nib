@@ -66,14 +66,11 @@ public struct NibDropletContainer<Content: View>: View {
     @ViewBuilder private var measuredContainerBody: some View {
         #if DEBUG
         containerBody
-            .onChange(of: field.clusters.map(\.frame), initial: true) { old, new in
-                searchLayoutTrace.write("cluster frames", old: old, new: new)
-            }
-            .onChange(of: field.node("searchui.libraryField").presentation, initial: true) { old, new in
-                searchLayoutTrace.presentation("field rest/body", old: old, new: new)
-            }
-            .onChange(of: field.node("searchui.libraryResults").presentation, initial: true) { old, new in
-                searchLayoutTrace.presentation("results rest/body", old: old, new: new)
+            .background {
+                NibSearchContainerProbe(field: field, trace: searchLayoutTrace)
+                    .frame(width: 0, height: 0)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
             }
         #else
         containerBody
@@ -173,6 +170,25 @@ enum DropletContainerMeasurement {
 }
 
 #if DEBUG
+/// Only this leaf observes per-frame geometry; tracing must not invalidate the container.
+private struct NibSearchContainerProbe: View {
+    let field: DropletField
+    let trace: NibSearchContainerTrace
+
+    var body: some View {
+        Color.clear
+            .onChange(of: field.clusters.map(\.frame), initial: true) { old, new in
+                trace.write("cluster frames", old: old, new: new)
+            }
+            .onChange(of: field.node("searchui.libraryField").presentation, initial: true) { old, new in
+                trace.presentation("field rest/body", old: old, new: new)
+            }
+            .onChange(of: field.node("searchui.libraryResults").presentation, initial: true) { old, new in
+                trace.presentation("results rest/body", old: old, new: new)
+            }
+    }
+}
+
 private final class NibSearchContainerTrace {
     private var count = 0
     func write<T>(_ name: String, old: T, new: T) {
