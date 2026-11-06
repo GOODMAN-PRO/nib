@@ -332,3 +332,7 @@ Confirmed insert-controls#0 correction: final playback lasted 31 ms with both op
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | AudioPlayPauseSeekSkipSettingsAndClose | Audio settings-off playback | Were both processing options off before the final Play/Pause? |
+
+### N4 - collection strip
+
+Confirmed insert-controls#1 against ElementsCollectionBar and the vertical My Objects reveal. Use 11b H6 within Elements, anchored by Stickers, for the chip tap after reopen. The app owns selected-chip scrolling; the test still taps and verifies the actual saved/deleted element. CI must log Horizontal reveal and finish all source/reuse/delete checks.

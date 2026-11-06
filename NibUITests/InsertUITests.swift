@@ -1021,7 +1021,9 @@ final class InsertUITests: XCTestCase {
         try ui.nativeContextMenu(element, path: ["Rename"])
         try collectionPrompt("Lab Node", fieldName: "Element name", action: "Rename")
         try tap("Lab Node"); try counts(6)
-        try elements(); try tap("My Objects", scroll: true)
+        try elements()
+        try ui.revealInHorizontalRow("My Objects", in: ui.app.scrollViews["Elements"].firstMatch,
+                                     containing: "Stickers").tap()
         try ui.nativeContextMenu(try control("Lab Node"), path: ["Delete"]); try ui.cancelConfirmation(action: "Delete Element")
         XCTAssertTrue(query("Lab Node").firstMatch.exists)
         try ui.nativeContextMenu(try control("Lab Node"), path: ["Delete"]); try tap("Delete Element")
