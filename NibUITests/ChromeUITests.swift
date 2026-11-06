@@ -1461,6 +1461,106 @@ final class ChromeUITests: XCTestCase {
         try tap("cmd.panel.close"); try timeKeeper()
         XCTAssertFalse(query("Delete Chrome study").firstMatch.exists)
     }
+    private func completeHistoryInventory() throws -> [String] {
+        let form = ui.app.scrollViews["Time Keeper"].firstMatch
+        let heading = form.staticTexts["History"].firstMatch
+        ui.revealFormElement(named: "History", type: .staticText, fullyVisible: true) { heading }
+        if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
+        let window = ui.app.windows.firstMatch.frame
+        let deadline = Date().addingTimeInterval(30)
+        var inventory: [(name: String, y: CGFloat)] = []
+        var coveredThrough: CGFloat = 0
+        var previousTop: CGFloat?
+        var complete = false
+        for step in 0..<12 {
+            guard Date() < deadline else { break }
+            let snapshot = try form.snapshot()
+            func descendants(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
+                [node] + node.children.flatMap { descendants($0) }
+            }
+            let nodes = descendants(snapshot)
+            let header = try XCTUnwrap(nodes.first { $0.elementType == .staticText && $0.label == "History" },
+                                       "History inventory needs its non-lazy section heading as a scroll anchor")
+            // The named outer scroller can contain the actual content scroller. Clip to both
+            // to exclude the fixed panel header, and read the inner scroller's end indicator.
+            func headingContext(_ node: XCUIElementSnapshot, clip: CGRect,
+                                scroller: XCUIElementSnapshot) -> (viewport: CGRect, scroller: XCUIElementSnapshot)? {
+                let clipped = node.elementType == .scrollView ? clip.intersection(node.frame) : clip
+                let current = node.elementType == .scrollView ? node : scroller
+                if node.elementType == .staticText && node.label == "History" { return (clipped, current) }
+                for child in node.children {
+                    if let found = headingContext(child, clip: clipped, scroller: current) { return found }
+                }
+                return nil
+            }
+            let context = try XCTUnwrap(headingContext(snapshot, clip: window, scroller: snapshot))
+            let viewport = context.viewport
+            guard viewport.width > 40, viewport.height > 80, !header.frame.isEmpty else {
+                throw NibUI.Failure.message("History inventory has no usable viewport/heading geometry")
+            }
+            let top = viewport.minY - header.frame.maxY
+            let bottom = viewport.maxY - header.frame.maxY
+            if step == 0 {
+                guard viewport.contains(header.frame) else {
+                    throw NibUI.Failure.message("History inventory must start with the complete section heading visible")
+                }
+            } else if let previousTop {
+                // Overlap must be at least half a viewport: no lazy row may jump over the scan.
+                guard top >= previousTop - 1, top <= coveredThrough - viewport.height / 2 + 1 else {
+                    throw NibUI.Failure.message("History inventory lost continuous scroll coverage")
+                }
+            }
+            let historyTexts = nodes.filter {
+                $0.elementType == .staticText && !$0.frame.isEmpty
+                    && $0.frame.intersects(viewport) && $0.frame.minY >= header.frame.maxY
+            }
+            // No unrecognised history text may be silently filtered out of the inventory.
+            // The only other row texts in TimeKeeperHistoryRow are subtitle and Completed.
+            for text in historyTexts where !text.label.hasPrefix("Chrome history ") {
+                guard text.label == "Completed" || text.label.hasPrefix(notebook + " · ") else {
+                    throw NibUI.Failure.message("Unexpected text in complete history inventory: " + text.label)
+                }
+            }
+            let rows = historyTexts.filter { $0.label.hasPrefix("Chrome history ") }
+            for row in rows {
+                let y = row.frame.minY - header.frame.maxY
+                // Deduplicate the physical position, never the name: a repeated name at a
+                // second position is another record and must fail the exact-once assertion.
+                if let existing = inventory.first(where: { abs($0.y - y) <= 1 }) {
+                    guard existing.name == row.label else {
+                        throw NibUI.Failure.message("History inventory changed a row at an already visited position")
+                    }
+                } else { inventory.append((row.label, y)) }
+            }
+            let percentages = descendants(context.scroller).compactMap { node -> Double? in
+                guard node.elementType == .scrollView || node.label.hasPrefix("Vertical scroll bar,"),
+                      let value = node.value as? String, value.hasSuffix("%") else { return nil }
+                return Double(value.dropLast().trimmingCharacters(in: .whitespaces))
+            }
+            ui.logQA("Timer history inventory", "step=\(step) range=\(top)...\(bottom) percentages=\(percentages) rows=\(inventory)")
+            // History is the final section in TimeKeeperPanel. A 100% scroll indicator plus
+            // unchanged heading position after an upward drag proves the end (100% alone rounds).
+            if let previousTop, abs(top - previousTop) <= 1,
+               !percentages.isEmpty, percentages.allSatisfy({ $0 == 100 }) {
+                complete = true
+                break
+            }
+            coveredThrough = max(coveredThrough, bottom)
+            previousTop = top
+            guard Date() < deadline, step < 11 else { break }
+            let start = CGPoint(x: viewport.minX + 8, y: viewport.minY + viewport.height * 0.75)
+            let end = CGPoint(x: start.x, y: start.y - viewport.height * 0.4)
+            let origin = ui.app.coordinate(withNormalizedOffset: .zero)
+            origin.withOffset(CGVector(dx: start.x, dy: start.y)).press(forDuration: 0.01,
+                thenDragTo: origin.withOffset(CGVector(dx: end.x, dy: end.y)),
+                withVelocity: .slow, thenHoldForDuration: 0)
+        }
+        guard complete, Date() < deadline else {
+            throw NibUI.Failure.message("History inventory did not prove complete coverage to the scroll bottom within 12 snapshots / 30 seconds")
+        }
+        return inventory.map { $0.name }
+    }
+
     private func historyRows(_ count: Int) throws {
         let form = ui.app.scrollViews["Time Keeper"].firstMatch
         for index in 1...count {
@@ -1468,6 +1568,8 @@ final class ChromeUITests: XCTestCase {
             _ = try reachable(title)
             XCTAssertEqual(ui.app.staticTexts.matching(identifier: title).count, 1,
                            "History must contain each session exactly once")
+            // Confirmed against TimeKeeperHistoryRow.subtitle and NibInspectorRow: document,
+            // elapsed (optionally "of duration"), optional laps, then date; title precedes subtitle.
             // NibInspectorRow renders the name then its subtitle in one leading-aligned VStack.
             // SwiftUI can flatten that stack in AX; use its actual text reading order in a single snapshot.
             let snapshot = try form.snapshot()
@@ -1489,10 +1591,12 @@ final class ChromeUITests: XCTestCase {
                             "History row must show its duration: " + title)
             ui.logQA("Timer history row", "name=\(title) subtitle=\(subtitle)")
         }
-        // LazyVStack may release rows visited earlier. Per-row exact-once checks above
-        // are the oracle; the currently exposed AX total is only diagnostic.
-        let exposedCount = form.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Chrome history '")).count
-        ui.logQA("Timer history exposure", "expectedVisited=\(count) exposedAfterTraversal=\(exposedCount)")
+        let inventory = try completeHistoryInventory()
+        XCTAssertEqual(inventory.count, count, "Complete history must contain exactly \(count) rows")
+        for index in 1...count {
+            XCTAssertEqual(inventory.filter { $0 == "Chrome history \(index)" }.count, 1,
+                           "Complete history must contain each expected session exactly once")
+        }
     }
 
     func testTimerHistoryShowsDocumentDurationsAndNoDuplicateRows() throws {
