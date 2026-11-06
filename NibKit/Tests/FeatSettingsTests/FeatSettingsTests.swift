@@ -305,6 +305,25 @@ final class FeatSettingsTests: XCTestCase {
         XCTAssertTrue(catalog.search("quantum").isEmpty)
     }
 
+    #if DEBUG
+    func testToolbarDiagnosticCountsWithoutPublishingViewUpdatesAndResetsOnPush() {
+        let state = SettingsNavigationState()
+        state.compactPath = [SettingsPageLink(id: "settings.editing")]
+        var updates = 0
+        let observation = state.objectWillChange.sink { updates += 1 }
+        state.logToolbar(page: "settings.editing")
+        state.logToolbar(page: "settings.editing")
+        XCTAssertEqual(state.toolbarEvaluations["settings.editing"], 2)
+        XCTAssertEqual(updates, 0, "Logging a toolbar must not cause the rebuild loop being diagnosed")
+        state.compactPath = []
+        state.compactPath = [SettingsPageLink(id: "settings.editing")]
+        XCTAssertTrue(state.toolbarEvaluations.isEmpty)
+        state.logToolbar(page: "settings.editing")
+        XCTAssertEqual(state.toolbarEvaluations["settings.editing"], 1)
+        withExtendedLifetime(observation) {}
+    }
+    #endif
+
     func testShowingAPageSelectsItsSectionAndPushesIt() {
         let h = Harness(features: [FeatSettingsFeature.self])
         let catalog = SettingsCatalog(pages: h.app.ui.settingsPages.all)

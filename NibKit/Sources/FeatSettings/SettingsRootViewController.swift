@@ -119,7 +119,21 @@ final class SettingsNavigationState: ObservableObject {
     @Published var section: SettingsSection?
     /// Legacy section-relative state; both layouts now navigate with compactPath.
     @Published var detailPath: [SettingsPageLink] = []
-    @Published var compactPath: [SettingsPageLink] = []
+    @Published var compactPath: [SettingsPageLink] = [] {
+        didSet {
+            #if DEBUG
+            if compactPath != oldValue {
+                toolbarPushStarted = ProcessInfo.processInfo.systemUptime
+                toolbarEvaluations = [:]
+            }
+            #endif
+        }
+    }
+    #if DEBUG
+    // Plain stored values: diagnostic evaluation must never publish another view update.
+    private var toolbarPushStarted = ProcessInfo.processInfo.systemUptime
+    private(set) var toolbarEvaluations: [String: Int] = [:]
+    #endif
     @Published var query = ""
     /// An explicit return to the compact index, distinct from the default section selection.
     @Published var showsIndex = false
@@ -148,6 +162,16 @@ final class SettingsNavigationState: ObservableObject {
         if (catalog.group(page.section)?.pages.count ?? 0) > 1 { detail.append(SettingsPageLink(id: id)) }
         detailPath = detail
         compactPath = detail
+    }
+
+    func logToolbar(page: String) {
+        #if DEBUG
+        let count = (toolbarEvaluations[page] ?? 0) + 1
+        toolbarEvaluations[page] = count
+        let elapsed = ProcessInfo.processInfo.systemUptime - toolbarPushStarted
+        NSLog("[Nib QA settings] toolbar page=%@ count=%ld sincePush=%.3f active=%@",
+              page, count, elapsed, compactPath.last?.id == page ? "true" : "false")
+        #endif
     }
 
     func logSelection(in catalog: SettingsCatalog) {
@@ -323,7 +347,7 @@ struct SettingsRootView: View {
                     SettingsSectionDetail(app: app, catalog: catalog, state: state, regular: regular)
                         .navigationDestination(for: SettingsPageLink.self) { link in
                             SettingsPageHost(app: app, page: catalog.page(link.id))
-                                .settingsDoneButton(onDone)
+                                .settingsDoneButton(onDone, toolbarEvaluation: { state.logToolbar(page: link.id) })
                         }
                         .settingsDoneButton(onDone)
                 }
@@ -557,9 +581,14 @@ struct SettingsPageHost: View {
 
 extension View {
     /// Done (⎋) on every settings screen: the iPad section list has no bar of its own.
-    func settingsDoneButton(_ onDone: @escaping () -> Void) -> some View {
+    @MainActor
+    func settingsDoneButton(_ onDone: @escaping () -> Void,
+                            toolbarEvaluation: (@MainActor () -> Void)? = nil) -> some View {
         toolbar {
             ToolbarItem(placement: .confirmationAction) {
+                #if DEBUG
+                let _ = toolbarEvaluation?()
+                #endif
                 Button(String(localized: "Done"), action: onDone)
                     .accessibilityIdentifier("sheet.dismiss")
                     .font(NibFont.bodyEmphasis)
