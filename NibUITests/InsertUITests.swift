@@ -782,15 +782,15 @@ final class InsertUITests: XCTestCase {
         let midpoint = ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
             dx: (startFrame.midX + endFrame.midX) / 2, dy: (startFrame.midY + endFrame.midY) / 2))
         midpoint.press(forDuration: 0.1, thenDragTo: midpoint.withOffset(CGVector(dx: -45, dy: 35)))
-        let bends = try XCTUnwrap(try item("connector")["bends"] as? [JSON])
+        let bends = try XCTUnwrap(try item("connector")["bends"] as? [[Double]])
         XCTAssertEqual(bends.count, 1, "Dragging the midpoint must insert a control bend")
         let bend = try visibleContact(overlayControl("Bend 1"))
         bend.press(forDuration: 0.1, thenDragTo: bend.withOffset(CGVector(dx: 20, dy: 20)))
         XCTAssertNotEqual(json(try item("connector")["bends"]), json(bends))
         try menu("Connector Style", "Remove Bends")
-        XCTAssertEqual((try item("connector")["bends"] as? [JSON])?.count, 0)
+        XCTAssertEqual((try item("connector")["bends"] as? [[Double]])?.count, 0)
         try ui.tapCommand("edit.undo")
-        XCTAssertEqual((try item("connector")["bends"] as? [JSON])?.count, 1)
+        XCTAssertEqual((try item("connector")["bends"] as? [[Double]])?.count, 1)
     }
     private func settingsControl(_ name: String, scroll: Bool = true,
                                  timeout: TimeInterval = 8) throws -> XCUIElement {

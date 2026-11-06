@@ -344,3 +344,7 @@ Confirmed insert-controls#2: reveal ran while the network-dependent row did not 
 ### N6 - retained Tape scroll
 
 Confirmed insert-controls#3: History at y290 was above the restored y476 viewport. Request scroll:true before History. No app reset assumption; every pattern/width/straightness/orientation/history assertion remains. CI must reveal History then reach Clear History and the second drawing checks.
+
+### N7 - connector point encoding
+
+Confirmed insert-controls#5 against Geometry.Point's unkeyed [x,y] encoding. All three bends casts now use [[Double]]. Original count-one, changed geometry, Remove Bends and Undo count assertions are unchanged. CI must progress past the old nil dictionary-array cast and exercise the remaining bend edits.
