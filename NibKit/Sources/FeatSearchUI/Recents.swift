@@ -194,16 +194,9 @@ final class SearchState: ObservableObject {
     @Published var refreshPending = false
     @Published var error: String?
     @Published var progress: IndexProgressPayload?
-    @Published var isPresented = false {
-        didSet {
-            if !isPresented { navigationCounterPlacement = nil }
-        }
-    }
+    @Published var isPresented = false
     @Published var instant = false
     @Published var focusGeneration = 0
-    // Retain through no-hit queries, but only reuse within the measured window/keyboard geometry.
-    @Published var navigationCounterPlacement: SearchViewport?
-    var navigationCounterTop: CGFloat? { navigationCounterPlacement?.columnTop }
     var generation = 0
     var cursor: String?
     var seenCursors = Set<String>()

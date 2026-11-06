@@ -334,7 +334,6 @@ struct SearchResults: View {
     let session: EditorSession
     @ObservedObject var state: SearchState
     @State private var overflows = false
-    @State private var visibleGroupHeadings: [SearchGroup: Bool] = [:]
     #if DEBUG
     @State private var layoutTrace = SearchLayoutTrace()
     #endif
@@ -429,12 +428,6 @@ struct SearchResults: View {
                     #endif
                     overflows = next
                 }
-                .overlayPreferenceValue(SearchGroupStartBounds.self) { anchors in
-                    SearchGroupHeadingReader(anchors: anchors)
-                }
-                .onPreferenceChange(SearchVisibleGroupHeadings.self) { next in
-                    if visibleGroupHeadings != next { visibleGroupHeadings = next }
-                }
                 .scrollBounceBehavior(.basedOnSize)
                 .scrollIndicators(.visible)
                 .nibFadeBottomEdge(showsContinuation ? NibSpacing.l : 0)
@@ -459,20 +452,11 @@ struct SearchResults: View {
     @ViewBuilder private func resultGroup(_ group: SearchGroup) -> some View {
         let hits = state.visibleMatches.filter { $0.group == group }
         if let first = hits.first {
-            // Measure the heading together with its first row. Hiding only the heading
-            // preserves scroll extent and every result's id, including scrollTo targets.
-            VStack(alignment: .leading, spacing: NibSpacing.l) {
-                Text(group.title).font(NibFont.headline).accessibilityAddTraits(.isHeader)
-                    .searchLayoutFrame("heading." + group.rawValue)
-                    // A new group stays visible until its first measurement arrives.
-                    .opacity(visibleGroupHeadings[group] == false ? 0 : 1)
-                    .accessibilityHidden(visibleGroupHeadings[group] == false)
-                SearchResultRow(app: app, session: session, state: state, hit: first)
-                    .searchLayoutFrame("firstRow." + group.rawValue)
-                    .id(first.id)
-            }
-            .anchorPreference(key: SearchGroupStartBounds.self, value: .bounds) { [group: $0] }
-            .searchLayoutFrame("group." + group.rawValue)
+            Text(group.title).font(NibFont.headline).accessibilityAddTraits(.isHeader)
+                .searchLayoutFrame("heading." + group.rawValue)
+            SearchResultRow(app: app, session: session, state: state, hit: first)
+                .searchLayoutFrame("firstRow." + group.rawValue)
+                .id(first.id)
             ForEach(Array(hits.dropFirst())) { hit in
                 SearchResultRow(app: app, session: session, state: state, hit: hit)
                     .id(hit.id)
@@ -487,43 +471,6 @@ struct SearchResults: View {
 private struct SearchContentBounds: PreferenceKey {
     static let defaultValue: Anchor<CGRect>? = nil
     static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = nextValue() ?? value }
-}
-
-private struct SearchGroupStartBounds: PreferenceKey {
-    static let defaultValue: [SearchGroup: Anchor<CGRect>] = [:]
-    static func reduce(value: inout [SearchGroup: Anchor<CGRect>], nextValue: () -> [SearchGroup: Anchor<CGRect>]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
-private struct SearchGroupHeadingReader: View {
-    let anchors: [SearchGroup: Anchor<CGRect>]
-    var body: some View {
-        GeometryReader { geometry in
-            // safeAreaInset reserves the continuation cue; it is not usable row space.
-            let height = max(0, geometry.size.height - geometry.safeAreaInsets.bottom)
-            let viewport = CGRect(x: 0, y: 0, width: geometry.size.width, height: height)
-            let visible = anchors.mapValues { anchor in
-                SearchGroupHeadingVisibility.isVisible(groupStart: geometry[anchor], viewport: viewport)
-            }
-            Color.clear.preference(key: SearchVisibleGroupHeadings.self, value: visible)
-        }
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
-}
-
-struct SearchVisibleGroupHeadings: PreferenceKey {
-    static let defaultValue: [SearchGroup: Bool] = [:]
-    static func reduce(value: inout [SearchGroup: Bool], nextValue: () -> [SearchGroup: Bool]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
-enum SearchGroupHeadingVisibility {
-    static func isVisible(groupStart: CGRect, viewport: CGRect) -> Bool {
-        viewport.height > 0 && groupStart.maxY <= viewport.maxY
-    }
 }
 
 private struct SearchContinuationVisible: PreferenceKey {

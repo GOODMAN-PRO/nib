@@ -1479,18 +1479,39 @@ final class FeatSearchUITests: XCTestCase {
         defer { window.isHidden = true; window.rootViewController = nil }
         host.view.frame = CGRect(x: 16, y: 100, width: 560, height: 780)
         host.view.layoutIfNeeded()
+        let outsideKeyboard = window.convert(CGRect(x: 900, y: 360, width: 300, height: 300),
+            to: window.screen.coordinateSpace)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil,
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: outsideKeyboard)])
+        for hasMatches in [true, false, true] {
+            state.query = hasMatches ? "Hello" : "Missing"
+            state.matches = hasMatches ? [hit()] : []
+            let key = hasMatches ? "firstRow.typed" : "results.empty"
+            var stableSamples = 0
+            for _ in 0..<50 {
+                try await Task.sleep(for: .milliseconds(20))
+                if let panel = frames["document.results"], abs(panel.height - 600) < 1,
+                   let content = frames[key], content.height > 0,
+                   panel.insetBy(dx: -1, dy: -1).contains(content) {
+                    stableSamples += 1
+                } else { stableSamples = 0 }
+                if stableSamples >= 3 { break }
+            }
+            XCTAssertGreaterThanOrEqual(stableSamples, 3,
+                "An outside-column floating keyboard must not collapse results as matches disappear or return")
+        }
         let keyboard = CGRect(x: 500, y: 535, width: 400, height: 300)
         let screenKeyboard = window.convert(keyboard, to: window.screen.coordinateSpace)
         NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil,
             userInfo: [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: screenKeyboard)])
-        state.navigationCounterPlacement = SearchViewport.measure(windowBounds: window.bounds,
-            safeArea: window.safeAreaInsets, frame: CGRect(x: 600, y: 479, width: 166, height: 40),
-            keyboard: keyboard)
         for _ in 0..<50 {
-            if frames["firstRow.typed"] != nil { break }
+            if let panel = frames["document.results"], abs(panel.height - 299) < 1,
+               frames["firstRow.typed"] != nil { break }
             try await Task.sleep(for: .milliseconds(20))
         }
-        XCTAssertNotNil(frames["firstRow.typed"], "Begin with matches and a measured counter")
+        XCTAssertNotNil(frames["firstRow.typed"], "Begin with matches")
+        XCTAssertEqual(try XCTUnwrap(frames["document.results"]).height, 299, accuracy: 1,
+            "The full-width landscape window reserves exactly one HUD row")
         state.query = "Missing"
         state.matches = [] // Production removes the counter overlay at this point.
         for size in [CGSize(width: 834, height: 1194), CGSize(width: 900, height: 1200)] {
@@ -1520,59 +1541,6 @@ final class FeatSearchUITests: XCTestCase {
                 XCTAssertGreaterThanOrEqual(content.minY, filter.maxY)
             }
         }
-    }
-
-    func testResultsHideOrphanHeadingAndRestoreItWhenFirstRowScrollsIntoView() async throws {
-        executionTimeAllowance = 60
-        let h = Harness(features: [FeatSearchUIFeature.self])
-        let state = SearchState()
-        state.query = "Hello"
-        state.matches = [hit(kind: "title"), hit()]
-        var headings: [SearchGroup: Bool] = [:]
-        var frames: [String: CGRect] = [:]
-        let results = SearchResults(app: h.app, session: h.session, state: state)
-            .onPreferenceChange(SearchVisibleGroupHeadings.self) { headings = $0 }
-            .environment(\.searchLayoutDiagnostics, true)
-            .onPreferenceChange(SearchLayoutFrames.self) { frames = $0 }
-        let host = UIHostingController(rootView: results)
-        host.safeAreaRegions = []
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 560, height: 800))
-        window.rootViewController = host
-        window.isHidden = false
-        defer { window.isHidden = true; window.rootViewController = nil }
-        host.view.frame = window.bounds
-        host.view.layoutIfNeeded()
-        for _ in 0..<50 {
-            if headings[.titles] == true, headings[.typed] == true, frames["group.typed"] != nil { break }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        let first = try XCTUnwrap(frames["group.titles"])
-        let second = try XCTUnwrap(frames["group.typed"])
-        XCTAssertTrue(headings[.typed] == true, "Start with both complete groups visible")
-        // Derive clipping from the real heading/row fonts and filter header. Leave half
-        // the second block below the window instead of assuming a 240 pt device region.
-        window.frame.size.height = first.maxY + second.height / 2
-        host.view.frame = window.bounds
-        host.view.setNeedsLayout()
-        host.view.layoutIfNeeded()
-        for _ in 0..<50 {
-            if headings[.titles] == true, headings[.typed] == false { break }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        XCTAssertTrue(headings[.titles] == true)
-        XCTAssertEqual(headings[.typed], false, "Typed Notes must not appear without its first result")
-        let list = try XCTUnwrap(searchDescendants(UIScrollView.self, in: host.view)
-            .first { $0.contentSize.height > $0.bounds.height + 1
-                && $0.contentSize.width <= $0.bounds.width + 1 })
-        let bottom = max(0, list.contentSize.height - list.bounds.height + list.adjustedContentInset.bottom)
-        list.setContentOffset(CGPoint(x: 0, y: bottom), animated: false)
-        host.view.layoutIfNeeded()
-        for _ in 0..<50 {
-            if headings[.typed] == true { break }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        XCTAssertTrue(headings[.typed] == true, "The heading must return when scrolling reveals its complete row")
-        XCTAssertEqual(state.visibleMatches.count, 2, "Clipping a heading must not remove a result")
     }
 
     func testFilterHeaderStaysInsetWhenResultsScrollInShortKeyboardRegion() async throws {

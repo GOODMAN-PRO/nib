@@ -14,31 +14,20 @@ enum SearchLayoutMeasurement {
     }
 }
 
-/// Geometry shared by the panel and counter, independent of their measured sizes/positions.
-struct SearchWindowGeometry: Equatable {
-    var bounds: CGRect
-    var safeArea: UIEdgeInsets
-    var keyboard: CGRect?
-}
-
 /// Measurements in the presenting window, unaffected by the keyboard changing the visible aspect ratio.
 struct SearchViewport: Equatable {
     var windowSize: CGSize
     var availableHeight: CGFloat
     /// The visible part of the host, expressed in the host's own coordinates.
     var visibleBounds: CGRect
-    var columnTop: CGFloat = 0
-    var windowGeometry: SearchWindowGeometry?
 
     func differs(from old: SearchViewport?, scale: CGFloat) -> Bool {
         guard let old else { return true }
         let window = CGRect(origin: .zero, size: windowSize)
         let oldWindow = CGRect(origin: .zero, size: old.windowSize)
         return SearchLayoutMeasurement.changed(oldWindow, window, scale: scale)
-            || old.windowGeometry != windowGeometry
             || SearchLayoutMeasurement.changed(old.visibleBounds, visibleBounds, scale: scale)
             || abs(old.availableHeight - availableHeight) > 1 / max(1, scale)
-            || abs(old.columnTop - columnTop) > 1 / max(1, scale)
     }
 
     static var idealHeight: CGFloat {
@@ -67,29 +56,13 @@ struct SearchViewport: Equatable {
         let bounds = hostBounds.intersection(localColumn)
         return bounds.isEmpty ? .zero : bounds
     }
-    /// ChromeOverlayGeometry stacks the centred match HUD above colliding bottom HUDs using
-    /// their measured widths, not ChromeLayout's sidebar docking breakpoint. Read that final
-    /// placement: the counter's distance from the usable bottom includes every occupied row.
-    static func navigationRows(counterAvailableHeight: CGFloat) -> Int {
-        let row = NibMetrics.hitTarget + NibMetrics.minimumRestingGap
-        return max(1, Int(ceil((counterAvailableHeight + NibMetrics.minimumRestingGap) / row)))
-    }
-    func navigationRows(counterTop: CGFloat?) -> Int {
-        guard let counterTop else { return 2 }
-        // Use the panel's keyboard boundary, even if a floating keyboard intersects the
-        // results but not the narrower counter. Both positions are in window coordinates.
-        return Self.navigationRows(counterAvailableHeight: columnTop + availableHeight - counterTop)
-    }
-    func navigationRows(counterPlacement: SearchViewport?) -> Int {
-        // A no-hit query removes the counter's reader. Never combine its old absolute
-        // coordinate with a resized window, changed safe area or dismissed/moved keyboard.
-        guard let counterPlacement, counterPlacement.windowGeometry == windowGeometry,
-              counterPlacement.windowSize == windowSize else { return 2 }
-        return navigationRows(counterTop: counterPlacement.columnTop)
-    }
     static func resultsHeight(availableHeight: CGFloat, reservesNavigation: Bool,
-                              navigationRows: Int = 2) -> CGFloat {
-        let reserve = CGFloat(max(0, navigationRows)) * (NibMetrics.hitTarget + NibMetrics.minimumRestingGap)
+                              windowSize: CGSize? = nil) -> CGFloat {
+        // Mirrors the 900 pt width test in ChromeLayout.init (dockingWidth, DESIGN.md §14.4).
+        // FeatSearchUI cannot import FeatDocChrome. Use the documented wide-window breakpoint
+        // for side-by-side HUD clearance, never a measured or retained counter position.
+        let rows: CGFloat = (windowSize?.width ?? 0) >= 900 ? 1 : 2
+        let reserve = rows * (NibMetrics.hitTarget + NibMetrics.minimumRestingGap)
         return max(0, min(NibMetrics.searchResultsMaxHeight,
             availableHeight - NibMetrics.barHeight - NibMetrics.minimumRestingGap
                 - (reservesNavigation ? reserve : 0)))
@@ -102,18 +75,13 @@ struct SearchViewport: Equatable {
         }
         let visible = windowBounds.intersection(frame)
         return SearchViewport(windowSize: windowBounds.size, availableHeight: max(0, bottom - frame.minY),
-            visibleBounds: visible.isEmpty ? .zero : visible.offsetBy(dx: -frame.minX, dy: -frame.minY),
-            columnTop: frame.minY,
-            windowGeometry: SearchWindowGeometry(bounds: windowBounds, safeArea: safeArea, keyboard: keyboard))
+            visibleBounds: visible.isEmpty ? .zero : visible.offsetBy(dx: -frame.minX, dy: -frame.minY))
     }
 }
 
 /// Uses this view's window (never the main screen), including Stage Manager and floating keyboards.
 @MainActor
 struct SearchViewportReader: UIViewRepresentable {
-    // A moved ancestor need not resize the sensor. Supplying its SwiftUI position makes
-    // updateUIView schedule another window-coordinate measurement after HUD placement.
-    var layoutPosition: CGPoint = .zero
     var onChange: (SearchViewport) -> Void
     func makeUIView(context: Context) -> Sensor { Sensor(onChange: onChange) }
     func updateUIView(_ view: Sensor, context: Context) { view.onChange = onChange; view.setNeedsLayout() }
@@ -191,7 +159,7 @@ struct DocumentSearchPanel: View {
                 windowSize: viewport?.windowSize)
             let height = SearchViewport.resultsHeight(availableHeight: min(geometry.size.height,
                 viewport?.availableHeight ?? geometry.size.height), reservesNavigation: true,
-                navigationRows: viewport?.navigationRows(counterPlacement: state.navigationCounterPlacement) ?? 2)
+                windowSize: viewport?.windowSize)
             VStack(spacing: NibMetrics.minimumRestingGap) {
                 DocumentSearchField(app: app, session: session, state: state)
                 SearchResults(app: app, session: session, state: state)
@@ -278,18 +246,6 @@ struct SearchCounter: View {
         Group {
             if usesHUD {
                 NibHUDGroup(id: "searchui.matchCounter") { controls }
-                    .background {
-                        GeometryReader { geometry in
-                            SearchViewportReader(layoutPosition: geometry.frame(in: .global).origin) { viewport in
-                                guard state.isPresented else { return }
-                                if state.navigationCounterPlacement != viewport {
-                                    state.navigationCounterPlacement = viewport
-                                }
-                            }
-                        }
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                    }
             } else {
                 HStack(spacing: NibSpacing.s) { controls }
                     .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget)
