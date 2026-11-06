@@ -1144,13 +1144,17 @@ final class FeatLibraryUITests: XCTestCase {
     func testProductionListAlignsFolderGlyphAndThumbnailWithoutShadowHalos() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         let folder = LibraryRow(ref: "folder:REVIEW", kind: "folder", title: "Folder")
+        let emoji = LibraryRow(ref: "folder:EMOJI", kind: "folder", title: "Emoji", icon: "📚")
         let document = LibraryRow(ref: "doc:REVIEW", kind: "notebook", title: "Notebook")
         for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
             for variant in [NibSnapshot.Variant.light, .dark] {
                 var frames: [String: CGRect] = [:]
                 let view = VStack(spacing: NibSpacing.xl) {
                     LibraryListRow(row: folder, model: model)
+                    LibraryListRow(row: emoji, model: model)
                     LibraryListRow(row: document, model: model)
+                    NibColor.backgroundSecondary.frame(width: 20, height: 20)
+                        .libraryLayoutFrame("tile.reference", space: .global)
                 }
                 .padding(NibSpacing.xl)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -1163,9 +1167,44 @@ final class FeatLibraryUITests: XCTestCase {
                 let folderTitle = try XCTUnwrap(frames["row.title." + folder.ref])
                 let documentTitle = try XCTUnwrap(frames["row.title." + document.ref])
                 XCTAssertEqual(glyph.size, cover.size)
+                XCTAssertEqual(glyph.size, CGSize(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax))
                 XCTAssertEqual(glyph.minX, cover.minX, accuracy: 0.5)
                 XCTAssertEqual(folderTitle.minX, documentTitle.minX, accuracy: 0.5)
-                for rect in [glyph, cover] {
+                let emojiFrame = try XCTUnwrap(frames["row.thumbnail." + emoji.ref])
+                XCTAssertEqual(emojiFrame.size, cover.size)
+                XCTAssertEqual(emojiFrame.minX, cover.minX, accuracy: 0.5)
+                let reference = try XCTUnwrap(frames["tile.reference"])
+                let tile = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: reference.midX, y: reference.midY)))
+                for rect in [glyph, emojiFrame] {
+                    // Actual theme-resolved tile colour, independent of the glyph and rounded corners.
+                    for point in [CGPoint(x: rect.minX + 3, y: rect.midY),
+                                  CGPoint(x: rect.maxX - 3, y: rect.midY),
+                                  CGPoint(x: rect.midX, y: rect.minY + 3),
+                                  CGPoint(x: rect.midX, y: rect.maxY - 3)] {
+                        let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: point))
+                        XCTAssertEqual(Double(pixel.r), Double(tile.r), accuracy: 2)
+                        XCTAssertEqual(Double(pixel.g), Double(tile.g), accuracy: 2)
+                        XCTAssertEqual(Double(pixel.b), Double(tile.b), accuracy: 2)
+                    }
+                    var ink = CGRect.null
+                    // Exclude only the rounded corner fringe, not the required 8 pt glyph inset.
+                    for y in Int(ceil(rect.minY + 4))..<Int(floor(rect.maxY - 4)) {
+                        for x in Int(ceil(rect.minX + 4))..<Int(floor(rect.maxX - 4)) {
+                            let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
+                            let difference = max(abs(Int(pixel.r) - Int(tile.r)),
+                                max(abs(Int(pixel.g) - Int(tile.g)), abs(Int(pixel.b) - Int(tile.b))))
+                            if difference > 24 {
+                                ink = ink.union(CGRect(x: CGFloat(x), y: CGFloat(y), width: 1, height: 1))
+                            }
+                        }
+                    }
+                    XCTAssertFalse(ink.isNull, "Both symbol and emoji folders must draw a glyph")
+                    XCTAssertGreaterThan(ink.width, 8)
+                    XCTAssertGreaterThan(ink.height, 8)
+                    XCTAssertTrue(rect.insetBy(dx: NibSpacing.s - 1, dy: NibSpacing.s - 1).contains(ink),
+                        "The visible glyph must stay inside the padded tile: \(ink) in \(rect)")
+                }
+                for rect in [glyph, emojiFrame, cover] {
                     // Sample just outside the flat thumbnail on both sides; cover elevation paints here.
                     for x in [rect.minX - 3, rect.maxX + 3] {
                         let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: x, y: rect.midY)))

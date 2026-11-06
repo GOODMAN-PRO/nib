@@ -2,7 +2,7 @@ import XCTest
 import SwiftUI
 import UIKit
 import NibContracts
-import NibDesign
+@testable import NibDesign
 import NibTesting
 @testable import FeatSearchUI
 
@@ -1167,6 +1167,123 @@ final class FeatSearchUITests: XCTestCase {
         }
     }
 
+    func testLibraryFieldAlignsContentAndOwnsOnlyThePillSurface() async throws {
+        executionTimeAllowance = 60
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let reduced = NibMotion.forcesReduced
+        let haptics = NibHaptics.isEnabled
+        NibMotion.forcesReduced = true
+        NibHaptics.isEnabled = false
+        defer { NibMotion.forcesReduced = reduced; NibHaptics.isEnabled = haptics }
+        for scheme in [ColorScheme.light, .dark] {
+            for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+                for mode in [NibLiquidMode.full, .off] {
+                    let state = SearchState()
+                    state.scope = "lib"
+                    state.query = "Hello"
+                    state.matches = [hit()]
+                    state.isPresented = true
+                    state.instant = true
+                    var frames: [String: CGRect] = [:]
+                    var field: DropletField?
+                    let root = NibDropletContainer {
+                        ZStack {
+                            LibrarySearchFloatingContent(app: h.app, session: h.session, state: state)
+                            SearchTestFieldProbe { field = $0 }
+                        }
+                    }
+                    .nibLiquidMode(mode)
+                    .environment(\.horizontalSizeClass, .regular)
+                    .environment(\.colorScheme, scheme)
+                    .environment(\.dynamicTypeSize, .large)
+                    .environment(\.accessibilityReduceMotion, true)
+                    .environment(\.searchLayoutDiagnostics, true)
+                    .onPreferenceChange(SearchLayoutFrames.self) { frames = $0 }
+                    let host = UIHostingController(rootView: root)
+                    host.safeAreaRegions = []
+                    let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                    window.rootViewController = host
+                    window.isHidden = false
+                    defer { window.isHidden = true; window.rootViewController = nil }
+                    host.view.frame = window.bounds
+                    var previous: [CGRect] = []
+                    var stableSamples = 0
+                    for _ in 0..<50 {
+                        host.view.setNeedsLayout()
+                        host.view.layoutIfNeeded()
+                        try await Task.sleep(for: .milliseconds(20))
+                        let sample = [frames["library.input"], frames["library.close"], frames["filter.all"],
+                            frames["heading.typed"], frames["firstRow.typed"],
+                            field?.visualFrame("searchui.libraryField"), field?.visualFrame("searchui.libraryResults")]
+                            .compactMap { $0 }
+                        stableSamples = sample.count == 7 && sample == previous ? stableSamples + 1 : 0
+                        previous = sample
+                        if stableSamples >= 3 { break }
+                    }
+                    let context = "\(scheme) \(size) \(mode)"
+                    XCTAssertGreaterThanOrEqual(stableSamples, 3, context)
+                    let liquid = try XCTUnwrap(field, context)
+                    let pill = try XCTUnwrap(liquid.visualFrame("searchui.libraryField"), context)
+                    let panel = try XCTUnwrap(liquid.visualFrame("searchui.libraryResults"), context)
+                    let input = try XCTUnwrap(frames["library.input"], context)
+                    let close = try XCTUnwrap(frames["library.close"], context)
+                    XCTAssertEqual(panel.minX, NibMetrics.libraryGutter, accuracy: 1, context)
+                    XCTAssertEqual(panel.maxX, size.width - NibMetrics.libraryGutter, accuracy: 1, context)
+                    for key in ["filter.all", "heading.typed", "firstRow.typed"] {
+                        let content = try XCTUnwrap(frames[key], key + context)
+                        XCTAssertEqual(pill.minX, content.minX, accuracy: 1, key + context)
+                    }
+                    XCTAssertEqual(pill.minX, panel.minX + NibSpacing.l, accuracy: 1, context)
+                    XCTAssertEqual(pill.minX, input.minX, accuracy: 1, context)
+                    XCTAssertEqual(pill.maxX, input.maxX, accuracy: 1, context)
+                    XCTAssertEqual(pill.height, input.height, accuracy: 1, context)
+                    XCTAssertLessThan(pill.maxX, close.minX, "Glass must end before the separate close control; " + context)
+                    // Inspect the actual registered surfaces, not a test-built facsimile.
+                    let entries = try XCTUnwrap(Mirror(reflecting: liquid).children.first { $0.label == "entries" }?.value
+                        as? [String: DropletField.Entry],
+                        "NibDesign.DropletField.entries was renamed or changed type; update this reflection assertion.")
+                    XCTAssertEqual(Set(entries.keys),
+                        Set(["searchui.libraryField", "searchui.libraryResults"]), context)
+                    XCTAssertEqual(entries["searchui.libraryField"]?.style, .bar, context)
+                    XCTAssertEqual(entries["searchui.libraryField"]?.bud?.source, "library.controls", context)
+                    XCTAssertEqual(close.width, NibMetrics.hitTarget, accuracy: 1, context)
+                    XCTAssertEqual(close.height, NibMetrics.hitTarget, accuracy: 1, context)
+                    XCTAssertGreaterThanOrEqual(close.minX, panel.minX, context)
+                    XCTAssertLessThanOrEqual(close.maxX, panel.maxX, context)
+                    if mode == .off {
+                        // Off mode is compositor-independent. Locate the bare glyph pixels;
+                        // its 44 pt hit target must stay inside the field row above the panel.
+                        host.view.layer.displayIfNeeded()
+                        let format = UIGraphicsImageRendererFormat()
+                        format.scale = 1
+                        let image = UIGraphicsImageRenderer(size: size, format: format).image { renderer in
+                            host.view.layer.render(in: renderer.cgContext)
+                        }
+                        let backdrop = try XCTUnwrap(NibSnapshot.pixel(image,
+                            at: CGPoint(x: panel.maxX, y: close.minY - 2)))
+                        var glyph = CGRect.null
+                        for y in Int(ceil(close.minY))..<Int(floor(close.maxY)) {
+                            for x in Int(ceil(close.minX))..<Int(floor(close.maxX)) {
+                                let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
+                                let delta = max(abs(Int(pixel.r) - Int(backdrop.r)),
+                                    max(abs(Int(pixel.g) - Int(backdrop.g)), abs(Int(pixel.b) - Int(backdrop.b))))
+                                if delta > 4 {
+                                    glyph = glyph.union(CGRect(x: CGFloat(x), y: CGFloat(y), width: 1, height: 1))
+                                }
+                            }
+                        }
+                        XCTAssertFalse(glyph.isNull, context)
+                        XCTAssertGreaterThan(glyph.width, 10, context)
+                        XCTAssertLessThan(glyph.width, 26, "The close control must be a bare glyph, not a 30 pt disc; " + context)
+                        XCTAssertLessThan(glyph.height, 26, context)
+                        let row = try XCTUnwrap(frames["firstRow.typed"], context)
+                        XCTAssertEqual(glyph.maxX, row.maxX, accuracy: 2, context)
+                    }
+                }
+            }
+        }
+    }
+
     func testLibraryWithoutFloatingHostKeepsBackdropInsteadOfOpeningCover() async throws {
         let h = Harness(features: [FeatSearchUIFeature.self])
         installDependencies(h, hits: [])
@@ -1347,6 +1464,92 @@ final class FeatSearchUITests: XCTestCase {
         XCTAssertTrue(closed, "Cancel dismisses even with an empty query")
     }
 
+    func testDocumentNoHitsAndErrorStayVisibleAfterResizeAndKeyboardDismissal() async throws {
+        executionTimeAllowance = 60
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let state = SearchState()
+        state.scope = NodeRef.document(Fixtures.docID).description
+        state.query = "Hello"
+        state.matches = [hit()]
+        state.isPresented = true
+        state.instant = true
+        var frames: [String: CGRect] = [:]
+        let root = DocumentSearchPanel(app: h.app, session: h.session, state: state)
+            .frame(width: 560, height: 780)
+            .environment(\.searchLayoutDiagnostics, true)
+            .onPreferenceChange(SearchLayoutFrames.self) { frames = $0 }
+        let host = UIHostingController(rootView: root)
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1366, height: 1024))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = CGRect(x: 16, y: 100, width: 560, height: 780)
+        host.view.layoutIfNeeded()
+        let outsideKeyboard = window.convert(CGRect(x: 900, y: 360, width: 300, height: 300),
+            to: window.screen.coordinateSpace)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil,
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: outsideKeyboard)])
+        for hasMatches in [true, false, true] {
+            state.query = hasMatches ? "Hello" : "Missing"
+            state.matches = hasMatches ? [hit()] : []
+            let key = hasMatches ? "firstRow.typed" : "results.empty"
+            var stableSamples = 0
+            for _ in 0..<50 {
+                try await Task.sleep(for: .milliseconds(20))
+                if let panel = frames["document.results"], abs(panel.height - 600) < 1,
+                   let content = frames[key], content.height > 0,
+                   panel.insetBy(dx: -1, dy: -1).contains(content) {
+                    stableSamples += 1
+                } else { stableSamples = 0 }
+                if stableSamples >= 3 { break }
+            }
+            XCTAssertGreaterThanOrEqual(stableSamples, 3,
+                "An outside-column floating keyboard must not collapse results as matches disappear or return")
+        }
+        let keyboard = CGRect(x: 500, y: 535, width: 400, height: 300)
+        let screenKeyboard = window.convert(keyboard, to: window.screen.coordinateSpace)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil,
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: screenKeyboard)])
+        for _ in 0..<50 {
+            if let panel = frames["document.results"], abs(panel.height - 299) < 1,
+               frames["firstRow.typed"] != nil { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNotNil(frames["firstRow.typed"], "Begin with matches")
+        XCTAssertEqual(try XCTUnwrap(frames["document.results"]).height, 299, accuracy: 1,
+            "The full-width landscape window reserves exactly one HUD row")
+        state.query = "Missing"
+        state.matches = [] // Production removes the counter overlay at this point.
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 900, height: 1200)] {
+            window.frame.size = size
+            host.view.frame = CGRect(x: 16, y: 100, width: 560, height: 780)
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            let hiddenKeyboard = window.convert(CGRect(x: 0, y: size.height, width: size.width, height: 0),
+                to: window.screen.coordinateSpace)
+            NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil,
+                userInfo: [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: hiddenKeyboard)])
+            for message in ["results.empty", "results.error"] {
+                state.error = message == "results.error" ? "Search unavailable" : nil
+                for _ in 0..<100 {
+                    if let panel = frames["document.results"], panel.height >= 599,
+                       let content = frames[message], content.height > 0,
+                       panel.insetBy(dx: -1, dy: -1).contains(content) { break }
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                let panel = try XCTUnwrap(frames["document.results"])
+                let content = try XCTUnwrap(frames[message])
+                let filter = try XCTUnwrap(frames["filter.all"])
+                XCTAssertEqual(panel.height, 600, accuracy: 1)
+                XCTAssertGreaterThan(content.height, 0)
+                XCTAssertTrue(panel.insetBy(dx: -1, dy: -1).contains(content), "Keep the complete message visible")
+                XCTAssertTrue(panel.insetBy(dx: -1, dy: -1).contains(filter), "Keep the filter header visible")
+                XCTAssertGreaterThanOrEqual(content.minY, filter.maxY)
+            }
+        }
+    }
+
     func testFilterHeaderStaysInsetWhenResultsScrollInShortKeyboardRegion() async throws {
         let h = Harness(features: [FeatSearchUIFeature.self])
         let state = SearchState()
@@ -1437,6 +1640,26 @@ final class FeatSearchUITests: XCTestCase {
                 add(attachment)
             } else { XCTFail("Document search snapshot did not render") }
         }
+    }
+}
+
+@MainActor
+private struct SearchTestFieldProbe: View {
+    @Environment(DropletField.self) private var field: DropletField?
+    let capture: (DropletField) -> Void
+
+    private var ready: Bool {
+        guard let field else { return false }
+        return ["searchui.libraryField", "searchui.libraryResults"].allSatisfy {
+            field.node($0).presentation.isDrawn
+        }
+    }
+
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .onChange(of: ready, initial: true) { _, ready in
+                if ready, let field { capture(field) }
+            }
     }
 }
 

@@ -203,15 +203,22 @@ struct LibrarySearchFloatingContent: View {
                     .accessibilityHidden(true)
                 VStack(spacing: NibSpacing.l) {
                     HStack(spacing: NibSpacing.s) {
-                        SearchInput(app: app, session: session, state: state, style: .filled)
+                        // The pill is the only glass surface; the close control stays outside it.
+                        SearchInput(app: app, session: session, state: state, style: .onDroplet)
                             .frame(minWidth: 0, maxWidth: .infinity)
+                            .searchLayoutFrame("library.input")
+                            .droplet("searchui.libraryField", style: .bar)
+                            .budsFrom("library.controls", isPresented: presentationBinding, instant: state.instant)
                         NibIconButton(.xmark, label: String(localized: "Close search"), action: close)
+                            .searchLayoutFrame("library.close")
                     }
+                    // Match the panel content without putting its chips against the clipped rim.
+                    .padding(.leading, NibSpacing.l)
+                    // The bare glyph's inner margin plus this padding aligns it with the
+                    // results' 16 pt inset, while its entire 44 pt target stays in the row.
                     .padding(.trailing, NibSpacing.xs)
                     .frame(width: width)
                     .nibChromeTypeCap()
-                    .droplet("searchui.libraryField", style: .bar)
-                    .budsFrom("library.controls", isPresented: presentationBinding, instant: state.instant)
                     #if DEBUG
                     .background(layoutDiagnostic("library field rest frame"))
                     #endif
@@ -348,6 +355,7 @@ struct SearchResults: View {
                             NibBanner(error, style: .warning, action: NibAction(String(localized: "Try search again"), command: CommandIDs.searchOpen) {
                                 app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "refresh": true], session: session)
                             })
+                            .searchLayoutFrame("results.error")
                         } else if state.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             if state.scope == "lib" {
                                 Text(String(localized: "Recently opened")).font(NibFont.headline).accessibilityAddTraits(.isHeader)
@@ -379,16 +387,10 @@ struct SearchResults: View {
                         } else if let empty = state.emptyPresentation {
                             NibEmptyState(symbol: .search, title: empty.title, message: empty.message)
                                 .frame(maxWidth: .infinity)
+                                .searchLayoutFrame("results.empty")
                         } else {
                             ForEach(SearchGroup.allCases) { group in
-                                let hits = state.visibleMatches.filter { $0.group == group }
-                                if !hits.isEmpty {
-                                    Text(group.title).font(NibFont.headline).accessibilityAddTraits(.isHeader)
-                                    ForEach(hits) { hit in
-                                        SearchResultRow(app: app, session: session, state: state, hit: hit)
-                                            .id(hit.id)
-                                    }
-                                }
+                                resultGroup(group)
                             }
                         }
                         if let cursor = state.cursor {
@@ -448,6 +450,20 @@ struct SearchResults: View {
             }
         }
     }
+    @ViewBuilder private func resultGroup(_ group: SearchGroup) -> some View {
+        let hits = state.visibleMatches.filter { $0.group == group }
+        if let first = hits.first {
+            Text(group.title).font(NibFont.headline).accessibilityAddTraits(.isHeader)
+                .searchLayoutFrame("heading." + group.rawValue)
+            SearchResultRow(app: app, session: session, state: state, hit: first)
+                .searchLayoutFrame("firstRow." + group.rawValue)
+                .id(first.id)
+            ForEach(Array(hits.dropFirst())) { hit in
+                SearchResultRow(app: app, session: session, state: state, hit: hit)
+                    .id(hit.id)
+            }
+        }
+    }
     private func loadMore() {
         app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "more": true], session: session)
     }
@@ -490,6 +506,7 @@ struct SearchFilterHeader: View {
                         app.perform(CommandIDs.searchOpen,
                             ["scope": .string(state.scope), "filter": .string(filter.rawValue)], session: session)
                     })
+                    .searchLayoutFrame("filter." + filter.rawValue)
                 }
             }
             .frame(minHeight: NibMetrics.hitTarget)
@@ -617,4 +634,48 @@ func highlighted(_ snippet: String, query: String) -> AttributedString {
         }
     }
     return text
+}
+
+// Opt-in observations for hosted regression tests. No measurement is consumed by
+// production state or layout: the host proposal remains the only sizing input.
+struct SearchLayoutFrames: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private struct SearchLayoutDiagnosticsKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var searchLayoutDiagnostics: Bool {
+        get { self[SearchLayoutDiagnosticsKey.self] }
+        set { self[SearchLayoutDiagnosticsKey.self] = newValue }
+    }
+}
+
+extension View {
+    func searchLayoutFrame(_ id: String) -> some View {
+        modifier(SearchLayoutFrame(id: id))
+    }
+}
+
+private struct SearchLayoutFrame: ViewModifier {
+    @Environment(\.searchLayoutDiagnostics) private var enabled
+    let id: String
+
+    func body(content: Content) -> some View {
+        content.background {
+            if enabled {
+                GeometryReader { geometry in
+                    Color.clear.preference(key: SearchLayoutFrames.self,
+                        value: [id: geometry.frame(in: .global)])
+                }
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
+        }
+    }
 }

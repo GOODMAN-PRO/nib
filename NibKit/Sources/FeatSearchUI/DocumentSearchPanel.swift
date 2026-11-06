@@ -56,10 +56,16 @@ struct SearchViewport: Equatable {
         let bounds = hostBounds.intersection(localColumn)
         return bounds.isEmpty ? .zero : bounds
     }
-    static func resultsHeight(availableHeight: CGFloat, reservesNavigation: Bool) -> CGFloat {
-        max(0, min(NibMetrics.searchResultsMaxHeight,
+    static func resultsHeight(availableHeight: CGFloat, reservesNavigation: Bool,
+                              windowSize: CGSize? = nil) -> CGFloat {
+        // Mirrors the 900 pt width test in ChromeLayout.init (dockingWidth, DESIGN.md §14.4).
+        // FeatSearchUI cannot import FeatDocChrome. Use the documented wide-window breakpoint
+        // for side-by-side HUD clearance, never a measured or retained counter position.
+        let rows: CGFloat = (windowSize?.width ?? 0) >= 900 ? 1 : 2
+        let reserve = rows * (NibMetrics.hitTarget + NibMetrics.minimumRestingGap)
+        return max(0, min(NibMetrics.searchResultsMaxHeight,
             availableHeight - NibMetrics.barHeight - NibMetrics.minimumRestingGap
-                - (reservesNavigation ? navigationReserve : 0)))
+                - (reservesNavigation ? reserve : 0)))
     }
     static func measure(windowBounds: CGRect, safeArea: UIEdgeInsets, frame: CGRect,
                         keyboard: CGRect?) -> SearchViewport {
@@ -152,11 +158,13 @@ struct DocumentSearchPanel: View {
             let width = SearchViewport.panelWidth(availableWidth: geometry.size.width,
                 windowSize: viewport?.windowSize)
             let height = SearchViewport.resultsHeight(availableHeight: min(geometry.size.height,
-                viewport?.availableHeight ?? geometry.size.height), reservesNavigation: true)
+                viewport?.availableHeight ?? geometry.size.height), reservesNavigation: true,
+                windowSize: viewport?.windowSize)
             VStack(spacing: NibMetrics.minimumRestingGap) {
                 DocumentSearchField(app: app, session: session, state: state)
                 SearchResults(app: app, session: session, state: state)
                     .frame(height: height, alignment: .top)
+                    .searchLayoutFrame("document.results")
                     .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
                     .droplet("searchui.documentResults", style: .panel)
                     .budsFrom("searchui.documentField", isPresented: presentationBinding, instant: state.instant)

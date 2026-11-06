@@ -3,11 +3,76 @@ import SwiftUI
 import UIKit
 import Combine
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatSearchUI
 
 @MainActor
 final class SearchLayoutTests: XCTestCase {
+    func testSearchHeightReservesOneRowInWideWindowsAndTwoInSplitView() {
+        let landscape = CGSize(width: 1366, height: 1024)
+        let split = CGSize(width: 600, height: 1024)
+        XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 419, reservesNavigation: true,
+            windowSize: landscape), 299)
+        XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 419, reservesNavigation: true,
+            windowSize: split), 239)
+        // Mirror ChromeLayout's documented 900 pt width boundary, not the keyboard's
+        // visible aspect ratio or the width of the 560 pt results panel.
+        for width: CGFloat in [899, 900] {
+            XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 419, reservesNavigation: true,
+                windowSize: CGSize(width: width, height: 700)), width < 900 ? 239 : 299)
+        }
+        XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 419, reservesNavigation: true), 239,
+            "An unmeasured window keeps the conservative two-row reserve")
+    }
+
+    func testSearchHeightKeepsTheExistingMinimumMaximumAndLibraryClearance() {
+        for size in [CGSize(width: 600, height: 1024), CGSize(width: 1366, height: 1024)] {
+            for available: CGFloat in [-100, 0, 100, 180, 419, 780, 2000] {
+                let height = SearchViewport.resultsHeight(availableHeight: available,
+                    reservesNavigation: true, windowSize: size)
+                let previous = max(0, min(NibMetrics.searchResultsMaxHeight,
+                    available - NibMetrics.barHeight - NibMetrics.minimumRestingGap
+                        - SearchViewport.navigationReserve))
+                XCTAssertGreaterThanOrEqual(height, previous, "Never reduce the panel's previous minimum")
+                XCTAssertGreaterThanOrEqual(height, 0)
+                XCTAssertLessThanOrEqual(height, NibMetrics.searchResultsMaxHeight)
+                XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: available,
+                    reservesNavigation: false, windowSize: size),
+                    SearchViewport.resultsHeight(availableHeight: available, reservesNavigation: false),
+                    "The library does not reserve document HUD rows")
+            }
+            XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 100,
+                reservesNavigation: true, windowSize: size), 0)
+            XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 2000,
+                reservesNavigation: true, windowSize: size), 600)
+        }
+    }
+
+    func testFloatingKeyboardOutsidePanelColumnDoesNotChangeViewportOrResultsHeight() {
+        let bounds = CGRect(x: 0, y: 0, width: 1366, height: 1024)
+        let safe = UIEdgeInsets(top: 0, left: 0, bottom: 34, right: 0)
+        let column = CGRect(x: 16, y: 100, width: 560, height: 924)
+        let clear = SearchViewport.measure(windowBounds: bounds, safeArea: safe,
+            frame: column, keyboard: nil)
+        let floating = SearchViewport.measure(windowBounds: bounds, safeArea: safe,
+            frame: column, keyboard: CGRect(x: 900, y: 360, width: 300, height: 300))
+        XCTAssertEqual(floating, clear)
+        XCTAssertFalse(floating.differs(from: clear, scale: 2))
+        XCTAssertEqual(floating.availableHeight, 874)
+        // Apply the actual host cap first. No counter position can subtract twelve rows
+        // from this 780 pt host, even when the other chrome lifts above the keyboard.
+        for viewport in [clear, floating] {
+            XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: min(780, viewport.availableHeight),
+                reservesNavigation: true, windowSize: viewport.windowSize), 600)
+        }
+        let intersecting = SearchViewport.measure(windowBounds: bounds, safeArea: safe,
+            frame: column, keyboard: CGRect(x: 500, y: 535, width: 400, height: 300))
+        XCTAssertEqual(intersecting.availableHeight, 419)
+        XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: intersecting.availableHeight,
+            reservesNavigation: true, windowSize: intersecting.windowSize), 299)
+    }
+
     func testBoundsIgnoreOnePixelNoiseButRetainAccumulatedMovementAndRemoval() {
         let original = CGRect(x: 16, y: 62, width: 358, height: 738)
         var retained: CGRect? = original
