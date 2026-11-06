@@ -209,13 +209,14 @@ struct LibrarySearchFloatingContent: View {
                             .searchLayoutFrame("library.input")
                             .droplet("searchui.libraryField", style: .bar)
                             .budsFrom("library.controls", isPresented: presentationBinding, instant: state.instant)
-                        NibIconButton(.xmark, label: String(localized: "Close search"), size: .round, action: close)
+                        NibIconButton(.xmark, label: String(localized: "Close search"), action: close)
                             .searchLayoutFrame("library.close")
-                            // NibIconButton.round draws a 30 pt disc inside its 44 pt target.
-                            .offset(x: (NibMetrics.hitTarget - 30) / 2)
                     }
                     // Match the panel content without putting its chips against the clipped rim.
                     .padding(.leading, NibSpacing.l)
+                    // The bare glyph's inner margin plus this padding aligns it with the
+                    // results' 16 pt inset, while its entire 44 pt target stays in the row.
+                    .padding(.trailing, NibSpacing.xs)
                     .frame(width: width)
                     .nibChromeTypeCap()
                     #if DEBUG

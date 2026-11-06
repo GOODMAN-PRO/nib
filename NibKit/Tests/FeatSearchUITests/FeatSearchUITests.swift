@@ -1239,15 +1239,20 @@ final class FeatSearchUITests: XCTestCase {
                     XCTAssertEqual(pill.height, input.height, accuracy: 1, context)
                     XCTAssertLessThan(pill.maxX, close.minX, "Glass must end before the separate close control; " + context)
                     // Inspect the actual registered surfaces, not a test-built facsimile.
-                    let entries = Mirror(reflecting: liquid).children.first { $0.label == "entries" }?.value
-                        as? [String: DropletField.Entry]
-                    XCTAssertEqual(Set(try XCTUnwrap(entries).keys),
+                    let entries = try XCTUnwrap(Mirror(reflecting: liquid).children.first { $0.label == "entries" }?.value
+                        as? [String: DropletField.Entry],
+                        "NibDesign.DropletField.entries was renamed or changed type; update this reflection assertion.")
+                    XCTAssertEqual(Set(entries.keys),
                         Set(["searchui.libraryField", "searchui.libraryResults"]), context)
-                    XCTAssertEqual(entries?["searchui.libraryField"]?.style, .bar, context)
-                    XCTAssertEqual(entries?["searchui.libraryField"]?.bud?.source, "library.controls", context)
+                    XCTAssertEqual(entries["searchui.libraryField"]?.style, .bar, context)
+                    XCTAssertEqual(entries["searchui.libraryField"]?.bud?.source, "library.controls", context)
+                    XCTAssertEqual(close.width, NibMetrics.hitTarget, accuracy: 1, context)
+                    XCTAssertEqual(close.height, NibMetrics.hitTarget, accuracy: 1, context)
+                    XCTAssertGreaterThanOrEqual(close.minX, panel.minX, context)
+                    XCTAssertLessThanOrEqual(close.maxX, panel.maxX, context)
                     if mode == .off {
-                        // Off mode is compositor-independent. Locate actual painted disc pixels,
-                        // rather than equating the 44 pt accessibility target with its visible edge.
+                        // Off mode is compositor-independent. Locate the bare glyph pixels;
+                        // its 44 pt hit target must stay inside the field row above the panel.
                         host.view.layer.displayIfNeeded()
                         let format = UIGraphicsImageRendererFormat()
                         format.scale = 1
@@ -1256,21 +1261,23 @@ final class FeatSearchUITests: XCTestCase {
                         }
                         let backdrop = try XCTUnwrap(NibSnapshot.pixel(image,
                             at: CGPoint(x: panel.maxX, y: close.minY - 2)))
-                        var disc = CGRect.null
+                        var glyph = CGRect.null
                         for y in Int(ceil(close.minY))..<Int(floor(close.maxY)) {
                             for x in Int(ceil(close.minX))..<Int(floor(close.maxX)) {
                                 let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
                                 let delta = max(abs(Int(pixel.r) - Int(backdrop.r)),
                                     max(abs(Int(pixel.g) - Int(backdrop.g)), abs(Int(pixel.b) - Int(backdrop.b))))
                                 if delta > 4 {
-                                    disc = disc.union(CGRect(x: CGFloat(x), y: CGFloat(y), width: 1, height: 1))
+                                    glyph = glyph.union(CGRect(x: CGFloat(x), y: CGFloat(y), width: 1, height: 1))
                                 }
                             }
                         }
-                        XCTAssertFalse(disc.isNull, context)
-                        XCTAssertEqual(disc.width, 30, accuracy: 2, context)
-                        XCTAssertEqual(disc.height, 30, accuracy: 2, context)
-                        XCTAssertEqual(disc.maxX, panel.maxX, accuracy: 1, context)
+                        XCTAssertFalse(glyph.isNull, context)
+                        XCTAssertGreaterThan(glyph.width, 10, context)
+                        XCTAssertLessThan(glyph.width, 26, "The close control must be a bare glyph, not a 30 pt disc; " + context)
+                        XCTAssertLessThan(glyph.height, 26, context)
+                        let row = try XCTUnwrap(frames["firstRow.typed"], context)
+                        XCTAssertEqual(glyph.maxX, row.maxX, accuracy: 2, context)
                     }
                 }
             }
