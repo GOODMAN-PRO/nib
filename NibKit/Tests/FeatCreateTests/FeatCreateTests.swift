@@ -1931,7 +1931,11 @@ final class FeatCreateTests: XCTestCase {
                 let paper = try XCTUnwrap(frames["paper." + firstPaper.id])
                 let preview = try XCTUnwrap(frames["preview"])
                 let cue = try XCTUnwrap(frames["cue"], "Overflow must announce more options")
-                XCTAssertGreaterThan(sheetFrame.height, NibMetrics.newDocumentSheetSize.height)
+                let expectedHeight = size.height > size.width
+                    ? min(size.height - 4 * NibSpacing.xxl, 1000)
+                    : min(NibMetrics.newDocumentSheetSize.height + NibMetrics.paperTileSize.height + NibSpacing.xl,
+                          size.height - 2 * NibSpacing.xl)
+                XCTAssertEqual(sheetFrame.height, expectedHeight, accuracy: 1)
                 XCTAssertGreaterThan(paper.height, NibMetrics.paperTileSize.height)
                 XCTAssertLessThanOrEqual(paper.maxY, viewport.maxY - NibSpacing.l + 1,
                     "The first paper tile and label must clear the bottom fade on opening")
@@ -1957,6 +1961,11 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertEqual((try XCTUnwrap(frames["documentType"])).minY - viewport.minY,
                                NibSpacing.xl, accuracy: 1, diagnostics())
                 let strip = try XCTUnwrap(frames["coverStrip"])
+                let ring = NibStroke.ring + NibStroke.ringOutset
+                let tileCount = (strip.width - NibSpacing.l - 2 * ring + NibSpacing.l)
+                    / (NibMetrics.coverStripSize.width + NibSpacing.l)
+                XCTAssertEqual(tileCount, tileCount.rounded(), accuracy: 0.01,
+                               "The initial cover viewport must end between complete tiles")
                 let horizontal = try XCTUnwrap(scrollViews(host.view).first {
                     $0.contentSize.width > $0.bounds.width + 1
                         && abs($0.convert($0.bounds, to: window).minY - strip.minY) < 2
@@ -1968,7 +1977,7 @@ final class FeatCreateTests: XCTestCase {
                 let finalStrip = try XCTUnwrap(frames["coverStrip"])
                 XCTAssertGreaterThanOrEqual(finalCover.minX, finalStrip.minX)
                 XCTAssertLessThanOrEqual(finalCover.maxX, finalStrip.maxX - NibSpacing.l + 0.5,
-                    "The final cover name must clear the entire trailing fade")
+                    "The final cover name must clear the reserved overflow cue")
                 XCTAssertGreaterThan(finalCover.height, NibMetrics.coverStripSize.height)
                 let resting = vertical.contentOffset.y
                 vertical.setContentOffset(CGPoint(x: vertical.contentOffset.x, y: resting + 100), animated: false)
