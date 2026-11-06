@@ -545,7 +545,7 @@ final class InkUITests: XCTestCase {
         for tool in ["pen", "pencil"] {
             var images: [Raster] = []
             for value: CGFloat in [0.01, 0.99] {
-                try settings(tool); _ = try slider("Stabilisation", to: value); closePopover()
+                try settings(tool, revealTop: false); _ = try slider("Stabilisation", to: value); closePopover()
                 let before = try ui.state(), blank = try raster()
                 let endpoints = [zigzag.first!, zigzag.last!].map {
                     CGRect(x: $0.x - 0.01, y: $0.y - 0.01, width: 0.02, height: 0.02)
