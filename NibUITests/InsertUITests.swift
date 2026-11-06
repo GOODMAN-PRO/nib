@@ -1361,13 +1361,12 @@ final class InsertUITests: XCTestCase {
         try clearText(composer)
         XCTAssertTrue(try message("Shape annotation").exists)
     }
-    /// Waits for the inline message editor by its current content within the scroll view containing Save.
+    /// Polls the inline editor directly by its current content, without a containing-ScrollView query.
     private func commentEditor(_ original: String) throws -> XCUIElement {
-        let panel = ui.app.scrollViews.containing(.button, identifier: "Save").firstMatch
-        let field = panel.textFields.matching(NSPredicate(format: "value == %@", original)).firstMatch
+        let field = ui.app.textFields.matching(NSPredicate(format: "value == %@", original)).firstMatch
         try wait("Inline comment editor must expose its existing message") { field.exists && field.isHittable }
         // Rebind without the mutable value: typing must not invalidate the editor query.
-        return panel.textFields.matching(NSPredicate(format: "identifier == %@ AND label == %@", field.identifier, field.label)).firstMatch
+        return ui.app.textFields.matching(NSPredicate(format: "identifier == %@ AND label == %@", field.identifier, field.label)).firstMatch
     }
     func testCommentEditCancelSaveAndDeleteFinalMessageRemovesAnchor() throws {
         try comment(); try ui.nativeContextMenu(try message("Check the units"), path: ["Edit Message"])

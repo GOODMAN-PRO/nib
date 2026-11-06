@@ -296,3 +296,11 @@ Confirmed pages-drag-photos#0 correction: selection succeeded, snapshot-clipped 
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | AddImageFromPhotosPreservesOriginalPages; multi-select Photos | Photos confirmation scope / Photos picker buttons / Photos picker confirm | Is the scope wrong, is the snapshot empty, and which live button satisfies the existing rule? |
+
+### H14 / S2 - direct control polls and step timing
+
+Confirmed selection#2 correction: activateLayer's containing-ScrollView poll consumed 45 seconds; host-wide slowdown is unproven. Poll Layer N directly after the existing panel-state wait, retaining selected/Active value and closure checks. Audited containing queries across all classes: Insert's commentEditor had another repeatedly evaluated containing query and now polls/rebinds the typed editor directly; other containing queries perform one-time discovery rather than polling. Selection setup and crossPage steps log wall time including launch, document open, drawing, selection, zoom, destination query/drag, navigation and undo/count waits. Should unblock MoveObjectsToLayer and locate MoveAcross's 53-second startup. CI must correlate timings with the new eight-second silence samples before assigning app versus host cause.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| MoveAcrossPagesAndLinkedUndo; Selection setup/cross-page sibling | Selection step begin / Selection step timing | Which action, including work before the first key, consumed the time? |

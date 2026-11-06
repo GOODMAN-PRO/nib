@@ -17,10 +17,10 @@ final class SelectionUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
-        ui.logIdleSelectors(for: String(describing: type(of: self)))
-        try ui.launchFixture()
-        try ui.openDocument("Physics — Motion")
-        _ = try ui.waitForState { $0.itemCountOnPage == 4 && $0.strokeCountOnPage == 1 }
+        step("idle selectors") { ui.logIdleSelectors(for: String(describing: type(of: self))) }
+        try step("launch fixture") { try ui.launchFixture() }
+        try step("open document") { try ui.openDocument("Physics — Motion") }
+        _ = try step("initial counts") { try ui.waitForState { $0.itemCountOnPage == 4 && $0.strokeCountOnPage == 1 } }
     }
 
     override func tearDownWithError() throws {
@@ -37,6 +37,13 @@ final class SelectionUITests: XCTestCase {
         }
         ui.app.terminate()
         self.ui = nil
+    }
+
+    private func step<T>(_ label: String, _ body: () throws -> T) rethrows -> T {
+        let started = ProcessInfo.processInfo.systemUptime
+        ui.logQA("Selection step begin", label)
+        defer { ui.logQA("Selection step timing", "step=\(label) seconds=\(ProcessInfo.processInfo.systemUptime - started)") }
+        return try body()
     }
 
     private func query(_ name: String, type: XCUIElement.ElementType = .any) -> XCUIElementQuery {
@@ -1004,8 +1011,7 @@ final class SelectionUITests: XCTestCase {
         try key("l", [.command, .option]) {
             _ = try self.ui.waitForState(timeout: 8) { $0.openPanels.contains("layers") }
         }
-        let panel = ui.app.scrollViews.containing(.button, identifier: "Layer 1").firstMatch
-        let row = panel.buttons.matching(NSPredicate(format: "label == %@", "Layer \(number)")).firstMatch
+        let row = ui.app.buttons.matching(NSPredicate(format: "label == %@", "Layer \(number)")).firstMatch
         try wait("Layers panel must expose the target row") { row.exists && row.isHittable }
         try key(String(number), [.command, .option]) {
             try self.wait("Layer \(number) shortcut must mark its row active") {
@@ -1075,23 +1081,25 @@ final class SelectionUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 10) { !$0.openPanels.contains("pages.goToPage") && (original == nil || $0.page == original) }
     }
     private func crossPage(copy: Bool) throws {
-        try selectedInk(); let source = try ui.state()
-        try ui.pinchZoom(scale: 0.5)
-        let zoomed = try ui.waitForState(timeout: 10) { $0.zoom < source.zoom }
+        try step("draw source") { try draw() }
+        try step("select source") { try loop(count: 1) }
+        let source = try step("source state") { try ui.state() }
+        try step("pinch") { try ui.pinchZoom(scale: 0.5) }
+        let zoomed = try step("wait for zoom") { try ui.waitForState(timeout: 10) { $0.zoom < source.zoom } }
         XCTAssertGreaterThanOrEqual(zoomed.zoom, 0.499); XCTAssertLessThanOrEqual(zoomed.zoom, 8.001)
-        let page2 = ui.app.otherElements.matching(NSPredicate(format: "label == 'Page 2 of 4'")).allElementsBoundByIndex.first { $0.frame.height > 100 }
+        let page2 = step("adjacent page query") { ui.app.otherElements.matching(NSPredicate(format: "label == 'Page 2 of 4'")).allElementsBoundByIndex.first { $0.frame.height > 100 } }
         let target = try XCTUnwrap(page2, "Cross-page drag needs the adjacent page laid out")
         let visible = target.frame.intersection(ui.canvas.frame)
         XCTAssertGreaterThan(visible.height, 30, "Zoomed adjacent page must expose a real drop target")
-        drag(centre(try bounds()), centre(visible), modifiers: copy ? .option : [])
-        try goToPage(2)
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == 1 && $0.strokeCountOnPage == 1 }
-        try goToPage(1, original: source.page)
+        try step("cross-page drag") { drag(centre(try bounds()), centre(visible), modifiers: copy ? .option : []) }
+        try step("go to page 2") { try goToPage(2) }
+        _ = try step("destination counts") { try ui.waitForState(timeout: 10) { $0.itemCountOnPage == 1 && $0.strokeCountOnPage == 1 } }
+        try step("return to source") { try goToPage(1, original: source.page) }
         XCTAssertEqual(try ui.state().itemCountOnPage, source.itemCountOnPage - (copy ? 0 : 1))
-        try ui.tapCommand("edit.undo")
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == source.itemCountOnPage }
-        try goToPage(2)
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == 0 }
+        try step("linked undo") { try ui.tapCommand("edit.undo") }
+        _ = try step("undo counts") { try ui.waitForState(timeout: 10) { $0.itemCountOnPage == source.itemCountOnPage } }
+        try step("go to page 2") { try goToPage(2) }
+        _ = try step("empty destination") { try ui.waitForState(timeout: 10) { $0.itemCountOnPage == 0 } }
     }
     func testMoveAcrossPagesAndLinkedUndo() throws { try crossPage(copy: false) }
     func testCopyDragAcrossPagesKeepsSourceAndLinkedUndo() throws { try crossPage(copy: true) }
