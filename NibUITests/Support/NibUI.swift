@@ -1363,8 +1363,8 @@ final class NibUI {
             let logBeforeDelivery = deliveryBefore.state?.keyLog ?? focused.keyLog ?? []
             logQA("Key before delivery", "route=hardware typeKey key=\(key) modifiers=\(modifiers.rawValue) keyboardExists=\(app.keyboards.firstMatch.exists) " + deliveryBefore.facts)
             let precedingActivity = previousActivity
-            try openHardwareKeyRoute()
             let precedingContext = keyContext() + " precedingAction=" + precedingActivity
+            try openHardwareKeyRoute()
             try sendHardwareKey(key, modifiers)
             // The app's own account of the key (window press, responder, command run) goes into the test log
             // for passing and failing chords alike.

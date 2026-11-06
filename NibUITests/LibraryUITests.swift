@@ -51,11 +51,12 @@ final class LibraryUITests: XCTestCase {
         app.buttons.matching(matching(label)).firstMatch
     }
 
+    // These waits also run inside chord() postconditions. Only throw here so a proven
+    // dropped delivery can retry; an exhausted/rejected retry fails the throwing test.
     private func visible(_ element: XCUIElement, _ message: String, timeout: TimeInterval = 12,
                          file: StaticString = #filePath, line: UInt = #line) throws {
         guard element.exists || element.waitForExistence(timeout: timeout) else {
-            XCTFail(message, file: file, line: line)
-            throw NibUI.Failure.message(message)
+            throw NibUI.Failure.message("\(message) (\(file):\(line))")
         }
     }
 
@@ -65,8 +66,7 @@ final class LibraryUITests: XCTestCase {
         if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
-            XCTFail(message, file: file, line: line)
-            throw NibUI.Failure.message(message)
+            throw NibUI.Failure.message("\(message) (\(file):\(line))")
         }
     }
 
