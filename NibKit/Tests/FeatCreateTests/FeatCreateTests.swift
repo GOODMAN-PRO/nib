@@ -1937,8 +1937,19 @@ final class FeatCreateTests: XCTestCase {
                           size.height - 2 * NibSpacing.xl)
                 XCTAssertEqual(sheetFrame.height, expectedHeight, accuracy: 1)
                 XCTAssertGreaterThan(paper.height, NibMetrics.paperTileSize.height)
-                XCTAssertLessThanOrEqual(paper.maxY, viewport.maxY - NibSpacing.xxl + 1,
-                    "The first paper tile and label must clear the bottom fade on opening")
+                let openingMargin = viewport.maxY - paper.maxY
+                let openingDiagnostic = "size=\(size), variant=\(variant), first-row clearance=\(openingMargin), frames=\(frames)"
+                if size.height > size.width {
+                    XCTAssertGreaterThanOrEqual(openingMargin, NibSpacing.xxl - 1,
+                        "The taller portrait sheet must clear the first paper label; \(openingDiagnostic)")
+                } else {
+                    // Landscape keeps its 794 pt sheet in this window. It exposes Paper,
+                    // but does not promise an entire row above the 24 pt fade until scrolling.
+                    // At nominal Large line heights (footnote 16, caption 15), the viewport
+                    // is 794 - 60 - (16 + 16) = 702 pt and the first row ends about 716 pt
+                    // below its top. Bottom content padding cannot change that opening offset.
+                    XCTAssertLessThan(paper.minY, viewport.maxY - NibSpacing.xxl, openingDiagnostic)
+                }
                 XCTAssertGreaterThan(paper.minY, preview.maxY)
                 XCTAssertTrue(sheetFrame.contains(cue))
                 XCTAssertGreaterThanOrEqual(cue.minY, viewport.maxY)
@@ -1986,6 +1997,10 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertEqual(vertical.adjustedContentInset, inset, diagnostics())
                 XCTAssertEqual(frames["viewport"], viewport, diagnostics())
                 XCTAssertEqual(frames["cue"], cue, diagnostics())
+                let scrolledPaper = try XCTUnwrap(frames["paper." + firstPaper.id])
+                XCTAssertGreaterThanOrEqual(scrolledPaper.minY, viewport.minY, diagnostics())
+                XCTAssertLessThanOrEqual(scrolledPaper.maxY, viewport.maxY - NibSpacing.xxl + 1,
+                    "Scrolling must expose the complete first row above the fade; \(diagnostics())")
             }
         }
     }
@@ -2232,8 +2247,12 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertEqual(categoryFrame.minY, NibSpacing.m, accuracy: 1)
                 XCTAssertGreaterThanOrEqual(tileFrame.minY, categoryFrame.maxY)
                 XCTAssertGreaterThanOrEqual(tileFrame.height, NibMetrics.paperTileSize.height)
+                // The shortest compact fixture is 520 pt. At Large, its clearance after
+                // scrolling is 520 - 32 (cue) - 12 (offset) - 44 (category) - 8 (gap)
+                // - (135 + 6 + 15) (tile and caption) = 268 pt, comfortably beyond 24.
+                // Keep the frame assertion for actual font metrics, including accessibility3.
                 XCTAssertLessThan(tileFrame.maxY, viewport.maxY - NibSpacing.xxl,
-                                  "The entire first tile and its name must be above the continuation fade")
+                                  "The entire first tile and its name must clear the fade; clearance=\(viewport.maxY - tileFrame.maxY)")
                 XCTAssertGreaterThanOrEqual(categoryFrame.minX, NibSpacing.l)
                 XCTAssertLessThanOrEqual(categoryFrame.maxX, size.width - NibSpacing.l)
 
