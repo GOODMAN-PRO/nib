@@ -9,6 +9,7 @@ final class FloatingHitDiagnosticsTests: XCTestCase {
         let window = ReentrantDiagnosticWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 1000))
         let canvas = UIView(frame: CGRect(x: 100, y: 200, width: 400, height: 500))
         window.addSubview(canvas)
+        window.probeView = canvas
 
         for _ in 0..<2 {
             window.hitCount = 0
@@ -32,13 +33,15 @@ private final class ReentrantDiagnosticWindow: UIWindow {
     var hitCount = 0
     var lastPoint = CGPoint.zero
     var nestedDetails = ""
+    /// The view whose hit test re-enters the diagnostic in the app (the canvas). A window's own `window` is nil.
+    weak var probeView: UIView?
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         hitCount += 1
         lastPoint = point
         // Bound a regression instead of allowing recursive hit testing to hang the test job.
         guard hitCount == 1 else { return nil }
-        nestedDetails = NibFloatingHitDiagnostics.contactDetails(at: point, in: self, event: event)
+        nestedDetails = NibFloatingHitDiagnostics.contactDetails(at: convert(point, to: probeView), in: probeView, event: event)
         return self
     }
 }
