@@ -933,6 +933,13 @@ final class LibraryUITests: XCTestCase {
 
     // library.dropImport
     func testExternalFilesDropImportsIntoCurrentFolder() throws {
+        try openFolder(folder)
+        try visible(item("Lecture notes"), "The intended drop folder must expose its existing document")
+        let capability = ui.systemWindowControls()
+        guard capability.exists else {
+            throw XCTSkip("Device-only: side-by-side app window controls are missing; verified here: Nib library shows Semester Notes, the intended drop folder")
+        }
+        try destination("Documents")
         // Loose files at Nib's Documents root are intentionally scanned as imports.
         // Save the external fixture in a plain subfolder so it remains an external payload.
         let fixtureFolder = "Library Drop " + String(UUID().uuidString.prefix(8))

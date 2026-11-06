@@ -394,3 +394,7 @@ Confirmed pages-drag-photos#1. Retain Open in New Window and the original sideba
 ### D1 - external-display captures
 
 Confirmed current QAStateProbe publishes qa.externalDisplay from the connected external-display scene role and Presenter Page is capability-gated. The four presentation methods use a throwing variant entry point so XCTest receives XCTSkip; ordinary variants keep their existing diagnostic/XCTFail wrapper. Require the actual Share and Export menu with content, read the lenient Boolean fact, assert Presenter Page absent and only then skip when false. A missing/malformed fact or unexpected control fails. When true, the original Presenter Page, Stop Presenting and capture route remains. CI must count four device-only skips with the prerequisite screenshot; a device must deliver the original captures.
+
+### D2 - Files capability before preparation
+
+Confirmed library#1's simulator limitation and current 11b Files rename-commit route. First open the intended Semester Notes destination, verify its title/library state and existing Lecture notes card, then query systemWindowControls. Missing controls produce the explicit device-only skip before any export or Files picker. With controls, return to Documents and run the unchanged export/new-folder commit/import/persisted-destination sequence. CI should save the observed roughly 90 seconds of unusable Files preparation and report a skip; all real-device assertions remain.
