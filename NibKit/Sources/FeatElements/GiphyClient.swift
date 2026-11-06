@@ -39,6 +39,13 @@ struct URLSessionGiphyTransport: GiphyTransport {
     }
 }
 
+/// UI fixtures exercise the retry UI without depending on the runner's network.
+struct OfflineGiphyTransport: GiphyTransport {
+    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        throw URLError(.notConnectedToInternet)
+    }
+}
+
 /// The user's GIPHY key in the Keychain (`Harness` swaps in an in-memory store).
 enum GiphyKey {
     static let service = "app.nib.giphy"

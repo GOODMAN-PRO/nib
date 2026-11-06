@@ -1193,6 +1193,28 @@ final class FeatElementsTests: XCTestCase {
      "pagination": {"total_count": 42, "count": 2, "offset": 20}}
     """#
 
+    func testRuntimeUsesImmediateOfflineTransportOnlyForUITestFixtures() async throws {
+        XCTAssertTrue(ElementsRuntime.transport(uiTestMode: false) is URLSessionGiphyTransport)
+        let transport = ElementsRuntime.transport(uiTestMode: true)
+        XCTAssertTrue(transport is OfflineGiphyTransport)
+        XCTAssertEqual(ElementsRuntime().giphy.transport is OfflineGiphyTransport, NibUITestMode.isEnabled)
+        let request = try XCTUnwrap(GiphyClient.request(query: "cat", key: "fixture", kind: .gifs, limit: 1, offset: 0))
+        do {
+            _ = try await transport.data(for: request)
+            XCTFail("The fixture must fail without a network request")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .notConnectedToInternet)
+        }
+        let client = GiphyClient(transport: transport, key: { "fixture" })
+        do {
+            _ = try await client.search("cat", kind: .gifs, limit: 1, offset: 0)
+            XCTFail("The client must show its retryable connection failure")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .unavailable)
+            XCTAssertEqual(error.message, String(localized: "GIPHY could not be reached"))
+        }
+    }
+
     func testGiphySearchUsesTheUsersKeyAndParsesReplies() async throws {
         let transport = FakeGiphyTransport()
         transport.body = Data(FeatElementsTests.giphyReply.utf8)

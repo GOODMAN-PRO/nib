@@ -13,8 +13,13 @@ final class ElementsRuntime {
 
     var giphy: GiphyClient
 
-    init(giphy: GiphyClient = GiphyClient()) {
-        self.giphy = giphy
+    init(giphy: GiphyClient? = nil) {
+        self.giphy = giphy ?? GiphyClient(transport: Self.transport(uiTestMode: NibUITestMode.isEnabled))
+    }
+
+    static func transport(uiTestMode: Bool) -> GiphyTransport {
+        if uiTestMode { return OfflineGiphyTransport() }
+        return URLSessionGiphyTransport()
     }
 }
 
