@@ -77,7 +77,7 @@ final class ChromeUITests: XCTestCase {
     private func reachable(_ name: String, type: XCUIElement.ElementType = .any) throws -> XCUIElement {
         let toolbarButton = ["Hide ", "Show ", "Apply ", "Reset "].contains { name.hasPrefix($0) }
             || name == "Save current layout"
-        let kind: XCUIElement.ElementType = type == .any && toolbarButton && customizingToolbar ? .button : type
+        let kind: XCUIElement.ElementType = type == .any && toolbarButton ? .button : type
         let edge: NibUI.FormEdge?
         if customizingToolbar && toolbarButton {
             edge = name.hasPrefix("Hide ") ? .top : (name.hasPrefix("Show ") ? .nearest : .bottom)
@@ -1140,31 +1140,37 @@ final class ChromeUITests: XCTestCase {
         func geometry() -> [CGRect] {
             [alert.frame, button.frame] + ui.app.keyboards.allElementsBoundByIndex.map(\.frame)
         }
-        func stableGeometry() throws -> [CGRect] {
+        func stableGeometry(allowDismissed: Bool = false) throws -> [CGRect]? {
             var previous: [CGRect] = []
-            var settled: [CGRect] = []
-            try wait("Ruler confirmation must be enabled, hittable and stable", timeout: 5) {
-                guard alert.exists, button.exists, button.isEnabled, button.isHittable else { previous = []; return false }
-                let current = geometry()
-                defer { previous = current }
-                if previous == current { settled = current; return true }
-                return false
+            var settled: [CGRect]?
+            do {
+                try wait("Ruler confirmation must be enabled, hittable and stable", timeout: 5) {
+                    guard alert.exists else { previous = []; return allowDismissed }
+                    guard button.exists, button.isEnabled, button.isHittable else { previous = []; return false }
+                    let current = geometry()
+                    defer { previous = current }
+                    if previous == current { settled = current; return true }
+                    return false
+                }
+            } catch {
+                if allowDismissed && !alert.exists { return nil }
+                throw error
             }
             return settled
         }
-        let before = try stableGeometry()
+        let before = try XCTUnwrap(stableGeometry())
         ui.logQA("Ruler alert confirm", "action=\(title) alert/button/keyboards=\(before)")
         button.tap()
         // A minimized keyboard can re-dock on this touch and move the button before touch-up.
-        // Only that observed geometry change authorizes a second confirmation, never an inert tap.
+        // Only alert/button movement authorizes a second confirmation. Keyboard-only
+        // changes can be normal dismissal and must not trigger a retry.
         var moved = false
         try wait("Ruler alert must close or expose the keyboard layout shift", timeout: 5) {
             if !alert.exists { return true }
-            moved = geometry() != before
+            moved = alert.frame != before[0] || button.frame != before[1]
             return moved
         }
-        if moved, alert.exists {
-            let after = try stableGeometry()
+        if moved, alert.exists, let after = try stableGeometry(allowDismissed: true), alert.exists {
             ui.logQA("Ruler alert shifted retry", "action=\(title) before=\(before) stable=\(after)")
             button.tap()
         }

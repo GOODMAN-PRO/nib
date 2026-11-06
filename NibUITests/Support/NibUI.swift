@@ -45,6 +45,7 @@ final class NibUI {
     private(set) var formRevealFailure: String?
     var diagnoseKeyDelivery = false
     var diagnoseStateReads = false
+    private var slowTreeLogged = false
     var canvas: XCUIElement { app.scrollViews["nib.canvas"].firstMatch }
 
     /// Instrument synchronous AX calls without changing their result or adding a retry.
@@ -54,10 +55,18 @@ final class NibUI {
         defer {
             let elapsed = ProcessInfo.processInfo.systemUptime - started
             if elapsed > 10 {
-                logQA("slow query", "asked=\(asked) seconds=\(elapsed); collecting one diagnostic tree")
-                if let root = try? measuredSnapshot(app, named: "slow query diagnostic tree for " + asked) {
-                    logSnapshotSize(root, asked: asked, seconds: elapsed, diagnostic: true)
-                } else { logQA("slow query", "asked=\(asked) elements=unavailable focus=unavailable") }
+                // Each test creates a fresh NibUI. Consume the allowance before attempting
+                // AX so a failed snapshot cannot cause repeated full-tree fetches.
+                if !slowTreeLogged && elapsed <= 20 {
+                    slowTreeLogged = true
+                    logQA("slow query", "asked=\(asked) seconds=\(elapsed); collecting one diagnostic tree per NibUI")
+                    if let root = try? measuredSnapshot(app, named: "slow query diagnostic tree for " + asked) {
+                        logSnapshotSize(root, asked: asked, seconds: elapsed, diagnostic: true)
+                    } else { logQA("slow query", "asked=\(asked) elements=unavailable focus=unavailable") }
+                } else {
+                    let reason = elapsed > 20 ? "query exceeded 20s" : "diagnostic tree already attempted"
+                    logQA("slow query", "asked=\(asked) seconds=\(elapsed) diagnosticTree=skipped reason=\(reason)")
+                }
             }
         }
         return try query()
@@ -2032,6 +2041,7 @@ final class NibUI {
         inspectClear("after Select All")
         // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
         logQA("Native clear HID", "Delete after Select All; field=\(field.label)")
+        logQA("Stall boundary", "native clear Delete after Select All; route=HID")
         try sendHIDKey(0x2A)
         inspectClear("after first Delete")
         let remainingValue = field.value as? String
