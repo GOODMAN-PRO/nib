@@ -298,3 +298,17 @@ Audited replacement/clear/type callers in all classes: Canvas, Chrome via fillNa
 | Intentional empty clears | Native Delete recovery (failure) | Did the exact field regain focus and the keyboard frame stabilize before the next action? |
 
 Validation: python Scripts/lint.py: 0 errors, 25 warnings; git diff --check passes. Runtime saving is not measured; removing the observed 121-second idle stall is a CI hypothesis, not a guaranteed saving.
+
+### H17 - typed direction rows from the current offset
+
+Confirmed R14:canvas#2 with correction: the measured Horizontal reveal took four moves/21.22 seconds; the second choice was still in lookup when the test hit 180 seconds. Episodic environment slowness is supported; stderr blocking in THIS test is not proven. Current FeatDocChromeFeature gives both buttons cmd.doc.setScrollDirection and distinct exact labels, orders 100/110 at the list end. Selecting either closes More, so keeping a single presentation open is impossible.
+
+Canvas setDirection now binds a scoped Button query with identifier AND exact label, uses edge .bottom only if needed, then requires enabled/hittable and the existing menu-closure helper. Reopening for the second choice preserves the app's retained offset; the helper never homes or resets it. All layout/navigation/content assertions remain. No environment settings or sampler compensation. Next CI should log fewer queries/moves and lower per-choice time than the measured reveal, with both Horizontal and Vertical selected and all reopen/page-frame assertions passing. No fixed runtime saving is claimed; the app may rebuild at top, which still gets bottom-directed reveal rather than a test-side reset.
+
+Compatibility check found an important current-source distinction for H15: Chrome/palette buds use AX-hidden DismissCatcher (DropletContainer), not a native PopoverDismissRegion. The already-existing menuHasActiveContent closure policy distinguishes live rows from retained empty shells. The safety classifier now also accepts that source-backed custom scrolling surface ONLY with a matching live hittable host and actual button rows, excluding every subtree containing nib.canvas. Explicit More scopes use one list snapshot, reused for the reveal, instead of a whole-app ancestry walk; this source-defined custom bud has no native cover. Every reveal contact rechecks live content before trusting cached foreground geometry. Native modal ancestry remains supported. This preserves More/horizontal tool menus without reviving the non-hittable retained fallback implicated in R14.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Canvas layout tests using setDirection | Canvas direction row / Form reveal timing | What is the full per-choice cost, and how many bottom-directed moves were needed without homing? |
+
+Validation: source query uses two predicate placeholders/two arguments and current helper signatures. Compilation and timing await CI.

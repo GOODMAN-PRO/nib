@@ -200,7 +200,29 @@ final class CanvasUITests: XCTestCase {
     }
 
     private func setDirection(_ direction: String) throws {
-        try more(direction)
+        let started = ProcessInfo.processInfo.systemUptime
+        defer { ui.logQA("Canvas direction row", "direction=\(direction) seconds=\(ProcessInfo.processInfo.systemUptime - started) edge=bottom; no homing") }
+        try tap("menu.more")
+        let menu = ui.app.scrollViews["More"].firstMatch
+        guard menu.waitForExistence(timeout: 8) else { throw NibUI.Failure.message("More scrolling surface missing") }
+        // Both options have the same command identifier. Resolve the actual button by
+        // identifier AND label once, retaining the menu's current offset on every open.
+        let row = menu.buttons.matching(NSPredicate(format: "identifier == %@ AND label == %@",
+                                                    "cmd.doc.setScrollDirection", direction)).firstMatch
+        if !row.isHittable {
+            ui.revealFormElement(in: menu, edge: .bottom, named: direction, type: .button) { row }
+            if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
+        }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            row.exists && row.isHittable && row.isEnabled
+        }, object: row)
+        guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
+            throw NibUI.Failure.message("More scroll direction must be reachable and enabled: " + direction)
+        }
+        row.tap()
+        // The action closes More. Reopen for the next choice, preserving any retained
+        // list position; never home the list or assume both choices share one presentation.
+        try ui.waitForMenuClosed(menu, named: "More direction " + direction)
     }
 
     private func pencilOnly() throws {
