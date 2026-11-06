@@ -77,6 +77,10 @@ enum LibraryMenus {
         func action(_ entry: MenuItemDescriptor) -> UIAction {
             let action = UIAction(title: entry.resolvedTitle(for: context), image: entry.icon.flatMap(UIImage.init(systemName:)),
                 attributes: entry.destructive ? .destructive : [], state: entry.isChecked?(context) == true ? .on : .off) { _ in
+                #if DEBUG
+                let items = rows.map(\.ref).joined(separator: ",")
+                NSLog("%@", "[Nib QA menu] action invoked id=\(entry.command) item=\(items)")
+                #endif
                 activate(entry, context: context, model: model, rows: rows)
             }
             action.accessibilityIdentifier = "cmd." + entry.command
