@@ -271,7 +271,7 @@ Base unit 4 pt; 2 pt only inside controls.
 - **Hit targets ≥ 44 × 44 pt, always.** The visual can be smaller (a 40 pt HUD, a 12 pt handle bead, a 38 pt proposal button, a 20 pt citation chip); the hit area can't. Palette colour swatches have a 44 pt pitch for this reason.
 - Top bars: 44 pt tall at safe-area top + 8 pt, 16 pt from the sides. **Every HUD is 40 pt tall** (page counter, zoom, ruler angle, recording, follow, presenter).
 - Palette: 56 pt thick, 44 pt tool pitch (46 on iPhone), 6 pt end padding, a 17 pt divider slot with a 0.5 × 28 pt hairline, 44 pt swatch pitch. Six tools, More and three inks make it 469 pt long (6 + 7 × 44 + 17 + 3 × 44 + 6), which leaves an 834 pt landscape iPad most of its left edge.
-- Popover 312 pt wide on iPad (345 pt on iPhone: the screen minus 48), 20 pt from the palette (16 on iPhone), scrolls past 520 pt.
+- Popover 312 pt wide on iPad (345 pt on iPhone: the screen minus 48), 20 pt from the palette (16 on iPhone), scrolls past 520 pt. A dialog whose form cannot fit in 520 pt may ask for the height it measures (`heightCap:`), up to the room beside its source: Share and Export does, so no option row is cut while the window has room.
 - Panels (assistant, plugins, search results) 344 pt, **420 pt at AX1 and larger**; page navigator 240 pt with 176 pt thumbnails.
 - Library grid: covers 140 × 182 pt with a 24 pt gutter (164 pt pitch; five columns in 11″ landscape, four in portrait, six on 13″); what is left of the content width goes to the trailing margin. Rows 250 pt apart. iPhone: three columns of 110 × 143 with a 16 pt gutter.
 - Folder tiles 78 pt tall on the same 24 pt gutter; their width is computed, `(content width − 3 × 24) / 4` on iPad (188.5 pt in 11″ landscape), never hard-coded. Names are one line with tail truncation. Sidebar 320.
@@ -978,7 +978,7 @@ A completed lasso whose projected bounds surround the selected items with empty 
 
 ### 14.6 New document and templates sheet (mockup 05)
 
-- **iPad form sheet** 720 × 640, opaque `backgroundSecondary`, radius 28. `NibSheetHeader`: Cancel · "New Notebook" · Create (Tinted, the sheet's only water).
+- **iPad form sheet** 720 wide, opaque `backgroundSecondary`, radius 28. Height: 795 pt (640 plus one paper row and its cue) in landscape, capped by the window minus 2 × 20 pt; in a portrait regular-width window it takes the room it is offered up to 1000 pt, so the Paper section ends between rows. The Cover strip is a horizontal `NibScrollView` whose viewport holds whole tiles. `NibSheetHeader`: Cancel · "New Notebook" · Create (Tinted, the sheet's only water).
 - Type segmented: Notebook · Whiteboard · Text document · Study set.
 - **Title field** (44 pt). The AI suggestion appears as placeholder text with a "Use" button when a provider is connected.
 - **Live cover preview** (104 × 136) left of the title, updating as choices change.
