@@ -251,3 +251,16 @@ Validation: **python Scripts/lint.py: 0 errors, 25 existing warnings**; **git di
 Reviewed every Ink toggle caller: all other callers retain scroll: true by default, including Draw and hold, Auto-deselect and other tool settings. Existing value, persistence and no-mark assertions, reveal bounds and allowances remain. No new diagnostics, sleeps, retries or test removals. CI must show edge-clipped tool switches revealed before Switch before press without dismissing their panels, plus passing hover/haptics off/on and reopen checks without redundant panel scans. No runtime saving is claimed.
 
 Validation: **python Scripts/lint.py: 0 errors, 25 existing warnings**; **git diff --check** passes. Re-read changed Swift control flow and call labels against the current helper signatures. Only InkUITests.swift and this review record changed, both within NibUITests; job 11a and app files are unchanged. Swift compilation and simulator execution require GitHub Actions on macOS. One new round-4 commit; no amendment or push.
+
+
+## Round 11c
+
+Merged integration 923759cf cleanly. Read prompts 11a/11b, prior support records and all six assigned R12 families including verdicts. Current source wins; only NibUITests changes. No local Swift compiler or simulator.
+
+### H9 - cheap native-menu closure
+
+Confirmed pages-menus-outline#0 correction and insert-menus-alerts-forms#0: the Templates/Comment/Rename successor already appeared while AX walks exhausted the eight-second double-pass gate. Capture the menu/Preview scope before the final tap and accept its first absent observation. Trees without either retain the last-row disappearance/successor-frame check. The timeout remains eight seconds; callers still verify their own result. Also replaces P1's repeated pre-press live control inventory with one snapshot and removes per-item global counts. All Pages/Insert nativeContextMenu paths, submenu and outside cancellation callers were inspected. Next CI must log menu dismissed and reach Templates, Rename and Comment postconditions; no app export stall is claimed.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Pages/Insert native-menu callers | Native menu pre-press inventory / Native menu dismissed / Native menu row tap | Did a scoped closure observation finish within eight seconds after the single tap? |

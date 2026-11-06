@@ -2643,17 +2643,16 @@ final class NibUI {
         // Native menus may expose only buttons under Preview. Remember existing controls so
         // an app-wide fallback cannot mistake persistent Delete/Move chrome for a new item.
         var existingFrames: [String: [CGRect]] = [:]
-        for name in path {
-            var frames: [CGRect] = []
-            for kind in [XCUIElement.ElementType.button, .menuItem] {
-                let matches = app.descendants(matching: kind).matching(NSPredicate(
-                    format: "label == %@ OR identifier == %@", name, name))
-                for candidate in matches.allElementsBoundByIndex.prefix(16) {
-                    if hasVisibleFrame(candidate), candidate.isHittable { frames.append(candidate.frame) }
+        let before = try measuredSnapshot(app, named: "native menu pre-press inventory")
+        func inventory(_ node: XCUIElementSnapshot) {
+            if node.elementType == .button || node.elementType == .menuItem {
+                for name in path where node.label == name || node.identifier == name {
+                    if !node.frame.isEmpty { existingFrames[name, default: []].append(node.frame) }
                 }
             }
-            existingFrames[name] = frames
+            for child in node.children { inventory(child) }
         }
+        inventory(before)
         var previous: CGRect?
         var settled: CGRect?
         let stable = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
@@ -2672,7 +2671,8 @@ final class NibUI {
         logQA("Native menu opening", "path=\(path) frame=\(frame)")
         try pressWithoutIdle(at: CGPoint(x: frame.minX + frame.width * point.x,
                                          y: frame.minY + frame.height * point.y), duration: 0.8)
-        var activated: [(item: XCUIElement, frame: CGRect)] = []
+        var closingContainer: XCUIElement?
+        var lastAction: (item: XCUIElement, frame: CGRect)?
         var tapFacts: [String] = []
         for name in path {
             var found: XCUIElement?
@@ -2687,7 +2687,9 @@ final class NibUI {
                         for candidate in matches.allElementsBoundByIndex.prefix(16) {
                             guard hasVisibleFrame(candidate), candidate.isEnabled, candidate.isHittable else { continue }
                             if scope === app, existingFrames[name, default: []].contains(candidate.frame) { continue }
-                            found = candidate; return true
+                            found = candidate
+                            closingContainer = scope === app ? nil : scope
+                            return true
                         }
                     }
                 }
@@ -2701,25 +2703,26 @@ final class NibUI {
                 recordDiagnostics("Native menu missing", includeHierarchy: true)
                 throw Failure.message(message)
             }
-            activated.append((item, item.frame))
-            logQA("Native menu item", "path=\(path) item=" + elementFacts(item))
+            lastAction = (item, item.frame)
+            logQA("Native menu item", "path=\(path) label=\(item.label) frame=\(item.frame)")
+            if closingContainer == nil {
+                let menu = app.menus.firstMatch
+                if menu.exists { closingContainer = menu }
+            }
             if let dismissAt { try pressWithoutIdle(at: dismissAt, duration: 0.05); break }
             let facts = nativeMenuRowFacts(item)
             tapFacts.append(facts)
             logQA("Native menu row tap", facts)
             try tapWithoutIdle(item)
         }
-        var previouslyGone = false
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            let menuVisible = app.menus.firstMatch.exists || app.otherElements["Preview"].firstMatch.exists
-            let itemsGone = !menuVisible && activated.allSatisfy { action in
-                if !action.item.exists { return true }
-                // Lazy queries may now resolve to a same-named confirmation anywhere in the
-                // app, including an iPad popover or a SwiftUI form with no Sheet AX ancestor.
-                return action.item.frame != action.frame
-            }
-            defer { previouslyGone = itemsGone }
-            return previouslyGone && itemsGone
+        // Bind the small container before delivery. Accept the first absent observation;
+        // the caller owns the successor form/alert/content postcondition.
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            if let container = closingContainer { return !container.exists }
+            // Some native trees expose only the row. Keep the existing successor-frame
+            // rule there, without three app-wide walks or a mandatory second evaluation.
+            guard let action = lastAction else { return false }
+            return !action.item.exists || action.item.frame != action.frame
         }, object: nil)
         guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
             recordDiagnostics("Native menu dismissal failed")
