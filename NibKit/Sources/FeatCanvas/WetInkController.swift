@@ -498,7 +498,8 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                     }
                     NSLog("%@", "[Nib QA ruler] inkAdmitted=true rulerUnderTouch=\(rulerUnderTouch) point=\(point) touchCount=\(event?.allTouches?.count ?? 0) reason=\(reason)")
                 }
-                NSLog("%@", "[Nib QA ink] contact accepted=\(accepted) reason=\(reason) point=\(point) tool=\(host?.session.tool ?? "nil") inkEnabled=\(host?.isInkEnabled ?? false) drawingGesture=\(canvas?.drawingGestureRecognizer.isEnabled ?? false) hitView=\(String(describing: hit.map { type(of: $0) })) surfaceActive=\(surface?.active ?? false) allowedPage=\(String(describing: surface?.page)) allowedRegion=\(String(describing: surface?.region)) panels=\(String(describing: host?.session.openPanels)) presented=\(String(describing: canvas?.window?.rootViewController?.presentedViewController.map { type(of: $0) }))")
+                let details = NibFloatingHitDiagnostics.contactDetails(at: point, in: canvas, event: event)
+                NSLog("%@", "[Nib QA ink] contact accepted=\(accepted) reason=\(reason) point=\(point) tool=\(host?.session.tool ?? "nil") inkEnabled=\(host?.isInkEnabled ?? false) drawingGesture=\(canvas?.drawingGestureRecognizer.isEnabled ?? false) hitView=\(String(describing: hit.map { type(of: $0) })) surfaceActive=\(surface?.active ?? false) allowedPage=\(String(describing: surface?.page)) allowedRegion=\(String(describing: surface?.region)) panels=\(String(describing: host?.session.openPanels)) presented=\(String(describing: canvas?.window?.rootViewController?.presentedViewController.map { type(of: $0) }))\(details)")
                 #endif
                 return accepted
             }
