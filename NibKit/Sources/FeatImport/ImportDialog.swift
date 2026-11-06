@@ -444,6 +444,7 @@ final class ImportDialogSession {
     private weak var navigator: SceneNavigator?
     private var controller: UIViewController?
     private var pending: CheckedContinuation<ImportDialogOutcome, Never>?
+    private var presentationTask: Task<Void, Never>?
     /// Watches the dialog's window while it waits for a choice: closing that window (app switcher, Stage Manager)
     /// never calls `onChoose`.
     private var disconnectObserver: NSObjectProtocol?
@@ -474,28 +475,35 @@ final class ImportDialogSession {
         return shown
     }
 
-    func choose() async -> ImportDialogOutcome {
+    func choose(presentationTimeoutNanoseconds: UInt64 = 3_000_000_000,
+                presentation: ImportUI.Presentation? = nil) async -> ImportDialogOutcome {
         #if DEBUG
         NSLog("%@", "[Nib QA import] choose entered navigator=\(navigator != nil)")
         #endif
-        guard let navigator = navigator, navigator.rootViewController?.view.window != nil else { return .notShown }
+        guard !Task.isCancelled, pending == nil, let navigator = navigator,
+              navigator.rootViewController?.view.window != nil else { return .notShown }
         await ImportUI.waitUntilPresentable(navigator)
-        return await withCheckedContinuation { (continuation: CheckedContinuation<ImportDialogOutcome, Never>) in
-            pending = continuation
-            model.onChoose = { [weak self] choice in self?.resolve(choice.map { .chosen($0) } ?? .cancelled) }
-            model.onClose = { [weak self] in self?.dismiss() }
-            watchScene(of: navigator)
-            let host = UIHostingController(rootView: ImportDialogView(model: model))
-            host.modalPresentationStyle = .formSheet
-            host.isModalInPresentation = true
-            ImportUI.applySheetChrome(host)
-            controller = host
-            Task { @MainActor in
-                if !(await ImportUI.present(host, navigator: navigator)) {
-                    self.controller = nil
-                    self.resolve(.notShown)
+        return await withTaskCancellationHandler {
+            guard !Task.isCancelled, pending == nil else { return .notShown }
+            return await withCheckedContinuation { (continuation: CheckedContinuation<ImportDialogOutcome, Never>) in
+                pending = continuation
+                model.onChoose = { [weak self] choice in self?.resolve(choice.map { .chosen($0) } ?? .cancelled) }
+                model.onClose = { [weak self] in self?.dismiss() }
+                watchScene(of: navigator)
+                let host = UIHostingController(rootView: ImportDialogView(model: model))
+                host.modalPresentationStyle = .formSheet
+                host.isModalInPresentation = true
+                ImportUI.applySheetChrome(host)
+                controller = host
+                presentationTask = Task { @MainActor in
+                    let shown = await ImportUI.present(host, navigator: navigator,
+                        timeoutNanoseconds: presentationTimeoutNanoseconds, presentation: presentation)
+                    if !shown, self.pending != nil { self.resolve(.notShown) }
                 }
             }
+        } onCancel: {
+            // Task cancellation is not the person's decision to discard the shared originals.
+            Task { @MainActor in self.resolve(.notShown) }
         }
     }
 
@@ -543,6 +551,8 @@ final class ImportDialogSession {
     }
 
     private func dismiss() {
+        presentationTask?.cancel()
+        presentationTask = nil
         controller?.dismiss(animated: true)
         controller = nil
         stopWatchingScene()
@@ -715,6 +725,7 @@ enum ImportUI {
         /// A timed-out request can still attach during UIKit's deferred transition. Do not leave a picker
         /// on screen after its caller released the delegate. Completion also checks after this grace period.
         func watchForLatePresentation(_ controller: UIViewController, presenter: UIViewController) {
+            if Self.dismissIfAttached(controller, presenter: presenter) { return }
             latePresentation = Task { @MainActor [weak controller, weak presenter] in
                 for _ in 0..<30 {
                     do { try await Task.sleep(nanoseconds: 100_000_000) } catch { return }
@@ -754,7 +765,7 @@ enum ImportUI {
         guard !top.isBeingPresented, !top.isBeingDismissed, top.viewIfLoaded?.window != nil else { return false }
         controller.overrideUserInterfaceStyle = root.traitCollection.userInterfaceStyle
         let outcome = PresentationOutcome()
-        return await withTaskCancellationHandler {
+        let shown: Bool = await withTaskCancellationHandler {
             guard !Task.isCancelled else { return false }
             return await withCheckedContinuation { continuation in
                 outcome.continuation = continuation
@@ -766,15 +777,14 @@ enum ImportUI {
                 }
                 outcome.timeout = Task { @MainActor in
                     do { try await Task.sleep(nanoseconds: timeoutNanoseconds) } catch { return }
-                    let shown = controller.presentingViewController != nil
+                    let attached = controller.presentingViewController != nil
                         || top.presentedViewController === controller || controller.viewIfLoaded?.window != nil
                     #if DEBUG
                     let presented = String(describing: top.presentedViewController)
                     let presenting = String(describing: controller.presentingViewController)
                     NSLog("%@", "[Nib QA import] presentation deadline presentedViewController=\(presented) isBeingDismissed=\(controller.isBeingDismissed) presentingViewController=\(presenting)")
                     #endif
-                    if !shown { outcome.watchForLatePresentation(controller, presenter: top) }
-                    outcome.resolve(shown)
+                    outcome.resolve(attached)
                 }
                 let complete: @MainActor () -> Void = {
                     #if DEBUG
@@ -790,6 +800,9 @@ enum ImportUI {
         } onCancel: {
             Task { @MainActor in outcome.resolve(false) }
         }
+        // Cancellation and scene loss need the same cleanup as a deadline, including a deferred attachment.
+        if !shown { outcome.watchForLatePresentation(controller, presenter: top) }
+        return shown
     }
 
     /// The window that asks the user, waiting briefly for it: an Open In at launch arrives before the window is active.

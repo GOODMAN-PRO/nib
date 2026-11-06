@@ -2,10 +2,114 @@ import XCTest
 import UIKit
 import UniformTypeIdentifiers
 import NibContracts
+import NibTesting
 @testable import FeatImport
 
 @MainActor
 final class DocumentPickerLifecycleTests: XCTestCase {
+    func testMissingWindowFailsWithoutCallingThePresenter() async throws {
+        let navigator = PickerNavigator()
+        do {
+            _ = try await importStep("picker without a window reports unavailable") {
+                try await DocumentPicker.pick(types: [.pdf], navigator: navigator) { _, _, _ in
+                    XCTFail("No window must fail before presentation")
+                }
+            }
+            XCTFail("Missing window must fail")
+        } catch { XCTAssertEqual(NibError.wrap(error).code, .unavailable) }
+    }
+
+    func testImportDialogMissingPresentationCompletionReleasesItsChoice() async throws {
+        let fixture = PickerWindow()
+        defer { fixture.close() }
+        let h = Harness(features: [])
+        let dialog = ImportDialogSession(navigator: fixture.navigator, library: h.library, workspace: h.app.workspace,
+            session: nil, sources: [ImportSource(original: "file:///shared.pdf")], preset: nil)
+        var lateCompletion: (@MainActor () -> Void)?
+        let outcome = try await importStep("unpresented import dialog releases choice continuation") {
+            await dialog.choose(presentationTimeoutNanoseconds: 20_000_000) { _, _, complete in
+                lateCompletion = complete
+            }
+        }
+        XCTAssertEqual(outcome, .notShown)
+        lateCompletion?()
+        dialog.model.confirm()
+        dialog.model.cancel()
+        XCTAssertEqual(dialog.model.phase, .choosing, "Late UI events cannot restart an abandoned import")
+    }
+
+    func testImportDialogCancellationAndSceneLossResolveExactlyOnce() async throws {
+        for end in ["task", "scene", "user"] {
+            let fixture = PickerWindow()
+            defer { fixture.close() }
+            let h = Harness(features: [])
+            let dialog = ImportDialogSession(navigator: fixture.navigator, library: h.library, workspace: h.app.workspace,
+                session: nil, sources: [ImportSource(original: "file:///shared.pdf")], preset: nil)
+            let requested = expectation(description: "dialog presentation requested before \(end)")
+            let finished = expectation(description: "dialog resolves after \(end)")
+            let task = Task { @MainActor in
+                let outcome = await dialog.choose { _, _, complete in
+                    complete()
+                    requested.fulfill()
+                }
+                XCTAssertEqual(outcome, end == "user" ? .cancelled : .notShown)
+                finished.fulfill()
+            }
+            defer { task.cancel() }
+            await fulfillment(of: [requested], timeout: 2)
+            switch end {
+            case "task": task.cancel()
+            case "scene": dialog.sceneDisconnected()
+            default: dialog.model.cancel()
+            }
+            await fulfillment(of: [finished], timeout: 2)
+            dialog.sceneDisconnected()
+            dialog.model.confirm()
+            dialog.model.cancel()
+        }
+    }
+
+    func testImportDialogConfirmationResumesWithItsChoice() async throws {
+        let fixture = PickerWindow()
+        defer { fixture.close() }
+        let h = Harness(features: [])
+        let dialog = ImportDialogSession(navigator: fixture.navigator, library: h.library, workspace: h.app.workspace,
+            session: nil, sources: [ImportSource(original: "file:///shared.pdf")], preset: nil)
+        defer { dialog.close() }
+        let outcome = try await importStep("confirmed dialog returns its choice") {
+            await dialog.choose { _, _, complete in
+                complete()
+                dialog.model.confirm()
+                dialog.model.confirm()
+            }
+        }
+        XCTAssertEqual(outcome, .chosen(ImportChoice(destination: .libraryRoot, order: [0])))
+        XCTAssertEqual(dialog.model.phase, .importing)
+    }
+
+    func testCancelledPresentationDismissesAnAttachmentWithoutCompletion() async throws {
+        let fixture = PickerWindow()
+        defer { fixture.close() }
+        let controller = LatePresentationController()
+        let requested = expectation(description: "presentation requested before cancellation")
+        let finished = expectation(description: "cancelled presentation returned")
+        let dismissed = expectation(description: "cancelled controller dismissed")
+        controller.onDismiss = { dismissed.fulfill() }
+        let task = Task { @MainActor in
+            let shown = await ImportUI.present(controller, navigator: fixture.navigator) { _, _, _ in
+                controller.presenter = fixture.root
+                requested.fulfill()
+            }
+            XCTAssertFalse(shown)
+            finished.fulfill()
+        }
+        defer { task.cancel() }
+        await fulfillment(of: [requested], timeout: 2)
+        task.cancel()
+        await fulfillment(of: [finished, dismissed], timeout: 2)
+        XCTAssertEqual(controller.dismissCalls, 1)
+    }
+
     func testMissingPresentationCompletionFailsAndReleasesThePicker() async {
         let fixture = PickerWindow()
         defer { fixture.close() }

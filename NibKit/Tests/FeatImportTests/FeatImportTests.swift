@@ -852,9 +852,9 @@ final class FeatImportTests: XCTestCase {
 
     func testHandoffSurvivesUnavailableDialogAndStagingCleanup() async throws {
         let h = harness()
-        let board = UIPasteboard.general
-        let previous = board.items
-        defer { board.items = previous }
+        let fixture = HandoffTestFixture()
+        defer { fixture.restore() }
+        let board = fixture.board
         let bytes = Data("shared original".utf8)
         let name = UUID().uuidString + ".pdf"
         board.items = [[ShareHandoff.nameType: name, ShareHandoff.dataType: bytes]]
@@ -863,7 +863,8 @@ final class FeatImportTests: XCTestCase {
         h.app.commands.register(CommandDescriptor(id: "test.handoff", title: "Import", summary: "Exercise failed presentation.",
             effect: .read, exposure: .ui)) { _, ctx in
             let staging = try ImportStaging()
-            let sources = try ImportEngine.expandHandoff([ImportSource(original: ShareHandoff.link)], staging: staging, ctx: ctx)
+            defer { staging.cleanUp() }
+            let sources = try await ImportEngine.expandHandoff([ImportSource(original: ShareHandoff.link)], staging: staging, ctx: ctx)
             let navigator = StubNavigator()
             let dialog = ImportDialogSession(navigator: navigator, library: h.library, workspace: ctx.workspace,
                 session: h.session, sources: sources, preset: nil)
@@ -875,26 +876,33 @@ final class FeatImportTests: XCTestCase {
             XCTAssertFalse(claimed.paths.isEmpty, "Inbox scan must not import the same handoff concurrently")
             return .null
         }
-        try await h.run("test.handoff")
+        _ = try await importStep("share expansion, unavailable dialog, staging cleanup and claim release") {
+            try await h.run("test.handoff")
+        }
         XCTAssertFalse(ShareHandoff.isWaiting)
     }
 
     func testHandoffSurvivesImporterFailure() async throws {
         let h = harness()
-        let board = UIPasteboard.general
-        let previous = board.items
-        defer { board.items = previous }
+        let fixture = HandoffTestFixture()
+        defer { fixture.restore() }
+        let board = fixture.board
         let name = UUID().uuidString + ".png"
         let bytes = Data("not a decodable image".utf8)
         board.items = [[ShareHandoff.nameType: name, ShareHandoff.dataType: bytes]]
         let saved = ImportLocations.openInInbox.appendingPathComponent(name)
         defer { ImportEngine.consumeInboxCopy(saved.absoluteString) }
         do {
-            try await h.run("import.files", ["urls": [.string(ShareHandoff.link)], "folder": "lib"])
+            _ = try await importStep("shared image importer reports failure and releases staging") {
+                try await h.run("import.files", ["urls": [.string(ShareHandoff.link)], "folder": "lib"])
+            }
             XCTFail("Invalid image must fail")
         } catch {
+            XCTAssertEqual(NibError.wrap(error).code, .unsupported)
             XCTAssertEqual(try Data(contentsOf: saved), bytes)
         }
+        XCTAssertFalse(ImportEngine.inFlight.contains(saved.standardizedFileURL.path))
+        XCTAssertFalse(ShareHandoff.isWaiting)
     }
 
     func testFailedInboxCopyIsRemovedAfterTheDialogsFailureReport() async throws {
@@ -922,9 +930,9 @@ final class FeatImportTests: XCTestCase {
 
     func testFailedDialogHandoffRetainsOriginalAcrossInboxRetries() async throws {
         let h = harness()
-        let board = UIPasteboard.general
-        let previous = board.items
-        defer { board.items = previous }
+        let fixture = HandoffTestFixture()
+        defer { fixture.restore() }
+        let board = fixture.board
         let name = UUID().uuidString + ".png"
         let bytes = Data("not an image".utf8)
         board.items = [[ShareHandoff.nameType: name, ShareHandoff.dataType: bytes]]
@@ -945,7 +953,10 @@ final class FeatImportTests: XCTestCase {
             }
             return .null
         }
-        try await h.run("test.failedHandoffDialog")
+        _ = try await importStep("failed dialog import and inbox retry retain the shared original") {
+            try await h.run("test.failedHandoffDialog")
+        }
+        XCTAssertFalse(ImportEngine.inFlight.contains(saved.standardizedFileURL.path))
         ImportEngine.consumeInboxCopy(saved.absoluteString)
         XCTAssertFalse(FileManager.default.fileExists(atPath: saved.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: ShareHandoff.recoveryMarker(saved).path))
