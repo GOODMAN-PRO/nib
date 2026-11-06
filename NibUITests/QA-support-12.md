@@ -280,3 +280,21 @@ Should unblock BoardFrameworkMeeting and BoardRenamePersistsAfterReopeningDocume
 | Held-drag callers | System drag requires a live source (failure) | Was the start the actual hittable source centre rather than a retained container coordinate? |
 
 Validation: python Scripts/lint.py: 0 errors, 25 warnings; git diff --check passes. No local compilation/runtime claim.
+
+### H16 - replace a selection without Delete
+
+Confirmed R14:canvas#1's correction: type 5 began at t=43.14, idle waits ended at 103.16 and 164.54; HID Delete preceded hide/show and loss of field focus. The animation monitor's persistent non-idle cause is NOT proven. Merely switching typeText to SPI while retaining Delete would leave subsequent ordinary actions exposed to the same stall.
+
+replaceNativeText now proves this exact field's focus, uses focusedKey Command-A for existing text and focusedText's existing runner text-event SPI to type over the selection. No Delete is sent for a nonempty replacement, including the invalid-page loop. Exact waitForNativeText verification is retained. Selection focus is checked boundedly before typing without retapping or destroying the selection. Unicode/punctuation use the existing route 3 full-string API, not an ASCII-only key mapping. Empty replacements retain clearNativeText/HID Delete; immediately after every such Delete, the helper waits up to five seconds for exact field focus and an unchanged keyboard frame across at least 300 ms of predicate observations before further actions/value diagnostics. Explicit clearNativeText callers also get this recovery gate, with unchanged empty-value and decimal diagnostic checks.
+
+Keyboard visibility is observed at replacement boundaries and each focus/value/recovery poll. Logs include elapsed transition times and a flap line when multiple transitions are observed, plus the replacement start uptime. This is runner AX sampling, not a complete app-notification stream: a hide/show entirely between observations can be missed. No timer, sleep, swizzle, app change or claimed monitor-cause fix is added. Compare these observations with the app's existing idle/keyboard lines and missing idle replies in CI.
+
+Audited replacement/clear/type callers in all classes: Canvas, Chrome via fillNativeForm, Create, Ink, Insert, Library, Pages, Selection and internal Files naming. Existing signatures stay source-compatible through defaulted diagnostic parameters; explicit Return/commit paths and numeric-format callers retain their behavior. fillNativeForm's separately opted-in keyboard traversal already verifies explicit clearing and is unchanged. Should unblock GoToPageRejectsInvalidNumbersAndNavigatesValidTarget; next CI must show Select All/no Delete for 5, -1 and 3, exact text and every existing assertion, no repeated 60-second idle waits, and bounded recovery on intentional empty clears. Native SPI/focus AX exposure remains uncompiled here.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| All replaceNativeText callers, especially invalid-page loop | Native replacement selection | Was Select All followed by replacement typing with no Delete? |
+| Same | Native replacement keyboard / Native replacement keyboard flap | Which hide/show transitions were observed, at what elapsed times, during this replacement? |
+| Intentional empty clears | Native Delete recovery (failure) | Did the exact field regain focus and the keyboard frame stabilize before the next action? |
+
+Validation: python Scripts/lint.py: 0 errors, 25 warnings; git diff --check passes. Runtime saving is not measured; removing the observed 121-second idle stall is a CI hypothesis, not a guaranteed saving.

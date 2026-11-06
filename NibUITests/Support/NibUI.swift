@@ -2406,8 +2406,34 @@ final class NibUI {
         }
     }
 
+    /// After HID Delete, observe only AX attributes until this exact editor is first
+    /// responder again and the keyboard frame is unchanged across a polling interval.
+    private func waitForNativeKeyboardRecovery(in field: XCUIElement, container: XCUIElement?,
+                                                observing observe: (() -> Void)? = nil) throws {
+        let scope = container ?? nativeFormContainer()
+        var previous: CGRect?
+        var sampled = false
+        var stableSince = ProcessInfo.processInfo.systemUptime
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            observe?()
+            let keyboard = app.keyboards.firstMatch
+            let frame: CGRect? = keyboard.exists ? keyboard.frame : nil
+            let now = ProcessInfo.processInfo.systemUptime
+            let focused = isKeyboardFocused(field, allowingAttributeFallback: true, in: scope)
+            if !sampled || frame != previous || !focused {
+                previous = frame; sampled = true; stableSince = now
+                return false
+            }
+            return focused && now - stableSince >= 0.3
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 5) == .completed else {
+            throw Failure.message("Native Delete recovery: field did not regain verified focus with a stable keyboard frame")
+        }
+    }
+
     /// Clear is an observable prerequisite, so a failed Select All can never append replacement text.
-    func clearNativeText(in field: XCUIElement, container: XCUIElement? = nil, diagnoseClear: Bool = false) throws {
+    func clearNativeText(in field: XCUIElement, container: XCUIElement? = nil, diagnoseClear: Bool = false,
+                         observingKeyboard observe: (() -> Void)? = nil) throws {
         func inspectClear(_ stage: String) {
             guard diagnoseClear else { return }
             let value = field.value as? String
@@ -2425,6 +2451,7 @@ final class NibUI {
         logQA("Native clear HID", "Delete after Select All; field=\(field.label)")
         logQA("Stall boundary", "native clear Delete after Select All; route=HID")
         try sendHIDKey(0x2A)
+        try waitForNativeKeyboardRecovery(in: field, container: container, observing: observe)
         inspectClear("after first Delete")
         let remainingValue = field.value as? String
         guard let remaining = remainingValue ?? (field.elementType == .textView ? "" : nil) else {
@@ -2437,7 +2464,10 @@ final class NibUI {
                   current.count <= 4096 else { throw Failure.message("Native clear needs a readable bounded value after caret tap") }
             logQA("Native clear", "field=\(field.identifier) frame=\(field.frame) deleteCount=\(current.count)")
             if !current.isEmpty {
-                for _ in 0..<current.count { try sendHIDKey(0x2A) }
+                for _ in 0..<current.count {
+                    try sendHIDKey(0x2A)
+                    try waitForNativeKeyboardRecovery(in: field, container: container, observing: observe)
+                }
                 inspectClear("after fallback Delete batch count=\(current.count)")
             }
         }
@@ -2471,20 +2501,67 @@ final class NibUI {
         if let failure { throw failure }
     }
 
-    /// Waits for exact replacement, including empty fields, after proving the old content is gone.
+    /// Nonempty replacement types over Select All, without a HID Delete or an
+    /// idle-waiting XCUIElement key/text action. Exact value verification remains mandatory.
     func replaceNativeText(in field: XCUIElement, with text: String, container: XCUIElement? = nil) throws {
-        let started = Date()
-        defer { logQA("Native replacement duration", "seconds=\(Date().timeIntervalSince(started))") }
-        try clearNativeText(in: field, container: container)
-        if !text.isEmpty {
-            try timedAction("Native replacement delivery (\(text.count) characters)") { try typeNativeText(text, in: field) }
+        let started = ProcessInfo.processInfo.systemUptime
+        var visibility: Bool?
+        var transitions: [String] = []
+        var samples = 0
+        func observeKeyboard() {
+            let keyboard = app.keyboards.firstMatch
+            let visible = keyboard.exists && !keyboard.frame.isEmpty
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            samples += 1
+            if let visibility, visibility != visible {
+                transitions.append("\(visible ? "show" : "hide")@\(elapsed)s")
+            }
+            visibility = visible
         }
-        try waitForNativeText(in: field, equals: text)
+        defer {
+            observeKeyboard()
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            logQA("Native replacement duration", "seconds=\(elapsed)")
+            logQA("Native replacement keyboard", "samples=\(samples) transitions=\(transitions) seconds=\(elapsed); AX observations, not app notification history")
+            if transitions.count > 1 {
+                logQA("Native replacement keyboard flap", "transitions=\(transitions) replacementStartUptime=\(started)")
+            }
+        }
+        observeKeyboard()
+        let scope = container ?? nativeFormContainer()
+        try focusField(field, in: scope)
+        observeKeyboard()
+        guard isKeyboardFocused(field, allowingAttributeFallback: true, in: scope) else {
+            throw Failure.message("Native replacement requires this field's verified keyboard focus")
+        }
+        guard let value = field.value as? String else { throw Failure.message("Native editor has no readable value") }
+        if text.isEmpty {
+            // Explicit clearing is the only replacement route that needs Delete. Recovery
+            // runs before value queries, fallback caret taps or any later ordinary action.
+            try clearNativeText(in: field, container: scope, observingKeyboard: observeKeyboard)
+        } else if value != text {
+            if !value.isEmpty && value != field.placeholderValue {
+                logQA("Native replacement selection", "route=focusedKey Select All; no Delete")
+                try focusedKey("a", .command)
+                observeKeyboard()
+                let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                    observeKeyboard()
+                    return isKeyboardFocused(field, allowingAttributeFallback: true, in: scope)
+                }, object: nil)
+                guard XCTWaiter.wait(for: [focused], timeout: 3) == .completed else {
+                    throw Failure.message("Native replacement lost field focus after Select All")
+                }
+            }
+            try timedAction("Native replacement delivery (\(text.count) characters)") { try focusedText(text) }
+            observeKeyboard()
+        }
+        try waitForNativeText(in: field, equals: text, observing: observeKeyboard)
     }
 
     /// Waits for the native editor's actual text; a placeholder represents an empty value, not user content.
-    func waitForNativeText(in field: XCUIElement, equals text: String) throws {
+    func waitForNativeText(in field: XCUIElement, equals text: String, observing observe: (() -> Void)? = nil) throws {
         func matches() -> Bool {
+            observe?()
             guard field.exists else { return false }
             guard let value = field.value as? String else { return text.isEmpty && field.elementType == .textView }
             return value == text || (text.isEmpty && value == field.placeholderValue)
