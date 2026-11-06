@@ -56,6 +56,12 @@ final class QAStateProbe: UIView {
                 "height": .number(Double(window?.bounds.height ?? 0)),
                 "sceneActivation": .number(Double(window?.windowScene?.activationState.rawValue ?? -1))
             ]
+            // Every fixture fact a feature publishes as session.toolOptions["nib.qa.<name>"] (only in UI-test mode)
+            // appears under "qa" by its name, so a new fact needs no change here and none in the tests' strict decoder.
+            var qaFacts: [String: JSONValue] = [:]
+            for (key, value) in session.toolOptions where key.hasPrefix("nib.qa.") {
+                qaFacts[String(key.dropFirst("nib.qa.".count))] = value
+            }
             let state: JSONValue = [
                 "keyResponder": keyResponder,
                 "keyResponderIsText": keyResponderIsText,
@@ -79,6 +85,7 @@ final class QAStateProbe: UIView {
                 "redoAvailable": .bool(UndoRoute.resolve(redo: true, doc: doc, history: app.bus.history, window: shell.view.window?.undoManager) != .nothing),
                 "openPanels": .array(session.openPanels.sorted().map(JSONValue.string)),
                 "paletteDock": canvas == nil ? .null : session.toolOptions["nib.qa.paletteDock"] ?? .null,
+                "qa": .object(qaFacts),
                 "fixtureError": UITestFixture.failure.map(JSONValue.string) ?? .null,
                 "fixtureScenario": .string(NibUITestMode.scenario.rawValue),
                 "boardReadReceipts": .object(receipts),
