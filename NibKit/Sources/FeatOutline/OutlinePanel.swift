@@ -529,16 +529,17 @@ final class OutlinePanelModel: ObservableObject {
 
 /// The navigator is only 240 pt wide. Preserve the title's ideal width in the inline arrangement and move
 /// accessories below it when they cannot fit, rather than splitting a word to make room (DESIGN.md §§13.6, 16).
-/// The host still supplies placement controls and the panel's Deep surface; this header adds no nested glass.
+/// The host supplies placement command data and the panel's Deep surface; this header adds no nested glass.
 struct OutlinePanelHeader: View {
     @ObservedObject var model: OutlinePanelModel
     let dismiss: @MainActor () -> Void
     var title = String(localized: "Outline")
     var handlesEscape = false
+    var placementActions: [OutlinePlacementAction] = []
 
     var body: some View {
         NibPanelHeader(title: title, symbol: .outline, handlesEscape: handlesEscape, onClose: dismiss) {
-            OutlineOptionsMenu(model: model)
+            OutlineOptionsMenu(model: model, placementActions: placementActions)
         }
     }
 }
@@ -548,17 +549,20 @@ struct OutlinePanel: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
     private let dismiss: @MainActor () -> Void
     private let handlesEscape: Bool
+    private let placementActions: [OutlinePlacementAction]
 
     init(context: PanelContext) {
         let session = context.session ?? context.app.services.sessions.active
         _model = StateObject(wrappedValue: OutlinePanelModel(app: context.app, session: session))
         dismiss = context.dismiss
         handlesEscape = context.presentation == .sheet || context.presentation == .fullScreen
+        placementActions = OutlinePlacementAction.read(context)
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            OutlinePanelHeader(model: model, dismiss: dismiss, handlesEscape: handlesEscape)
+            OutlinePanelHeader(model: model, dismiss: dismiss, handlesEscape: handlesEscape,
+                               placementActions: placementActions)
             if !model.sections.isEmpty {
                 addEntryButton
             }
@@ -611,6 +615,7 @@ struct OutlinePanel: View {
 /// Show Thumbnails, PDF Outline, Custom Outline and Sort by Page Number (D-128).
 struct OutlineOptionsMenu: View {
     @ObservedObject var model: OutlinePanelModel
+    var placementActions: [OutlinePlacementAction] = []
 
     var body: some View {
         Menu {
@@ -624,6 +629,16 @@ struct OutlineOptionsMenu: View {
                 Label { Text(String(localized: "Sort by Page Number")) } icon: { Image(nib: .sort) }
             }
             .disabled(!model.hasCustomEntries)
+            if placementActions.contains(where: \.isPanel) {
+                Section(String(localized: "Panels")) {
+                    ForEach(placementActions.filter(\.isPanel)) { action in placementEntry(action) }
+                }
+            }
+            if placementActions.contains(where: { !$0.isPanel }) {
+                Section(String(localized: "Panel Options")) {
+                    ForEach(placementActions.filter { !$0.isPanel }) { action in placementEntry(action) }
+                }
+            }
         } label: {
             Image(nib: .more)
                 .font(NibFont.glyph(.panel))
@@ -637,6 +652,40 @@ struct OutlineOptionsMenu: View {
 
     private func option(_ key: SettingKey<Bool>, _ value: Bool) -> Binding<Bool> {
         Binding(get: { value }, set: { model.setOption(key, $0) })
+    }
+
+    private func placementEntry(_ action: OutlinePlacementAction) -> some View {
+        Button { model.tracker.perform(action.command, action.params) } label: {
+            if let symbol = action.symbol {
+                Label { Text(action.title) } icon: { Image(nib: symbol) }
+            } else {
+                Text(action.title)
+            }
+        }
+        .disabled(!action.isEnabled)
+        .accessibilityIdentifier("cmd." + action.command)
+    }
+}
+
+/// Host-owned menu commands passed through PanelContext, without importing the chrome feature.
+/// Floating/sheet hosts that supply no actions retain Outline's feature menu and Close/Escape behaviour.
+struct OutlinePlacementAction: Identifiable {
+    let id: String
+    let title: String
+    let command: String
+    let params: JSONValue
+    let symbol: NibSymbol?
+    let isEnabled: Bool
+    let isPanel: Bool
+
+    static func read(_ context: PanelContext) -> [OutlinePlacementAction] {
+        (context.params["chrome.panelOptions"]?.arrayValue ?? []).compactMap { value -> OutlinePlacementAction? in
+            guard let id = value["id"]?.stringValue, let title = value["title"]?.stringValue,
+                  let command = value["command"]?.stringValue, let params = value["params"] else { return nil }
+            return OutlinePlacementAction(id: id, title: title, command: command, params: params,
+                symbol: value["symbol"]?.stringValue.flatMap { NibSymbol(systemName: $0) },
+                isEnabled: value["enabled"]?.boolValue ?? true, isPanel: value["panel"]?.boolValue ?? false)
+        }
     }
 }
 

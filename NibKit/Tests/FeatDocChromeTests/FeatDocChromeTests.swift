@@ -1466,7 +1466,7 @@ final class FeatDocChromeTests: XCTestCase {
         }
     }
 
-    func testSelfHeadedOutlineTabsKeepVisiblePanelOptionsAndReadableLabelsAt240Points() async throws {
+    func testSidebarTabsKeepTheSameFullWidthAndReadableLabelsOnEveryPanel() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         let chrome = try makeWindow(h)
         let titles = ["Pages", "Outline", "Bookmarks"]
@@ -1474,15 +1474,15 @@ final class FeatDocChromeTests: XCTestCase {
         let tabs = zip(ids, titles).map { id, title in
             var descriptor = PanelDescriptor(id: id, title: title, icon: NibSymbol.outline.name,
                 placement: .sidebarTab, order: 0, owner: "tests") { _ in
-                AnyView(NibPanelHeader(title: title, symbol: .outline, onClose: {}) {
+                guard id == "outline.tab" else { return AnyView(Color.clear) }
+                return AnyView(NibPanelHeader(title: title, symbol: .outline, onClose: {}) {
                     NibIconButton(.more, label: "Outline Options", size: .round) {}
                 })
             }
-            descriptor.providesHeader = true
+            descriptor.providesHeader = id == "outline.tab"
             return descriptor
         }
-        for selected in [tabs[1], tabs[2]] {
-            XCTAssertFalse(chrome.drawsHeader(selected), "Exercise both self-headed navigators")
+        for selected in tabs {
             for scheme in [ColorScheme.light, .dark] {
                 var frames: [String: CGRect] = [:]
                 let content = SidebarPanelView(chrome: chrome, side: .left, tabs: tabs, selected: selected,
@@ -1503,10 +1503,10 @@ final class FeatDocChromeTests: XCTestCase {
                 let row = segments.reduce(CGRect.null) { $0.union($1) }
                 let inset = NibSpacing.xs + 2 // Sidebar padding and segmented-track inset.
                 XCTAssertEqual(row.minX, inset, accuracy: 1)
-                XCTAssertEqual(row.maxX, 240 - NibMetrics.hitTarget - inset, accuracy: 1,
-                               "A visible 44 pt Panel Options button must remain beside self-headed tabs")
+                XCTAssertEqual(row.maxX, 240 - inset, accuracy: 1,
+                               "Every selected panel uses the full row; its header owns the only menu")
                 for segment in segments {
-                    XCTAssertEqual(segment.width, (240 - NibMetrics.hitTarget - 2 * inset) / 3, accuracy: 1)
+                    XCTAssertEqual(segment.width, (240 - 2 * inset) / 3, accuracy: 1)
                     XCTAssertEqual(segment.minY, row.minY, accuracy: 1, "All tabs stay in one row")
                     XCTAssertEqual(segment.height, NibMetrics.hitTarget, accuracy: 1)
                 }
@@ -1516,14 +1516,53 @@ final class FeatDocChromeTests: XCTestCase {
                 let font = selected.id == "outline.bookmarks"
                     ? UIFont.systemFont(ofSize: base.pointSize, weight: .semibold) : base
                 let labelWidth = ("Bookmarks" as NSString).size(withAttributes: [.font: font]).width
-                let sizing = NibSegmentedControl<String>.Sizing.compactFitting
+                let sizing = NibSegmentedControl<String>.Sizing.fitting
                 XCTAssertLessThanOrEqual(labelWidth * sizing.minimumLabelScale,
                                         bookmarks.width - 2 * sizing.labelPadding,
                                         "Bookmarks must fit its actual production segment without truncation")
-                // Removing the host menu fails the row width assertion. Restoring it
-                // without compact sizing fails the measured Bookmarks label budget.
             }
         }
+    }
+
+    func testSelfHeadedSidebarReceivesTheSamePlacementCommandsAsTheHostMenu() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        var outline = panel("outline.tab", .sidebarTab)
+        outline.providesHeader = true
+        let pages = panel("sidebar.pages", .sidebarTab)
+        let tabs = [pages, outline]
+        for tab in tabs { h.app.ui.panels.register(tab) }
+        chrome.state.params[outline.id] = ["entry": "keep-me"]
+        for side in [SidebarSide.left, .right] {
+            for mode in [SidebarMode.sidebar, .window] {
+                let view = SidebarPanelView(chrome: chrome, side: side, tabs: tabs, selected: outline,
+                                            mode: mode, presentation: .sidebar)
+                let context = view.panelContext
+                let menu = PanelPlacementMenu(chrome: chrome, panel: outline, current: side.spot,
+                                              mode: mode, additionalPanels: tabs)
+                XCTAssertEqual(context.params["entry"], "keep-me")
+                XCTAssertEqual(context.params["chrome.panelOptions"], .array(menu.actions.map(\.json)))
+                XCTAssertEqual(menu.actions.filter(\.isPanel).map(\.params),
+                               [["id": "sidebar.pages"], ["id": "outline.tab"]])
+                let toggle = try XCTUnwrap(menu.actions.first { $0.command == "sidebar.toggle" })
+                XCTAssertEqual(toggle.params, ["mode": .string(mode == .window ? "sidebar" : "window")])
+                XCTAssertFalse(try XCTUnwrap(menu.actions.first { $0.id == side.rawValue }).isEnabled)
+                XCTAssertEqual(menu.actions.filter { $0.command == "settings.set" }.count, 3)
+            }
+        }
+        let menu = PanelPlacementMenu(chrome: chrome, panel: outline, current: .left)
+        let float = try XCTUnwrap(menu.actions.first { $0.id == "floating" })
+        _ = try await h.run(float.command, float.params)
+        XCTAssertEqual(h.app.settings.json(ChromeSettings.placementName(outline.id)), "floating")
+        let reset = try XCTUnwrap(menu.actions.first { $0.id == "default" })
+        XCTAssertEqual(reset.params["value"], .null)
+        _ = try await h.run(reset.command, reset.params)
+        XCTAssertNil(h.app.settings.json(ChromeSettings.placementName(outline.id)))
+        let sheet = SidebarPanelView(chrome: chrome, side: .left, tabs: tabs, selected: outline,
+                                     mode: .sidebar, presentation: .sheet, showsModeToggle: false)
+        XCTAssertEqual(sheet.panelContext.presentation, .sheet)
+        let actions = try XCTUnwrap(sheet.panelContext.params["chrome.panelOptions"]?.arrayValue)
+        XCTAssertFalse(actions.contains { $0["command"]?.stringValue == "sidebar.toggle" })
     }
 
     func testSidebarToggleShowsHidesAndSwitchesMode() async throws {

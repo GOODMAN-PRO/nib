@@ -562,6 +562,36 @@ final class FeatOutlineTests: XCTestCase {
         }
     }
 
+    func testOutlineReadsHostPlacementCommandsWithoutChangingTheirMeaning() throws {
+        let h = harness()
+        var context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+        context.params = ["chrome.panelOptions": [
+            ["id": "sidebar.pages", "title": "Pages", "command": "panel.open",
+             "params": ["id": "sidebar.pages"], "symbol": .null, "enabled": true, "panel": true],
+            ["id": "mode", "title": "Show as Window", "command": "sidebar.toggle",
+             "params": ["mode": "window"], "symbol": .null, "enabled": true, "panel": false],
+            ["id": "left", "title": "Move to Left Side", "command": "settings.set",
+             "params": ["name": "chrome.panelPlacement.outline.tab", "value": "left"],
+             "symbol": .string(NibSymbol.sidebar.name), "enabled": false, "panel": false],
+            ["id": "default", "title": "Use Default Position", "command": "settings.set",
+             "params": ["name": "chrome.panelPlacement.outline.tab", "value": .null],
+             "symbol": .null, "enabled": true, "panel": false]
+        ]]
+        let actions = OutlinePlacementAction.read(context)
+        XCTAssertEqual(actions.map(\.id), ["sidebar.pages", "mode", "left", "default"])
+        XCTAssertEqual(actions.filter(\.isPanel).map(\.command), ["panel.open"])
+        XCTAssertEqual(actions[1].params, ["mode": "window"])
+        XCTAssertEqual(actions[2].symbol?.name, NibSymbol.sidebar.name)
+        XCTAssertFalse(actions[2].isEnabled)
+        XCTAssertEqual(actions[3].params["value"], .null)
+        // Other hosts need no new header row or placeholder menu when no host payload is supplied.
+        context.params = [:]
+        for presentation in [PanelPresentation.floating, .sheet, .fullScreen] {
+            context.presentation = presentation
+            XCTAssertTrue(OutlinePlacementAction.read(context).isEmpty)
+        }
+    }
+
     func testNavigatorHeadingKeepsItsTitleReadableAndReflowsAccessories() {
         let h = harness()
         let model = OutlinePanelModel(app: h.app, session: h.session)
