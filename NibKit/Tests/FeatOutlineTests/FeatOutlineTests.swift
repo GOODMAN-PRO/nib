@@ -580,7 +580,7 @@ final class FeatOutlineTests: XCTestCase {
         let actions = OutlinePlacementAction.read(context)
         let model = OutlinePanelModel(app: h.app, session: h.session)
         XCTAssertEqual(OutlineOptionsMenu(model: model, placementActions: actions).accessibilityLabel,
-                       String(localized: "Panel Options"))
+                       String(localized: "Outline Options"))
         XCTAssertEqual(actions.map(\.id), ["sidebar.pages", "mode", "left", "default"])
         XCTAssertEqual(actions.filter(\.isPanel).map(\.command), ["panel.open"])
         XCTAssertEqual(actions[1].params, ["mode": "window"])

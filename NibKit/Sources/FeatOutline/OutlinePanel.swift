@@ -617,9 +617,8 @@ struct OutlineOptionsMenu: View {
     @ObservedObject var model: OutlinePanelModel
     var placementActions: [OutlinePlacementAction] = []
 
-    var accessibilityLabel: String {
-        placementActions.isEmpty ? String(localized: "Outline Options") : String(localized: "Panel Options")
-    }
+    /// One name wherever the panel shows: the menu is Outline's, with the host's placement actions as a section.
+    var accessibilityLabel: String { String(localized: "Outline Options") }
 
     var body: some View {
         Menu {

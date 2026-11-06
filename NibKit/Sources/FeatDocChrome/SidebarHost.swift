@@ -4,7 +4,8 @@ import NibDesign
 
 /// One sidebar side (D-065, D-117, D-136): a readable selected title, primary labelled navigation, one overflow
 /// for other panels and presentation controls, and Close. The caller supplies the Deep panel or compact sheet.
-/// Self-headed panels receive host placement actions in their context for their own header menu.
+/// Outline, which draws its own header, receives the host's placement actions in its context for its header menu;
+/// other self-headed panels keep the host's menu beside the tabs.
 /// The assistant is a standalone panel without navigation tabs.
 struct SidebarPanelView: View {
     let chrome: ChromeWindow
@@ -20,8 +21,13 @@ struct SidebarPanelView: View {
         VStack(spacing: 0) {
             // §14.4: tabs lead every navigator, including panels that embed their own header.
             if selected.id != PanelIDs.assistant, SidebarNavigation.primary(tabs).count > 1 {
-                tabStrip.frame(maxWidth: .infinity)
-                    .contextMenu { placementMenu.items }
+                HStack(spacing: 0) {
+                    tabStrip.frame(maxWidth: .infinity)
+                        .contextMenu { placementMenu.items }
+                    // A self-headed panel that does not take the placement actions into its own header menu
+                    // (Transcript, plugin panels) keeps the host's menu beside the tabs, as before.
+                    if !chrome.drawsHeader(selected) && !hostsOwnPlacementMenu { placementMenu }
+                }
             }
             Rectangle()
                 .fill(NibColor.separatorSoft)
@@ -50,10 +56,14 @@ struct SidebarPanelView: View {
                            mode: showsModeToggle ? mode : nil, additionalPanels: tabs)
     }
 
+    /// ponytail: Outline is the one self-headed panel whose own header menu hosts the placement actions, so the host
+    /// names it here. A descriptor flag when a second panel does the same.
+    private var hostsOwnPlacementMenu: Bool { selected.providesHeader && selected.id == "outline.tab" }
+
     var panelContext: PanelContext {
         let context = chrome.panelContext(selected.id, presentation: presentation)
         // Outline consumes this private handoff. Do not inject it into plugin panel parameters.
-        return selected.providesHeader && selected.id == "outline.tab" ? placementMenu.addingActions(to: context) : context
+        return hostsOwnPlacementMenu ? placementMenu.addingActions(to: context) : context
     }
 
     /// Pages, Outline and Bookmarks remain labelled; secondary panels live in the header's single menu.
@@ -62,7 +72,8 @@ struct SidebarPanelView: View {
         let primary = SidebarNavigation.primary(tabs)
         if primary.count > 1 {
             NibSegmentedControl(selection: selection, options: primary.map { $0.id },
-                                sizing: .fitting) { id in
+                                sizing: chrome.drawsHeader(selected) || hostsOwnPlacementMenu
+                                    ? .fitting : .compactFitting) { id in
                 primary.first(where: { $0.id == id })?.title ?? id
             }
             .padding(.horizontal, NibSpacing.xs)
