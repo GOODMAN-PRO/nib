@@ -6,6 +6,10 @@ import UIKit
 @MainActor
 final class PaletteSettingsScrollTests: XCTestCase {
     func testToolChangeStartsAtTopWhileSameToolRetainsScrollerAcrossGrowthAndReopening() async throws {
+        // accessibilityReduceMotion is a read-only environment value: the design system's own switch forces it.
+        let reducedMotion = NibMotion.forcesReduced
+        NibMotion.forcesReduced = true
+        defer { NibMotion.forcesReduced = reducedMotion }
         let tools = [NibTool(id: "pen", label: "Pen", symbol: .pen),
                      NibTool(id: "pencil", label: "Pencil", symbol: .pencil)]
         for size in [CGSize(width: 1024, height: 1366), CGSize(width: 1366, height: 1024)] {
@@ -25,7 +29,6 @@ final class PaletteSettingsScrollTests: XCTestCase {
                         .environment(\.horizontalSizeClass, .regular)
                         .environment(\.colorScheme, scheme)
                         .environment(\.nibLiquidMode, .off)
-                        .environment(\.accessibilityReduceMotion, true)
                         .coordinateSpace(NibLiquid.space)
                         .ignoresSafeArea()
                         .transaction { $0.disablesAnimations = true; $0.animation = nil }
