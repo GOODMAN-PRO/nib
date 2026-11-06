@@ -164,3 +164,16 @@ Should unblock TabsOverflowAndKeyboardOneThroughEightAndNineLast and the new set
 | Tests | Log prefix | Question answered |
 | --- | --- | --- |
 | Both tabs tests | Existing Requested chord / App key log; named fixture and overflow assertions | Were all seeded destinations usable, did each chord reach the independently observed document ID, and did tab visibility track the setting? |
+
+### K5 - two live saves and six seeded history rows
+
+Confirmed R13:chrome-still-failing#4 and holds=true: timer cycles began t=24.63/68.12/116.42/165.54 and the fourth exhausted 180 seconds; each costs ~47 seconds. Current TimeKeeperHistorySection collapses at five, so Show All needs six, and TimeKeeperHistoryRow builds its subtitle from docTitle, elapsed/duration, then date. No timerHistory scenario exists in merged app sources yet; this job implements the supplied companion-job contract only in the runner enum/launch arguments. Setup throws 'Missing timerHistory fixture scenario' if the probe does not echo it. It never substitutes UI creation, passes on missing records, or skips.
+
+Original TimerHistoryShowsDocumentDurationsAndNoDuplicateRows now saves two named sessions through the unchanged timer UI path, then checks both names exactly once and both document rows. New TimerHistorySeedShowsAllAndLessWithoutDuplicateRows launches timerHistory and retains Show All, all six exact-once names, the original >=6 document-title assertion, Show Less, Show All and the final history-6 exact count. Shared row verification additionally checks the document/duration/date subtitle directly after each name in the Time Keeper snapshot's text reading order (the source's NibInspectorRow VStack can be flattened in AX) and exact total row count. Show Less checks five rows. Names are searched independently, never asserted in any session/time order.
+
+Should unblock live saving and the formerly unreachable six-record expansion tail. Next CI must execute two real saves below ~150 seconds, and seeded expansion below ~60-90 seconds, with all names, per-row document/duration subtitles, exact counts, collapse and re-expansion. AX text ordering/lazy retention needs CI confirmation; missing row metadata fails rather than falling back to the old aggregate title count. Roughly four ~47-second UI cycles (~190 seconds) are removed, offset by the new test launch and row checks; no sleep, allowance increase or timer() optimisation is introduced without further evidence.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Both timer history tests | Timer history row | Which exact session name was paired with which document/duration/date subtitle? |
+| Seeded history test setup | Missing timerHistory fixture scenario (failure) | Did the companion app actually recognise the scenario rather than silently launch standard? |

@@ -26,8 +26,12 @@ final class ChromeUITests: XCTestCase {
         }
         let tabsScenario = name.contains("testTabsOverflowAndKeyboardOneThroughEightAndNineLast")
             || name.contains("testDocumentEditingHidesAndShowsOpenTabs")
-        let scenario: NibUI.FixtureScenario = tabsScenario ? .tabsOverflow : .standard
+        let historyScenario = name.contains("testTimerHistorySeedShowsAllAndLessWithoutDuplicateRows")
+        let scenario: NibUI.FixtureScenario = historyScenario ? .timerHistory : (tabsScenario ? .tabsOverflow : .standard)
         try ui.launchFixture(scenario: scenario)
+        if historyScenario, try ui.state().fixtureScenario != "timerHistory" {
+            throw NibUI.Failure.message("Missing timerHistory fixture scenario: expected six saved Chrome history sessions")
+        }
         ui.logQA("Typed probe estimate", "Chrome toolbar/More rows use buttons; baseline Any probes ~0.99s vs present typed ~0.16s. Potential 50-70s/layout test, unmeasured; modal typed queries may remain slow.")
     }
 
@@ -1419,20 +1423,63 @@ final class ChromeUITests: XCTestCase {
         try tap("cmd.panel.close"); try timeKeeper()
         XCTAssertFalse(query("Delete Chrome study").firstMatch.exists)
     }
+    private func historyRows(_ count: Int) throws {
+        let form = ui.app.scrollViews["Time Keeper"].firstMatch
+        for index in 1...count {
+            let title = "Chrome history \(index)"
+            _ = try reachable(title)
+            XCTAssertEqual(ui.app.staticTexts.matching(identifier: title).count, 1,
+                           "History must contain each session exactly once")
+            // NibInspectorRow renders the name then its subtitle in one leading-aligned VStack.
+            // SwiftUI can flatten that stack in AX; use its actual text reading order in a single snapshot.
+            let snapshot = try form.snapshot()
+            func texts(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
+                if node.elementType == .staticText { return [node] }
+                return node.children.flatMap { texts($0) }
+            }
+            let rows = texts(snapshot)
+            let position = try XCTUnwrap(rows.firstIndex { $0.label == title })
+            guard position + 1 < rows.count else {
+                throw NibUI.Failure.message("History row has no document/duration subtitle: " + title)
+            }
+            let subtitle = rows[position + 1].label
+            XCTAssertTrue(subtitle.hasPrefix(notebook + " · "), "Each history row must name its document: " + title)
+            let parts = subtitle.components(separatedBy: " · ")
+            XCTAssertGreaterThanOrEqual(parts.count, 3, "History subtitle must include document, duration and date")
+            let duration = parts.count > 1 ? parts[1] : ""
+            XCTAssertNotNil(duration.range(of: "[0-9]+:[0-9]{2}", options: .regularExpression),
+                            "History row must show its duration: " + title)
+            ui.logQA("Timer history row", "name=\(title) subtitle=\(subtitle)")
+        }
+        XCTAssertEqual(form.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Chrome history '")).count, count,
+                       "History must have exactly the expected number of rows")
+    }
+
     func testTimerHistoryShowsDocumentDurationsAndNoDuplicateRows() throws {
         try open()
-        for index in 1...6 {
+        for index in 1...2 {
             try timer("1:00", name: "Chrome history \(index)")
             try tap("Stop and Save")
         }
-        try timeKeeper(); try tap("Show All")
-        for index in 1...6 {
-            _ = try reachable("Chrome history \(index)")
-            XCTAssertEqual(ui.app.staticTexts.matching(identifier: "Chrome history \(index)").count, 1, "History must contain each session exactly once")
-        }
+        try timeKeeper()
+        try historyRows(2)
+        XCTAssertTrue(ui.app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", notebook)).count >= 2,
+                      "Each history record must name its document")
+    }
+
+    func testTimerHistorySeedShowsAllAndLessWithoutDuplicateRows() throws {
+        // setUp rejects a missing scenario explicitly; no UI-generated substitute or skip.
+        try open(); try timeKeeper(); try tap("Show All")
+        try historyRows(6)
         XCTAssertTrue(ui.app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", notebook)).count >= 6,
                       "Each history record must name its document")
-        try tap("Show Less"); try tap("Show All")
+        try tap("Show Less")
+        let collapsedRows = ui.app.scrollViews["Time Keeper"].staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH 'Chrome history '"))
+        try wait("Show Less must finish collapsing history") { collapsedRows.count == 5 }
+        XCTAssertEqual(collapsedRows.count, 5,
+                       "Show Less must collapse six records to five, without assuming which name is first")
+        try tap("Show All")
         XCTAssertEqual(ui.app.staticTexts.matching(identifier: "Chrome history 6").count, 1)
     }
 

@@ -133,7 +133,7 @@ final class NibUI {
     }
 
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
-    enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards, tabsOverflow }
+    enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards, tabsOverflow, timerHistory }
     enum FormEdge { case top, bottom, nearest }
 
     /// Reject hidden SwiftUI menu copies before asking AX for an activation point (zero frames can raise).
