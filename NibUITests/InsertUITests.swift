@@ -1251,7 +1251,7 @@ final class InsertUITests: XCTestCase {
             let cross = (points[index] - points[0]) * dy - (points[index + 1] - points[1]) * dx
             XCTAssertEqual(cross / max(hypot(dx, dy), 1), 0, accuracy: 0.1, "Straight tape must flatten the bent gesture")
         }
-        try ui.openToolSettings("tape"); try tap("History"); try tap("Clear History")
+        try ui.openToolSettings("tape"); try tap("History", scroll: true); try tap("Clear History")
         XCTAssertTrue(query("Tape you use appears here.").firstMatch.waitForExistence(timeout: 8))
         try tap("Patterns"); XCTAssertTrue(query("Stripes").firstMatch.exists)
         try tap("Follow stroke", scroll: true); try toggle("Straight tape", to: false); outside()

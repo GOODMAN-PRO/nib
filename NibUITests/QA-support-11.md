@@ -340,3 +340,7 @@ Confirmed insert-controls#1 against ElementsCollectionBar and the vertical My Ob
 ### N5 - GIPHY readiness
 
 Confirmed insert-controls#2: reveal ran while the network-dependent row did not exist. The companion app job supplies immediate fixture failure; wait boundedly for the actual Try Again button before reveal/tap. Query-retention and key removal remain. CI must expose it within about one second without network activity or an absent-row drag.
+
+### N6 - retained Tape scroll
+
+Confirmed insert-controls#3: History at y290 was above the restored y476 viewport. Request scroll:true before History. No app reset assumption; every pattern/width/straightness/orientation/history assertion remains. CI must reveal History then reach Clear History and the second drawing checks.
