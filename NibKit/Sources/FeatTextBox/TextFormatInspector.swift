@@ -669,8 +669,8 @@ struct TextStyleNamePrompt: UIViewControllerRepresentable {
 
         private func presentIfNeeded() {
             #if DEBUG
-            let facts = "naming=\(isPresented.wrappedValue) window=\(viewIfLoaded?.window != nil)"
-                + " prompt=\(prompt != nil) presented=\(String(describing: presentedViewController.map { type(of: $0) }))"
+            let presenter = String(describing: presentedViewController.map { type(of: $0) })
+            let facts = "naming=\(isPresented.wrappedValue) window=\(viewIfLoaded?.window != nil) prompt=\(prompt != nil) presented=\(presenter)"
             #endif
             guard isPresented.wrappedValue else {
                 #if DEBUG

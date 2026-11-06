@@ -232,13 +232,14 @@ public enum NibFloatingHitDiagnostics {
                 let visibleFrame = reference.convert(frame.offsetBy(dx: -host.layerOrigin.x, dy: -host.layerOrigin.y), to: window)
                 let scroll = surface.scrollView
                 let scrollFrame = scroll.map { $0.convert($0.bounds, to: window) } ?? .null
-                let claimed = scroll.map { hit?.isDescendant(of: $0) == true } ?? false
-                guard visibleFrame.contains(location), !claimed else { continue }
+                let claimedByScroll = scroll.map { hit?.isDescendant(of: $0) == true } ?? false
+                guard visibleFrame.contains(location), !claimedByScroll else { continue }
                 let contentFrame = surface.convert(surface.bounds, to: window)
                 let geometry = "visibleFrame=\(visibleFrame) scrollFrame=\(scrollFrame) contentFrame=\(contentFrame)"
-                let input = "scrollEnabled=\(scroll?.isUserInteractionEnabled ?? false) windowHit=\(hitClass)"
+                // Chrome outside the scroller may legitimately own the hit; this is not proof of fall-through.
+                let input = "claimedByScroll=\(claimedByScroll) scrollEnabled=\(scroll?.isUserInteractionEnabled ?? false) windowHit=\(hitClass)"
                 let ancestors = surface.ancestorFrames(in: window, at: location)
-                NSLog("%@", "[Nib QA format] floating unclaimed id=\(surface.id) windowPoint=\(location) \(geometry) \(input) ancestors=\(ancestors)")
+                NSLog("%@", "[Nib QA format] floating scroll-claim id=\(surface.id) windowPoint=\(location) \(geometry) \(input) ancestors=\(ancestors)")
             }
         }
         let touchPoint = event?.allTouches?.first?.location(in: window)
