@@ -329,3 +329,15 @@ Next CI must show no Width keyboard/Decimal clear logs for CustomSize, one cache
 | Create testCustomSize | Custom size heading | Which single heading frame was reused for both numeric keyboard dismissals? |
 
 Validation: current dismissNativeKeyboard/replace callers audited; new arguments are defaulted. Runtime saving and cached-heading geometry need CI verification.
+
+### C9 - name helper ink at the board boundary
+
+Confirmed R14:canvas#0 and its verdict against current UITestFixture: Concept map has an ellipse, text and sticky, with zero strokes (the notebook's separate ink seed does not belong to this board). Meeting's extra stroke survived template Undo; Rename had four items without a Duplicate action. H15 owns the cause fix.
+
+Both BoardFrameworkMeeting and BoardRenamePersistsAfterReopeningDocument now assert strokeCountOnPage == 0 immediately after boards(), before Templates/rename actions. The message explicitly says a helper drew on the page. This uses the fixture's known count, not a baseline captured after the bad helper, and retains all original item-count, Undo/Redo, rename and reopen assertions. The framework guard is limited to Meeting Notes as requested; no added per-test cost for the other templates.
+
+Next CI must log zero before either first board operation, no native pen stroke from setup, and pass all original assertions. A regression should fail at the named helper boundary instead of a later count timeout.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| BoardFrameworkMeeting; BoardRenamePersistsAfterReopeningDocument | Board helper ink guard | Did setup leave any stroke beyond the fixture's zero before the first board operation? |

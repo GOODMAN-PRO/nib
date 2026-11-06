@@ -715,6 +715,7 @@ final class CanvasUITests: XCTestCase {
         executionTimeAllowance = 300
         try open(whiteboard)
         try boards()
+        try assertNoHelperInkOnFixtureBoard()
         let row = try boardRow(1, count: 1)
         try openBoardMenu(row)
         try boardMenuTap("Rename")
@@ -734,11 +735,20 @@ final class CanvasUITests: XCTestCase {
         XCTAssertEqual(try ui.state().itemCountOnPage, 3)
     }
 
+    private func assertNoHelperInkOnFixtureBoard() throws {
+        // UITestFixture seeds Concept map with ellipse, text and sticky only: zero ink.
+        let state = try ui.state()
+        ui.logQA("Board helper ink guard", "expectedFixtureStrokes=0 actual=\(state.strokeCountOnPage) page=\(state.page ?? "missing")")
+        XCTAssertEqual(state.strokeCountOnPage, 0,
+                       "A helper drew on the page before the test's first board operation; fixture has no strokes")
+    }
+
     // board.insertTemplate; F044. Separate tests keep one missing framework from hiding the other seven.
     private func framework(_ title: String) throws {
         try open(whiteboard)
         let before = try ui.state()
         try boards()
+        if title == "Meeting Notes" { try assertNoHelperInkOnFixtureBoard() }
         try tap("Templates")
         // performTap reveals the requested row in its live container, including virtualized templates.
         try tap(title)
