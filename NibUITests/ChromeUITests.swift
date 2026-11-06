@@ -1021,14 +1021,14 @@ final class ChromeUITests: XCTestCase {
     }
 
     // layer.panel/setActive/setVisible/rename
-    private func layers(useShortcut: Bool = false) throws {
+    private func layers(useShortcut: Bool = true) throws {
         try open(); try editing("Layers"); try toggle("Layers", to: true); try closeEditing()
         if useShortcut { try key("l", [.command, .option]) }
         else { try more("Layers") }
         try panel("layers")
     }
     func testLayersSettingMenuAndShortcutReflectFiveLayers() throws {
-        try layers()
+        try layers(useShortcut: false)
         for number in 1...5 { _ = try require("Layer \(number)") }
         XCTAssertTrue(try require("Layer 1").isSelected)
         try tap("cmd.panel.close"); try panel("layers", shown: false)

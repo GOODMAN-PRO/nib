@@ -62,3 +62,7 @@ Confirmed R12:chrome-customise#3 correction and ToolbarCustomizationModel.show's
 | --- | --- | --- |
 | Both reorder tests | Toolbar reorder before / after; slow query | Was the initial ordering non-vacuous, did the real drag reverse it, and was the order snapshot slow? |
 
+### C2 - Layers setup shortcut
+
+Confirmed R12:chrome-customise#4 and correction: the 32 s launch/77 s canvas window is unexplained; replacing setup cannot rescue that entire host slowdown. layers() now defaults to its already-supported Command-Option-L route after enabling Layers. LayersSettingMenuAndShortcutReflectFiveLayers explicitly keeps More because that test covers the menu. Rename and every selection/ink/lasso assertion remain. CI should reach ActiveLayerLimitsLassoSelectionToChosenLayer's lasso steps before 90 s on a normal host; estimated saving is one 10-19 s reveal, not a host-stall fix.
+
