@@ -99,9 +99,46 @@ enum UITestFixture {
         for (front, back) in [("Velocity", "Displacement per unit time"), ("Acceleration", "Change in velocity per unit time"), ("Force", "Mass times acceleration")] {
             try await run("card.add", ["doc": study["ref"] ?? .null, "front": .string(front), "back": .string(back)])
         }
+        // T2(a), R13:chrome-still-failing#3 — NibUITests contract:
+        // settings.set editing.showTabs=true; doc.open mode=newTab for Physics — Motion,
+        // then Chrome tab 2...9 in order; tab.select index=0. These commands finish in seed().
+        // BLOCKED on the app-shell owner: AppDelegate currently sets isReady then calls
+        // showLibrary, which clears session.document. The complete startup therefore leaves
+        // the library plus nine open tabs, with no active document; the wait below proves
+        // seed-time selection only. AppDelegate's fixture startup must skip showLibrary only
+        // for .tabsOverflow, validate nine ordered tabs, editing.showTabs=true and Physics
+        // active after startup navigation, then set isReady. Other scenarios must keep their
+        // existing library startup. Cover that full path in the app/UI-test target; the
+        // CanvasFixtureTests command-list test cannot prove the final shell state.
         if scenario == .tabsOverflow {
-            // Prerequisites only. The UI test opens each persisted document through the library.
-            for index in 2...9 { _ = try await create("notebook", "Chrome tab \(index)") }
+            func documentID(_ result: JSONValue) throws -> DocumentID {
+                guard let raw = result["ref"]?.stringValue, case let .document(doc)? = NodeRef(raw) else {
+                    throw NibError.invalid("Tab fixture creation returned no document reference")
+                }
+                return doc
+            }
+            var documents = [try documentID(physics)]
+            for title in scenario.overflowTabTitles {
+                let result = try await create("notebook", title)
+                documents.append(try documentID(result))
+            }
+            // Seeding starts in application startup, potentially before the first scene connects.
+            try await waitFor("The fixture window did not open", timeout: 30) { app.ui.activeNavigator != nil }
+            guard let navigator = app.ui.activeNavigator else { throw NibError.unavailable("fixture window") }
+            for step in try scenario.tabSetupCommands(documents: documents) {
+                try await app.bus.execute(step.command, step.params, session: navigator.session)
+                if step.command == CommandIDs.docOpen, let raw = step.params["doc"]?.stringValue,
+                   case let .document(doc)? = NodeRef(raw) {
+                    // doc.open returns before the asynchronous document lock gate completes.
+                    // Await each actual open so tab order and seed completion are deterministic.
+                    try await waitFor("The fixture tab did not open: " + raw) {
+                        navigator.session.document == doc && navigator.openDocuments.contains(doc)
+                    }
+                }
+            }
+            try await waitFor("The fixture notebook was not selected before seed completed") {
+                navigator.session.document == documents.first && navigator.openDocuments == documents
+            }
         }
         let listing = try await run("library.list", [:])
         guard listing["nodes"]?.arrayValue?.contains(where: { $0["title"]?.stringValue == "Physics — Motion" }) == true else {
@@ -128,6 +165,14 @@ enum UITestFixture {
                     NotificationCenter.default.post(name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
                 }
             }
+        }
+    }
+
+    private static func waitFor(_ failure: String, timeout: TimeInterval = 5, until ready: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !ready() {
+            guard Date() < deadline else { throw NibError.unavailable(failure) }
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
     }
 }

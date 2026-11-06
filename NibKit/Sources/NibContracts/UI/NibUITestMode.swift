@@ -62,6 +62,27 @@ public enum NibUITestScenario: String, CaseIterable {
 
     public var notebookPageCount: Int { self == .largeDocument ? 300 : 4 }
 
+    public var overflowTabTitles: [String] {
+        self == .tabsOverflow ? (2...9).map { "Chrome tab \($0)" } : []
+    }
+
+    /// The fixture notebook is first. Use the same registered commands as Document Editing,
+    /// library taps and tab selection; explicitly request newTab regardless of the user's default.
+    public func tabSetupCommands(documents: [DocumentID]) throws -> [(command: String, params: JSONValue)] {
+        guard self == .tabsOverflow else { return [] }
+        guard documents.count == 9, Set(documents).count == 9 else {
+            throw NibError.invalid("The tabsOverflow fixture requires nine distinct notebooks")
+        }
+        var commands: [(command: String, params: JSONValue)] = [
+            (CommandIDs.settingsSet, ["name": "editing.showTabs", "value": true])
+        ]
+        commands += documents.map { doc -> (command: String, params: JSONValue) in
+            (CommandIDs.docOpen, ["doc": .string(NodeRef.document(doc).description), "mode": "newTab"])
+        }
+        commands.append((CommandIDs.tabSelect, ["index": 0]))
+        return commands
+    }
+
     /// A local first board and two changed, offscreen boards. Keeping the changed boards offscreen avoids the
     /// production dwell-to-mark-seen behaviour consuming the prerequisite before the user opens Select mode.
     public static func unseenBoardContent(localDevice: UInt32) -> DocumentContent {

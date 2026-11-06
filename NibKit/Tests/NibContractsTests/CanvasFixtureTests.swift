@@ -32,6 +32,33 @@ final class CanvasFixtureTests: XCTestCase {
         }
     }
 
+    func testTabsOverflowSeedsVisibleOrderedTabsAndRestoresTheFixtureNotebook() throws {
+        let scenario = NibUITestScenario.parse(["-NibUITestFixture", "-NibUITestScenario", "tabsOverflow"])
+        XCTAssertEqual(scenario.overflowTabTitles, (2...9).map { "Chrome tab \($0)" })
+        let documents = (0..<9).map { _ in DocumentID.make() }
+        let commands = try scenario.tabSetupCommands(documents: documents)
+        XCTAssertEqual(commands.count, 11, "One setting, nine opens and one selection; no UI construction loops")
+        XCTAssertEqual(commands.first?.command, CommandIDs.settingsSet)
+        XCTAssertEqual(commands.first?.params, ["name": "editing.showTabs", "value": true])
+        for (step, doc) in zip(commands.dropFirst().prefix(9), documents) {
+            XCTAssertEqual(step.command, CommandIDs.docOpen)
+            XCTAssertEqual(step.params, ["doc": .string(NodeRef.document(doc).description), "mode": "newTab"])
+        }
+        XCTAssertEqual(commands.last?.command, CommandIDs.tabSelect)
+        XCTAssertEqual(commands.last?.params, ["index": 0])
+        XCTAssertThrowsError(try scenario.tabSetupCommands(documents: Array(documents.prefix(8))))
+        XCTAssertThrowsError(try scenario.tabSetupCommands(documents: Array(repeating: documents[0], count: 9)))
+    }
+
+    func testOtherScenariosNeverEnableOrOpenOverflowTabs() throws {
+        for scenario in NibUITestScenario.allCases where scenario != .tabsOverflow {
+            XCTAssertTrue(scenario.overflowTabTitles.isEmpty)
+            XCTAssertTrue(try scenario.tabSetupCommands(documents: []).isEmpty)
+        }
+        let production = NibUITestScenario.parse(["-NibUITestScenario", "tabsOverflow"])
+        XCTAssertTrue(try production.tabSetupCommands(documents: []).isEmpty)
+    }
+
     func testFailureOnlyAffectsOneTargetScreenTileAndRetryUsesRealRenderer() async throws {
         let base = FakeRenderer()
         let renderer = NibUITestRenderer(base: base, failingPage: (Fixtures.docID, Fixtures.page1))

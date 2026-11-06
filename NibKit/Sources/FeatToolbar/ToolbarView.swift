@@ -173,6 +173,11 @@ final class ToolbarModel: ObservableObject {
     private var lastRect: Rect?
     private var lastRectPage: PageID?
     private var scrollTravel: Double = 0
+    /// The canvas scroll view's offset and viewport, and the zoom, at the last publication (see `canvasDidScroll`).
+    private var lastCanvasSample: (offset: CGPoint, zoom: Double, size: CGSize)?
+    #if DEBUG
+    private var scrollLogCount = 0
+    #endif
     private var refreshScheduled = false
     private var cancellables = Set<AnyCancellable>()
     private var commits: EventSubscription?
@@ -423,13 +428,44 @@ final class ToolbarModel: ObservableObject {
     /// Scrolling or pulling the page folds the secondary bar away (and its popover with it); choosing a tool brings it
     /// back unless the user folded that tool. A zoom changes the visible size and does not count.
     private func canvasDidScroll(_ rect: Rect?) {
+        // The published rect is the window clipped to the current page, in page coordinates. While an edge of the
+        // page is inside the window its size changes although the user only scrolled, so a fast scroll past a page
+        // edge never gave two comparable samples and the bar stayed (UI run 42163879315). Where the editor has a
+        // scroll view, travel is read from its content offset, which has no such jumps: a zoom changes the zoom, a
+        // rotation changes the viewport, and a jump to another page changes the page; none of them counts.
+        // ponytail: sampled when the rect is published (every 100 ms while it changes), not per frame; a caret
+        // reveal that scrolls the canvas counts as a scroll. Observe the scroll view if either matters.
+        let scroll = session.editor?.canvasHost?.canvasView as? UIScrollView
+        let sample = scroll.map { (offset: $0.contentOffset, zoom: session.zoom, size: $0.bounds.size) }
+        let samePage = lastRectPage == session.page
+        let previousRect = lastRect, previousSample = lastCanvasSample
         defer {
             lastRect = rect
             lastRectPage = session.page
+            lastCanvasSample = sample
         }
-        guard let rect, let last = lastRect, lastRectPage == session.page, !optionsCollapsed,
-              abs(rect.width - last.width) < 0.5, abs(rect.height - last.height) < 0.5 else { return }
-        scrollTravel += abs(rect.y - last.y) + abs(rect.x - last.x)
+        guard !optionsCollapsed else { return }
+        var moved: Double?
+        if let sample {
+            if samePage, let last = previousSample, abs(sample.zoom - last.zoom) < 0.0005, sample.size == last.size {
+                let points = abs(sample.offset.x - last.offset.x) + abs(sample.offset.y - last.offset.y)
+                moved = Double(points) / max(sample.zoom, 0.01)
+            }
+        } else if samePage, let rect, let last = previousRect,
+                  abs(rect.width - last.width) < 0.5, abs(rect.height - last.height) < 0.5 {
+            // No scroll view (a hostless test, an editor without a canvas): the rule as it was.
+            moved = abs(rect.y - last.y) + abs(rect.x - last.x)
+        }
+        #if DEBUG
+        if scrollLogCount < 60 {
+            scrollLogCount += 1
+            let movedText = moved.map { String(format: "%.1f", $0) } ?? "dropped"
+            let offsetText = sample.map { "\($0.offset)" } ?? "none"
+            NSLog("%@", "[Nib QA toolbar] scroll moved=\(movedText) travel=\(scrollTravel) samePage=\(samePage) offset=\(offsetText) zoom=\(session.zoom)")
+        }
+        #endif
+        guard let moved else { return }
+        scrollTravel += moved
         if scrollTravel >= Self.collapseTravel {
             closeOptionsPopovers()
             optionsFoldedByScroll = true
