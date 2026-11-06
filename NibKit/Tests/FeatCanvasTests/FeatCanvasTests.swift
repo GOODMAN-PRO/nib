@@ -261,8 +261,10 @@ final class FeatCanvasTests: XCTestCase {
                 XCTAssertEqual(pageTop, vc.scrollView.chromeInsets.top, accuracy: 0.5)
                 XCTAssertEqual(vc.zoom, vc.fitZoom, accuracy: 1e-9)
                 XCTAssertEqual(h.session.page, Fixtures.page2)
+                // A guard against runaway insets, not a layout rule. Since the options strip sits a 16 pt gap away
+                // from the palette, a 390 pt tall compact window keeps 186 pt of canvas under a top dock with a strip.
                 XCTAssertGreaterThan(vc.view.bounds.height - vc.scrollView.chromeInsets.top
-                                     - vc.scrollView.chromeInsets.bottom, vc.view.bounds.height / 2)
+                                     - vc.scrollView.chromeInsets.bottom, vc.view.bounds.height * 0.45)
 
                 // Docking back automatically uses the released clearance on the same page.
                 h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])

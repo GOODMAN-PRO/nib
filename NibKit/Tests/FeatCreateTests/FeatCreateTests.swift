@@ -1952,7 +1952,9 @@ final class FeatCreateTests: XCTestCase {
                 }
                 XCTAssertGreaterThan(paper.minY, preview.maxY)
                 XCTAssertTrue(sheetFrame.contains(cue))
-                XCTAssertGreaterThanOrEqual(cue.minY, viewport.maxY)
+                // Half a point of tolerance: the two frames come from separate layout passes (968.3333333333334
+                // against 968.3333333333335 in package run 42182139031).
+                XCTAssertGreaterThanOrEqual(cue.minY, viewport.maxY - 0.5)
                 XCTAssertFalse(cue.intersects(try XCTUnwrap(frames["documentType"])))
                 let verticals = scrollViews(host.view).filter { $0.contentSize.height > $0.bounds.height + 1 }
                 XCTAssertEqual(verticals.count, 1, "The production sheet has one vertical form scroll")
@@ -2039,7 +2041,9 @@ final class FeatCreateTests: XCTestCase {
                 let type = try XCTUnwrap(frames["documentType"])
                 XCTAssertTrue(viewport.contains(type), "The document-type control must be fully visible on opening")
                 XCTAssertFalse(cue.intersects(type), "The cue must not cover any part of the document-type control")
-                XCTAssertGreaterThanOrEqual(cue.minY, viewport.maxY)
+                // Half a point of tolerance: the two frames come from separate layout passes (968.3333333333334
+                // against 968.3333333333335 in package run 42182139031).
+                XCTAssertGreaterThanOrEqual(cue.minY, viewport.maxY - 0.5)
                 let scroll = try XCTUnwrap(scrollViews(host.view).first { $0.contentSize.height > $0.bounds.height + 1 })
                 let inset = scroll.adjustedContentInset
                 let resting = scroll.contentOffset.y
