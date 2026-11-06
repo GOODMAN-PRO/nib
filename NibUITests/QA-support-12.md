@@ -41,3 +41,69 @@ A timeout throws 'Settings bar did not settle', logs geometry/byte count/interva
 | Tests | Log prefix | Question answered |
 | --- | --- | --- |
 | Capture test16, Editing and Stylus, all variants | Capture pixel settle / Capture pixel timeout | Was the actual navigation bar hittable and pixel-identical across the logged interval, or did it keep changing/miss its region? |
+
+### G5 - audit every capture boundary
+
+Reviewed every capture call and all 96 declarations against current sources. The shared capture path now adds the requested observable content-region pixel check for grid/list/folder covers (LibraryGridView.LibraryCover's async load), the actual search.open result rows headed Physics — Motion (LibrarySearchView.SearchResultRow, not an underlying library card), the continuous New Notebook form containing No cover and Paper (TemplatePreview's async raster), the plugin list (PluginListView), the practice face (PracticeView), and the export form (ExportDialog). Each region is resolved from a fresh snapshot, clipped to real ancestor scrollers/window, then compared at full pixel resolution with the G4 helper. These checks share the original capture deadline after state/canvas facts. Missing regions fail with named screen reasons, last geometry and two keepAlways images; no fixed delay was added.
+
+Plugin readiness additionally requires a loaded Enable switch or No plugins yet and no Loading plugins; Install from alone was not evidence of a loaded list. Practice additionally requires Question side containing one of the three fixture fronts (Velocity, Acceleration, Force), so the always-present Flip Card header cannot substitute for a loaded card. Current export defaults to All, and ExportPageChoice thumbnails exist ONLY for Selected: capture17 has no asynchronous page preview in this source. We retain its route and check the content region enclosing File name and Save to Files, which also contains page-choice images when present, rather than change the screenshot to a different scope. Document search already waits for the result count's 'Search result ... of ...' AX element; its page pixels additionally get G2. Text capture already waits for the actual fixture paragraph. No speculative app fixes.
+
+The assistant policy and its existing regression-test entry point are preserved, but its private real-app wrapper now throws after the original diagnostic/XCTFail if readiness was not confirmed. This closes the existing continueAfterFailure path that could still emit a normal review attachment after a failed assistant gate. The private Capture wait now subtracts the first predicate's elapsed time before polling, so snapshot work does not start a fresh full budget. Settings also requires the destination's real navigation title before comparing its bar; an unchanged old bar cannot stand in for the pushed page.
+
+Should protect capture01/02/03/15/17/20 (all four variants) and prevent a misleading capture14 after failure. Next CI must show content-region coordinates and two identical samples before each normal image, no ordinary attachment after timeout, actual result rows rather than background library cards, a loaded plugin/empty-list state and the study front text. Review the images as well as logs: pixel equality is the requested fallback where source hides bitmap readiness from AX; a static placeholder or persistent blur can be stable. It is not an app-owned completion signal like canvasSettled/thumbnails. The next visual audit must identify any such residual case for an app fact rather than silently treating stability as proof of image semantics.
+
+#### Complete capture inventory
+
+All rows retain their original state predicate. 'AX' means a mounted accessibility element/geometry, not proof of raster completion. 'Pixels' means identical real cropped screenshots at least 300 ms apart. 'Canvas' means the companion app's rendered-content canvasSettled fact, after state and inside the same 15-second deadline. Every row applies to all four appearances/orientations of the named test group.
+
+| Attachment / test group | Existing gate and what it actually established | Final drawn-content gate / decision |
+| --- | --- | --- |
+| 01 library-grid / 01 | library model + notebook card AX; cover could load later | Visible document-card region Pixels |
+| 02 library-list / 01 | library model + notebook card after List; cover could load later | Visible document-row region Pixels |
+| 03 open-folder / 01 | library model + Back to Documents and Lecture notes AX | Visible folder document-card region Pixels |
+| 04 library-search / 02 | library model + notebook label, potentially the background card | Actual search.open result row with notebook heading + result-region Pixels |
+| 05 new-menu / 03 | library model + Notebook choice AX | Static menu content already offered; no async content in this menu |
+| 06 new-notebook / 03 | library model/panel + New Notebook title; preview/tiles could load later | Continuous form containing cover and paper sections + Pixels |
+| 07 canvas-palette-left / 04 | document/dock model + visible More and Colour 1 | Canvas; existing palette visibility checks retained |
+| 08 canvas-palette-top / 04 | document/dock model + visible More and Colour 1 | Canvas; existing palette visibility checks retained |
+| 09 canvas-palette-bottom / 04 | document/dock model + visible More and Colour 1 | Canvas; existing palette visibility checks retained |
+| 10 options-bar / 04 | document/pen model + menu.toolSettings AX | Canvas; static options controls already mounted |
+| 11 pen-options / 05 | document/tool model + Fountain Pen AX | Canvas + existing actual settings-title requirement |
+| 12 highlighter-options / 06 | document/tool model + Highlighter AX | Canvas + existing actual settings-title requirement |
+| 13 eraser-options / 07 | document/tool model + Eraser AX | Canvas + existing actual settings-title requirement |
+| 14 lasso-options / 08 | document/tool model + Lasso AX | Canvas + existing actual settings-title requirement |
+| 15 shapes-options / 09 | document/tool model + Shapes AX | Canvas + existing actual settings-title requirement |
+| 16 text-options / 10 | document/tool model + Text AX | Canvas + existing actual settings-title requirement |
+| 17 lasso-object-menu / 11 | stroke/selection model + duplicate action AX | Canvas + existing selection/menu requirements |
+| 18 page-sidebar / 12 | sidebar.pages model only after toggle | Canvas + thumbnails visible > 0, loaded == visible |
+| 19 outline / 12 | outline.tab model + No outline yet AX | Canvas + actual empty-outline text; no async entries in fixture |
+| 20 document-search-matches / 13 | document model + Search result ... of ... count AX after query | Canvas + existing result-specific element; count proves results, not a toolbar title |
+| 21 ai-assistant / 14 | document/items/panel model + rendered pen/note contrast and 0.5-second geometry gate | Canvas + retained 20-second assistant foreground gate; abort ordinary capture on its failure |
+| 22 plugin-manager / 15 | library model + Install from action AX; list may still load | Loaded/empty-list marker, no Loading plugins, list-region Pixels |
+| 23 settings-general / 16 | library model + visible Settings navigation and Done control | Static root section content, no push; existing surface gate retained |
+| 24 settings-editing / 16 | library model + Open documents in tabs AX | Destination title + hittable sheet.dismiss + whole bar Pixels within 5 seconds |
+| 25 settings-stylus / 16 | library model after push (no destination content wait) | Destination title + hittable sheet.dismiss + whole bar Pixels within 5 seconds |
+| 26 export-sheet / 17 | document model + Save to Files AX | Canvas + actual export form Pixels; current All scope has no page-choice preview |
+| 27 whiteboard / 18 | document/itemCount == 3 model only | G1 mounted canvas + Canvas |
+| 28 text-document / 19 | document model + fixture paragraph AX | G1 Text document collection + retained actual paragraph requirement; no tiled canvas |
+| 29 study-session / 20 | practice panel model + Flip Card header geometry/hittability | Actual Question side/front text + card-region Pixels |
+| 30 presentation-mode / 21 | external-display capability, Stop Presenting AX + document model | Canvas + existing capability/action requirements; four existing device-only skips unchanged |
+| 31 three-document-tabs / 22 | document model + Tab 3 of 3 / 3 open documents AX | G1 mounts each kind + Canvas for final notebook; tab count AX retained |
+| 32 empty-folder / 23 | library model, folder breadcrumb and zero document controls | Intentional empty content, no thumbnails to await; existing empty-folder gate retained |
+| 33 page-render-error / 24 | failedRender/failureCount == 1 model + settled hittable Try Again | Intentional error UI; successful tile fact is inapplicable, all error assertions retained |
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Capture 01/02/03/15/17/20, all variants | Capture content region | Did the source-defined content/loaded marker exist, and which clipped pixels were tested? |
+| Same content captures | Capture pixel settle / Capture pixel timeout | Did real content pixels stop changing within the existing budget; what did the last two frames show? |
+| Capture 14, all variants | Assistant readiness timeout (existing) plus thrown failure | Was unconfirmed foreground rendering diagnosed without emitting a normal review image afterwards? |
+
+### Final review and verification
+
+Re-read all changed Swift blocks and surrounding control flow, the unchanged NibTouchPaths.h signatures, all openDocument class callers and both CaptureReadinessUITests callers of checkAssistantReadiness. No Objective-C changes or new SPI calls. Reviewed XCTest queries/snapshot attributes, optional bindings (no same-scope guard rebinding), enum cases, escaping/nonthrowing predicate closures, region coordinate mapping, CG image buffer formats, deadlines, and all call labels. The shared openDocument signature and strict model-state assertion remain unchanged. Capture's private assistant wrapper is its only changed throwing call site; the static regression-test API is unchanged. Existing predicates, assertions, 96 capture test declarations, other class test declarations, allowances, sleeps and skips are preserved.
+
+Required validation: python Scripts/lint.py reports **0 errors, 25 warnings**; git diff --check (including against 5040b001) passes. Source inventory checks preserve all existing test declarations, XCTAssert lines, allowances and sleep/skip calls. Only three NibUITests paths changed. Five cluster commits with the requested attribution body; no push.
+
+Runtime saving estimate: **0 seconds claimed**. These gates intentionally add necessary readiness work. The 32 new content-region checks plus eight bar checks require at least 12 seconds of sample separation across the class, plus AX/screenshot cost and actual loading time; roughly 1-3 additional minutes on an otherwise healthy run is an unmeasured planning estimate, not a runtime result. All existing test allowances remain. Synchronous XCTest AX/screenshot requests cannot be interrupted by outer deadlines; late render observations are rejected and their cost is logged.
+
+Unverified until macOS CI: Swift/XCTest compilation; UIKit/SwiftUI AX exposure of the text collection, study header/face children, navigation title/bar, scroller anchors and result labels; full-resolution crop equality in both orientations; the companion canvasSettled/thumbnails facts and their latency. Exact pixel equality may expose continuing animations and fail, intentionally retaining evidence. A stable placeholder remains a limitation of pixel fallback, documented above. The failedRender and All-scope export decisions are explicit source-backed exceptions, not missing work. All G1-G5 clusters are complete; none left unstarted.

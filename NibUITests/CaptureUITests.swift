@@ -71,9 +71,12 @@ final class CaptureUITests: XCTestCase {
 
     private func wait(_ message: String, timeout: TimeInterval = 12,
                       _ predicate: @escaping () -> Bool) throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
         if predicate() { return }
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0 else { throw NibUI.Failure.message(message) }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
-        guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
+        guard XCTWaiter.wait(for: [expectation], timeout: remaining) == .completed else {
             throw NibUI.Failure.message(message)
         }
     }
@@ -130,6 +133,14 @@ final class CaptureUITests: XCTestCase {
                 guard let counts = $0 as? [String: Any], let visible = counts["visible"] as? Int,
                       let loaded = counts["loaded"] as? Int else { return false }
                 return visible > 0 && loaded == visible
+            }
+        }
+        let asynchronousSurfaces = ["library-grid", "library-list", "open-folder", "library-search",
+                                    "new-notebook", "plugin-manager", "study-session", "export-sheet"]
+        if asynchronousSurfaces.contains(screen) {
+            try settledPixels("\(screen) content did not settle",
+                              timeout: deadline - ProcessInfo.processInfo.systemUptime) {
+                self.captureContentRegion(screen)
             }
         }
         let stem = String(format: "%02d", number) + "-\(screen)-\(appearance)-\(orientation)"
@@ -193,13 +204,14 @@ final class CaptureUITests: XCTestCase {
 
     /// Accessibility state can precede the canvas bitmaps and palette foreground. See QA-ui-app15-strip.md
     /// for the rendering paths and the unresolved diagnosis. A timeout fails the test and preserves the capture.
-    private func settledNotebookWithAssistant() {
+    private func settledNotebookWithAssistant() throws {
         var readiness = CaptureReadiness()
         var lastScreenshot: XCUIScreenshot?
         var lastSnapshot: XCUIElementSnapshot?
         var lastFacts = "No app snapshot obtained"
         var lastDiagnosis = "elements.missing; no observation"
         var pass = 0
+        var confirmed = false
         func find(_ root: XCUIElementSnapshot?, matching predicate: (XCUIElementSnapshot) -> Bool) -> XCUIElementSnapshot? {
             guard let root else { return nil }
             if predicate(root) { return root }
@@ -249,7 +261,7 @@ final class CaptureUITests: XCTestCase {
                 }.joined(separator: "; ")
                 let presence = "snapshot=\(root != nil) canvasExists=\(canvas != nil) windowExists=\(window != nil)"
                 ui.logQA("Assistant readiness pass", "pass=\(pass) \(presence) \(imageFacts); \(cropFacts); \(lastDiagnosis)")
-                if verdict.isReady { return }
+                if verdict.isReady { confirmed = true; return }
             }
             throw NibUI.Failure.message(lastDiagnosis)
         }, diagnose: { error in
@@ -267,6 +279,9 @@ final class CaptureUITests: XCTestCase {
             ui.logStateStep(stem) // Raw nib.qa.state value; text attachments are not exported by CI.
             attach(XCTAttachment(string: "Rendering readiness unconfirmed: \(error)"), name: stem + "-reason")
         })
+        guard confirmed else {
+            throw NibUI.Failure.message("Assistant rendering readiness failed: " + lastDiagnosis)
+        }
     }
 
     /// Shared by the real assistant wait and its regression tests. Keep gathering evidence after a timeout,
@@ -384,6 +399,84 @@ final class CaptureUITests: XCTestCase {
             }) else { return nil }
             return bar.frame
         }
+    }
+
+    /// Resolve the content from one fresh snapshot per sample. Crop to its actual viewport,
+    /// excluding the keyboard/search caret and unrelated animated chrome. AX content anchors
+    /// precede the pixel check; a toolbar/title alone is never the readiness signal.
+    private func captureContentRegion(_ screen: String) -> CGRect? {
+        guard let root = try? ui.app.snapshot() else {
+            ui.logQA("Capture content region", "screen=\(screen) snapshot missing")
+            return nil
+        }
+        typealias Node = (element: XCUIElementSnapshot, visible: CGRect)
+        var nodes: [Node] = []
+        func collect(_ node: XCUIElementSnapshot, viewport: CGRect) {
+            let clipped = node.frame.intersection(viewport)
+            if !clipped.isNull, !clipped.isEmpty { nodes.append((node, clipped)) }
+            let clips = [XCUIElement.ElementType.scrollView, .collectionView, .table, .window].contains(node.elementType)
+            for child in node.children { collect(child, viewport: clips ? clipped : viewport) }
+        }
+        collect(root, viewport: root.frame)
+        func contains(_ node: XCUIElementSnapshot, _ predicate: (XCUIElementSnapshot) -> Bool) -> Bool {
+            predicate(node) || node.children.contains { contains($0, predicate) }
+        }
+        func union(_ matches: [Node]) -> CGRect? {
+            guard let first = matches.first else { return nil }
+            return matches.dropFirst().reduce(first.visible) { $0.union($1.visible) }
+        }
+        func container(kinds: [XCUIElement.ElementType],
+                       first: (XCUIElementSnapshot) -> Bool,
+                       second: (XCUIElementSnapshot) -> Bool) -> CGRect? {
+            nodes.filter { kinds.contains($0.element.elementType) && contains($0.element, first)
+                && contains($0.element, second) }
+                .min { $0.visible.width * $0.visible.height < $1.visible.width * $1.visible.height }?.visible
+        }
+        let scrollers: [XCUIElement.ElementType] = [.scrollView, .collectionView, .table]
+        let region: CGRect?
+        switch screen {
+        case "library-grid", "library-list", "open-folder":
+            // LibraryItemTapTarget encloses the cover in grid and list layouts.
+            region = union(nodes.filter { $0.element.elementType == .button && $0.element.identifier == "cmd.doc.open" })
+        case "library-search":
+            // Unlike the underlying library card, SearchResultRow owns search.open and the hit heading.
+            region = union(nodes.filter {
+                $0.element.elementType == .button && $0.element.identifier == "cmd.search.open"
+                    && $0.element.label.contains(notebook)
+            })
+        case "new-notebook":
+            // The outer continuous form contains title/preview, cover strip AND the paper grid.
+            region = container(kinds: scrollers, first: { $0.label == "No cover" },
+                               second: { $0.label == "Paper" })
+        case "plugin-manager":
+            let loaded: (XCUIElementSnapshot) -> Bool = {
+                $0.label == "No plugins yet" || ($0.elementType == .switch && $0.label.hasPrefix("Enable "))
+            }
+            if nodes.contains(where: { $0.element.label == "Loading plugins" }) {
+                region = nil
+            } else {
+                region = container(kinds: scrollers, first: loaded, second: { $0.label == "Galleries" })
+            }
+        case "study-session":
+            // Fixture fronts are text, in any practice order. Flip Card is in the header and
+            // can exist before model.current; require the actual face and its fixture text.
+            let fronts = ["Velocity", "Acceleration", "Force"]
+            region = nodes.first { node in
+                guard node.element.label == "Question side" else { return false }
+                return contains(node.element) { child in
+                    child.elementType == .staticText && fronts.contains(child.label)
+                }
+            }?.visible
+        case "export-sheet":
+            // All is the default scope (no page-choice previews). If previews are present,
+            // the form encompassing File name and Save to Files includes them too.
+            region = container(kinds: scrollers + [.other, .sheet, .alert, .popover],
+                               first: { $0.label == "File name" }, second: { $0.label == "Save to Files" })
+        default:
+            region = nil
+        }
+        ui.logQA("Capture content region", "screen=\(screen) region=\(String(describing: region)) visibleNodes=\(nodes.count)")
+        return region
     }
 
     private func folder(_ title: String) throws {
@@ -559,7 +652,7 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook()
             try self.tap("Assistant")
             _ = try self.ui.waitForState { $0.openPanels.contains("aichat.panel") }
-            self.settledNotebookWithAssistant()
+            try self.settledNotebookWithAssistant()
             try self.capture(21, "ai-assistant") {
                 $0.screen == "document" && $0.document != nil && $0.itemCountOnPage > 0
                     && $0.openPanels.contains("aichat.panel")
