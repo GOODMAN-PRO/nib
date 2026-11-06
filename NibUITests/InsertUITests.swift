@@ -14,6 +14,7 @@ import Network
 final class InsertUITests: XCTestCase {
     private var ui: NibUI!
     private var provider: InsertProviderFixture?
+    private var mediaPermissionMonitor: NSObjectProtocol?
     private var resetMicrophonePermission = false
     private var recordedStrokeAnchor: (page: XCUIElement, point: CGPoint)?
     private let point = CGPoint(x: 0.46, y: 0.65)
@@ -26,8 +27,9 @@ final class InsertUITests: XCTestCase {
         ui.logIdleSelectors(for: String(describing: type(of: self)))
         // A timed-out denial test cannot run teardown. Reset TCC before every fresh fixture.
         ui.app.resetAuthorizationStatus(for: .microphone)
-        addUIInterruptionMonitor(withDescription: "System media permission") { alert in
-            if let allow = alert.buttons.allElementsBoundByIndex.first(where: { $0.label.hasPrefix("Allow") || $0.label == "OK" }) {
+        mediaPermissionMonitor = addUIInterruptionMonitor(withDescription: "System media permission") { alert in
+            let allow = alert.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Allow' OR label == 'OK'")).firstMatch
+            if allow.exists {
                 allow.tap(); return true
             }
             return false
@@ -928,7 +930,7 @@ final class InsertUITests: XCTestCase {
         try counts(5); try selectAt()
         let before = try item("image")
         try menu("Replace Image")
-        let photo = try ui.photoAsset(diagnostics: true)
+        let photo = try ui.photoAsset()
         XCTAssertTrue(photo.waitForExistence(timeout: 10)); try ui.tapPhotoAsset(photo)
         // F034 replaces an existing item, so its unchanged count is not a completion
         // signal. Let the native picker finish before querying the canvas hierarchy.
@@ -944,7 +946,7 @@ final class InsertUITests: XCTestCase {
         try image(); try menu("Save to Photos")
         try allowSystemPermissionIfPresented()
         outside(); try ui.selectTool("image"); ui.coordinate(CGPoint(x: 0.63, y: 0.8)).tap(); try tap("Photos")
-        let photo = try ui.photoAsset(diagnostics: true)
+        let photo = try ui.photoAsset()
         XCTAssertTrue(photo.waitForExistence(timeout: 10), "Saved image must be available in Photos, or a useful permission error must be shown")
         try ui.cancelRemotePicker(.photos); try counts(5)
     }
@@ -1161,12 +1163,16 @@ final class InsertUITests: XCTestCase {
         try selectAt(target: canvasText(text))
     }
     func testStickySevenColoursAndSelectedOnlyRecolour() throws {
+        if let monitor = mediaPermissionMonitor { removeUIInterruptionMonitor(monitor); mediaPermissionMonitor = nil }
         try sticky(); let original = try item("sticky")
         var colours = Set<String>()
         for colour in ["Lemon", "Blush", "Apricot", "Mint", "Sky", "Lilac", "Stone"] {
             try menu("Style")
             if query("Sticky Note", .button).allElementsBoundByIndex.contains(where: { $0.isHittable }) { try tap("Sticky Note") }
-            try tap(colour); outside()
+            let started = ProcessInfo.processInfo.systemUptime
+            defer { ui.logQA("Sticky colour timing", "colour=\(colour) seconds=\(ProcessInfo.processInfo.systemUptime - started)") }
+            try tap(colour)
+            try ui.pressWithoutIdle(at: ui.interfacePoint(CGPoint(x: 0.93, y: 0.83)), duration: 0.05)
             let changed = try item("sticky")
             colours.insert(json(changed["color"]))
             XCTAssertEqual(try plain(changed), "Lab reminder")
@@ -1283,7 +1289,7 @@ final class InsertUITests: XCTestCase {
     func testTapeImportedPhotoPatternCanBeDrawnAndDeleted() throws {
         try image(); try menu("Save to Photos"); try allowSystemPermissionIfPresented(); outside()
         try ui.openToolSettings("tape"); try tap("Add a pattern from an image", scroll: true); try tap("Photos")
-        let photo = try ui.photoAsset(diagnostics: true)
+        let photo = try ui.photoAsset()
         XCTAssertTrue(photo.waitForExistence(timeout: 10)); try ui.tapPhotoAsset(photo)
         try tap("Image 1", scroll: true); outside(); try drawTape()
         XCTAssertNotNil((try snapshot("stroke")["style"] as? JSON)?["tapePattern"])

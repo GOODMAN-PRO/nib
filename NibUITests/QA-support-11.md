@@ -366,3 +366,11 @@ Confirmed insert-providers-timeouts#2 against the banner's 28-point offset chang
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | ReplayModesAndSeekFromRealTimestampedInk | Replay recording geometry / Replay settled contact | Did the contact follow the page's current transform after the banner disappeared? |
+
+### N10 - remove measured diagnostic/interruption cost
+
+Confirmed insert-providers-timeouts#3/#4: Sticky completed all assertions in 190.5 seconds with seven 3.2-4.7-second interruption blocks; Tape Photos spent about 37 seconds inventorying assets. The permission monitor now uses one predicate instead of enumerating all buttons; Sticky explicitly removes its unneeded monitor and dismisses each colour popover through the existing runner touch route at the same outside point, bypassing the default interruption path as well. All seven colours, uniqueness/text/source/author checks remain together. Removed diagnostics:true from the three diagnosed photoAsset calls; selection and failure diagnostics remain. CI must fit Sticky under 180 seconds and Tape near 140 seconds; estimated savings about 25-30 and 37 seconds respectively, unmeasured. No split is justified until these measured costs are removed and CI rechecks.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| StickySevenColoursAndSelectedOnlyRecolour | Sticky colour timing | What remains of colour delivery/copy time without interruption handling? |
