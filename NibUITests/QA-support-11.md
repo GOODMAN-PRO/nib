@@ -46,3 +46,11 @@ Added measuredSnapshot and measuredQuery around shared list/form snapshots, find
 | KeyProbe text matrix; Canvas go(); Chrome Customise and shared queries | slow query | Which AX request exceeded 10 s, how many elements returned, and which keyboard-focus attributes were exposed? |
 | Canvas go() callers | Go to Page focus | Was autofocus reused once and was input sent through SPI? |
 
+### H5 - one retry for a proven undelivered chord
+
+Confirmed R12:capture-and-probe#1 against chord and capture16Settings: the bounded Settings postcondition failed and both keyLog and keyLogTotal were unchanged. The catch path now requires decoded before/after logs and nonnil equal totals, plus an explicitly non-text responder, before resending once with existing sendHardwareKey. It logs keyboard frames/responder/key-window facts. The same bounded postcondition runs again; an arrived chord with no effect fails as before (existing proven modifier-loss handling remains). No retry follows missing probe evidence. Should unblock test16SettingsDarkLandscape and other proven dropped global chords without hiding app failures. CI must show arrival in App key log, Settings navigation/Done, or one failed retry with facts; no second retry.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Capture Settings / global chord callers | Chord undelivered retry / App key log activity | Was the log demonstrably unchanged after the bounded action wait, and did the single SPI resend arrive? |
+

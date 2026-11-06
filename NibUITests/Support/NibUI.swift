@@ -1092,12 +1092,23 @@ final class NibUI {
                 let deliveryAfter = chordProbeSnapshot()
                 if let prior = deliveryBefore.state, let after = deliveryAfter.state,
                    let priorLog = prior.keyLog, let afterLog = after.keyLog,
-                   priorLog == afterLog, prior.keyLogTotal == after.keyLogTotal {
+                   let priorTotal = prior.keyLogTotal, let afterTotal = after.keyLogTotal,
+                   priorLog == afterLog, priorTotal == afterTotal {
                     logQA("Chord no new key event", "key=\(key) modifiers=\(modifiers.rawValue)\nbefore delivery: "
                         + deliveryBefore.facts + "\nafter failed postcondition: " + deliveryAfter.facts)
+                    if after.keyResponderIsText == false {
+                        let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
+                        logQA("Chord undelivered retry", "key=\(key) modifiers=\(modifiers.rawValue) keyboards=\(keyboards) " + deliveryAfter.facts)
+                        try sendHardwareKey(key, modifiers)
+                        do { try postcondition(); return }
+                        catch {
+                            recordDiagnostics("Chord undelivered retry failed", facts: "key=\(key) modifiers=\(modifiers.rawValue)")
+                            throw error
+                        }
+                    }
                 }
-                // Retry only a proven modifier loss on a fresh printable press outside text editing.
-                // In particular, missing events and control keys are not retry evidence.
+                // Otherwise retry only a proven modifier loss on a fresh printable press.
+                // An arrived, correctly modified chord with no effect remains an app failure.
                 if let current = try? state(), current.keyResponderIsText != true,
                    let observed = missingChordModifiers(key, modifiers, before: logBeforeDelivery,
                                                         after: current.keyLog ?? []) {
