@@ -965,7 +965,6 @@ final class FeatElementsTests: XCTestCase {
 
     // MARK: GIPHY
 
-    /// The starter grid used to push the collection bar below the tool panel's 520 pt viewport.
     func testCollectionBarTargetsTheSelectedChipAfterLoadingAndCreating() async throws {
         let h = harness()
         let model = ElementsModel(app: h.app, session: h.session)
@@ -983,6 +982,7 @@ final class FeatElementsTests: XCTestCase {
         XCTAssertEqual(ElementsCollectionBar(model: model).scrollTarget, "new-collection", "Reopening keeps the selected target")
     }
 
+    /// The starter grid used to push the collection bar below the tool panel's 520 pt viewport.
     /// Measure real SwiftUI content with both optional footer actions, not a duplicate layout formula.
     func testStickerCatalogueLeavesRoomForCollectionControlsWithSelection() async throws {
         let h = harness()

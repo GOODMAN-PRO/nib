@@ -917,7 +917,6 @@ final class FeatClipboardTests: XCTestCase {
         XCTAssertEqual(broken["source"], "empty")
     }
 
-    /// A drag dropped back on its own canvas moves the selection: same page = item.transform, other page = item.moveToPage.
     func testDragSourceFactDescribesTheProviderAndLoadedPNG() async throws {
         let h = Harness(features: [FeatClipboardFeature.self])
         h.app.services.renderer = FakeRenderer()
@@ -1059,6 +1058,7 @@ final class FeatClipboardTests: XCTestCase {
         XCTAssertEqual(calls, 2)
     }
 
+    /// A drag dropped back on its own canvas moves the selection: same page = item.transform, other page = item.moveToPage.
     func testOwnDragDropRouting() {
         let source = CanvasDragContext(host: ObjectIdentifier(self), doc: Fixtures.docID, page: Fixtures.page1,
                                        start: Point(150, 240), bounds: Rect(x: 100, y: 200, width: 120, height: 90),

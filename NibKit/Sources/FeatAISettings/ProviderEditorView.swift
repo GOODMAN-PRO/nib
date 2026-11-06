@@ -224,6 +224,8 @@ struct ProviderEditorView: View {
     }
 
     // A Form realises its rows lazily. These controls live with the form, even while its action rows are off screen.
+    // Shortcut registration with hit testing disabled still needs a device/UI run. If it fails, remove
+    // allowsHitTesting(false); do not add hidden(), which would remove the shortcuts.
     private var keyboardActions: some View {
         Group {
             Button(String(localized: "Save provider")) { save() }

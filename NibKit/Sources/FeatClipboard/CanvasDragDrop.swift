@@ -37,13 +37,15 @@ struct CanvasDragSourceFact {
     }
 
     var json: JSONValue {
+        let registeredTypes: JSONValue = .array(types.map { JSONValue.string($0) })
+        let png: JSONValue = pngBytes.map { JSONValue.number(Double($0)) } ?? .null
         let target: JSONValue = preview.map { rect in
             .object(["x": .number(Double(rect.minX)), "y": .number(Double(rect.minY)),
                      "width": .number(Double(rect.width)), "height": .number(Double(rect.height))])
         } ?? .null
         return ["sequence": .number(Double(sequence)), "items": .number(Double(items)),
-                "types": .array(types.map { .string($0) }), "restricted": .bool(restricted),
-                "preview": target, "pngBytes": pngBytes.map { .number(Double($0)) } ?? .null]
+                "types": registeredTypes, "restricted": .bool(restricted),
+                "preview": target, "pngBytes": png]
     }
 }
 

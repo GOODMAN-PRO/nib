@@ -536,11 +536,15 @@ final class FeatSidebarTests: XCTestCase {
         let targetBefore = try h.snapshot(target)
         let originalPages = try h.app.workspace.content(target).livePages.count
         let targetUndo = h.undoDepth(target)
-        let model = PagesPanelModel(app: h.app, session: window(h, target))
+        let session = window(h, target)
+        let model = PagesPanelModel(app: h.app, session: session)
         let providers = [p1, p2].map { provider(h, $0) }
         let kind = PageDropKind.of(local: doc, target: target, hasPages: true, hasFiles: false)
         XCTAssertEqual(kind, .pages)
-        XCTAssertEqual(PageDropKind.proposal(for: kind, canEdit: model.canEdit, allowsMoveOperation: true).operation, .copy)
+        // The receiving path checks document permissions; the notebook-only panel disables itself for this fixture.
+        let canEdit = SidebarMenuTarget.canEdit(app: h.app, session: session, doc: target)
+        XCTAssertTrue(canEdit)
+        XCTAssertEqual(PageDropKind.proposal(for: kind, canEdit: canEdit, allowsMoveOperation: true).operation, .copy)
         let finished = expectation(description: "foreign window pages received")
         let task = Task { @MainActor in
             if kind == .pages { await model.pastePages(providers, into: target, at: .end) }
