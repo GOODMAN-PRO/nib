@@ -528,23 +528,32 @@ final class CaptureUITests: XCTestCase {
 
     /// Waits for the named capture surface and attaches it after the state predicate succeeds.
     private func capture21Presentation() throws {
-        try runVariant {
-            try self.openNotebook()
-            try self.tap("Share and Export")
-            let share = self.ui.app.scrollViews["Share and Export"].firstMatch
-            try self.wait("Share and Export must open its menu") { share.exists && share.buttons.firstMatch.exists }
-            let externalDisplay = try XCTUnwrap(try self.ui.qaFact("externalDisplay") as? Bool,
-                                                "QA fact externalDisplay must be Boolean")
-            if !externalDisplay {
-                let presenter = self.query("Presenter Page").firstMatch
-                XCTAssertFalse(presenter.exists, "Presenter Page must not be offered without an external display")
-                guard !presenter.exists else { throw NibUI.Failure.message("Unexpected Presenter Page without an external display") }
-                self.ui.recordDiagnostics("Presentation device-only prerequisite", includeHierarchy: false)
-                throw XCTSkip("Device-only: external display is missing; verified here: Share and Export opens and does not offer Presenter Page")
+        do {
+            try runVariant {
+                try self.openNotebook()
+                try self.tap("Share and Export")
+                let share = self.ui.app.scrollViews["Share and Export"].firstMatch
+                try self.wait("Share and Export must open its menu") { share.exists && share.buttons.firstMatch.exists }
+                let externalDisplay = try XCTUnwrap(try self.ui.qaFact("externalDisplay") as? Bool,
+                                                    "QA fact externalDisplay must be Boolean")
+                if !externalDisplay {
+                    let presenter = self.query("Presenter Page").firstMatch
+                    XCTAssertFalse(presenter.exists, "Presenter Page must not be offered without an external display")
+                    guard !presenter.exists else { throw NibUI.Failure.message("Unexpected Presenter Page without an external display") }
+                    self.ui.recordDiagnostics("Presentation device-only prerequisite", includeHierarchy: false)
+                    throw XCTSkip("Device-only: external display is missing; verified here: Share and Export opens and does not offer Presenter Page")
+                }
+                try self.tap("Presenter Page", scroll: true)
+                _ = try self.require("Stop Presenting")
+                try self.documentCapture(30, "presentation-mode")
             }
-            try self.tap("Presenter Page", scroll: true)
-            _ = try self.require("Stop Presenting")
-            try self.documentCapture(30, "presentation-mode")
+        } catch {
+            if !(error is XCTSkip) {
+                let reason = "\(name) / \(appearance) / \(orientation): \(error)"
+                attach(XCTAttachment(string: reason + "\n\n" + ui.app.debugDescription), name: "unreachable-\(name)")
+                attach(XCTAttachment(screenshot: XCUIScreen.main.screenshot()), name: "diagnostic-\(name)")
+            }
+            throw error
         }
     }
 

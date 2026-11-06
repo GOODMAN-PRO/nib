@@ -185,10 +185,10 @@ final class NibUI {
         return actionable ? nil : candidates.first?.0
     }
 
-    /// Full containment in the nearest enclosing scroller, not merely a window sliver.
+    /// Full vertical containment; horizontal strips retain the existing hittable result.
     private func controlFitsScroller(_ target: XCUIElement, in scope: XCUIElement?) -> Bool {
         guard let control = try? measuredSnapshot(target, named: "scroll control"),
-              let root = try? measuredSnapshot(scope ?? app, named: "scroll control ancestry") else { return false }
+              let root = try? measuredSnapshot(scope ?? app, named: "scroll control ancestry") else { return true }
         func find(_ node: XCUIElementSnapshot, ancestors: [XCUIElementSnapshot]) -> [XCUIElementSnapshot]? {
             if node.elementType == control.elementType && node.identifier == control.identifier
                 && node.label == control.label && node.frame == control.frame { return ancestors }
@@ -196,16 +196,49 @@ final class NibUI {
             for child in node.children { if let result = find(child, ancestors: next) { return result } }
             return nil
         }
-        guard let ancestors = find(root, ancestors: []) else { return false }
+        // Separate snapshots can straddle a layout change. An unmatched frame is not
+        // evidence of clipping: retain findControl's existing hittable result.
+        guard let ancestors = find(root, ancestors: []) else { return true }
         guard let nearest = ancestors.last else { return true }
+        if isHorizontalOnlyScroller(nearest) { return true }
         var viewport = nearest.frame.intersection(app.windows.firstMatch.frame)
         for ancestor in ancestors.dropLast() { viewport = viewport.intersection(ancestor.frame) }
         viewport = verticalCueViewport(nearest, viewport: viewport)
-        let fits = !control.frame.isEmpty && viewport.contains(control.frame)
+        let fits = fitsVerticalViewport(control.frame, viewport: viewport)
         if !fits {
             logQA("Clipped control reveal", "label=\(control.label) target=\(control.frame) scroller=\(nearest.frame) viewport=\(viewport)")
         }
         return fits
+    }
+
+    private func fitsVerticalViewport(_ frame: CGRect, viewport: CGRect) -> Bool {
+        !frame.isEmpty && !viewport.isEmpty
+            && viewport.contains(CGPoint(x: frame.midX, y: frame.midY))
+            && frame.minY >= viewport.minY && frame.maxY <= viewport.maxY
+    }
+
+    private func isHorizontalOnlyScroller(_ scroller: XCUIElementSnapshot) -> Bool {
+        guard scroller.elementType == .scrollView else { return false }
+        var horizontal = false
+        var vertical = false
+        func visit(_ node: XCUIElementSnapshot) {
+            if node.elementType == .scrollBar {
+                horizontal = horizontal || node.label.hasPrefix("Horizontal scroll bar")
+                vertical = vertical || node.label.hasPrefix("Vertical scroll bar")
+                return
+            }
+            if !node.frame.isEmpty && !node.frame.isInfinite && !node.frame.isNull {
+                horizontal = horizontal || node.frame.minX < scroller.frame.minX - 1
+                    || node.frame.maxX > scroller.frame.maxX + 1
+                vertical = vertical || node.frame.minY < scroller.frame.minY - 1
+                    || node.frame.maxY > scroller.frame.maxY + 1
+            }
+            // A nested scroller's content belongs to its own axis, not this one's.
+            if [.scrollView, .table, .collectionView].contains(node.elementType) { return }
+            for child in node.children { visit(child) }
+        }
+        for child in scroller.children { visit(child) }
+        return horizontal && !vertical
     }
 
     private func verticalCueViewport(_ scroller: XCUIElementSnapshot, viewport: CGRect) -> CGRect {
@@ -608,7 +641,7 @@ final class NibUI {
             let targetFrame = name != nil || identity != nil ? targetNode(snapshot)?.frame
                 : (element.exists ? element.frame : nil)
             if let targetFrame {
-                let inside = fullyVisible ? viewport.contains(targetFrame)
+                let inside = fullyVisible ? fitsVerticalViewport(targetFrame, viewport: viewport)
                     : viewport.contains(CGPoint(x: targetFrame.midX, y: targetFrame.midY))
                 if inside && element.isHittable { fullyRevealed = true; return }
             }
@@ -2846,14 +2879,19 @@ final class NibUI {
             logQA("Native menu row tap", facts)
             try tapWithoutIdle(item)
         }
-        // Bind the small container before delivery. Accept the first absent observation;
-        // the caller owns the successor form/alert/content postcondition.
+        // Keep the small container check, but require two consecutive absent observations
+        // so ordinary input cannot race a transient absence during dismissal animation.
+        var absentObservations = 0
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            if let container = closingContainer { return !container.exists }
+            let absent: Bool
+            if let container = closingContainer { absent = !container.exists }
             // Some native trees expose only the row. Keep the existing successor-frame
-            // rule there, without three app-wide walks or a mandatory second evaluation.
-            guard let action = lastAction else { return false }
-            return !action.item.exists || action.item.frame != action.frame
+            // rule there without three app-wide walks.
+            else if let action = lastAction {
+                absent = !action.item.exists || action.item.frame != action.frame
+            } else { absent = false }
+            absentObservations = absent ? absentObservations + 1 : 0
+            return absentObservations >= 2
         }, object: nil)
         guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
             recordDiagnostics("Native menu dismissal failed")
@@ -3251,11 +3289,16 @@ final class NibUI {
         // typed Sheet, run 41961796255), so the close control is looked up app-wide as before. A panel's own
         // close button counts only until something else was dismissed: after Audio's share sheet closes,
         // the loop must not go on to close the Audio panel behind it (D:controls-forms#9).
-        var dismissedSurface = false
+        var dismissedSurface = try dismissSystemShareSheet()
+        var shouldProbeShareSheet = false
         for _ in 0..<8 {
-            if try dismissSystemShareSheet() {
-                dismissedSurface = true
-                continue
+            // Re-probe only after dismissing a covering surface that could reveal sharing.
+            if shouldProbeShareSheet {
+                shouldProbeShareSheet = false
+                if try dismissSystemShareSheet() {
+                    dismissedSurface = true
+                    continue
+                }
             }
             if requireClosedPopover {
                 let form = presentedFormSnapshot()
@@ -3265,10 +3308,12 @@ final class NibUI {
                     close.tap()
                     try waitForFormClosed(form, cover: region)
                     dismissedSurface = true
+                    shouldProbeShareSheet = true
                     continue
                 }
                 if try dismissPresentedPopover(form: form) {
                     dismissedSurface = true
+                    shouldProbeShareSheet = true
                     continue
                 }
             }
@@ -3279,11 +3324,14 @@ final class NibUI {
             }
             if let close {
                 if close.identifier != "cmd.panel.close" { dismissedSurface = true }
+                shouldProbeShareSheet = close.identifier != "cmd.panel.close"
                 close.tap()
                 continue
             }
             if let sheet = app.sheets.allElementsBoundByIndex.first(where: { hasVisibleFrame($0) && $0.isHittable }) {
-                sheet.swipeDown(); continue
+                sheet.swipeDown()
+                shouldProbeShareSheet = true
+                continue
             }
             if !requireClosedPopover {
                 // A settings bud is not a native popover. Preserve the historical return for shared

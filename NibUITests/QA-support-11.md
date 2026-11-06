@@ -422,3 +422,14 @@ No local Swift/XCTest compilation or simulator execution is possible here. Revie
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | Capture test21Presentation and its three variants | Presentation device-only prerequisite | Did Share and Export open without Presenter Page before the external-display skip? |
+
+### Review fixes - round 6 (2026-11-06)
+
+Confirmed the four review findings against job 11c and the shared-helper callers across all test classes. Changes remain confined to NibUITests; jobs 11a/11b and app code are not revised.
+
+- H11: requireControl's containment guard and fullyVisible reveal now require full vertical extent plus the horizontal centre inside the viewport. A nearest scroller with horizontal-only scrollbar/content-overflow evidence retains the already-hittable result; nested scroller content does not establish its parent's axis. Missing snapshots or an unmatched target between snapshots also retain that result instead of forcing a vertical reveal. The bottom cue and vertical clipping guard remain. CI must reach horizontal swatches/chips without vertical reveal failures while still fully revealing Fit Height to Text.
+- H12: probe system sharing once before the dismissal loop; re-arm only after closing a form, popover, non-panel close control or native sheet that could reveal it. Closing the share sheet itself or an app panel does not trigger another probe. Preserve share closure verification and protection of Audio behind it. Query savings depend on the dismissal path and are not measured locally.
+- H9: require two consecutive absent observations of the bound menu container (or the existing row fallback), resetting the count on presence. Each poll retains the single-container check and the unchanged eight-second bound. CI must show settled dismissal before the next ordinary input without restoring tree-wide polling.
+- D1: catch presentation variant errors, attach the same unreachable text/app hierarchy and diagnostic screenshot as ordinary variants for non-XCTSkip errors, then rethrow every error. The four presentation skips and all prerequisite/capability checks remain unchanged; CI must retain evidence for genuine failures and count only the authorized device-only skips.
+
+Validation: python Scripts/lint.py reports **0 errors, 25 existing warnings**; git diff --check passes. Reviewed the changed Swift signatures, closure state and shared callers. No Swift toolchain or simulator is available here; compilation, AX axis exposure, dismissal timing and capture attachments require GitHub Actions verification.
