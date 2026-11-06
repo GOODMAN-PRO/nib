@@ -2102,6 +2102,46 @@ final class NibUI {
         return last
     }
 
+    /// Opt-in for the native provider Form: reveal once, then let UIKit's keyboard
+    /// traversal bring successive editors into view. No form/model state is injected.
+    func fillNativeFormByKeyboard(_ values: [(String, String)]) throws -> XCUIElement {
+        guard let first = values.first else { throw Failure.message("Native form needs at least one field") }
+        let container = nativeFormContainer()
+        let initial = try requireControl(first.0, type: .textField, scroll: true, in: container)
+        try focusField(initial, in: container)
+        var last = initial
+        for (index, pair) in values.enumerated() {
+            let (name, text) = pair
+            let started = ProcessInfo.processInfo.systemUptime
+            defer { logQA("Native keyboard form field", "field=\(name) seconds=\(ProcessInfo.processInfo.systemUptime - started)") }
+            let field = app.textFields.matching(NSPredicate(
+                format: "label == %@ OR identifier == %@ OR placeholderValue == %@", name, name, name)).firstMatch
+            if index > 0 {
+                var reached = isKeyboardFocused(field, in: container)
+                for _ in 0..<8 where !reached {
+                    try sendHIDKey(0x2B)
+                    let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                        isKeyboardFocused(field, in: container)
+                    }, object: nil)
+                    reached = XCTWaiter.wait(for: [focused], timeout: 1) == .completed
+                }
+                guard reached else { throw Failure.message("Keyboard traversal did not focus " + name) }
+            }
+            guard let value = field.value as? String else { throw Failure.message("Unreadable native field: " + name) }
+            if value != text {
+                if !value.isEmpty && value != field.placeholderValue {
+                    try focusedKey("a", .command)
+                    try sendHIDKey(0x2A)
+                    try waitForNativeText(in: field, equals: "")
+                }
+                if !text.isEmpty { try focusedText(text) }
+            }
+            try waitForNativeText(in: field, equals: text)
+            last = field
+        }
+        return last
+    }
+
     /// A focused field under a floating keypad can be non-hittable and still be the correct typing target.
     func textEditor(_ name: String, timeout: TimeInterval = 8) throws -> XCUIElement {
         let container = nativeFormContainer()
@@ -2239,6 +2279,11 @@ final class NibUI {
         guard app.alerts.firstMatch.exists else { field.typeText(text); return }
         logQA("Native alert text", "route=runner text SPI characters=\(text.count)")
         if text == "\n" { try sendHIDKey(0x28); return }
+        try focusedText(text)
+    }
+
+    /// Caller has established the focused field; exact text is verified by the caller.
+    func focusedText(_ text: String) throws {
         let delivered = XCTestExpectation(description: "Alert text delivered")
         var failure: Error?
         NibTouchPaths.sendKey(text, modifiers: 0, route: 3) { error in

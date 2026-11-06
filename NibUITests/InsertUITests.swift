@@ -802,13 +802,17 @@ final class InsertUITests: XCTestCase {
         guard target.isEnabled else { throw NibUI.Failure.message("Insert Settings control is disabled: " + name) }
         return target
     }
-    private func configureProvider() throws {
+    private func configureProvider(cloudTranscription: Bool = false) throws {
         let started = Date()
         defer { ui.logQA("Insert provider setup", "seconds=\(Date().timeIntervalSince(started))") }
         let state = try ui.state()
         provider = try InsertProviderFixture(page: "page:\(try XCTUnwrap(state.document))/\(try XCTUnwrap(state.page))")
         try wait("External fixture endpoint must start") { self.provider?.port != nil }
         try ui.chord(",", .command) { _ = try self.settingsControl("Editing", scroll: false, timeout: 3) }
+        if cloudTranscription {
+            try settingsControl("Recording Settings").tap()
+            try toggle("Cloud transcription", to: true)
+        }
         try settingsControl("AI").tap(); try settingsControl("Add provider").tap()
         let preset = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Preset,")).firstMatch
         ui.revealFormElement(preset)
@@ -816,10 +820,11 @@ final class InsertUITests: XCTestCase {
         preset.tap()
         try tap("Custom OpenAI-compatible", scroll: true)
         ui.recordDiagnostics("Provider custom preset selected", facts: ui.elementFacts(preset), includeHierarchy: false)
-        let lastField = try ui.fillNativeForm([("Name", "Insert fixture"),
+        let lastField = try ui.fillNativeFormByKeyboard([("Name", "Insert fixture"),
             ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider?.port))/v1"),
             ("Chat model", "insert-fixture"), ("Transcription model", "insert-transcript")])
-        try ui.nativeKey("s", in: lastField)
+        ui.logQA("Provider save shortcut", "saveButtonExists=\(ui.app.buttons["Save provider"].exists)")
+        try ui.nativeKey("s", in: lastField, focusVerified: true)
         let saved = ui.app.staticTexts["Provider saved."].firstMatch
         try wait("Provider save must complete") { saved.exists }
         try ui.dismissSheets(requireClosedPopover: true)
@@ -1619,10 +1624,7 @@ final class InsertUITests: XCTestCase {
     // No app storage, commands, or services are injected; provider setup and regeneration use real UI.
 
     private func transcript() throws {
-        try configureProvider()
-        try ui.chord(",", .command) { _ = try self.settingsControl("Editing", scroll: false) }
-        try settingsControl("Recording Settings").tap(); try toggle("Cloud transcription", to: true)
-        try ui.dismissSheets(requireClosedPopover: true)
+        try configureProvider(cloudTranscription: true)
         try recordClip(); try documentMenu("Transcript")
         _ = try ui.waitForState(timeout: 8) { $0.openPanels.contains("transcription") }
     }

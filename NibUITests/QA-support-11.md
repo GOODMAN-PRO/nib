@@ -348,3 +348,13 @@ Confirmed insert-controls#3: History at y290 was above the restored y476 viewpor
 ### N7 - connector point encoding
 
 Confirmed insert-controls#5 against Geometry.Point's unkeyed [x,y] encoding. All three bends casts now use [[Double]]. Original count-one, changed geometry, Remove Bends and Undo count assertions are unchanged. CI must progress past the old nil dictionary-array cast and exercise the remaining bend edits.
+
+### N8 / S1 - provider setup and shortcut evidence
+
+Confirmed insert-providers-timeouts#0/#1 and selection#0: Command-S was unclaimed; lazy-row causation is inferred. Retain Command-S for the companion app shortcut fix and log Save provider existence immediately before sending it. Provider forms opt into a new keyboard batch: one initial Name reveal, field-specific focus checked after bounded HID Tab traversal, exact values read, Select All/Delete only for nonempty differing values, runner SPI typing and exact waitForNativeText for every field. ProviderEditorView source establishes Name/Base URL/API key/Chat model/Transcription ordering; intervening fields are traversed without editing. Each target allows at most eight Tabs with one-second focus waits, then fails explicitly. Shared fillNativeForm defaults/callers are unchanged. Transcript config enables Cloud transcription before AI within the same Settings visit, removing reopen/dismiss work. No seeded storage or shortcut fallback.
+
+Should unblock NativeDiagram, both Transcript tests and AssistantAttribution. CI must show every exact field, Provider saved, transcript/assistant original assertions and setup below the observed 116-171 seconds. Estimate: one Settings reopen saves about 25 seconds; reduced focus/reveal/clear work is unmeasured. Native Tab focus/automatic scroll and runner text SPI need macOS compilation/runtime verification; failure cannot silently type into another field.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Provider-dependent Insert/Selection tests | Native keyboard form field / Provider save shortcut / Insert provider setup | How long did verified field entry take, and was Save realised when Command-S was sent? |
