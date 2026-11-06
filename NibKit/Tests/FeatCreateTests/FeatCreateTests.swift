@@ -1937,7 +1937,7 @@ final class FeatCreateTests: XCTestCase {
                           size.height - 2 * NibSpacing.xl)
                 XCTAssertEqual(sheetFrame.height, expectedHeight, accuracy: 1)
                 XCTAssertGreaterThan(paper.height, NibMetrics.paperTileSize.height)
-                XCTAssertLessThanOrEqual(paper.maxY, viewport.maxY - NibSpacing.l + 1,
+                XCTAssertLessThanOrEqual(paper.maxY, viewport.maxY - NibSpacing.xxl + 1,
                     "The first paper tile and label must clear the bottom fade on opening")
                 XCTAssertGreaterThan(paper.minY, preview.maxY)
                 XCTAssertTrue(sheetFrame.contains(cue))
@@ -2232,7 +2232,7 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertEqual(categoryFrame.minY, NibSpacing.m, accuracy: 1)
                 XCTAssertGreaterThanOrEqual(tileFrame.minY, categoryFrame.maxY)
                 XCTAssertGreaterThanOrEqual(tileFrame.height, NibMetrics.paperTileSize.height)
-                XCTAssertLessThan(tileFrame.maxY, viewport.maxY - NibSpacing.l,
+                XCTAssertLessThan(tileFrame.maxY, viewport.maxY - NibSpacing.xxl,
                                   "The entire first tile and its name must be above the continuation fade")
                 XCTAssertGreaterThanOrEqual(categoryFrame.minX, NibSpacing.l)
                 XCTAssertLessThanOrEqual(categoryFrame.maxX, size.width - NibSpacing.l)
@@ -2251,9 +2251,11 @@ final class FeatCreateTests: XCTestCase {
                     "adjusted=\(region.adjustedContentInset), safeArea=\(region.safeAreaInsets)"
                 ].joined(separator: "; ")
                 XCTAssertEqual(fadeViewport, viewport, diagnostics)
-                XCTAssertGreaterThan(fadeViewport.height, 20, diagnostics)
+                // S3 lengthens this form's edge to 24 pt; other nibFadeBottomEdge callers keep 16.
+                let fadeHeight = NibSpacing.xxl
+                XCTAssertGreaterThan(fadeViewport.height, fadeHeight + NibSpacing.xs, diagnostics)
                 let sampleX = captureViewport.midX
-                for distance in [CGFloat(20), 16, 8, 1] {
+                for distance in [fadeHeight + NibSpacing.xs, fadeHeight, fadeHeight / 2, 1] {
                     let point = CGPoint(x: sampleX, y: captureViewport.maxY - distance)
                     XCTAssertTrue(host.view.bounds.contains(point), diagnostics)
                     XCTAssertTrue(captureInk.contains(point), "The fade samples must lie over ink; \(diagnostics)")
@@ -2273,13 +2275,13 @@ final class FeatCreateTests: XCTestCase {
                     return abs(Int(pixel.r) - Int(background.r))
                         + abs(Int(pixel.g) - Int(background.g)) + abs(Int(pixel.b) - Int(background.b))
                 }
-                let solid = try contrast(at: 20)
-                let fadeStart = try contrast(at: 16)
-                let fadeMiddle = try contrast(at: 8)
+                let solid = try contrast(at: fadeHeight + NibSpacing.xs)
+                let fadeStart = try contrast(at: fadeHeight)
+                let fadeMiddle = try contrast(at: fadeHeight / 2)
                 let fadeEnd = try contrast(at: 1)
                 XCTAssertGreaterThan(solid, 100, "The scrolling content must actually render; \(diagnostics)")
                 XCTAssertEqual(Double(fadeStart), Double(solid), accuracy: 20,
-                               "Only the final 16 pt should fade; \(diagnostics)")
+                               "Only the final 24 pt of this form should fade; \(diagnostics)")
                 XCTAssertGreaterThan(fadeStart, fadeMiddle, diagnostics)
                 XCTAssertGreaterThan(fadeMiddle, fadeEnd, diagnostics)
                 XCTAssertLessThan(fadeEnd, solid / 4, diagnostics)

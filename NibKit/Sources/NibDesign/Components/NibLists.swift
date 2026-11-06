@@ -172,6 +172,13 @@ public struct NibPaperTile<Content: View>: View {
                     .frame(width: size.width, height: size.height)
                     .clipShape(shape)
                     .nibElevation(.paper)
+                    // Keep the vertical lift, but never paint a later tile's broad shadow
+                    // across its neighbour. The selection ring is drawn outside this mask.
+                    .mask {
+                        Rectangle()
+                            .padding(.vertical, -2 * NibSpacing.xl)
+                            .padding(.horizontal, -NibSpacing.xs)
+                    }
                     .nibSelectionRing(isSelected, cornerRadius: NibRadius.thumbnail)
                 Text(name)
                     .font(NibFont.caption1)

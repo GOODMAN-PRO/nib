@@ -991,7 +991,7 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
         .scrollIndicatorsFlash(onAppear: true)
         .contentMargins(.horizontal, contentInset, for: .scrollContent)
         .scrollDismissesKeyboard(.interactively)
-        .nibFadeBottomEdge()
+        .nibFadeBottomEdge(NibSpacing.xxl)
         // A drawing mask alone does not constrain SwiftUI's hit testing after scrolling.
         .contentShape(Rectangle())
         .notebookLayoutFrame("viewport")
