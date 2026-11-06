@@ -312,3 +312,20 @@ Compatibility check found an important current-source distinction for H15: Chrom
 | Canvas layout tests using setDirection | Canvas direction row / Form reveal timing | What is the full per-choice cost, and how many bottom-directed moves were needed without homing? |
 
 Validation: source query uses two predicate placeholders/two arguments and current helper signatures. Compilation and timing await CI.
+
+### C8 - remove happy-path diagnostic work
+
+Confirmed R14:create#0 and correction against current code and remeasured the raw logs. Run 42136488712 has 525 timed activities, passes in 151.340 s; Width typing t=90.89 to Height tap t=113.31 is 22.42 s. Run 42175781057 has 472 timed activities before the allowance kill; the equivalent t=65.06 to 83.37 is 18.31 s. The latter heading-existence query stalls from 126.78 to 152.08 (25.30 s); the surrounding 115.82->126.78, 152.08->157.97 and 161.96->169.28 gaps measure 10.96, 5.89 and 7.32 s. Those four late gaps total 49.47 s, not a new measured app-hang claim. The sampler overlaps the late stalls and is already removed externally.
+
+CustomSize no longer requests either Width snapshots or millimetre clear diagnostics. InvalidCustomSizePreventsCreation retains both diagnostic modes and its existing allowance. The happy path resolves New Notebook's heading frame once after choosing Custom, reuses that immutable frame for both inert-header dismissals, and relies on the valid default draft title because it never asserts a title. This removes the title replace/dismiss cycle entirely. dismissNativeKeyboard accepts an additive optional cached frame, validates it against current window/keyboard geometry, skips the unused Hide lookup for an inert-header route, and keeps the observed conditional second-contact and keyboard-gone gates. Other callers retain their element/default routes.
+
+All creation/persistence/dimension assertions are unchanged. Expected saving is approximately 20-30 s per the verifier, NOT the finder's speculative 40-60 s, and is unmeasured on the changed code. The default-title shortcut additionally removes observed title work but is not double-counted in that estimate. H16's safety recovery can add polling cost. This reduces budget exposure and cannot guarantee immunity to another 25-31 s stall.
+
+Next CI must show no Width keyboard/Decimal clear logs for CustomSize, one cached heading frame, the unchanged exact size oracle, and a lower runtime without an allowance increase. InvalidCustomSize must retain diagnostic snapshots/clear logs and every rejection/package assertion.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Create testCustomSize | Custom size timing | What is the new body duration after removing happy-path diagnostics/title editing? |
+| Create testCustomSize | Custom size heading | Which single heading frame was reused for both numeric keyboard dismissals? |
+
+Validation: current dismissNativeKeyboard/replace callers audited; new arguments are defaulted. Runtime saving and cached-heading geometry need CI verification.

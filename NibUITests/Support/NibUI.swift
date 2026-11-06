@@ -2153,15 +2153,16 @@ final class NibUI {
     /// Prefer the native dismissal control; floating number pads can expose an unusable AX frame.
     /// Escape is a fallback only. Synthesis completion is not proof that the keyboard disappeared.
     func dismissNativeKeyboard(in application: XCUIApplication? = nil, diagnoseWidth: Bool = false,
-                               inertHeader: XCUIElement? = nil) throws {
+                               inertHeader: XCUIElement? = nil, inertHeaderFrame: CGRect? = nil) throws {
         let source = application ?? app
         guard source.keyboards.firstMatch.exists else { return }
         let viewport = source.windows.firstMatch.frame
-        let hide = source.keyboards.buttons.matching(NSPredicate(
+        let hasInertHeader = inertHeader != nil || inertHeaderFrame != nil
+        let hide = hasInertHeader ? nil : source.keyboards.buttons.matching(NSPredicate(
             format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).allElementsBoundByIndex.prefix(8).first {
                 hasVisibleFrame($0, in: viewport)
             }
-        let route = inertHeader != nil ? "inert sheet header" :
+        let route = hasInertHeader ? "inert sheet header" :
             (hide == nil ? "hardware Escape (no hittable dismissal control)" : "native Hide/Dismiss keyboard button")
         let keyboardBefore = source.keyboards.firstMatch.frame
         func inspect(_ stage: String) {
@@ -2196,13 +2197,19 @@ final class NibUI {
         try XCTContext.runActivity(named: "Dismiss native keyboard") { activity in
             let attachment = XCTAttachment(string: "route=\(route)")
             attachment.lifetime = .keepAlways; activity.add(attachment)
-            if let inertHeader {
-                guard hasVisibleFrame(inertHeader), inertHeader.elementType == .staticText else {
-                    throw Failure.message("Numeric keyboard dismissal requires the inert sheet heading")
-                }
-                let frame = inertHeader.frame
-                guard !frame.intersects(keyboardBefore) else {
-                    throw Failure.message("Numeric keyboard covers the sheet heading")
+            if hasInertHeader {
+                let frame: CGRect
+                if let cached = inertHeaderFrame {
+                    frame = cached
+                } else if let inertHeader {
+                    guard hasVisibleFrame(inertHeader), inertHeader.elementType == .staticText else {
+                        throw Failure.message("Numeric keyboard dismissal requires the inert sheet heading")
+                    }
+                    frame = inertHeader.frame
+                } else { throw Failure.message("Numeric keyboard dismissal heading missing") }
+                guard !frame.isNull, !frame.isInfinite, !frame.isEmpty, viewport.contains(frame),
+                      !frame.intersects(keyboardBefore) else {
+                    throw Failure.message("Numeric keyboard covers the sheet heading or its cached frame is invalid")
                 }
                 source.coordinate(withNormalizedOffset: .zero).withOffset(
                     CGVector(dx: frame.midX - source.frame.minX, dy: frame.midY - source.frame.minY)).tap()
@@ -2218,7 +2225,7 @@ final class NibUI {
         // In the custom-size decimal editor the first outside tap dismisses only the floating pad.
         // A second contact is justified only by a still-present keyboard, never by a fixed delay.
         let firstDismissal = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
-        if inertHeader != nil, source.keyboards.firstMatch.exists,
+        if hasInertHeader, source.keyboards.firstMatch.exists,
            XCTWaiter.wait(for: [firstDismissal], timeout: 2) != .completed,
            source.keyboards.firstMatch.exists {
             guard let dockedHide = source.keyboards.buttons.matching(NSPredicate(

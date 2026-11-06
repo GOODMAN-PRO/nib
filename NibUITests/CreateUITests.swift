@@ -226,13 +226,20 @@ final class CreateUITests: XCTestCase {
     func testSquareSize() throws { try sizeCase("Square", width: 595.28, height: 595.28) }
 
     func testCustomSize() throws {
-        try notebook("Custom dimensions")
+        let started = ProcessInfo.processInfo.systemUptime
+        defer { ui.logQA("Custom size timing", "seconds=\(ProcessInfo.processInfo.systemUptime - started) diagnostics=false; default draft title") }
+        // This test asserts dimensions, not the title; the draft's valid default is sufficient.
+        try newMenu("Notebook")
         try tap("No cover")
         try chooseSize("Custom")
-        try replace(ui.app.textFields["Width in millimetres"], with: "100", matching: numericValueMatches)
-        try ui.dismissNativeKeyboard(diagnoseWidth: true, inertHeader: ui.app.staticTexts["New Notebook"].firstMatch)
-        try replace(ui.app.textFields["Height in millimetres"], with: "150", matching: numericValueMatches)
-        try ui.dismissNativeKeyboard(diagnoseWidth: true, inertHeader: ui.app.staticTexts["New Notebook"].firstMatch)
+        let heading = ui.app.staticTexts["New Notebook"].firstMatch
+        try require(heading, "Custom size needs the inert New Notebook heading")
+        let headingFrame = heading.frame
+        ui.logQA("Custom size heading", "cachedFrame=\(headingFrame); reused for both dismissals")
+        try replace(ui.app.textFields["Width in millimetres"], with: "100", diagnoseClear: false, matching: numericValueMatches)
+        try ui.dismissNativeKeyboard(inertHeaderFrame: headingFrame)
+        try replace(ui.app.textFields["Height in millimetres"], with: "150", diagnoseClear: false, matching: numericValueMatches)
+        try ui.dismissNativeKeyboard(inertHeaderFrame: headingFrame)
         try assertSize(try create(), width: 100 * 72 / 25.4, height: 150 * 72 / 25.4)
     }
 
@@ -893,7 +900,7 @@ final class CreateUITests: XCTestCase {
 
     /// Waits for the edited value before dismissal; only explicitly formatted fields opt out of exact string comparison.
     private func replace(_ field: XCUIElement, with text: String, in application: XCUIApplication? = nil,
-                         matching matcher: ((String, String) -> Bool)? = nil) throws {
+                         diagnoseClear: Bool? = nil, matching matcher: ((String, String) -> Bool)? = nil) throws {
         try require(field, "Missing editable field: \(field)")
         try scrollTo(field, name: field.label, in: application)
         if name.contains("testSuggestedTitleUseReachesCreatedDocument") {
@@ -901,7 +908,7 @@ final class CreateUITests: XCTestCase {
         }
         ui.logQA("Stall boundary", "Create replacement field focus tap; field=\(field.label)")
         field.tap()
-        try ui.clearNativeText(in: field, diagnoseClear: field.label.contains("millimetres"))
+        try ui.clearNativeText(in: field, diagnoseClear: diagnoseClear ?? field.label.contains("millimetres"))
         if !text.isEmpty { try ui.typeNativeText(text, in: field) }
         try wait("Field must contain the replacement before dismissal: \(text)") {
             guard let actual = field.value as? String else { return false }
