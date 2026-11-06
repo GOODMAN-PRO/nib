@@ -14,6 +14,7 @@ final class ChromeUITests: XCTestCase {
     private var ui: NibUI!
     private let notebook = "Physics — Motion"
     private var imports: URL?
+    private var customizingToolbar = false
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -77,7 +78,11 @@ final class ChromeUITests: XCTestCase {
         let toolbarButton = ["Hide ", "Show ", "Apply ", "Reset "].contains { name.hasPrefix($0) }
             || name == "Save current layout"
         let kind: XCUIElement.ElementType = type == .any && toolbarButton ? .button : type
-        let found = try ui.requireControl(name, type: kind, scroll: true, timeout: 8)
+        let edge: NibUI.FormEdge?
+        if customizingToolbar && toolbarButton {
+            edge = name.hasPrefix("Hide ") ? .top : (name.hasPrefix("Show ") ? .nearest : .bottom)
+        } else { edge = nil }
+        let found = try ui.requireControl(name, type: kind, scroll: true, timeout: 8, edge: edge)
         guard found.isEnabled else { throw NibUI.Failure.message("Chrome control is not enabled: \(name)") }
         return found
     }
@@ -690,7 +695,7 @@ final class ChromeUITests: XCTestCase {
     func testPageScrollCollapsesOptionsAndChoosingToolRestoresThem() throws {
         try open(); try ui.selectTool("pen"); let before = try ui.state()
         _ = try reachable("menu.toolSettings")
-        try ui.twoFingerScroll(from: CGPoint(x: 0.12, y: 0.75), to: CGPoint(x: 0.12, y: 0.45))
+        try ui.twoFingerScroll(from: CGPoint(x: 0.12, y: 0.75), to: CGPoint(x: 0.12, y: 0.45), holdAtEnd: true)
         _ = try ui.waitForState { abs($0.contentOffset.y - before.contentOffset.y) > 20 }
         try wait("Page scrolling must collapse the secondary options bar") {
             !self.query("menu.toolSettings").firstMatch.exists
@@ -729,8 +734,8 @@ final class ChromeUITests: XCTestCase {
             $0.strokeCountOnPage == counted.strokeCountOnPage + 1 && $0.undoAvailable
         }
     }
-    private func customize() throws { try more("Customise Toolbar"); try panel("toolbar.customize") }
-    private func doneCustomizing() throws { try tap("sheet.dismiss"); try panel("toolbar.customize", shown: false) }
+    private func customize() throws { try more("Customise Toolbar"); try panel("toolbar.customize"); customizingToolbar = true }
+    private func doneCustomizing() throws { try tap("sheet.dismiss"); try panel("toolbar.customize", shown: false); customizingToolbar = false }
     private func confirmLayoutSave() throws {
         let alert = ui.app.alerts.firstMatch
         let save = try ui.requireControl("cmd.toolbar.saveLayout", type: .button, in: alert)
@@ -802,6 +807,8 @@ final class ChromeUITests: XCTestCase {
 
     func testApplySavedLayoutRestoresReorderedToolsWithLassoFirst() throws {
         try open(); try customize()
+        // show() appends: establish Pen above Highlighter before exercising the real drag.
+        try tap("Hide Highlighter"); try tap("Show Highlighter")
         let handle = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Highlighter'")).firstMatch
         XCTAssertTrue(handle.waitForExistence(timeout: 5))
         let pen = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Fountain Pen'")).firstMatch
@@ -810,7 +817,16 @@ final class ChromeUITests: XCTestCase {
         XCTAssertTrue(row.exists, "Reorder destination must be the Pen row")
         try reorderHighlighterAbovePen(handle)
         try wait("Reordering must move Highlighter above Pen") {
-            self.query("Hide Highlighter").firstMatch.frame.minY < self.query("Hide Fountain Pen").firstMatch.frame.minY
+            let list = self.ui.app.collectionViews.containing(.button, identifier: "cmd.toolbar.setLayout").firstMatch
+            guard let root = try? self.ui.measuredSnapshot(list, named: "reordered toolbar rows") else { return false }
+            func row(_ node: XCUIElementSnapshot, named name: String) -> CGRect? {
+                if node.elementType == .button && node.label == name { return node.frame }
+                for child in node.children { if let found = row(child, named: name) { return found } }
+                return nil
+            }
+            guard let highlighter = row(root, named: "Hide Highlighter"),
+                  let pen = row(root, named: "Hide Fountain Pen") else { return false }
+            return highlighter.minY < pen.minY
         }
         try saveLayout("Reordered chrome")
         try tap("Reset Toolbar"); try tap("Reset Writing Tools")
@@ -843,9 +859,13 @@ final class ChromeUITests: XCTestCase {
         try open(); try customize()
         try tap("Hide Highlighter"); try tap("Show Ruler"); try saveLayout("Retained reset layout")
         try tap("Reset Toolbar"); try tap(action)
-        _ = try reachable(tools ? "Hide Highlighter" : "Show Highlighter")
-        _ = try reachable(accessories ? "Show Ruler" : "Hide Ruler")
         _ = try reachable("Apply Retained reset layout")
+        // Check bottom-to-top, grouping the middle Show rows before the top Hide rows.
+        let expectedRows = [tools ? "Hide Highlighter" : "Show Highlighter",
+                            accessories ? "Show Ruler" : "Hide Ruler"]
+        for name in expectedRows.sorted(by: { $0.hasPrefix("Show ") && !$1.hasPrefix("Show ") }) {
+            _ = try reachable(name)
+        }
         XCTAssertFalse(query("Hide Lasso").firstMatch.exists)
     }
     func testResetWritingToolsPreservesAccessoriesAndSavedLayouts() throws { try reset("Reset Writing Tools", tools: true, accessories: false) }
@@ -1001,14 +1021,14 @@ final class ChromeUITests: XCTestCase {
     }
 
     // layer.panel/setActive/setVisible/rename
-    private func layers(useShortcut: Bool = false) throws {
+    private func layers(useShortcut: Bool = true) throws {
         try open(); try editing("Layers"); try toggle("Layers", to: true); try closeEditing()
         if useShortcut { try key("l", [.command, .option]) }
         else { try more("Layers") }
         try panel("layers")
     }
     func testLayersSettingMenuAndShortcutReflectFiveLayers() throws {
-        try layers()
+        try layers(useShortcut: false)
         for number in 1...5 { _ = try require("Layer \(number)") }
         XCTAssertTrue(try require("Layer 1").isSelected)
         try tap("cmd.panel.close"); try panel("layers", shown: false)
@@ -1102,20 +1122,58 @@ final class ChromeUITests: XCTestCase {
         try open(); try tap("tool.more"); try tap("cmd.ruler.set")
         XCTAssertTrue(ruler.waitForExistence(timeout: 8), "Ruler must appear on canvas")
     }
-    private func rulerMenu(_ action: String) throws { ruler.doubleTap(); try tap(action) }
+    private func rulerMenu(_ action: String) throws {
+        ruler.doubleTap()
+        do {
+            let row = try ui.requireControl(action, type: .staticText, timeout: 5)
+            guard row.isEnabled else { throw NibUI.Failure.message("Ruler menu row disabled: " + action) }
+            row.tap()
+        } catch {
+            ui.recordDiagnostics("Ruler menu row missing", facts: "action=" + action)
+            throw error
+        }
+    }
     private func confirmRulerAlert(_ title: String) throws {
         try ui.prepareCoveredControl(title)
         let alert = ui.app.alerts.firstMatch
         let button = alert.buttons[title].firstMatch
-        var previousFrame: CGRect?
-        try wait("Ruler confirmation must be enabled, hittable and stable") {
-            guard button.exists, button.isEnabled, button.isHittable else { previousFrame = nil; return false }
-            let frame = button.frame
-            defer { previousFrame = frame }
-            return previousFrame == frame
+        func geometry() -> [CGRect] {
+            [alert.frame, button.frame] + ui.app.keyboards.allElementsBoundByIndex.map(\.frame)
         }
-        ui.logQA("Ruler alert confirm", "action=\(title) " + ui.elementFacts(button))
+        func stableGeometry(allowDismissed: Bool = false) throws -> [CGRect]? {
+            var previous: [CGRect] = []
+            var settled: [CGRect]?
+            do {
+                try wait("Ruler confirmation must be enabled, hittable and stable", timeout: 5) {
+                    guard alert.exists else { previous = []; return allowDismissed }
+                    guard button.exists, button.isEnabled, button.isHittable else { previous = []; return false }
+                    let current = geometry()
+                    defer { previous = current }
+                    if previous == current { settled = current; return true }
+                    return false
+                }
+            } catch {
+                if allowDismissed && !alert.exists { return nil }
+                throw error
+            }
+            return settled
+        }
+        let before = try XCTUnwrap(stableGeometry())
+        ui.logQA("Ruler alert confirm", "action=\(title) alert/button/keyboards=\(before)")
         button.tap()
+        // A minimized keyboard can re-dock on this touch and move the button before touch-up.
+        // Only alert/button movement authorizes a second confirmation. Keyboard-only
+        // changes can be normal dismissal and must not trigger a retry.
+        var moved = false
+        try wait("Ruler alert must close or expose the keyboard layout shift", timeout: 5) {
+            if !alert.exists { return true }
+            moved = alert.frame != before[0] || button.frame != before[1]
+            return moved
+        }
+        if moved, alert.exists, let after = try stableGeometry(allowDismissed: true), alert.exists {
+            ui.logQA("Ruler alert shifted retry", "action=\(title) before=\(before) stable=\(after)")
+            button.tap()
+        }
         ui.logQA("Ruler alert after tap", "action=\(title) alerts=\(ui.app.alerts.count)")
         try wait("Ruler alert must close before another action") { !alert.exists }
     }
@@ -1241,6 +1299,9 @@ final class ChromeUITests: XCTestCase {
             return snapshot.isSelected
         }
         XCTAssertTrue(chip.isSelected)
+        let nameField = ui.app.textFields["Timer name"].firstMatch
+        ui.revealFormElement(named: "Timer name", type: .textField, fullyVisible: true) { nameField }
+        if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
         try replace("Timer name", "Preset countdown"); try tap("Start Timer")
         try ui.handleAuthorizationAlerts(waitForCountdown: { self.clockValue.exists })
         try wait("Preset countdown must run") { self.clockValue.exists }
@@ -1260,9 +1321,10 @@ final class ChromeUITests: XCTestCase {
         try wait("Resume must advance countdown") { self.clockValue.label != paused }
         try tap("Stop and Save"); try timeKeeper()
         _ = try reachable("Chrome countdown")
-        try tap("cmd.panel.close")
         try timer("1:00", name: "Discarded countdown")
         try timeKeeper(); try tap("Discard Session"); try tap("Discard Session")
+        // Discard returns to empty setup: establish valid input before expecting enabled Start.
+        try replace("Duration", "1:00")
         _ = try reachable("Start Timer")
         XCTAssertFalse(query("Discarded countdown").firstMatch.exists, "Discarded session must not enter history")
     }
@@ -1454,9 +1516,11 @@ final class ChromeUITests: XCTestCase {
     }
     func testPDFDefineOpensDictionaryForSelectedText() throws {
         try importTextPDF(); let before = try ui.state(); try selectPDFText(); try pdfAction("Define")
-        _ = try require("Done")
+        let close = try ui.requireControl("DDUIDone", type: .button, timeout: 8)
         XCTAssertTrue(ui.app.navigationBars.count > 0, "Define must present the system dictionary")
-        try tap("Done"); try sameContent(before)
+        close.tap()
+        try wait("Dictionary must close") { !close.exists || !close.isHittable }
+        try sameContent(before)
     }
     func testPDFSpeakStartsSpeechAndOffersStopSpeaking() throws {
         try importTextPDF(); let before = try ui.state(); try selectPDFText(); try pdfAction("Speak")

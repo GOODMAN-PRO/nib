@@ -45,10 +45,68 @@ final class NibUI {
     private(set) var formRevealFailure: String?
     var diagnoseKeyDelivery = false
     var diagnoseStateReads = false
+    private var slowTreeLogged = false
     var canvas: XCUIElement { app.scrollViews["nib.canvas"].firstMatch }
+
+    /// Instrument synchronous AX calls without changing their result or adding a retry.
+    /// XCTest owns their internal timeout; a bounded outer wait cannot interrupt a blocked query.
+    func measuredQuery<T>(_ asked: String, _ query: () throws -> T) rethrows -> T {
+        let started = ProcessInfo.processInfo.systemUptime
+        defer {
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            if elapsed > 10 {
+                // Each test creates a fresh NibUI. Consume the allowance before attempting
+                // AX so a failed snapshot cannot cause repeated full-tree fetches.
+                if !slowTreeLogged && elapsed <= 20 {
+                    slowTreeLogged = true
+                    logQA("slow query", "asked=\(asked) seconds=\(elapsed); collecting one diagnostic tree per NibUI")
+                    if let root = try? measuredSnapshot(app, named: "slow query diagnostic tree for " + asked) {
+                        logSnapshotSize(root, asked: asked, seconds: elapsed, diagnostic: true)
+                    } else { logQA("slow query", "asked=\(asked) elements=unavailable focus=unavailable") }
+                } else {
+                    let reason = elapsed > 20 ? "query exceeded 20s" : "diagnostic tree already attempted"
+                    logQA("slow query", "asked=\(asked) seconds=\(elapsed) diagnosticTree=skipped reason=\(reason)")
+                }
+            }
+        }
+        return try query()
+    }
+
+    func measuredSnapshot(_ element: XCUIElement, named asked: String) throws -> XCUIElementSnapshot {
+        let started = ProcessInfo.processInfo.systemUptime
+        do {
+            let result = try element.snapshot()
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            if elapsed > 10 { logSnapshotSize(result, asked: asked, seconds: elapsed, diagnostic: false) }
+            return result
+        } catch {
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            if elapsed > 10 { logQA("slow query", "asked=\(asked) seconds=\(elapsed) elements=unavailable focus=unavailable error=\(error)") }
+            throw error
+        }
+    }
+
+    private func logSnapshotSize(_ root: XCUIElementSnapshot, asked: String, seconds: TimeInterval, diagnostic: Bool) {
+        func count(_ node: XCUIElementSnapshot) -> Int { 1 + node.children.reduce(0) { $0 + count($1) } }
+        // Snapshot is an attributes protocol, not XCUIElement: inspect its public dictionary
+        // without assuming debugDescription or performing another live focus query.
+        func focusedNodes(_ node: XCUIElementSnapshot) -> [String] {
+            let keyboardFocus = node.dictionaryRepresentation.first {
+                String(describing: $0.key).lowercased().contains("keyboardfocus")
+            }?.value as? Bool
+            let own = keyboardFocus == true ? ["type=\(node.elementType) id=\(node.identifier) label=\(node.label) frame=\(node.frame)"] : []
+            return own + node.children.flatMap { focusedNodes($0) }
+        }
+        let focus = focusedNodes(root)
+        let focused = focus.isEmpty ? "not exposed in returned tree" : focus.joined(separator: " | ")
+        let timing = "asked=\(asked) seconds=\(seconds)"
+        let tree = "elements=\(count(root)) diagnosticTree=\(diagnostic) focus=\(focused)"
+        logQA("slow query", timing + " " + tree)
+    }
 
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
     enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards, tabsOverflow }
+    enum FormEdge { case top, bottom, nearest }
 
     /// Reject hidden SwiftUI menu copies before asking AX for an activation point (zero frames can raise).
     func hasVisibleFrame(_ element: XCUIElement, in viewport: CGRect? = nil) -> Bool {
@@ -59,7 +117,7 @@ final class NibUI {
     }
 
     func nativeEditorHittability(_ element: XCUIElement) -> Bool? {
-        guard let snapshot = try? element.snapshot(), !snapshot.frame.isNull, !snapshot.frame.isInfinite,
+        guard let snapshot = try? measuredSnapshot(element, named: "element snapshot"), !snapshot.frame.isNull, !snapshot.frame.isInfinite,
               snapshot.frame.minX.isFinite, snapshot.frame.minY.isFinite else { return nil }
         guard let reader = NSClassFromString("NibUIReadiness") as? NSObject.Type,
               let value = reader.perform(NSSelectorFromString("hittabilityOfElement:"), with: element)?
@@ -81,7 +139,7 @@ final class NibUI {
         let matches = (scope ?? app).descendants(matching: kind).matching(predicate)
         let first = matches.firstMatch
         // A missing control should cost one query, not every typed query on each poll.
-        guard first.exists else { return nil }
+        guard measuredQuery("findControl " + name, { first.exists }) else { return nil }
         if kind != .any {
             if !actionable, matches.count == 1 { return first }
             if hasVisibleFrame(first), !first.isEnabled || first.isHittable { return first }
@@ -90,7 +148,7 @@ final class NibUI {
         let indexed = min(matches.count, 16)
         for index in 0..<indexed {
             let element = matches.element(boundBy: index)
-            guard element.exists, let snapshot = try? element.snapshot() else { continue }
+            guard element.exists, let snapshot = try? measuredSnapshot(element, named: "element snapshot") else { continue }
             candidates.append((element, snapshot))
         }
         candidates.sort {
@@ -118,15 +176,15 @@ final class NibUI {
 
     func requireControl(_ name: String, type: XCUIElement.ElementType = .any,
                         scroll: Bool = false, timeout: TimeInterval = 3,
-                        in scope: XCUIElement? = nil) throws -> XCUIElement {
+                        in scope: XCUIElement? = nil, edge: FormEdge? = nil) throws -> XCUIElement {
         if let found = findControl(name, type: type, in: scope) { return found }
         if scroll {
             // Virtualized native rows do not exist until their collection view scrolls.
-            revealFormElement(in: scope) {
-                self.findControl(name, type: type, actionable: false, in: scope)
-                    ?? (scope ?? self.app).descendants(matching: type).matching(NSPredicate(
-                        format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
-            }
+            // Preserve the typed editor/control priority once, then reuse the query while scrolling.
+            let revealTarget = findControl(name, type: type, actionable: false, in: scope)
+                ?? (scope ?? app).descendants(matching: type).matching(NSPredicate(
+                    format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
+            revealFormElement(in: scope, edge: edge, named: name, type: type) { revealTarget }
             if let failure = formRevealFailure { throw Failure.message(failure) }
             if let found = findControl(name, type: type, in: scope) { return found }
         }
@@ -179,8 +237,16 @@ final class NibUI {
     func revealFormElement(_ element: XCUIElement) { revealFormElement { element } }
 
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
-    func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
+    func revealFormElement(in form: XCUIElement? = nil, edge: FormEdge? = nil,
+                           named name: String? = nil, type: XCUIElement.ElementType = .any,
+                           fullyVisible: Bool = false, target: () -> XCUIElement) {
         formRevealFailure = nil
+        var fullyRevealed = false
+        defer {
+            if fullyVisible && !fullyRevealed && formRevealFailure == nil {
+                formRevealFailure = "Full viewport reveal did not reach " + (name ?? "native field")
+            }
+        }
         let revealStarted = Date()
         var moves = 0
         defer { logQA("Form reveal timing", "moves=\(moves) seconds=\(Date().timeIntervalSince(revealStarted))") }
@@ -210,7 +276,7 @@ final class NibUI {
             XCTFail(message)
         }
         let initial = target()
-        let initialSnapshot = initial.exists ? (try? initial.snapshot()) : nil
+        let initialSnapshot = initial.exists ? (try? measuredSnapshot(initial, named: "initial snapshot")) : nil
         // Unlabelled native thumbs are not unique identities; keep the caller's scoped query.
         let identity = initialSnapshot.flatMap { $0.identifier.isEmpty && $0.label.isEmpty ? nil : $0 }
         func liveList() -> XCUIElement? {
@@ -221,15 +287,15 @@ final class NibUI {
                 // within a presented transient surface; native UIKit menus use a Preview sibling.
                 let surfaces = app.popovers.allElementsBoundByIndex + app.menus.allElementsBoundByIndex
                 let hasNativeMenu = app.otherElements["Preview"].firstMatch.exists
-                if !surfaces.isEmpty || hasNativeMenu, let node = try? form.snapshot() {
+                if !surfaces.isEmpty || hasNativeMenu, let node = try? measuredSnapshot(form, named: "form snapshot") {
                     for surface in surfaces where hasVisibleFrame(surface) {
-                        if let root = try? surface.snapshot(), let context = ancestry(node, in: root) {
+                        if let root = try? measuredSnapshot(surface, named: "surface snapshot"), let context = ancestry(node, in: root) {
                             ancestorClip = context.clip
                             containerIsTransient = context.transient
                             break
                         }
                     }
-                    if ancestorClip == nil, hasNativeMenu, let root = try? app.snapshot(),
+                    if ancestorClip == nil, hasNativeMenu, let root = try? measuredSnapshot(app, named: "app snapshot"),
                        let context = ancestry(node, in: root), context.transient {
                         ancestorClip = context.clip
                         containerIsTransient = true
@@ -237,7 +303,7 @@ final class NibUI {
                 }
                 return form
             }
-            guard let root = try? app.snapshot() else {
+            guard let root = try? measuredSnapshot(app, named: "app snapshot") else {
                 logQA("Form reveal unavailable", "snapshotCandidates=0; app snapshot unavailable; candidates not collected")
                 return nil
             }
@@ -365,7 +431,7 @@ final class NibUI {
                 + diagnostics.joined(separator: "\n"))
             return nil
         }
-        guard var list = liveList(), let firstSnapshot = try? list.snapshot() else {
+        guard var list = liveList(), let firstSnapshot = try? measuredSnapshot(list, named: "list snapshot") else {
             logQA("Form reveal unavailable", "No live container snapshot; caller retains its wait/fallback")
             return
         }
@@ -386,11 +452,12 @@ final class NibUI {
             ancestorClip = (ancestorClip ?? window).intersection(context.clip)
         }
         let initialTop = formTopPosition(firstSnapshot)
-        let homeThenScan = lazySearch && initialTop.atTop == false
+        let homeThenScan = edge == nil && lazySearch && initialTop.atTop == false
         var homing = homeThenScan
         var homeMoves = 0
         let appFrame = app.frame
-        let searchPath = lazySearch ? (homeThenScan ? "proven offset home then scan" : "bottom-first then reverse") : "target-directed"
+        let searchPath = edge.map { "hint \($0) from current offset" }
+            ?? (lazySearch ? (homeThenScan ? "proven offset home then scan" : "bottom-first then reverse") : "target-directed")
         logQA("Form reveal path", "path=\(searchPath) lazy=\(lazySearch) cover=\(coverVisible) OtherForm=\(String(describing: modal?.frame)) top=\(initialTop.evidence) velocity=slow")
         // Homing may consume six moves; preserve sixteen downward scans for a lazy row.
         let moveLimit = lazySearch ? 22 : 16
@@ -409,9 +476,28 @@ final class NibUI {
                 element = list.descendants(matching: identity.elementType).matching(NSPredicate(
                     format: "identifier == %@ AND label == %@", identity.identifier, identity.label)).firstMatch
             } else { element = target() }
-            let targetFrame = element.exists ? element.frame : nil
-            if let targetFrame, viewport.contains(CGPoint(x: targetFrame.midX, y: targetFrame.midY)),
-               element.isHittable { return }
+            // Named/identified targets are resolved in the one immutable list snapshot, not
+            // through another exists/frame round trip on every move of a virtualized list.
+            func targetNode(_ node: XCUIElementSnapshot) -> XCUIElementSnapshot? {
+                let matches: Bool
+                if let identity {
+                    matches = node.elementType == identity.elementType && node.identifier == identity.identifier
+                        && node.label == identity.label
+                } else if let name {
+                    matches = (type == .any || node.elementType == type)
+                        && (node.identifier == name || node.label == name || node.placeholderValue == name)
+                } else { matches = false }
+                if matches { return node }
+                for child in node.children { if let found = targetNode(child) { return found } }
+                return nil
+            }
+            let targetFrame = name != nil || identity != nil ? targetNode(snapshot)?.frame
+                : (element.exists ? element.frame : nil)
+            if let targetFrame {
+                let inside = fullyVisible ? viewport.contains(targetFrame)
+                    : viewport.contains(CGPoint(x: targetFrame.midX, y: targetFrame.midY))
+                if inside && element.isHittable { fullyRevealed = true; return }
+            }
             let top = formTopPosition(snapshot)
             if homing, top.atTop != false {
                 homing = false
@@ -445,7 +531,12 @@ final class NibUI {
                 return
             }
             if !homeThenScan && direction == nil {
-                direction = lazySearch ? false : (targetFrame.map { $0.midY < viewport.midY } ?? false)
+                if let targetFrame { direction = targetFrame.midY < viewport.midY }
+                else if edge == .top { direction = initialTop.atTop == false }
+                else if edge == .nearest {
+                    // Show rows occupy the middle section: from the lower half seek upwards.
+                    direction = initialTop.atTop == false && top.percent.map { $0 > 50 } == true
+                } else { direction = false }
             }
             guard homeThenScan || direction != nil else { return }
             let down = homeThenScan ? homing : (direction == true)
@@ -478,10 +569,10 @@ final class NibUI {
             }
             // Library grids can replace their containers while scrolling. Keep the cheap cached query
             // normally, but reacquire it if that container disappears or its snapshot becomes unavailable.
-            var nextSnapshot: XCUIElementSnapshot? = list.exists ? (try? list.snapshot()) : nil
+            var nextSnapshot: XCUIElementSnapshot? = try? measuredSnapshot(list, named: "list snapshot")
             if nextSnapshot == nil, let replacement = liveList() {
                 list = replacement
-                nextSnapshot = try? replacement.snapshot()
+                nextSnapshot = try? measuredSnapshot(replacement, named: "replacement snapshot")
             }
             guard let after = nextSnapshot else {
                 if wasTransient {
@@ -551,7 +642,7 @@ final class NibUI {
 
     /// Read only this list's vertical position, never a nested picker's or a background canvas's.
     /// A rounded zero is conservatively top. Missing values are not evidence of a nonzero offset.
-    private func formTopPosition(_ snapshot: XCUIElementSnapshot) -> (atTop: Bool?, evidence: String) {
+    private func formTopPosition(_ snapshot: XCUIElementSnapshot) -> (atTop: Bool?, evidence: String, percent: Double?) {
         func percentage(_ node: XCUIElementSnapshot) -> Double? {
             guard let value = node.value as? String, value.hasSuffix("%"),
                   let number = Double(value.dropLast().trimmingCharacters(in: .whitespaces)),
@@ -574,14 +665,14 @@ final class NibUI {
         }
         for child in snapshot.children { visit(child) }
         if let position = positions.min() {
-            return (position == 0, "verticalPercent=\(positions) atTop=\(position == 0)")
+            return (position == 0, "verticalPercent=\(positions) atTop=\(position == 0)", position)
         }
         // An instantiated first row above the list proves there is content to scroll back to.
         // A row inside the viewport may be a virtualized later row, so it cannot prove 'top'.
         if let firstRow, firstRow.minY < snapshot.frame.minY - 1 {
-            return (false, "firstRow=\(firstRow) above listTop=\(snapshot.frame.minY)")
+            return (false, "firstRow=\(firstRow) above listTop=\(snapshot.frame.minY)", nil)
         }
-        return (nil, "unknown; firstRow=\(String(describing: firstRow)) list=\(snapshot.frame)")
+        return (nil, "unknown; firstRow=\(String(describing: firstRow)) list=\(snapshot.frame)", nil)
     }
 
     /// Search real row gaps, plain rows, then the leading inset, all below minimumY.
@@ -1019,12 +1110,23 @@ final class NibUI {
                 let deliveryAfter = chordProbeSnapshot()
                 if let prior = deliveryBefore.state, let after = deliveryAfter.state,
                    let priorLog = prior.keyLog, let afterLog = after.keyLog,
-                   priorLog == afterLog, prior.keyLogTotal == after.keyLogTotal {
+                   let priorTotal = prior.keyLogTotal, let afterTotal = after.keyLogTotal,
+                   priorLog == afterLog, priorTotal == afterTotal {
                     logQA("Chord no new key event", "key=\(key) modifiers=\(modifiers.rawValue)\nbefore delivery: "
                         + deliveryBefore.facts + "\nafter failed postcondition: " + deliveryAfter.facts)
+                    if after.keyResponderIsText == false {
+                        let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
+                        logQA("Chord undelivered retry", "key=\(key) modifiers=\(modifiers.rawValue) keyboards=\(keyboards) " + deliveryAfter.facts)
+                        try sendHardwareKey(key, modifiers)
+                        do { try postcondition(); return }
+                        catch {
+                            recordDiagnostics("Chord undelivered retry failed", facts: "key=\(key) modifiers=\(modifiers.rawValue)")
+                            throw error
+                        }
+                    }
                 }
-                // Retry only a proven modifier loss on a fresh printable press outside text editing.
-                // In particular, missing events and control keys are not retry evidence.
+                // Otherwise retry only a proven modifier loss on a fresh printable press.
+                // An arrived, correctly modified chord with no effect remains an app failure.
                 if let current = try? state(), current.keyResponderIsText != true,
                    let observed = missingChordModifiers(key, modifiers, before: logBeforeDelivery,
                                                         after: current.keyLog ?? []) {
@@ -1105,7 +1207,7 @@ final class NibUI {
         func tapInertHeader(in surface: XCUIElement, modal: Bool) throws {
             // One snapshot avoids per-control AX round trips. Conservatively exclude every control frame,
             // including all button frames, so no hittable library button can become the focus target.
-            let snapshot = try surface.snapshot()
+            let snapshot = try measuredSnapshot(surface, named: "surface snapshot")
             let interactive: [XCUIElement.ElementType] = [.button, .cell, .link, .switch, .slider,
                 .segmentedControl, .textField, .textView, .searchField, .secureTextField, .picker, .pickerWheel]
             func occupiedFrames(_ node: XCUIElementSnapshot) -> [CGRect] {
@@ -1233,6 +1335,12 @@ final class NibUI {
         try sendHardwareKey(key, modifiers)
     }
 
+    /// Caller has established this native field's focus for the current editing session.
+    /// Device/SPI delivery bypasses XCTest's public animation-idle and interruption checks.
+    func focusedKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = []) throws {
+        try sendHardwareKey(key, modifiers)
+    }
+
     /// Keyboard-page HID usage for the keys XCTest's text-input synthesis cannot produce. typeKey maps characters
     /// through the keyboard layout: the probe runs 41986732631 and 41990900260 (KeyProbeUITests) showed that
     /// Escape, Delete and Forward Delete never reach the app that way, with or without text focus, while the
@@ -1348,7 +1456,7 @@ final class NibUI {
     }
 
     func logRemotePickerInventory(_ stage: String) {
-        guard let root = try? app.snapshot() else { logQA("Remote picker inventory", stage + " snapshot unavailable"); return }
+        guard let root = try? measuredSnapshot(app, named: "app snapshot") else { logQA("Remote picker inventory", stage + " snapshot unavailable"); return }
         func visit(_ node: XCUIElementSnapshot) {
             if node.elementType == .button || node.elementType == .cell {
                 logQA("Remote picker inventory", "stage=\(stage) type=\(node.elementType.rawValue) label=\(node.label) id=\(node.identifier) frame=\(node.frame) enabled=\(node.isEnabled)")
@@ -1457,7 +1565,7 @@ final class NibUI {
         // The title-bar confirm is a sibling of the inner Other labelled Photos (baseline
         // id=Add, label=Done), so inventory the app once and clip to the picker's observed frame.
         let bounds = selectionScope.frame
-        guard let snapshot = try? app.snapshot() else {
+        guard let snapshot = try? measuredSnapshot(app, named: "app snapshot") else {
             throw Failure.message("Selected Photos picker has no button inventory")
         }
         func buttons(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
@@ -1629,7 +1737,7 @@ final class NibUI {
             func focused(in source: XCUIElement) -> Bool {
                 let match = source.descendants(matching: field.elementType).matching(identity)
                     .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-                return match.exists && match.frame == field.frame
+                return measuredQuery("keyboard focus " + label) { match.exists && match.frame == field.frame }
             }
             if focused(in: scope) { return true }
             if scope !== app, focused(in: app) { return true }
@@ -1663,7 +1771,7 @@ final class NibUI {
                 logQA("Width keyboard " + stage, "keyboardExists=\(source.keyboards.firstMatch.exists)")
                 return
             }
-            if let root = try? source.snapshot() {
+            if let root = try? measuredSnapshot(source, named: "source snapshot") {
                 func inspectKeyboard(_ node: XCUIElementSnapshot, insideKeyboard: Bool = false) {
                     let inside = insideKeyboard || node.elementType == .keyboard
                     if inside && node.elementType == .button {
@@ -1747,7 +1855,7 @@ final class NibUI {
         guard numberPad || covered || lazyCovered else { return }
         let editors = app.descendants(matching: .any).matching(NSPredicate(format: "hasKeyboardFocus == true"))
             .allElementsBoundByIndex.prefix(4).compactMap { element -> (XCUIElement, String)? in
-                guard let snapshot = try? element.snapshot(),
+                guard let snapshot = try? measuredSnapshot(element, named: "element snapshot"),
                       [XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField].contains(snapshot.elementType),
                       let value = snapshot.value as? String else { return nil }
                 // Rebind without the focus predicate: that predicate stops matching after dismissal.
@@ -1932,8 +2040,9 @@ final class NibUI {
         try deliverNativeKey("a", .command, in: field)
         inspectClear("after Select All")
         // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
-        logQA("Stall boundary", "clearNativeText typeText Delete after Select All; field=\(field.label)")
-        field.typeText(XCUIKeyboardKey.delete.rawValue)
+        logQA("Native clear HID", "Delete after Select All; field=\(field.label)")
+        logQA("Stall boundary", "native clear Delete after Select All; route=HID")
+        try sendHIDKey(0x2A)
         inspectClear("after first Delete")
         let remainingValue = field.value as? String
         guard let remaining = remainingValue ?? (field.elementType == .textView ? "" : nil) else {
@@ -1946,7 +2055,7 @@ final class NibUI {
                   current.count <= 4096 else { throw Failure.message("Native clear needs a readable bounded value after caret tap") }
             logQA("Native clear", "field=\(field.identifier) frame=\(field.frame) deleteCount=\(current.count)")
             if !current.isEmpty {
-                field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count))
+                for _ in 0..<current.count { try sendHIDKey(0x2A) }
                 inspectClear("after fallback Delete batch count=\(current.count)")
             }
         }
@@ -2053,10 +2162,10 @@ final class NibUI {
                 logQA("State read result", facts + " seconds=\(Date().timeIntervalSince(started))")
             }
         }
-        let present = probe.exists
+        let present = measuredQuery("nib.qa.state exists") { probe.exists }
         exists = present
         guard present else { return nil }
-        let raw = probe.value
+        let raw = measuredQuery("nib.qa.state value") { probe.value }
         valueIsNil = raw == nil
         guard let state = try NibUITestSnapshot.decode(raw, as: QAState.self) else { return nil }
         decoded = true
@@ -2250,7 +2359,7 @@ final class NibUI {
 
     func elementFacts(_ element: XCUIElement, includeOverlaps: Bool = false) -> String {
         guard element.exists else { return "exists=false popovers=\(app.popovers.count) menus=\(app.menus.count) window=\(app.windows.firstMatch.frame)" }
-        guard let snapshot = try? element.snapshot() else { return "exists=true snapshot unavailable" }
+        guard let snapshot = try? measuredSnapshot(element, named: "element snapshot") else { return "exists=true snapshot unavailable" }
         let frame = snapshot.frame
         let centre = CGPoint(x: frame.midX, y: frame.midY)
         func covering(_ node: XCUIElementSnapshot) -> [String] {
@@ -2259,7 +2368,7 @@ final class NibUI {
             return [own] + node.children.flatMap { covering($0) }
         }
         // XCUITest has no public UIKit hitTest API. Report overlapping AX frames, not an invented hit result.
-        let overlaps = includeOverlaps ? ((try? app.snapshot()).map { covering($0) } ?? []) : []
+        let overlaps = includeOverlaps ? ((try? measuredSnapshot(app, named: "app snapshot")).map { covering($0) } ?? []) : []
         return "exists=true id=\(snapshot.identifier) label=\(snapshot.label) frame=\(frame) enabled=\(snapshot.isEnabled) hittable=\(element.isHittable) value=\(String(describing: snapshot.value)) popovers=\(app.popovers.count) menus=\(app.menus.count) window=\(app.windows.firstMatch.frame) centreOverlaps=\(overlaps)"
     }
 
@@ -2328,10 +2437,17 @@ final class NibUI {
         }
     }
 
-    func twoFingerScroll(from: CGPoint, to: CGPoint, duration: TimeInterval = 0.4) throws {
+    func twoFingerScroll(from: CGPoint, to: CGPoint, duration: TimeInterval = 0.4, holdAtEnd: Bool = false) throws {
         let spacing = min(0.035, 24 / canvas.frame.width)
-        try synthesize([[CGPoint(x: from.x - spacing, y: from.y), CGPoint(x: to.x - spacing, y: to.y)],
-                        [CGPoint(x: from.x + spacing, y: from.y), CGPoint(x: to.x + spacing, y: to.y)]], duration: duration)
+        let paths = [CGFloat(-1), CGFloat(1)].map { side -> [CGPoint] in
+            let start = CGPoint(x: from.x + side * spacing, y: from.y)
+            let end = CGPoint(x: to.x + side * spacing, y: to.y)
+            // Equal-time samples: preserve the original movement duration, then stay in
+            // contact at the destination for the same duration before lifting both fingers.
+            return holdAtEnd ? [start, end, end] : [start, end]
+        }
+        if holdAtEnd { logQA("Page scroll held release", "from=\(from) to=\(to) movement=\(duration) hold=\(duration)") }
+        try synthesize(paths, duration: holdAtEnd ? duration * 2 : duration)
     }
 
     /// Native context menus do not reliably let XCTest reach idle. Every menu contact is synthesized.
@@ -2532,7 +2648,7 @@ final class NibUI {
         if application != nil { sources.append(("Foreground app", primary)) }
         func inventory(_ stage: String) {
             for (name, source) in sources {
-                guard let snapshot = try? source.snapshot() else {
+                guard let snapshot = try? measuredSnapshot(source, named: "source snapshot") else {
                     logQA("Window top controls", "stage=\(stage) source=\(name) snapshot unavailable"); continue
                 }
                 func visit(_ node: XCUIElementSnapshot, top: CGFloat) {
@@ -2581,7 +2697,7 @@ final class NibUI {
             let matches = source.descendants(matching: .any).matching(predicate).allElementsBoundByIndex
             logQA("Window control inventory", "source=\(name) matches=\(matches.count)")
             for element in matches {
-                guard let snapshot = try? element.snapshot() else { continue }
+                guard let snapshot = try? measuredSnapshot(element, named: "element snapshot") else { continue }
                 logQA("Window control inventory", "source=\(name) type=\(snapshot.elementType.rawValue) id=\(snapshot.identifier) label=\(snapshot.label) frame=\(snapshot.frame) value=\(String(describing: snapshot.value))")
             }
             logQA("Window control hierarchy " + name, source.debugDescription)
@@ -2649,10 +2765,11 @@ final class NibUI {
     /// presented subtree. Keep snapshots for ancestry; never use child ordinals as live indices.
     private func presentedFormSnapshot() -> XCUIElementSnapshot? {
         let region = app.otherElements["PopoverDismissRegion"].firstMatch
-        guard hasVisibleFrame(region), let root = try? app.snapshot() else { return nil }
+        guard hasVisibleFrame(region), let root = try? measuredSnapshot(app, named: "app snapshot") else { return nil }
         let window = app.windows.firstMatch.frame
         func containsBackground(_ node: XCUIElementSnapshot) -> Bool {
-            ["nib.canvas", "nib.qa.state", "nib.qa.clipboard", "PopoverDismissRegion"].contains(node.identifier)
+            ["nib.canvas", "nib.qa.state", "nib.qa.clipboard", "PopoverDismissRegion",
+             "inputView", "inputAssistantView", "SystemInputAssistantView"].contains(node.identifier)
                 || node.elementType == .keyboard || node.children.contains { containsBackground($0) }
         }
         func hasContent(_ node: XCUIElementSnapshot) -> Bool {
@@ -2662,6 +2779,9 @@ final class NibUI {
         var candidates: [XCUIElementSnapshot] = []
         var passedCover = false
         func visit(_ node: XCUIElementSnapshot) {
+            // Prune the subtree, not just ancestors containing Keyboard: its inner Others
+            // have buttons and otherwise look exactly like a plain modal form.
+            if node.elementType == .keyboard || ["inputView", "inputAssistantView", "SystemInputAssistantView"].contains(node.identifier) { return }
             if node.identifier == "PopoverDismissRegion" { passedCover = true; return }
             if passedCover, node.elementType == .other, node.frame.width > 100,
                node.frame.height > 100, window.contains(node.frame),
@@ -2672,7 +2792,18 @@ final class NibUI {
             for child in node.children { visit(child) }
         }
         visit(root)
-        return candidates.last
+        func hasClose(_ node: XCUIElementSnapshot) -> Bool {
+            let names = ["sheet.dismiss", "Cancel", "Done", "Close", "Close export options"]
+            if node.elementType == .button && (names.contains(node.identifier) || names.contains(node.label)) { return true }
+            return node.children.contains { hasClose($0) }
+        }
+        let withClose = candidates.last(where: { hasClose($0) })
+        let chosen = withClose ?? candidates.last
+        if let chosen {
+            let reason = withClose != nil ? "foreground subtree with close control" : "foreground content without close control"
+            logQA("Modal form chosen", "type=\(chosen.elementType) label=\(chosen.label) frame=\(chosen.frame) reason=\(reason); keyboard subtrees excluded")
+        }
+        return chosen
     }
 
     private func formCloseControl(_ form: XCUIElementSnapshot) -> XCUIElement? {
@@ -2744,7 +2875,7 @@ final class NibUI {
             sameContainer(node) || node.children.contains { containsForm($0) }
         }
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            guard !hasVisibleFrame(cover), let root = try? app.snapshot() else { return false }
+            guard !hasVisibleFrame(cover), let root = try? measuredSnapshot(app, named: "app snapshot") else { return false }
             return !containsForm(root)
         }, object: nil)
         guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {

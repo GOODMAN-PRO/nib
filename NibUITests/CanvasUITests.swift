@@ -151,20 +151,28 @@ final class CanvasUITests: XCTestCase {
         let count = try ui.state().pageCount
         if shortcut { try key("g", [.command, .option]) { try self.ui.waitForState { $0.openPanels.contains("pages.goToPage") } } }
         else { try more("Go to Page…") }
-        let field = try require("Page number or title")
-        let autofocus = ui.isKeyboardFocused(field, allowingAttributeFallback: true)
-        if !autofocus { field.tap() }
-        ui.logQA("Go to Page focus", "page=\(number) autofocus=\(autofocus) afterTap=\(ui.isKeyboardFocused(field, allowingAttributeFallback: true))")
-        func focused() -> Bool { ui.isKeyboardFocused(field, allowingAttributeFallback: true) }
-        if !focused() {
-            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in focused() }, object: nil)
-            if XCTWaiter.wait(for: [ready], timeout: 3) != .completed {
-                field.tap()
-                ui.logQA("Go to Page focus retap", "page=\(number) focused=\(focused())")
+        let field = ui.app.textFields.matching(NSPredicate(
+            format: "identifier == %@ OR label == %@ OR placeholderValue == %@",
+            "Page number or title", "Page", "Page number or title")).firstMatch
+        guard ui.measuredQuery("Go to Page typed field", { field.waitForExistence(timeout: 8) }) else {
+            throw NibUI.Failure.message("Go to Page native field missing")
+        }
+        let autofocus = ui.isKeyboardFocused(field, allowingAttributeFallback: true, in: ui.app)
+        if !autofocus {
+            field.tap()
+            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                self.ui.isKeyboardFocused(field, allowingAttributeFallback: true, in: self.ui.app)
+            }, object: nil)
+            guard XCTWaiter.wait(for: [ready], timeout: 3) == .completed else {
+                throw NibUI.Failure.message("Go to Page field did not focus")
             }
         }
-        // Preserve app autofocus; do not tap it away or type the requested value twice.
-        if field.value as? String != String(number) { field.typeText(String(number)) }
+        ui.logQA("Go to Page focus", "page=\(number) autofocus=\(autofocus) verifiedOnce=true route=SPI")
+        if ui.measuredQuery("Go to Page value", { field.value as? String }) != String(number) {
+            try ui.focusedKey("a", .command)
+            for digit in String(number) { try ui.focusedKey(String(digit)) }
+        }
+        try ui.waitForNativeText(in: field, equals: String(number))
         try tap("Go")
         _ = try ui.waitForState { !$0.openPanels.contains("pages.goToPage") }
         eventually("Go must activate page \(number)") {
@@ -383,6 +391,12 @@ final class CanvasUITests: XCTestCase {
         try ui.twoFingerScroll(from: CGPoint(x: 0.8, y: 0.5), to: CGPoint(x: 0.2, y: 0.5))
         _ = try ui.waitForState { $0.page != before.page }
         _ = try page(2)
+    }
+
+    func testVerticalSinglePageLayoutPersistsAfterHorizontal() throws {
+        try open()
+        // Preserve the original transition; fixture-default Vertical alone would be vacuous.
+        try setDirection("Horizontal")
         try setDirection("Vertical")
         try go(1)
         XCTAssertEqual(try page(1).frame.midX, try page(2).frame.midX, accuracy: 2, "Vertical pages must share one column")
@@ -1094,17 +1108,19 @@ final class CanvasUITests: XCTestCase {
         try tap("Board 1")
         let before = try ui.state()
         try tap("Export")
-        _ = try require("Close export options")
+        let export = ui.app.alerts["Share & Export"].firstMatch
+        let close = export.buttons.matching(NSPredicate(format: "identifier == %@ AND label == %@", "xmark", "Close")).firstMatch
+        XCTAssertTrue(close.waitForExistence(timeout: 8), "Share & Export must expose its scoped Close control")
         for (title, value) in [("Board 1", "Selected"), ("Board 2", "Not selected")] {
             let choice = ui.app.buttons.matching(NSPredicate(format: "label == %@ AND value == %@", title, value)).firstMatch
             XCTAssertTrue(choice.waitForExistence(timeout: 5), "Export must honor board scope: \(title) \(value)")
         }
-        try tap("Close export options")
+        XCTAssertTrue(close.isEnabled && close.isHittable)
+        close.tap()
         // The floating host can retain a dismissed panel's accessibility representation.
         // Cancellation promises dismissal, not deallocation of that representation.
         eventually("Cancel must close export options") {
-            !self.ui.app.buttons.matching(NSPredicate(format: "label == %@", "Close export options"))
-                .allElementsBoundByIndex.contains { $0.isHittable }
+            !close.exists || !close.isHittable
         }
         unchanged(before, try ui.state())
     }
