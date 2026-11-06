@@ -273,11 +273,16 @@ final class NibUI {
                       height: max(0, min(viewport.maxY, scroller.frame.maxY - 16) - viewport.minY))
     }
 
+    /// `fullyVisible` (with `scroll`) also requires the control's whole height inside its scroller's viewport, minus
+    /// the cue lane, and reveals it otherwise: XCTest calls a row hittable when only a sliver shows, and a tap on
+    /// the sliver does nothing (Fit Height to Text, run 42136488712). It is opt-in because the check costs two
+    /// snapshots, one of them of the whole scope: the ordinary lookup stays one query.
     func requireControl(_ name: String, type: XCUIElement.ElementType = .any,
                         scroll: Bool = false, timeout: TimeInterval = 3,
-                        in scope: XCUIElement? = nil, edge: FormEdge? = nil) throws -> XCUIElement {
+                        in scope: XCUIElement? = nil, edge: FormEdge? = nil,
+                        fullyVisible: Bool = false) throws -> XCUIElement {
         if let found = findControl(name, type: type, in: scope) {
-            if !scroll { return found }
+            if !scroll || !fullyVisible { return found }
             var fits = controlFitsScroller(found, in: scope)
             if fits == nil {
                 let resolved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
@@ -296,7 +301,7 @@ final class NibUI {
             let revealTarget = findControl(name, type: type, actionable: false, in: scope)
                 ?? (scope ?? app).descendants(matching: type).matching(NSPredicate(
                     format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
-            revealFormElement(in: scope, edge: edge, named: name, type: type, fullyVisible: true) { revealTarget }
+            revealFormElement(in: scope, edge: edge, named: name, type: type, fullyVisible: fullyVisible) { revealTarget }
             if let failure = formRevealFailure { throw Failure.message(failure) }
         }
         var found: XCUIElement?
@@ -304,7 +309,7 @@ final class NibUI {
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
             found = findControl(name, type: type, in: scope)
             if let found {
-                if !scroll { return true }
+                if !scroll || !fullyVisible { return true }
                 let fits = controlFitsScroller(found, in: scope)
                 unresolvedGeometry = fits == nil
                 return fits == true

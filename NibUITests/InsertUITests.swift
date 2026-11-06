@@ -98,14 +98,15 @@ final class InsertUITests: XCTestCase {
         }
     }
     /// Waits for a freshly bound typed control in the active alert, menu or sheet, including native placeholders.
-    private func control(_ name: String, _ type: XCUIElement.ElementType = .any, scroll: Bool = false) throws -> XCUIElement {
+    private func control(_ name: String, _ type: XCUIElement.ElementType = .any, scroll: Bool = false,
+                         fullyVisible: Bool = false) throws -> XCUIElement {
         if [.textField, .secureTextField, .textView, .searchField].contains(type) {
             // Focus is valid even when the software keyboard makes the editor non-hittable.
             let field = try ui.textEditor(name)
             guard field.elementType == type, field.isEnabled else { throw NibUI.Failure.message("Unexpected or disabled editor: \(name)") }
             return field
         }
-        let target = try ui.requireControl(name, type: type, scroll: scroll, timeout: 8)
+        let target = try ui.requireControl(name, type: type, scroll: scroll, timeout: 8, fullyVisible: fullyVisible)
         guard target.isEnabled else { throw NibUI.Failure.message("Insert control is disabled: \(name)") }
         return target
     }
@@ -206,7 +207,8 @@ final class InsertUITests: XCTestCase {
         try ui.replaceNativeText(in: field, with: "")
     }
     private func toggle(_ name: String, to value: Bool) throws {
-        let element = try control(name, .switch, scroll: true)
+        // A switch row at the bottom of a popover can show only a sliver above the cue lane: require all of it.
+        let element = try control(name, .switch, scroll: true, fullyVisible: true)
         // DESIGN §1.7 uses native switches. UIKit can expose the whole labeled row
         // as a switch as well as its actual switch child; the row's centre is text.
         let nativeSwitch = element.descendants(matching: .switch).firstMatch

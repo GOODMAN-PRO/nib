@@ -451,3 +451,13 @@ Confirmed the two majors against H9/H11, R12 pages-menus-outline#0 and insert-me
 Caller audit: requireControl signatures/defaults remain compatible across Canvas, Capture, Chrome, Ink, Insert, Selection and internal provider/tool paths. Non-scrolling lookups are unchanged. Re-read Pages and Insert nativeContextMenu callers; successor alert/form, content and state checks remain intact. No test body, assertion, allowance, sleep, capability check or XCTSkip site changes; all seven authorized device-only boundaries remain as before. No app file changes.
 
 Validation: python Scripts/lint.py reports **0 errors, 25 warnings**; git diff --check passes. Static review covers optional Bool handling, snapshot tuple types, closure state, predicate return paths and bounded waits. No Swift compiler or simulator is available on Windows; CI must verify compilation, relayout/duplicate-identity behavior and runtime costs. XCTest synchronous snapshot calls can exceed an outer wait's deadline; no runtime pass or speedup is claimed.
+
+### Round 11c, integrator's change after review (6 Nov 2026)
+
+H11 as committed made `requireControl(scroll: true)` take two snapshots on every call, one of the whole scope, for
+about seventy callers; the last review kept that as a major finding (the slow-query pattern this round removes
+elsewhere). The containment check is now opt-in: `requireControl(..., scroll: true, fullyVisible: true)`. Without
+`fullyVisible` the lookup is what it was before 11c (the first hittable match, a reveal only when there is none).
+`InsertUITests.toggle` opts in, because a switch row at the bottom of a popover is the proven case
+(R12:insert-controls#4, Fit Height to Text). A caller that meets the same symptom (a tap on a hittable control that
+does nothing, the control's frame crossing its scroller's lower edge) should opt in too.
