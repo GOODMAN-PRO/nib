@@ -51,11 +51,12 @@ final class LibraryUITests: XCTestCase {
         app.buttons.matching(matching(label)).firstMatch
     }
 
+    // These waits also run inside chord() postconditions. Only throw here so a proven
+    // dropped delivery can retry; an exhausted/rejected retry fails the throwing test.
     private func visible(_ element: XCUIElement, _ message: String, timeout: TimeInterval = 12,
                          file: StaticString = #filePath, line: UInt = #line) throws {
         guard element.exists || element.waitForExistence(timeout: timeout) else {
-            XCTFail(message, file: file, line: line)
-            throw NibUI.Failure.message(message)
+            throw NibUI.Failure.message("\(message) (\(file):\(line))")
         }
     }
 
@@ -65,8 +66,7 @@ final class LibraryUITests: XCTestCase {
         if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
-            XCTFail(message, file: file, line: line)
-            throw NibUI.Failure.message(message)
+            throw NibUI.Failure.message("\(message) (\(file):\(line))")
         }
     }
 
@@ -402,7 +402,11 @@ final class LibraryUITests: XCTestCase {
         XCTAssertFalse(button("Finish Selecting").exists)
         try tap("Select Items")
         item(physics).tap()
-        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) {
+            try self.eventually("Escape must clear selection and exit selection mode") {
+                !self.item(self.physics).isSelected && !self.button("Finish Selecting").exists
+            }
+        }
         XCTAssertFalse(item(physics).isSelected, "Escape must clear selection")
         XCTAssertFalse(button("Finish Selecting").exists)
     }
@@ -416,9 +420,10 @@ final class LibraryUITests: XCTestCase {
         }
         try tap("Select Items")
         item(physics).tap()
-        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
-        try eventually("Escape must exit selection and clear the checked cover") {
-            !self.item(self.physics).isSelected && !self.button("Finish Selecting").exists
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) {
+            try self.eventually("Escape must exit selection and clear the checked cover") {
+                !self.item(self.physics).isSelected && !self.button("Finish Selecting").exists
+            }
         }
         try library()
     }

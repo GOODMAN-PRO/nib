@@ -29,7 +29,25 @@ cannot enable a scenario. Fixtures use an isolated library and preferences.
   its receipt advances while Board 3 remains unseen; Select All / Mark as Seen
   must clear both. Verify content and history as well. These fields inspect
   persisted receipts; they do not simulate F108's tracker or command results.
-- `tabsOverflow`: also seeds eight notebooks named `Chrome tab 2` through `Chrome tab 9`; Chrome opens them through the library alongside Physics — Motion to exercise nine open tabs and overflow without creating notebooks through the UI.
+- `tabsOverflow`: enables `editing.showTabs` and opens nine tabs through the app's
+  own commands before fixture readiness: `Physics — Motion`, then `Chrome tab 2`
+  through `Chrome tab 9`, in that order. Startup ends in the **library**, with no
+  active document; the nine tabs remain open. Open a document from the library
+  before using document chrome or Document Editing settings. The document strip
+  exposes hidden documents through `+N` (`windows.tabs.overflow`, accessibility
+  label `N more open documents`); it opens the same complete Tabs menu as
+  `windows.tabs.menu`. The number hidden depends on available strip geometry.
+- `timerHistory`: companion-app scenario contract for six saved Time Keeper
+  sessions, named `Chrome history 1` through `Chrome history 6`, all associated
+  with `Physics — Motion`. Durations are distinct and end times are one minute
+  apart. The contract does **not** specify display/name order. Assert all six
+  names, the document title on each row, exact count and no duplicates, then
+  exercise Show All / Show Less (the collapsed limit is five). Launch with
+  `-NibUITestFixture -NibUITestScenario timerHistory`; open the fixture notebook
+  from the library before Time Keeper. The app implementation is being supplied
+  separately and is absent from the 702e1519 baseline: the test must fail with
+  `Missing timerHistory fixture scenario` when `fixtureScenario` does not echo
+  `timerHistory`, never silently accept the standard fixture or skip coverage.
 
 The round-1 Canvas tests must explicitly launch the relevant scenario. The
 Mark as Seen test currently ends in an unconditional prerequisite `XCTFail`;

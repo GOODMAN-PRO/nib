@@ -243,14 +243,23 @@ final class InsertUITests: XCTestCase {
     }
     private func panel(_ name: String) throws {
         if query(name, .button).allElementsBoundByIndex.contains(where: { $0.isHittable }) { try tap(name); return }
-        if !visible("Panel Options") {
+        if !visible("Panel Options") && !visible("Outline Options") {
             if visible("cmd.panel.close") { try tap("cmd.panel.close") }
             try ui.tapCommand("sidebar.toggle")
         }
         // F052 exposes Audio as a sidebar tab. On whiteboards it is a primary
         // tab, so opening Panel Options would obscure it rather than list it.
         if query(name, .button).allElementsBoundByIndex.contains(where: { $0.isHittable }) { try tap(name); return }
-        try tap("Panel Options"); try tap(name)
+        let options = visible("Outline Options") ? "Outline Options" : "Panel Options"
+        try tap(options)
+        if options == "Outline Options" {
+            for action in ["Move to Left Side", "Move to Right Side", "Float Panel"] {
+                try wait("Outline Options must contain placement action: " + action) {
+                    self.query(action, .button).firstMatch.exists
+                }
+            }
+        }
+        try tap(name)
     }
     private func selectedBounds() throws -> CGRect {
         let q = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == 'Selection' AND (value == '1 item' OR value ENDSWITH ' items')"))

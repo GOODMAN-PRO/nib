@@ -46,6 +46,23 @@ final class NibUI {
     var diagnoseKeyDelivery = false
     var diagnoseStateReads = false
     private var slowTreeLogged = false
+    private var previousKey: (name: String, uptime: TimeInterval)?
+    private var previousActivity = "fixture setup"
+
+    /// Explicit runner action boundaries, not an inferred XCTest activity stack. No AX query.
+    func noteActivity(_ name: String) { previousActivity = name }
+
+    private func noteKeyDelivery(_ name: String) {
+        previousKey = (name, ProcessInfo.processInfo.systemUptime)
+        noteActivity(name)
+    }
+
+    private func keyContext() -> String {
+        let now = ProcessInfo.processInfo.systemUptime
+        let key = previousKey?.name ?? "none recorded"
+        let elapsed = previousKey.map { String(now - $0.uptime) } ?? "unavailable"
+        return "deliveryUptime=\(now) previousKey=\(key) secondsSincePreviousKey=\(elapsed) previousActivity=\(previousActivity)"
+    }
     var canvas: XCUIElement { app.scrollViews["nib.canvas"].firstMatch }
 
     /// Instrument synchronous AX calls without changing their result or adding a retry.
@@ -116,7 +133,7 @@ final class NibUI {
     }
 
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
-    enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards, tabsOverflow }
+    enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards, tabsOverflow, timerHistory }
     enum FormEdge { case top, bottom, nearest }
 
     /// Reject hidden SwiftUI menu copies before asking AX for an activation point (zero frames can raise).
@@ -634,8 +651,9 @@ final class NibUI {
         // A missing Sheet node says nothing about Nib's plain-Other forms. Decide from
         // this list's own scroll position; unknown positions must never start by pulling down.
         let lazySearch = initialSnapshot == nil
-        let modal = presentedFormSnapshot()
-        let coverVisible = hasVisibleFrame(app.otherElements["PopoverDismissRegion"].firstMatch)
+        let presentation = presentedFormContext()
+        let modal = presentation.form
+        let coverVisible = presentation.coverVisible
         if let modal, let context = ancestry(firstSnapshot, in: modal) {
             ancestorClip = (ancestorClip ?? window).intersection(context.clip)
         }
@@ -1344,7 +1362,10 @@ final class NibUI {
             let deliveryBefore = chordProbeSnapshot()
             let logBeforeDelivery = deliveryBefore.state?.keyLog ?? focused.keyLog ?? []
             logQA("Key before delivery", "route=hardware typeKey key=\(key) modifiers=\(modifiers.rawValue) keyboardExists=\(app.keyboards.firstMatch.exists) " + deliveryBefore.facts)
-            try hardwareKey(key, modifiers)
+            let precedingActivity = previousActivity
+            let precedingContext = keyContext() + " precedingAction=" + precedingActivity
+            try openHardwareKeyRoute()
+            try sendHardwareKey(key, modifiers)
             // The app's own account of the key (window press, responder, command run) goes into the test log
             // for passing and failing chords alike.
             defer {
@@ -1364,6 +1385,7 @@ final class NibUI {
                         + deliveryBefore.facts + "\nafter failed postcondition: " + deliveryAfter.facts)
                     if after.keyResponderIsText == false {
                         let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
+                        logQA("Chord lost context", precedingContext)
                         logQA("Chord undelivered retry", "key=\(key) modifiers=\(modifiers.rawValue) keyboards=\(keyboards) " + deliveryAfter.facts)
                         try sendHardwareKey(key, modifiers)
                         do { try postcondition(); return }
@@ -1378,6 +1400,7 @@ final class NibUI {
                 if let current = try? state(), current.keyResponderIsText != true,
                    let observed = missingChordModifiers(key, modifiers, before: logBeforeDelivery,
                                                         after: current.keyLog ?? []) {
+                    logQA("Chord lost context", precedingContext)
                     logQA("Chord modifier loss retry", "key=\(key) requested=\(modifiers.rawValue) observed=\(observed)")
                     try sendHardwareKey(key, modifiers)
                     do { try postcondition(); return }
@@ -1601,6 +1624,7 @@ final class NibUI {
     }
 
     private func sendHIDKey(_ usage: UInt) throws {
+        noteKeyDelivery("HID usage \(usage)")
         try XCTContext.runActivity(named: "Hardware key HID usage \(usage)") { _ in
             let done = XCTestExpectation(description: "HID key delivered")
             var failure: Error?
@@ -1628,6 +1652,7 @@ final class NibUI {
     }
 
     private func sendTypedKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags) throws {
+        noteKeyDelivery("typed key \(key) modifiers=\(modifiers.rawValue)")
         try XCTContext.runActivity(named: "Hardware key \(key), modifiers \(modifiers.rawValue)") { activity in
             let route = XCTAttachment(string: "route=NibTouchPaths key=\(key) modifiers=\(modifiers.rawValue); SPI route is in runner log")
             route.lifetime = .keepAlways; activity.add(route)
@@ -2092,13 +2117,14 @@ final class NibUI {
         }
     }
 
-    /// Explicit opt-in for four known covered controls, not a global tap policy.
+    /// Explicit opt-in for covered controls, including alert buttons; not a global tap policy.
     func prepareCoveredControl(_ name: String) throws {
         let target = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", name)).firstMatch
         let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
         let alert = app.alerts.firstMatch
         let region = app.otherElements["PopoverDismissRegion"].firstMatch
-        let numberPad = name == "Move Ruler" && alert.exists && region.exists && app.popovers.firstMatch.exists
+        let numberPad = alert.exists && alert.buttons[name].firstMatch.exists
+            && region.exists && app.popovers.firstMatch.exists
         let frame = target.exists ? target.frame : nil
         let covered = frame.map { rect in keyboards.contains { $0.intersects(rect) } } ?? false
         // Ivory is lazy: its Format container, rather than the absent swatch, proves the obstruction.
@@ -2315,6 +2341,7 @@ final class NibUI {
                     if diagnoseKeyDelivery { logQA("Key after delivery", "key=\(key) probe=\(String(describing: probe.value))") }
                 }
                 logQA("Stall boundary", "native typeKey key=\(key) modifiers=\(modifiers.rawValue)")
+                noteKeyDelivery("native key \(key) modifiers=\(modifiers.rawValue)")
                 field.typeKey(key == XCUIKeyboardKey.return.rawValue ? "\n" : key, modifierFlags: modifiers)
             }
         }
@@ -2362,7 +2389,10 @@ final class NibUI {
     /// XCUIElement.typeText, this never invokes XCTest's default interruption handler.
     /// Route 3 types the complete string (including shifted punctuation and Unicode).
     func typeNativeText(_ text: String, in field: XCUIElement) throws {
-        guard app.alerts.firstMatch.exists else { field.typeText(text); return }
+        guard app.alerts.firstMatch.exists else {
+            noteKeyDelivery("native text characters=\(text.count)")
+            field.typeText(text); return
+        }
         logQA("Native alert text", "route=runner text SPI characters=\(text.count)")
         if text == "\n" { try sendHIDKey(0x28); return }
         try focusedText(text)
@@ -2370,6 +2400,7 @@ final class NibUI {
 
     /// Caller has established the focused field; exact text is verified by the caller.
     func focusedText(_ text: String) throws {
+        noteKeyDelivery("focused text characters=\(text.count)")
         let delivered = XCTestExpectation(description: "Alert text delivered")
         var failure: Error?
         NibTouchPaths.sendKey(text, modifiers: 0, route: 3) { error in
@@ -2516,6 +2547,7 @@ final class NibUI {
     }
 
     func openDocument(_ title: String) throws {
+        noteActivity("open document " + title)
         _ = try waitForState { $0.screen == "library" }
         let document = app.buttons.matching(identifier: "cmd.doc.open")
             .matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", title, title + ",")).firstMatch
@@ -2563,6 +2595,7 @@ final class NibUI {
     }
 
     func tapCommand(_ id: String, diagnostics: Bool = false) throws {
+        noteActivity("tap command " + id)
         try tapControl("cmd." + id, overflow: ["menu.more", "tool.more"], diagnostics: diagnostics)
     }
 
@@ -2592,6 +2625,7 @@ final class NibUI {
     }
 
     func selectTool(_ id: String, scopedOverflow: Bool = false) throws {
+        noteActivity("select tool " + id)
         // Reselecting toggles its options strip (or settings for a tool without a strip).
         if try state().tool != id { try tapControl("tool." + id, overflow: ["tool.more"], scopedOverflow: scopedOverflow) }
         _ = try waitForState { $0.tool == id }
@@ -2681,7 +2715,8 @@ final class NibUI {
     /// The first attachment is emitted before touching AX so an idle stall still leaves a precise last-started action.
     @discardableResult
     func timedAction<T>(_ name: String, action: () throws -> T) rethrows -> T {
-        try XCTContext.runActivity(named: name) { activity in
+        noteActivity(name)
+        return try XCTContext.runActivity(named: name) { activity in
             let started = ProcessInfo.processInfo.systemUptime
             let start = XCTAttachment(string: "start uptime=\(started) wall=\(Date())")
             start.name = "action-start"; start.lifetime = .keepAlways; activity.add(start)
@@ -2731,6 +2766,7 @@ final class NibUI {
     /// Two points use the public coordinate press-and-drag API. Longer polylines keep one finger down using
     /// XCTest's event synthesizer (test runner only); no commands or app-side gesture injection are used.
     func drawStroke(_ path: [CGPoint], duration: TimeInterval = 0.35) throws {
+        noteActivity("draw stroke")
         guard path.count >= 2 else { throw Failure.message("A stroke needs at least two points") }
         if path.count == 2 {
             let start = coordinate(path[0]), end = coordinate(path[1])
@@ -3190,9 +3226,24 @@ final class NibUI {
     /// Exclude the underlying document/library and the cover itself before choosing the last
     /// presented subtree. Keep snapshots for ancestry; never use child ordinals as live indices.
     private func presentedFormSnapshot() -> XCUIElementSnapshot? {
+        presentedFormContext().form
+    }
+
+    private func presentedFormContext() -> (form: XCUIElementSnapshot?, coverVisible: Bool) {
         let region = app.otherElements["PopoverDismissRegion"].firstMatch
-        guard hasVisibleFrame(region), let root = try? measuredSnapshot(app, named: "app snapshot") else { return nil }
+        guard hasVisibleFrame(region) else { return (nil, false) }
+        // Keep the observed cover on a failed snapshot: loss of evidence must not permit a modal pull-down.
+        guard let root = try? measuredSnapshot(app, named: "app snapshot") else { return (nil, true) }
         let window = app.windows.firstMatch.frame
+        func containsVisibleCover(_ node: XCUIElementSnapshot) -> Bool {
+            if node.identifier == "PopoverDismissRegion" {
+                let visible = node.frame.intersection(window)
+                return !node.frame.isNull && !node.frame.isInfinite && !visible.isNull
+                    && visible.width > 1 && visible.height > 1
+            }
+            return node.children.contains { containsVisibleCover($0) }
+        }
+        let coverVisible = containsVisibleCover(root)
         func containsBackground(_ node: XCUIElementSnapshot) -> Bool {
             ["nib.canvas", "nib.qa.state", "nib.qa.clipboard", "PopoverDismissRegion",
              "inputView", "inputAssistantView", "SystemInputAssistantView"].contains(node.identifier)
@@ -3229,7 +3280,7 @@ final class NibUI {
             let reason = withClose != nil ? "foreground subtree with close control" : "foreground content without close control"
             logQA("Modal form chosen", "type=\(chosen.elementType) label=\(chosen.label) frame=\(chosen.frame) reason=\(reason); keyboard subtrees excluded")
         }
-        return chosen
+        return (chosen, coverVisible)
     }
 
     private func formCloseControl(_ form: XCUIElementSnapshot) -> XCUIElement? {
