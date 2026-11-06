@@ -1116,15 +1116,37 @@ final class ChromeUITests: XCTestCase {
         try ui.prepareCoveredControl(title)
         let alert = ui.app.alerts.firstMatch
         let button = alert.buttons[title].firstMatch
-        var previousFrame: CGRect?
-        try wait("Ruler confirmation must be enabled, hittable and stable") {
-            guard button.exists, button.isEnabled, button.isHittable else { previousFrame = nil; return false }
-            let frame = button.frame
-            defer { previousFrame = frame }
-            return previousFrame == frame
+        func geometry() -> [CGRect] {
+            [alert.frame, button.frame] + ui.app.keyboards.allElementsBoundByIndex.map(\.frame)
         }
-        ui.logQA("Ruler alert confirm", "action=\(title) " + ui.elementFacts(button))
+        func stableGeometry() throws -> [CGRect] {
+            var previous: [CGRect] = []
+            var settled: [CGRect] = []
+            try wait("Ruler confirmation must be enabled, hittable and stable", timeout: 5) {
+                guard alert.exists, button.exists, button.isEnabled, button.isHittable else { previous = []; return false }
+                let current = geometry()
+                defer { previous = current }
+                if previous == current { settled = current; return true }
+                return false
+            }
+            return settled
+        }
+        let before = try stableGeometry()
+        ui.logQA("Ruler alert confirm", "action=\(title) alert/button/keyboards=\(before)")
         button.tap()
+        // A minimized keyboard can re-dock on this touch and move the button before touch-up.
+        // Only that observed geometry change authorizes a second confirmation, never an inert tap.
+        var moved = false
+        try wait("Ruler alert must close or expose the keyboard layout shift", timeout: 5) {
+            if !alert.exists { return true }
+            moved = geometry() != before
+            return moved
+        }
+        if moved, alert.exists {
+            let after = try stableGeometry()
+            ui.logQA("Ruler alert shifted retry", "action=\(title) before=\(before) stable=\(after)")
+            button.tap()
+        }
         ui.logQA("Ruler alert after tap", "action=\(title) alerts=\(ui.app.alerts.count)")
         try wait("Ruler alert must close before another action") { !alert.exists }
     }

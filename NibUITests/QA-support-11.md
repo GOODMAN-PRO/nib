@@ -14,3 +14,14 @@ Chrome derives hints only during Customise Toolbar. Reset checks visit saved lay
 | --- | --- | --- |
 | Customise layout/reset and shared reveal callers | Form reveal path / Form search reverse / Form reveal timing | Which hint and offset selected the direction, did an edge repeat, and how many moves/seconds resulted? |
 
+### H2 - alert clearing and moved ruler confirmation
+
+Confirmed R12:chrome-customise#2: the one observed default-handler cancellation occurs inside public typeText(Delete), while KeyProbe demonstrates HID Delete editing 12 to 1. Both first and fallback clear deletions now use existing HID usage 0x2A; exact waitForNativeText remains. The unexplained interruption trigger is not declared fixed, nor attributed to this run's ruler failure.
+
+R12:chrome-timer-ruler#4 verifier correction wins: retained prepareCoveredControl's number-pad dismissal. Pre-tap stability alone cannot prevent the touch-triggered re-dock. Confirmation records alert/button/keyboard geometry, then waits boundedly for disappearance or an actual geometry change. Only a changed layout with the alert still present permits one newly resolved, stable confirmation tap; closure remains mandatory. Should unblock SaveLayoutRejectsBlank and ruler Set Position, preserving Angle and value assertions. CI must show exact empty/replacement values, no default cancellation during Delete, and a closed Set Position alert at the corrected frame. No sleep or allowance change.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Native clear callers / Save Layout | Native clear HID | Did Delete use device synthesis instead of the interruption-monitored public route? |
+| Ruler confirmation tests | Ruler alert confirm / Ruler alert shifted retry / Ruler alert after tap | Did touch move the alert with the keyboard, which stable geometry received the retry, and did it close? |
+

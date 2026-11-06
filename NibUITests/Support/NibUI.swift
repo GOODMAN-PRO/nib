@@ -1957,8 +1957,8 @@ final class NibUI {
         try deliverNativeKey("a", .command, in: field)
         inspectClear("after Select All")
         // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
-        logQA("Stall boundary", "clearNativeText typeText Delete after Select All; field=\(field.label)")
-        field.typeText(XCUIKeyboardKey.delete.rawValue)
+        logQA("Native clear HID", "Delete after Select All; field=\(field.label)")
+        try sendHIDKey(0x2A)
         inspectClear("after first Delete")
         let remainingValue = field.value as? String
         guard let remaining = remainingValue ?? (field.elementType == .textView ? "" : nil) else {
@@ -1971,7 +1971,7 @@ final class NibUI {
                   current.count <= 4096 else { throw Failure.message("Native clear needs a readable bounded value after caret tap") }
             logQA("Native clear", "field=\(field.identifier) frame=\(field.frame) deleteCount=\(current.count)")
             if !current.isEmpty {
-                field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count))
+                for _ in 0..<current.count { try sendHIDKey(0x2A) }
                 inspectClear("after fallback Delete batch count=\(current.count)")
             }
         }
