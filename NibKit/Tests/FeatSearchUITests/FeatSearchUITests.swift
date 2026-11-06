@@ -1196,7 +1196,6 @@ final class FeatSearchUITests: XCTestCase {
                     .environment(\.horizontalSizeClass, .regular)
                     .environment(\.colorScheme, scheme)
                     .environment(\.dynamicTypeSize, .large)
-                    .environment(\.accessibilityReduceMotion, true)
                     .environment(\.searchLayoutDiagnostics, true)
                     .onPreferenceChange(SearchLayoutFrames.self) { frames = $0 }
                     let host = UIHostingController(rootView: root)
@@ -1265,8 +1264,11 @@ final class FeatSearchUITests: XCTestCase {
                         for y in Int(ceil(close.minY))..<Int(floor(close.maxY)) {
                             for x in Int(ceil(close.minX))..<Int(floor(close.maxX)) {
                                 let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
-                                let delta = max(abs(Int(pixel.r) - Int(backdrop.r)),
-                                    max(abs(Int(pixel.g) - Int(backdrop.g)), abs(Int(pixel.b) - Int(backdrop.b))))
+                                // In steps: one nested expression was too much for the type checker (package run 42190166170).
+                                let red: Int = abs(Int(pixel.r) - Int(backdrop.r))
+                                let green: Int = abs(Int(pixel.g) - Int(backdrop.g))
+                                let blue: Int = abs(Int(pixel.b) - Int(backdrop.b))
+                                let delta: Int = max(red, max(green, blue))
                                 if delta > 4 {
                                     glyph = glyph.union(CGRect(x: CGFloat(x), y: CGFloat(y), width: 1, height: 1))
                                 }
