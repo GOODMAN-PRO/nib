@@ -138,3 +138,14 @@ Confirmed R12:ink-tools#0 against EraserFilterChips and NibScrollView: Tape star
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | EraserFiltersEraseOnlyEnabledPenPencilHighlighterAndTape | Horizontal reveal / Horizontal reveal failed | How many moves and seconds revealed the chip; which row/target geometry failed? |
+
+### H7 / L1 - commit the Files inline name
+
+Confirmed R12:library#0 and verdict: exact replacement passed, but Return at t=74.12 left DOC.inlineRenameField open through t=87.42 with the software keyboard. Why Return failed is unknown. Replace public typeText(Return) with one observed keyboard Return/Done key (Files process first, hosted picker keyboard second), then only if the editor remains, tap verified empty space in its containing browser collection. Each delivered route has a bounded field-disappearance wait. No app activation, repeated key or blind tile tap. The older Create-alert route retains its 12 s postcondition. Failure preserves the original message and first attaches XCUIScreen.main, then logs Files/hosted hierarchies and keyboard buttons. Both nameNewFilesFolder callers (Library external drop and saveSharedPNG) retain exact name replacement and downstream folder verification.
+
+R12:library#1 remains an environment limit: the next Library run should get past naming and reach **External drop setup requires iPad multitasking controls** again. The cross-app drop test, that message and all import/destination assertions remain unchanged; no simulated drop hook is substituted.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| ExternalFilesDropImportsIntoCurrentFolder; saveSharedPNG callers | Files rename key / Files rename commit | Which observed commit route ran, and did the editor disappear? |
+| Same, on failure | Files rename hierarchy / Files rename hosted hierarchy / Files rename keyboard buttons | What did Files and its keyboard actually expose after both routes failed? |

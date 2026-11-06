@@ -868,17 +868,76 @@ final class NibUI {
         let usesInlineEditor = inline.isHittable
         let field = usesInlineEditor ? inline : alertField
         try replaceNativeText(in: field, with: title)
+        func finished(_ route: String, timeout: TimeInterval) -> Bool {
+            let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !field.exists }, object: nil)
+            let result = XCTWaiter.wait(for: [gone], timeout: timeout) == .completed
+            logQA("Files rename commit", "route=\(route) fieldGone=\(result)")
+            return result
+        }
+        let files = XCUIApplication(bundleIdentifier: "com.apple.DocumentsApp")
         if usesInlineEditor {
-            field.typeText("\n")
+            // The remote Files picker can expose its keyboard under the host app tree.
+            // Prefer the Files process; never activate it and dismiss the current save picker.
+            let processes = files.state == .notRunning ? [app] : [files, app]
+            var commitKey: XCUIElement?
+            for process in processes {
+                let keyboard = process.keyboards.firstMatch
+                guard keyboard.exists else { continue }
+                let keys = keyboard.descendants(matching: .any).matching(NSPredicate(
+                    format: "label ==[c] 'Return' OR label ==[c] 'Done' OR identifier == 'Return' OR identifier == 'Done' OR label == %@", "\n"))
+                if let key = keys.allElementsBoundByIndex.prefix(16).first(where: { $0.isEnabled && $0.isHittable }) {
+                    commitKey = key; break
+                }
+            }
+            if let commitKey {
+                logQA("Files rename key", elementFacts(commitKey))
+                commitKey.tap()
+                if finished("keyboard Return/Done", timeout: 4) { return }
+            } else { logQA("Files rename key", "No hittable Return/Done in Files or its hosted keyboard") }
+            if !field.exists { return }
+            // End editing only on observed empty browser space, never on a tile or toolbar action.
+            let browser = app.collectionViews.containing(.textView, identifier: "DOC.inlineRenameField").firstMatch
+            if browser.exists, let snapshot = try? measuredSnapshot(browser, named: "Files rename browser") {
+                func occupied(_ node: XCUIElementSnapshot) -> [CGRect] {
+                    let interactive: [XCUIElement.ElementType] = [.cell, .button, .textView, .textField, .searchField, .keyboard]
+                    return (interactive.contains(node.elementType) ? [node.frame.insetBy(dx: -8, dy: -8)] : [])
+                        + node.children.flatMap { occupied($0) }
+                }
+                let frame = snapshot.frame.intersection(app.windows.firstMatch.frame).insetBy(dx: 24, dy: 24)
+                let keyboardFrames = processes.flatMap { $0.keyboards.allElementsBoundByIndex.map(\.frame) }
+                let blocked = occupied(snapshot) + keyboardFrames
+                let fractions: [CGFloat] = [0.85, 0.65, 0.45, 0.25, 0.10]
+                let points = fractions.flatMap { y in fractions.map { x in
+                    CGPoint(x: frame.minX + frame.width * x, y: frame.minY + frame.height * y)
+                } }
+                if !frame.isNull, frame.width > 0, frame.height > 0,
+                   let point = points.first(where: { point in !blocked.contains { $0.contains(point) } }) {
+                    logQA("Files rename commit", "route=empty browser point=\(point) browser=\(snapshot.frame)")
+                    app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+                        dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+                    if finished("empty browser", timeout: 4) { return }
+                }
+            }
         } else {
             let create = app.alerts.buttons["Create"]
             guard create.isHittable && create.isEnabled else { throw Failure.message("Files Create must be available") }
             create.tap()
+            if finished("alert Create", timeout: 12) { return }
         }
-        let finished = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !field.exists }, object: nil)
-        guard XCTWaiter.wait(for: [finished], timeout: 12) == .completed else {
-            throw Failure.message("Files must finish naming the new folder")
+        if !field.exists { return }
+        XCTContext.runActivity(named: "Files rename failure") { activity in
+            let shot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            shot.name = "Files inline rename full screen"; shot.lifetime = .keepAlways
+            activity.add(shot)
         }
+        logQA("Files rename hierarchy", files.state == .notRunning ? "Files process not running" : files.debugDescription)
+        logQA("Files rename hosted hierarchy", app.debugDescription)
+        let diagnosticProcesses: [(String, XCUIApplication)] = files.state == .notRunning
+            ? [("Nib hosted Files", app)] : [("com.apple.DocumentsApp", files), ("Nib hosted Files", app)]
+        for (name, process) in diagnosticProcesses {
+            logQA("Files rename keyboard buttons", "process=\(name) " + process.keyboards.buttons.debugDescription)
+        }
+        throw Failure.message("Files must finish naming the new folder")
     }
 
     /// Waits for the actual microphone prompt (or an already-authorized Recording HUD), then for system alerts to disappear.
