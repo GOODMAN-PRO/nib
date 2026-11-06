@@ -147,22 +147,96 @@ struct NibActionTouchTarget: UIViewRepresentable {
 final class NibActionTapRecognizer: UITapGestureRecognizer {
     var action: () -> Void = {}
     private var start: CGPoint?
-    @objc func activate() { action() }
+    #if DEBUG
+    private var qaBeganAt: TimeInterval?
+    private var qaDuration: TimeInterval = 0
+    private var qaMovement: CGFloat = 0
+    private var qaTouches = 0
+    private var qaReason = "reset before action delivery"
+    private var qaPreventer = "none observed"
+    private var qaEndState: Int?
+    private var qaHit = "unknown"
+
+    private func logTap(_ outcome: String) {
+        guard let began = qaBeganAt else { return }
+        let duration = qaDuration > 0 ? qaDuration : ProcessInfo.processInfo.systemUptime - began
+        let metrics = "durationMs=\(Int(duration * 1_000)) movement=\(qaMovement) touches=\(qaTouches)"
+        let end = "state=\(qaEndState ?? state.rawValue) reason=\(qaReason) preventionCandidate=\(qaPreventer)"
+        if outcome == "fired" {
+            NSLog("%@", "[Nib QA tap] fired recognizer=\(ObjectIdentifier(self)) hit=\(qaHit) durationMs=\(Int(duration * 1_000))")
+        } else {
+            NSLog("%@", "[Nib QA tap] \(outcome) recognizer=\(ObjectIdentifier(self)) hit=\(qaHit) \(metrics) \(end)")
+        }
+        qaBeganAt = nil // Exactly one outcome per sequence, including reset after fire.
+    }
+    #endif
+
+    @objc func activate() {
+        #if DEBUG
+        qaReason = "action delivered"
+        logTap("fired")
+        #endif
+        action()
+    }
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        #if DEBUG
+        if qaBeganAt == nil {
+            qaBeganAt = ProcessInfo.processInfo.systemUptime
+            qaDuration = 0; qaMovement = 0; qaTouches = 0; qaEndState = nil
+            qaReason = "reset before action delivery"; qaPreventer = "none observed"
+            qaHit = touches.first.flatMap(\.view).map { String(describing: type(of: $0)) } ?? "nil"
+        }
+        qaTouches += touches.count
+        #endif
         start = touches.first?.location(in: view)
         super.touchesBegan(touches, with: event)
     }
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        #if DEBUG
+        if let start, let point = touches.first?.location(in: view) {
+            qaMovement = max(qaMovement, hypot(point.x - start.x, point.y - start.y))
+            if qaMovement >= DropletPhysics.pickupSlop { qaReason = "movement exceeded pickup slop" }
+        }
+        #endif
         if let start, let point = touches.first?.location(in: view),
            hypot(point.x - start.x, point.y - start.y) >= DropletPhysics.pickupSlop {
             state = .failed
         } else { super.touchesMoved(touches, with: event) }
     }
-    override func reset() { super.reset(); start = nil }
+    #if DEBUG
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        if let began = qaBeganAt { qaDuration = ProcessInfo.processInfo.systemUptime - began }
+        if let start, let point = touches.first?.location(in: view) {
+            qaMovement = max(qaMovement, hypot(point.x - start.x, point.y - start.y))
+        }
+        super.touchesEnded(touches, with: event)
+        qaEndState = state.rawValue
+    }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        qaReason = "UIKit cancelled touch delivery"
+        let contenders = touches.flatMap { $0.gestureRecognizers ?? [] }
+        qaPreventer = contenders.filter { $0 !== self && ($0.state == .began || $0.state == .changed || $0.state == .ended) }
+            .map { "\(type(of: $0)):\($0.state.rawValue)" }.joined(separator: ",")
+        super.touchesCancelled(touches, with: event)
+        qaEndState = state.rawValue
+    }
+    #endif
+    override func reset() {
+        #if DEBUG
+        logTap("did not fire")
+        #endif
+        super.reset(); start = nil
+    }
     override func canBePrevented(by other: UIGestureRecognizer) -> Bool {
         // Scrolls and deliberate holds win. The hosting touch-down bridge does not.
         if other is UIPanGestureRecognizer || other is UILongPressGestureRecognizer {
-            return super.canBePrevented(by: other)
+            let prevents = super.canBePrevented(by: other)
+            #if DEBUG
+            if prevents, qaBeganAt != nil {
+                qaPreventer = "\(type(of: other)):\(other.state.rawValue)"
+            }
+            #endif
+            return prevents
         }
         return false
     }
