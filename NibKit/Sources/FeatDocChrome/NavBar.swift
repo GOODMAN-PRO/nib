@@ -506,9 +506,11 @@ struct NavStatusSizing: ViewModifier {
     func body(content: Content) -> some View {
         content
             .lineLimit(1)
+            .frame(maxWidth: compact ? 120 : 160)
             .fixedSize(horizontal: true, vertical: false)
             .frame(minWidth: NibMetrics.hitTarget, maxWidth: compact ? 120 : 160,
                    minHeight: NibMetrics.hitTarget)
+            .contentShape(.interaction, Rectangle())
             .clipped()
             .fixedSize(horizontal: true, vertical: false)
     }

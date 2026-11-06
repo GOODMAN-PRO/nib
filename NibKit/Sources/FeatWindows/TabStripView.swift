@@ -55,6 +55,9 @@ enum TabStripLayout {
     /// before its first layout. The assistant sits outside that bar, so its space is already accounted for.
     static func documentSlot(control: CGRect, bounds: CGRect, compact: Bool, rightToLeft: Bool,
                              trailingFrame: CGRect? = nil, leadingFrame: CGRect? = nil) -> CGRect {
+        // Bar markers exist before their first layout. A zero leading edge collapses the RTL slot.
+        let leadingFrame = leadingFrame.flatMap { usableBarFrame($0) ? $0 : nil }
+        let trailingFrame = trailingFrame.flatMap { usableBarFrame($0) ? $0 : nil }
         let trailingWidth = compact
             ? 3 * NibMetrics.hitTarget + 2 * NibSpacing.xs
             : 7 * NibMetrics.hitTarget + separatorWidth + 2 * NibSpacing.xs + NibSpacing.l
@@ -71,6 +74,11 @@ enum TabStripLayout {
                       width: max(0, end - start), height: stripHeight)
     }
 
+    private static func usableBarFrame(_ frame: CGRect) -> Bool {
+        !frame.isNull && !frame.isInfinite && frame.origin.x.isFinite && frame.origin.y.isFinite
+            && frame.width.isFinite && frame.height.isFinite && frame.width > 0 && frame.height > 0
+    }
+
     /// Document chrome already supplies Library and the Tabs menu. Spend only the measured gap on capsules;
     /// when none fit, every document stays reachable through that menu, without squeezing a tab below its minimum.
     static func documentPlan(count: Int, active: Int?, width: CGFloat, compact: Bool,
@@ -80,10 +88,15 @@ enum TabStripLayout {
         // A long title truncates inside the largest capsule instead of hiding the entire strip.
         let minimum = min(widths.upperBound,
                           max(widths.lowerBound, activeTitleWidth > 0 ? activeTitleWidth + NibSpacing.m + NibMetrics.hitTarget : 0))
-        var slots = min(max(0, count), maxTabs, Int(available / widths.lowerBound))
+        // Size class describes the window, not this gap. Use the existing narrow capsule floor to
+        // count slots even on portrait iPad; restore the regular 120 pt floor whenever they all fit.
+        // A lone capsule still needs the size-class minimum (and keeps its title-based preference).
+        let narrowMinimum = tabWidths(compact: true).lowerBound
+        var slots = available < widths.lowerBound ? 0
+            : min(max(0, count), maxTabs, Int(available / narrowMinimum))
         let hasOverflow = slots < count
         if hasOverflow, slots > 0 {
-            slots = max(1, min(slots, Int(max(0, available - NibMetrics.hitTarget) / widths.lowerBound)))
+            slots = max(1, min(slots, Int(max(0, available - NibMetrics.hitTarget) / narrowMinimum)))
         }
         var shown = Array(0..<slots)
         if let active, active >= slots, active < count, slots > 0 { shown[slots - 1] = active }
@@ -91,11 +104,12 @@ enum TabStripLayout {
         let inlineOverflow = hasOverflow && slots == 1 && available < widths.lowerBound + NibMetrics.hitTarget
         let overflow = hasOverflow && !inlineOverflow && slots > 0 ? NibMetrics.hitTarget : 0
         let room = max(0, available - overflow)
+        let slotMinimum = slots > 1 ? min(widths.lowerBound, room / CGFloat(slots)) : widths.lowerBound
         let activeTab = active.flatMap { shown.contains($0) ? $0 : nil } ?? shown.last
         let activeWidth = slots == 0 ? 0 : min(widths.upperBound,
-            max(minimum, room / CGFloat(slots)), room - CGFloat(slots - 1) * widths.lowerBound)
+            max(minimum, room / CGFloat(slots)), room - CGFloat(slots - 1) * slotMinimum)
         let tabWidth = slots <= 1 ? activeWidth
-            : min(widths.upperBound, max(widths.lowerBound, (room - activeWidth) / CGFloat(slots - 1)))
+            : min(widths.upperBound, max(slotMinimum, (room - activeWidth) / CGFloat(slots - 1)))
         let capsules = slots == 0 ? 0 : activeWidth + CGFloat(slots - 1) * tabWidth
         return Plan(shown: shown, hidden: hidden, tabWidth: tabWidth,
                     dropletWidth: slots == 0 ? 0 : 2 * inset + capsules + overflow,

@@ -578,6 +578,9 @@ final class FeatOutlineTests: XCTestCase {
              "symbol": .null, "enabled": true, "panel": false]
         ]]
         let actions = OutlinePlacementAction.read(context)
+        let model = OutlinePanelModel(app: h.app, session: h.session)
+        XCTAssertEqual(OutlineOptionsMenu(model: model, placementActions: actions).accessibilityLabel,
+                       String(localized: "Panel Options"))
         XCTAssertEqual(actions.map(\.id), ["sidebar.pages", "mode", "left", "default"])
         XCTAssertEqual(actions.filter(\.isPanel).map(\.command), ["panel.open"])
         XCTAssertEqual(actions[1].params, ["mode": "window"])
@@ -589,6 +592,9 @@ final class FeatOutlineTests: XCTestCase {
         for presentation in [PanelPresentation.floating, .sheet, .fullScreen] {
             context.presentation = presentation
             XCTAssertTrue(OutlinePlacementAction.read(context).isEmpty)
+            XCTAssertEqual(OutlineOptionsMenu(model: model,
+                placementActions: OutlinePlacementAction.read(context)).accessibilityLabel,
+                String(localized: "Outline Options"))
         }
     }
 

@@ -52,7 +52,8 @@ struct SidebarPanelView: View {
 
     var panelContext: PanelContext {
         let context = chrome.panelContext(selected.id, presentation: presentation)
-        return selected.providesHeader ? placementMenu.addingActions(to: context) : context
+        // Outline consumes this private handoff. Do not inject it into plugin panel parameters.
+        return selected.providesHeader && selected.id == "outline.tab" ? placementMenu.addingActions(to: context) : context
     }
 
     /// Pages, Outline and Bookmarks remain labelled; secondary panels live in the header's single menu.
@@ -114,7 +115,7 @@ struct PanelPlacementMenu: View {
     /// existing cross-module handoff; keep the private host payload separate from panel.open parameters.
     func addingActions(to context: PanelContext) -> PanelContext {
         var result = context
-        var params = context.params.objectValue ?? [:]
+        guard var params = context.params.objectValue else { return context }
         params["chrome.panelOptions"] = .array(actions.map(\.json))
         result.params = .object(params)
         return result

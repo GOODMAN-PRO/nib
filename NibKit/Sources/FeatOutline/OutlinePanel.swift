@@ -617,6 +617,10 @@ struct OutlineOptionsMenu: View {
     @ObservedObject var model: OutlinePanelModel
     var placementActions: [OutlinePlacementAction] = []
 
+    var accessibilityLabel: String {
+        placementActions.isEmpty ? String(localized: "Outline Options") : String(localized: "Panel Options")
+    }
+
     var body: some View {
         Menu {
             Toggle(String(localized: "Show thumbnails"), isOn: option(OutlineSettings.showThumbnails, model.showsThumbnails))
@@ -647,7 +651,7 @@ struct OutlineOptionsMenu: View {
                 .contentShape(Rectangle())
         }
         .hoverEffect(.highlight)
-        .accessibilityLabel(String(localized: "Outline Options"))
+        .accessibilityLabel(accessibilityLabel)
     }
 
     private func option(_ key: SettingKey<Bool>, _ value: Bool) -> Binding<Bool> {

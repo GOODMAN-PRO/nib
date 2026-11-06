@@ -8,6 +8,71 @@ import NibTesting
 
 @MainActor
 final class FeatDocChromeTests: XCTestCase {
+    func testLongStatusHitRegionStopsAtCapAndNeighboursReceiveTheirActions() async throws {
+        // Native action probes let a hostless package test verify the exact hit recipient, then
+        // invoke its registered action without UIApplicationMain or synthetic/private UITouch APIs.
+        for compact in [false, true] {
+            var actions: [String] = []
+            func button(_ title: String, action: String) -> UIButton {
+                let button = UIButton(type: .system)
+                button.setTitle(title, for: .normal)
+                button.addAction(UIAction { _ in actions.append(action) }, for: .touchUpInside)
+                return button
+            }
+            let back = button("Back", action: "back")
+            let status = button(String(repeating: "Long bridge client ", count: 20), action: "status")
+            let next = button("Next", action: "next")
+            let cap: CGFloat = compact ? 120 : 160
+            let root = HStack(spacing: 8) {
+                NavStatusActionProbe(button: back).frame(width: 44, height: 44)
+                Button { actions.append("status") } label: {
+                    NavStatusActionProbe(button: status)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(NibPressStyle(shape: Capsule()))
+                .modifier(NavStatusSizing(compact: compact))
+                NavStatusActionProbe(button: next).frame(width: 44, height: 44)
+            }
+            .fixedSize()
+            .frame(width: 393, height: 100)
+            let host = UIHostingController(rootView: root)
+            host.safeAreaRegions = []
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 100))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            try await waitUntil {
+                host.view.layoutIfNeeded()
+                return status.window === window && status.bounds.width > 0
+            }
+            let frame = status.convert(status.bounds, to: window)
+            XCTAssertEqual(frame.width, cap, accuracy: 0.5)
+            func recipient(at point: CGPoint) -> UIControl? {
+                var hit = window.hitTest(point, with: nil)
+                while let view = hit {
+                    if let control = view as? UIControl { return control }
+                    hit = view.superview
+                }
+                return nil
+            }
+            // Check both gaps and both neighbouring targets, not merely membership in the host.
+            for x in [frame.minX - 4, frame.maxX + 4] {
+                XCTAssertFalse(recipient(at: CGPoint(x: x, y: frame.midY)) === status)
+            }
+            for (control, action) in [(back, "back"), (status, "status"), (next, "next")] {
+                let point = control.convert(CGPoint(x: control.bounds.midX, y: control.bounds.midY), to: window)
+                let hit = try XCTUnwrap(recipient(at: point))
+                XCTAssertTrue(hit === control, "The point must reach \(action), not the oversized status")
+                hit.enumerateEventHandlers { registeredAction, _, events, _ in
+                    if events.contains(.touchUpInside), let registeredAction { hit.sendAction(registeredAction) }
+                }
+                XCTAssertEqual(actions.last, action)
+            }
+            XCTAssertEqual(actions, ["back", "status", "next"])
+        }
+    }
+
     func testStatusSizingKeepsMenuIntrinsicAndCapsLongPill() {
         for compact in [false, true] {
             let menu = Menu { Button("Document") {} } label: {
@@ -1551,6 +1616,15 @@ final class FeatDocChromeTests: XCTestCase {
             }
         }
         let menu = PanelPlacementMenu(chrome: chrome, panel: outline, current: .left)
+        var nonObject = chrome.panelContext(outline.id, presentation: .sidebar)
+        nonObject.params = ["original", "array"]
+        XCTAssertEqual(menu.addingActions(to: nonObject).params, nonObject.params)
+        var plugin = panel("plugin.navigator", .sidebarTab)
+        plugin.providesHeader = true
+        chrome.state.params[plugin.id] = ["plugin": "keep-me"]
+        let pluginView = SidebarPanelView(chrome: chrome, side: .left, tabs: [pages, plugin],
+            selected: plugin, mode: .sidebar, presentation: .sidebar)
+        XCTAssertEqual(pluginView.panelContext.params, ["plugin": "keep-me"])
         let float = try XCTUnwrap(menu.actions.first { $0.id == "floating" })
         _ = try await h.run(float.command, float.params)
         XCTAssertEqual(h.app.settings.json(ChromeSettings.placementName(outline.id)), "floating")
@@ -2172,6 +2246,19 @@ final class FeatDocChromeTests: XCTestCase {
         } catch {
             XCTFail("unexpected \(error)", file: file, line: line)
         }
+    }
+}
+
+/// A UIKit hit/action witness inside the real SwiftUI status sizing and press-style hierarchy.
+private struct NavStatusActionProbe: UIViewRepresentable {
+    let button: UIButton
+
+    func makeUIView(context: Context) -> UIButton { button }
+    func updateUIView(_ uiView: UIButton, context: Context) {}
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UIButton, context: Context) -> CGSize? {
+        CGSize(width: min(proposal.width ?? uiView.intrinsicContentSize.width, uiView.intrinsicContentSize.width),
+               height: NibMetrics.hitTarget)
     }
 }
 
