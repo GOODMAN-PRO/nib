@@ -328,6 +328,19 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     private var subscriptions = Set<AnyCancellable>()
     #if DEBUG
     private var lastDropDiagnostic: String?
+    private(set) var qaContextMenuState = "none"
+    private var qaContextMenu: ObjectIdentifier?
+
+    private func qaDragItems(_ items: [UIDragItem]) -> String {
+        items.enumerated().map { index, item -> String in
+            let local = item.localObject as? PageDragItem
+            let path = local.flatMap { dataSource?.indexPath(for: .page($0.page.raw)) }
+            let fields = ["item=\(index)", "doc=\(local?.doc.raw ?? "nil")", "page=\(local?.page.raw ?? "nil")",
+                          "index=\(String(describing: path))", "types=\(item.itemProvider.registeredTypeIdentifiers)",
+                          "customPreview=\(item.previewProvider != nil)"]
+            return fields.joined(separator: " ")
+        }.joined(separator: "; ")
+    }
     #endif
 
     init(model: PagesPanelModel) {
@@ -750,6 +763,39 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     // MARK: Context menu (MenuLocation.sidebarPage / .sidebarSelection)
 
+    #if DEBUG
+    func collectionView(_ collectionView: UICollectionView, willDisplayContextMenu configuration: UIContextMenuConfiguration,
+                        animator: UIContextMenuInteractionAnimating?) {
+        let id = ObjectIdentifier(configuration)
+        qaContextMenu = id
+        qaContextMenuState = animator == nil ? "presented" : "presenting"
+        NSLog("%@", "[Nib QA pages] contextMenu willDisplay state=\(qaContextMenuState)")
+        animator?.addCompletion { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.qaContextMenu == id, self.qaContextMenuState == "presenting" else { return }
+                self.qaContextMenuState = "presented"
+                NSLog("%@", "[Nib QA pages] contextMenu presentation completed")
+            }
+        }
+    }
+
+    func collectionView(_ collectionView: UICollectionView, willEndContextMenuInteraction configuration: UIContextMenuConfiguration,
+                        animator: UIContextMenuInteractionAnimating?) {
+        let id = ObjectIdentifier(configuration)
+        qaContextMenu = id
+        qaContextMenuState = animator == nil ? "none" : "dismissing"
+        NSLog("%@", "[Nib QA pages] contextMenu willEnd state=\(qaContextMenuState)")
+        animator?.addCompletion { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.qaContextMenu == id else { return }
+                self.qaContextMenuState = "none"
+                self.qaContextMenu = nil
+                NSLog("%@", "[Nib QA pages] contextMenu dismissal completed")
+            }
+        }
+    }
+    #endif
+
     func collectionView(_ collectionView: UICollectionView, contextMenuConfigurationForItemsAt indexPaths: [IndexPath],
                         point: CGPoint) -> UIContextMenuConfiguration? {
         guard let indexPath = indexPaths.first, let page = pageID(at: indexPath) else { return nil }
@@ -819,6 +865,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
                         at indexPath: IndexPath) -> [UIDragItem] {
         #if DEBUG
         NSLog("%@", "[Nib QA pages] itemsForBeginning index=\(indexPath) selection=\(model.selection.count)")
+        NSLog("%@", "[Nib QA pages] lift contextMenu=\(qaContextMenuState) selectedIndexPaths=\(collectionView.indexPathsForSelectedItems ?? [])")
         #endif
         guard let doc = model.doc, let page = pageID(at: indexPath), model.app.services.lock?.isLocked(doc) != true else {
             return []
@@ -832,6 +879,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         let items = pages.compactMap { dragItem($0, doc: doc) }
         #if DEBUG
         NSLog("%@", "[Nib QA pages] itemsForBeginning offered=\(items.count) pages=\(pages.count)")
+        NSLog("%@", "[Nib QA pages] lift items \(qaDragItems(items))")
         #endif
         return items
     }
@@ -842,6 +890,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         guard let doc = model.doc, (session.localContext as? PageDragSession)?.doc == doc, let page = pageID(at: indexPath),
               !session.items.contains(where: { ($0.localObject as? PageDragItem)?.page == page }),
               let item = dragItem(page, doc: doc) else { return [] }
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] itemsForAddingTo index=\(indexPath) existing=\(session.items.count) added=\(qaDragItems([item]))")
+        #endif
         return [item]
     }
 
@@ -861,7 +912,12 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     func collectionView(_ collectionView: UICollectionView, dragPreviewParametersForItemAt indexPath: IndexPath)
         -> UIDragPreviewParameters? {
-        envelope(indexPath)
+        let parameters = envelope(indexPath)
+        #if DEBUG
+        let page = pageID(at: indexPath)?.raw ?? "nil"
+        NSLog("%@", "[Nib QA pages] lift preview index=\(indexPath) page=\(page) available=\(parameters != nil) contextMenu=\(qaContextMenuState)")
+        #endif
+        return parameters
     }
 
     func collectionView(_ collectionView: UICollectionView, dragSessionIsRestrictedToDraggingApplication session: UIDragSession)
@@ -878,6 +934,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         lastDropDiagnostic = nil
         let pages = session.items.compactMap { ($0.localObject as? PageDragItem)?.page.raw }
         NSLog("%@", "[Nib QA pages] dragSessionWillBegin items=\(session.items.count) pages=\(pages)")
+        let restricted = self.collectionView(collectionView, dragSessionIsRestrictedToDraggingApplication: session)
+        let allowsMove = self.collectionView(collectionView, dragSessionAllowsMoveOperation: session)
+        NSLog("%@", "[Nib QA pages] drag began contextMenu=\(qaContextMenuState) restricted=\(restricted) allowsMove=\(allowsMove)")
         #endif
     }
 
@@ -902,8 +961,26 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     func collectionView(_ collectionView: UICollectionView, canHandle session: UIDropSession) -> Bool {
         guard model.doc != nil else { return false }
-        return session.localDragSession?.localContext is PageDragSession
+        let accepted = session.localDragSession?.localContext is PageDragSession
             || session.hasItemsConforming(toTypeIdentifiers: PageDropKind.acceptedTypes)
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] canHandle=\(accepted) items=\(session.items.count) localObjects=\(qaDragItems(session.items))")
+        #endif
+        return accepted
+    }
+
+    func collectionView(_ collectionView: UICollectionView, dropSessionDidEnter session: UIDropSession) {
+        #if DEBUG
+        lastDropDiagnostic = nil
+        NSLog("%@", "[Nib QA pages] dropSessionDidEnter items=\(session.items.count) contextMenu=\(qaContextMenuState) localObjects=\(qaDragItems(session.items))")
+        #endif
+    }
+
+    func collectionView(_ collectionView: UICollectionView, dropSessionDidExit session: UIDropSession) {
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] dropSessionDidExit items=\(session.items.count) localObjects=\(qaDragItems(session.items))")
+        lastDropDiagnostic = nil
+        #endif
     }
 
     func collectionView(_ collectionView: UICollectionView, dropSessionDidUpdate session: UIDropSession,
@@ -917,7 +994,8 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
             "destination=\(String(describing: destinationIndexPath)) canEdit=\(model.canEdit)",
             "kind=\(String(describing: kind)) allowsMoveOperation=\(session.allowsMoveOperation)",
             "hasActiveDrag=\(collectionView.hasActiveDrag) local=\(session.localDragSession != nil)",
-            "items=\(session.items.count) operation=\(proposal.operation.rawValue) intent=\(proposal.intent.rawValue)"
+            "items=\(session.items.count) operation=\(proposal.operation.rawValue) intent=\(proposal.intent.rawValue)",
+            "contextMenu=\(qaContextMenuState) localObjects=\(qaDragItems(session.items))"
         ].joined(separator: " ")
         if lastDropDiagnostic != state {
             lastDropDiagnostic = state
@@ -973,6 +1051,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     func collectionView(_ collectionView: UICollectionView, dropSessionDidEnd session: UIDropSession) {
         #if DEBUG
+        NSLog("%@", "[Nib QA pages] dropSessionDidEnd items=\(session.items.count) contextMenu=\(qaContextMenuState) localObjects=\(qaDragItems(session.items))")
         lastDropDiagnostic = nil
         #endif
         flushDeferredUpdate()

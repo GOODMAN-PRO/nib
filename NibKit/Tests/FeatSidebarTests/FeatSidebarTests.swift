@@ -525,6 +525,61 @@ final class FeatSidebarTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(target), before)
     }
 
+    func testForeignWindowDropCopiesItemKindsAndLeavesSourceUnchanged() async throws {
+        let h = harness()
+        let log = CallLog()
+        // The neighbouring acceptance test uses this registered command because FeatPages is not linked here.
+        installPasteStandIn(h, log)
+        let sourceBefore = try h.snapshot(doc)
+        let sourceUndo = h.undoDepth(doc)
+        let target = Fixtures.whiteboardID
+        let targetBefore = try h.snapshot(target)
+        let originalPages = try h.app.workspace.content(target).livePages.count
+        let targetUndo = h.undoDepth(target)
+        let model = PagesPanelModel(app: h.app, session: window(h, target))
+        let providers = [p1, p2].map { provider(h, $0) }
+        let kind = PageDropKind.of(local: doc, target: target, hasPages: true, hasFiles: false)
+        XCTAssertEqual(kind, .pages)
+        XCTAssertEqual(PageDropKind.proposal(for: kind, canEdit: model.canEdit, allowsMoveOperation: true).operation, .copy)
+        let finished = expectation(description: "foreign window pages received")
+        let task = Task { @MainActor in
+            if kind == .pages { await model.pastePages(providers, into: target, at: .end) }
+            finished.fulfill()
+        }
+        defer { task.cancel() }
+        await fulfillment(of: [finished], timeout: 3)
+        let pages = try h.app.workspace.content(target).livePages
+        XCTAssertEqual(pages.count, originalPages + 2)
+        for (source, copy) in zip([p1, p2], pages.suffix(2)) {
+            let sourceItems = try h.app.workspace.items(doc, page: source)
+            let copiedItems = try h.app.workspace.items(target, page: copy.id)
+            XCTAssertNotEqual(copy.id, source)
+            XCTAssertEqual(copiedItems.map { $0.kind.rawValue }.sorted(), sourceItems.map { $0.kind.rawValue }.sorted())
+            XCTAssertTrue(Set(copiedItems.map { $0.id }).isDisjoint(with: Set(sourceItems.map { $0.id })))
+        }
+        XCTAssertEqual(log.calls.map { $0.command }, [SidebarIDs.pagePaste])
+        XCTAssertEqual(h.undoDepth(target), targetUndo + 1)
+        XCTAssertEqual(try h.snapshot(doc), sourceBefore)
+        XCTAssertEqual(h.undoDepth(doc), sourceUndo)
+        XCTAssertTrue(h.app.bus.undo(target))
+        XCTAssertEqual(try h.snapshot(target), targetBefore)
+        XCTAssertEqual(try h.snapshot(doc), sourceBefore)
+    }
+
+    #if DEBUG
+    func testContextMenuDiagnosticsTrackPresentationAndDismissalWithoutAHost() {
+        let h = harness()
+        let grid = ThumbnailGridController(model: PagesPanelModel(app: h.app, session: h.session))
+        let collection = UICollectionView(frame: .zero, collectionViewLayout: UICollectionViewFlowLayout())
+        let configuration = UIContextMenuConfiguration(identifier: nil, previewProvider: nil, actionProvider: nil)
+        XCTAssertEqual(grid.qaContextMenuState, "none")
+        grid.collectionView(collection, willDisplayContextMenu: configuration, animator: nil)
+        XCTAssertEqual(grid.qaContextMenuState, "presented")
+        grid.collectionView(collection, willEndContextMenuInteraction: configuration, animator: nil)
+        XCTAssertEqual(grid.qaContextMenuState, "none")
+    }
+    #endif
+
     func testPastingNeedsAWritableDocument() async throws {
         let h = harness()
         let log = CallLog()
