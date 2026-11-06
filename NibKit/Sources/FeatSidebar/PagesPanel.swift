@@ -160,29 +160,29 @@ final class ThumbnailStore {
                     guard !Task.isCancelled, self?.displayed.contains(page) == true else { return }
                 }
                 let cgImage = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: pixelSize)
-                guard let self = self, !Task.isCancelled, self.loads[page]?.token == token else { return }
-                guard (self.generations[page] ?? 0) == generation else {
-                    self.loads[page] = nil
-                    self.request(doc: doc, page: page, pixelSize: pixelSize, renderer: renderer)
+                guard let store = self, !Task.isCancelled, store.loads[page]?.token == token else { return }
+                guard (store.generations[page] ?? 0) == generation else {
+                    store.loads[page] = nil
+                    store.request(doc: doc, page: page, pixelSize: pixelSize, renderer: renderer)
                     return
                 }
                 if let cgImage = cgImage {
-                    self.loads[page] = nil
-                    self.stale.remove(page)
-                    self.images.setObject(UIImage(cgImage: cgImage), forKey: page.raw as NSString,
+                    store.loads[page] = nil
+                    store.stale.remove(page)
+                    store.images.setObject(UIImage(cgImage: cgImage), forKey: page.raw as NSString,
                                           cost: cgImage.bytesPerRow * cgImage.height)
-                    self.onLoad?(page)
+                    store.onLoad?(page)
                     return
                 }
                 #if DEBUG
                 NSLog("%@", "[Nib QA render] thumbnail failed doc=\(doc.raw) page=\(page.raw) attempt=\(attempt + 1)")
                 #endif
                 // Keep stale images visible. Only a displayed page gets one automatic retry.
-                if attempt == 1 || !self.displayed.contains(page) {
-                    self.loads[page] = nil
+                if attempt == 1 || !store.displayed.contains(page) {
+                    store.loads[page] = nil
                     if attempt == 1 {
-                        self.exhausted.insert(page)
-                        self.onFailure?(page)
+                        store.exhausted.insert(page)
+                        store.onFailure?(page)
                     }
                     return
                 }
@@ -306,7 +306,8 @@ final class PagesPanelModel: ObservableObject {
         if next != doc {
             doc = next
             thumbnails.removeAll()
-            updateDisplayedThumbnails([:])
+            updateDisplayedPages([])
+            publishThumbnailReadiness([:])
             changedThumbnails = []
             if pendingTrash != nil { pendingTrash = nil }
             if !selection.isEmpty { selection = [] }
@@ -371,16 +372,33 @@ final class PagesPanelModel: ObservableObject {
         return changed
     }
 
-    /// Images actually installed in displayed cells, not merely present in the cache.
-    private(set) var thumbnailReadiness: JSONValue = ["visible": 0, "loaded": 0]
+    #if DEBUG
+    // Hostless unit tests can exercise both modes; app launches always use the launch flag.
+    var fixtureReadinessForTesting: Bool?
+    #endif
+    var fixtureReadinessEnabled: Bool {
+        #if DEBUG
+        if NibApp.isHostlessTest, let enabled = fixtureReadinessForTesting { return enabled }
+        #endif
+        return NibUITestMode.isEnabled
+    }
 
-    func updateDisplayedThumbnails(_ cells: [PageID: Bool]) {
-        thumbnails.setDisplayed(Set(cells.keys))
-        thumbnailReadiness = ["visible": .number(Double(cells.count)),
-                              "loaded": .number(Double(cells.values.filter { $0 }.count))]
-        guard NibUITestMode.isEnabled, let session = session else { return }
-        if session.toolOptions["nib.qa.thumbnails"] != thumbnailReadiness {
-            session.toolOptions["nib.qa.thumbnails"] = thumbnailReadiness
+    /// Production visibility is needed for the bounded thumbnail retry, independently of QA.
+    func updateDisplayedPages(_ pages: Set<PageID>) {
+        thumbnails.setDisplayed(pages)
+    }
+
+    /// Images actually installed in displayed cells, not merely present in the cache.
+    private(set) var thumbnailReadiness: JSONValue?
+
+    func publishThumbnailReadiness(_ displayedCells: @autoclosure () -> [PageID: Bool]) {
+        guard fixtureReadinessEnabled, let session = session else { return }
+        let cells = displayedCells()
+        let readiness: JSONValue = ["visible": .number(Double(cells.count)),
+                                    "loaded": .number(Double(cells.values.filter { $0 }.count))]
+        thumbnailReadiness = readiness
+        if session.toolOptions["nib.qa.thumbnails"] != readiness {
+            session.toolOptions["nib.qa.thumbnails"] = readiness
         }
     }
 

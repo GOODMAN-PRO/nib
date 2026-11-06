@@ -247,6 +247,7 @@ struct ThumbnailGridView: UIViewControllerRepresentable {
 /// stale while a snapshot is being applied).
 final class ThumbnailCell: UICollectionViewCell {
     var hasThumbnailImage = false
+    var onPrepareForReuse: (() -> Void)?
     var page: PageID?
     var activate: (() -> Void)?
 
@@ -259,6 +260,15 @@ final class ThumbnailCell: UICollectionViewCell {
     }
 
     required init?(coder: NSCoder) { return nil }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        hasThumbnailImage = false
+        page = nil
+        activate = nil
+        onPrepareForReuse?()
+        onPrepareForReuse = nil
+    }
 
     override func layoutSubviews() {
         super.layoutSubviews()
@@ -378,15 +388,18 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         view = collectionView
     }
 
-    private var displayedThumbnails: [ObjectIdentifier: (PageID, Bool)] = [:]
+    private var displayedThumbnails: [ObjectIdentifier: (PageID, ThumbnailCell)] = [:]
     private var hasDisappeared = false
 
     private func publishDisplayedThumbnails() {
+        model.updateDisplayedPages(Set(displayedThumbnails.values.map { $0.0 }))
+        // Do not inspect image flags or build fixture counts during a normal launch.
+        guard model.fixtureReadinessEnabled else { return }
         var pages: [PageID: Bool] = [:]
-        for (page, loaded) in displayedThumbnails.values {
-            pages[page] = (pages[page] ?? false) || loaded
+        for (page, cell) in displayedThumbnails.values {
+            pages[page] = (pages[page] ?? false) || cell.hasThumbnailImage
         }
-        model.updateDisplayedThumbnails(pages)
+        model.publishThumbnailReadiness(pages)
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -394,7 +407,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         hasDisappeared = false
         for cell in collectionView?.visibleCells ?? [] {
             guard let cell = cell as? ThumbnailCell, let page = cell.page else { continue }
-            displayedThumbnails[ObjectIdentifier(cell)] = (page, cell.hasThumbnailImage)
+            displayedThumbnails[ObjectIdentifier(cell)] = (page, cell)
         }
         publishDisplayedThumbnails()
         reconfigure(visibleOnly: true)
@@ -625,10 +638,19 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     // MARK: Cells
 
-    private func configure(_ cell: ThumbnailCell, raw: String) {
+    func configure(_ cell: ThumbnailCell, raw: String) {
+        let identity = ObjectIdentifier(cell)
+        cell.onPrepareForReuse = { [weak self] in
+            self?.displayedThumbnails.removeValue(forKey: identity)
+            self?.publishDisplayedThumbnails()
+        }
         guard let row = rowByID[raw] else {
             cell.page = nil
+            cell.hasThumbnailImage = false
+            cell.activate = nil
             cell.contentConfiguration = nil
+            displayedThumbnails.removeValue(forKey: identity)
+            publishDisplayedThumbnails()
             return
         }
         let page = row.id
@@ -657,9 +679,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         cell.contentConfiguration = UIHostingConfiguration { ThumbnailCellView(state: state, actions: actions) }
             .margins(.all, 0)
         cell.contentView.isUserInteractionEnabled = false
-        cell.hasThumbnailImage = state.image != nil
+        if model.fixtureReadinessEnabled { cell.hasThumbnailImage = state.image != nil }
         if displayedThumbnails[ObjectIdentifier(cell)] != nil {
-            displayedThumbnails[ObjectIdentifier(cell)] = (page, cell.hasThumbnailImage)
+            displayedThumbnails[ObjectIdentifier(cell)] = (page, cell)
             publishDisplayedThumbnails()
         }
     }
@@ -779,7 +801,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
                         forItemAt indexPath: IndexPath) {
         guard let page = (cell as? ThumbnailCell)?.page, let row = rowByID[page.raw] else { return }
         if !hasDisappeared, let thumbnail = cell as? ThumbnailCell {
-            displayedThumbnails[ObjectIdentifier(cell)] = (page, thumbnail.hasThumbnailImage)
+            displayedThumbnails[ObjectIdentifier(cell)] = (page, thumbnail)
             publishDisplayedThumbnails()
         }
         requestThumbnail(row)

@@ -254,6 +254,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         eventObservation = nil
         inkingObservation = nil
         subscriptions.removeAll()
+        fixtureSubscriptions.removeAll()
         for o in notificationObservers { NotificationCenter.default.removeObserver(o) }
         notificationObservers.removeAll()
         loadingTask?.cancel()
@@ -281,15 +282,17 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         inkingObservation = session.inking.observe { [weak self] signal in self?.inkingChanged(signal) }
         // @Published emits before the value changes: read the session on the next turn.
         let main = DispatchQueue.main
-        // These publishers emit before storage: clear immediately using the incoming value.
-        session.$document.dropFirst().sink { [weak self] next in
-            guard let self = self, next != self.documentID else { return }
-            self.publishCanvasSettled(false)
-        }.store(in: &subscriptions)
-        session.$page.dropFirst().sink { [weak self] next in
-            guard let self = self, next != self.displayedPage else { return }
-            self.publishCanvasSettled(false)
-        }.store(in: &subscriptions)
+        if fixtureReadinessEnabled {
+            // These publishers emit before storage: clear immediately using the incoming value.
+            session.$document.dropFirst().sink { [weak self] next in
+                guard let self = self, next != self.documentID else { return }
+                self.publishCanvasSettled(false)
+            }.store(in: &fixtureSubscriptions)
+            session.$page.dropFirst().sink { [weak self] next in
+                guard let self = self, next != self.displayedPage else { return }
+                self.publishCanvasSettled(false)
+            }.store(in: &fixtureSubscriptions)
+        }
         session.$tool.dropFirst().receive(on: main).sink { [weak self] _ in
             self?.host.syncActiveTool()
             self?.view.setNeedsLayout()
@@ -892,7 +895,12 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private(set) var displayedPage: PageID?
 
     private func updateCurrentPage() {
-        defer { canvasRenderStateChanged() }
+        defer {
+            canvasRenderStateChanged()
+            #if DEBUG
+            renderDiagnosticsChanged()
+            #endif
+        }
         var current = centreAnchor()?.page
         if let r = requestedPage {
             if isAnimatingScroll || isShowing(r) { current = r } else { requestedPage = nil }
@@ -1316,7 +1324,13 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         #if DEBUG
         beginRenderTiming(page)
         #endif
-        pageView.onRenderStateChange = { [weak self] in self?.canvasRenderStateChanged() }
+        pageView.onRenderStateChange = nil
+        if fixtureReadinessEnabled {
+            pageView.onRenderStateChange = { [weak self] in self?.canvasRenderStateChanged() }
+        }
+        #if DEBUG
+        pageView.onRenderDiagnosticChange = { [weak self] in self?.renderDiagnosticsChanged() }
+        #endif
         pageView.source = host
         pageView.configure(record, pageRect: rect, paper: paperColor(record))
         pageView.accessibilityProvider = { [weak self] v in self?.accessibilityElements(for: v) ?? [] }
@@ -1326,6 +1340,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     func documentScrollView(_ view: DocumentScrollView, didRecycle pageView: PageTileView, for page: PageID) {
         host.flushWaitersIfReady(page)
         canvasRenderStateChanged()
+        #if DEBUG
+        renderDiagnosticsChanged()
+        #endif
     }
 
     func documentScrollViewScrollPage(_ view: DocumentScrollView, forward: Bool) -> Bool {
@@ -1403,13 +1420,24 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         }
     }
 
+    #if DEBUG
+    // Hostless unit tests can exercise both modes; app launches always use the launch flag.
+    var fixtureReadinessForTesting: Bool?
+    #endif
+    var fixtureReadinessEnabled: Bool {
+        #if DEBUG
+        if NibApp.isHostlessTest, let enabled = fixtureReadinessForTesting { return enabled }
+        #endif
+        return NibUITestMode.isEnabled
+    }
+    private(set) var fixtureSubscriptions = Set<AnyCancellable>()
     private(set) var canvasSettled = false
 
-    private func publishCanvasSettled(_ settled: Bool) {
+    func publishCanvasSettled(_ evaluate: @autoclosure () -> Bool) {
         // A retiring controller must not overwrite the replacement editor's fact.
-        guard session.editor === self else { return }
+        guard fixtureReadinessEnabled, session.editor === self else { return }
+        let settled = evaluate()
         canvasSettled = settled
-        guard NibUITestMode.isEnabled else { return }
         let value = JSONValue.bool(settled)
         if session.toolOptions["nib.qa.canvasSettled"] != value {
             session.toolOptions["nib.qa.canvasSettled"] = value
@@ -1417,16 +1445,18 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     func canvasRenderStateChanged() {
-        guard !isClosed, session.editor === self else { return }
-        #if DEBUG
-        logRenderMilestones()
-        #endif
+        guard fixtureReadinessEnabled, !isClosed, session.editor === self else { return }
         let page = displayedPage.flatMap { scrollView.pageViews[$0] }
         let matches = session.document == documentID && session.page == displayedPage
         publishCanvasSettled(matches && !isClosed && !isAnimatingScroll && page?.hasRenderedCoverage == true)
     }
 
     #if DEBUG
+    private func renderDiagnosticsChanged() {
+        guard !isClosed, session.editor === self else { return }
+        logRenderMilestones()
+    }
+
     private struct RenderTiming {
         let layout = ProcessInfo.processInfo.systemUptime
         var firstTile = false

@@ -19,7 +19,8 @@ final class FeatCanvasTests: XCTestCase {
     /// Opens the editor the feature registered for `doc`'s kind in a window-sized view, laid out.
     @discardableResult
     private func makeCanvas(_ h: Harness, doc: DocumentID = Fixtures.docID, page: PageID? = nil,
-                            input: ((CanvasHostImpl) -> Void)? = nil, size: CGSize? = nil) throws -> CanvasViewController {
+                            input: ((CanvasHostImpl) -> Void)? = nil, size: CGSize? = nil,
+                            fixtureReadiness: Bool? = nil) throws -> CanvasViewController {
         let content = try h.app.workspace.content(doc)
         h.session.document = doc
         h.session.page = page ?? content.livePages.first?.id
@@ -29,6 +30,9 @@ final class FeatCanvasTests: XCTestCase {
         CanvasInputHooks.install = input
         defer { CanvasInputHooks.install = saved }
         let vc = try XCTUnwrap(descriptor.make(doc, h.session, h.app) as? CanvasViewController)
+        #if DEBUG
+        vc.fixtureReadinessForTesting = fixtureReadiness
+        #endif
         vc.loadViewIfNeeded()
         vc.view.frame = CGRect(origin: .zero, size: size ?? windowSize)
         vc.view.setNeedsLayout()
@@ -2688,12 +2692,46 @@ final class FeatCanvasTests: XCTestCase {
         await waitUntil("sharp tile shown") { page.hasRenderedCoverage }
     }
 
-    func testCanvasReadinessClearsImmediatelyForPageAndDocumentSwitches() async throws {
+    func testNormalCanvasNeverEvaluatesOrUpdatesFixtureReadiness() async throws {
+        XCTAssertFalse(NibUITestMode.isEnabled, "package tests must use normal launch arguments")
         let h = Harness(features: [FeatCanvasFeature.self])
         h.app.services.renderer = RecordingRenderer()
         let vc = try makeCanvas(h)
         defer { vc.closeCanvas() }
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        await waitUntil("rendered page") { page.hasRenderedCoverage }
+        XCTAssertFalse(vc.fixtureReadinessEnabled)
+        XCTAssertTrue(vc.fixtureSubscriptions.isEmpty)
+        XCTAssertNil(page.onRenderStateChange, "only the separate DEBUG diagnostic may observe normal renders")
+        var evaluations = 0
+        func evaluate() -> Bool { evaluations += 1; return true }
+        vc.publishCanvasSettled(evaluate())
+        vc.canvasRenderStateChanged()
+        XCTAssertEqual(evaluations, 0, "the guard must run before the readiness predicate")
+        XCTAssertFalse(vc.canvasSettled, "a rendered production page must not update fixture state")
+        h.session.page = Fixtures.page2
+        await waitUntil("normal navigation") { vc.displayedPage == Fixtures.page2 }
+        h.session.document = Fixtures.whiteboardID
+        vc.canvasRenderStateChanged()
+        XCTAssertFalse(vc.canvasSettled)
+        XCTAssertNil(h.session.toolOptions["nib.qa.canvasSettled"])
+    }
+
+    #if DEBUG
+    func testCanvasReadinessClearsImmediatelyForPageAndDocumentSwitches() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = RecordingRenderer()
+        let vc = try makeCanvas(h, fixtureReadiness: true)
+        defer { vc.closeCanvas() }
+        XCTAssertEqual(vc.fixtureSubscriptions.count, 2)
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        XCTAssertNotNil(page.onRenderStateChange)
         await waitUntil("canvas readiness") { vc.canvasSettled }
+        XCTAssertEqual(h.session.toolOptions["nib.qa.canvasSettled"], .bool(true))
+        page.invalidate(nil)
+        XCTAssertFalse(vc.canvasSettled)
+        XCTAssertEqual(h.session.toolOptions["nib.qa.canvasSettled"], .bool(false))
+        await waitUntil("rerender readiness") { vc.canvasSettled }
         h.session.page = Fixtures.page2
         XCTAssertFalse(vc.canvasSettled, "clear in the publisher, before deferred navigation")
         await waitUntil("new page readiness") { vc.displayedPage == Fixtures.page2 && vc.canvasSettled }
@@ -2701,8 +2739,12 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertFalse(vc.canvasSettled)
         vc.canvasRenderStateChanged()
         XCTAssertFalse(vc.canvasSettled, "late tiles from the old document cannot satisfy the new one")
-        if !NibUITestMode.isEnabled { XCTAssertNil(h.session.toolOptions["nib.qa.canvasSettled"]) }
+        XCTAssertEqual(h.session.toolOptions["nib.qa.canvasSettled"], .bool(false))
+        vc.closeCanvas()
+        XCTAssertTrue(vc.fixtureSubscriptions.isEmpty)
     }
+
+    #endif
 
     func testSuccessfulRerenderClearsFailureWithoutTryAgain() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])

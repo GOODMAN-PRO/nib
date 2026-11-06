@@ -1125,12 +1125,38 @@ final class FeatSidebarTests: XCTestCase {
         }
     }
 
-    func testThumbnailReadinessCountsOnlyImagesInstalledInVisibleCells() async throws {
+    func testNormalThumbnailVisibilityRetriesWithoutEvaluatingFixtureReadiness() async throws {
+        XCTAssertFalse(NibUITestMode.isEnabled, "package tests must use normal launch arguments")
         let h = harness()
         let model = PagesPanelModel(app: h.app, session: h.session)
         let renderer = GatedRenderer()
         model.thumbnails.coalescingDelay = 0
-        model.updateDisplayedThumbnails([p1: false, p2: false])
+        model.thumbnails.retryDelay = 0
+        model.updateDisplayedPages([p1])
+        var evaluations = 0
+        func cells() -> [PageID: Bool] { evaluations += 1; return [p1: true] }
+        model.publishThumbnailReadiness(cells())
+        XCTAssertEqual(evaluations, 0)
+        XCTAssertNil(model.thumbnailReadiness)
+        model.thumbnails.request(doc: doc, page: p1, pixelSize: 100, renderer: renderer)
+        try await waitUntil { renderer.calls.count == 1 }
+        renderer.fail()
+        try await waitUntil { renderer.calls.count == 2 }
+        renderer.finish(size: 100)
+        try await waitUntil { model.thumbnail(self.p1) != nil }
+        model.updateDisplayedPages([])
+        XCTAssertNil(model.thumbnailReadiness)
+        XCTAssertNil(h.session.toolOptions["nib.qa.thumbnails"])
+    }
+
+    #if DEBUG
+    func testThumbnailReadinessCountsOnlyImagesInstalledInVisibleCells() async throws {
+        let h = harness()
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        model.fixtureReadinessForTesting = true
+        let renderer = GatedRenderer()
+        model.thumbnails.coalescingDelay = 0
+        model.publishThumbnailReadiness([p1: false, p2: false])
         XCTAssertEqual(model.thumbnailReadiness, ["visible": 2, "loaded": 0])
         model.thumbnails.request(doc: doc, page: p1, pixelSize: 100, renderer: renderer)
         try await waitUntil { renderer.calls.count == 1 }
@@ -1138,14 +1164,16 @@ final class FeatSidebarTests: XCTestCase {
         try await waitUntil { model.thumbnail(self.p1) != nil }
         XCTAssertEqual(model.thumbnailReadiness, ["visible": 2, "loaded": 0],
                        "a cached image has not yet been installed in the cell")
-        model.updateDisplayedThumbnails([p1: true, p2: false])
+        model.publishThumbnailReadiness([p1: true, p2: false])
         XCTAssertEqual(model.thumbnailReadiness, ["visible": 2, "loaded": 1])
-        model.updateDisplayedThumbnails([p2: false])
+        model.publishThumbnailReadiness([p2: false])
         XCTAssertEqual(model.thumbnailReadiness, ["visible": 1, "loaded": 0])
-        model.updateDisplayedThumbnails([:])
+        model.publishThumbnailReadiness([:])
         XCTAssertEqual(model.thumbnailReadiness, ["visible": 0, "loaded": 0])
-        if !NibUITestMode.isEnabled { XCTAssertNil(h.session.toolOptions["nib.qa.thumbnails"]) }
+        XCTAssertEqual(h.session.toolOptions["nib.qa.thumbnails"], ["visible": 0, "loaded": 0])
     }
+
+    #endif
 
     // MARK: Unseen changes
 
@@ -1202,7 +1230,7 @@ final class FeatSidebarTests: XCTestCase {
         return grid
     }
 
-    func testGridReadinessUpdatesAfterImageInstallationAndDisappearance() async throws {
+    func testNormalGridDoesNotTrackLoadedImagesOrBuildFixtureFacts() async throws {
         let h = harness()
         let renderer = GatedRenderer()
         h.app.services.renderer = renderer
@@ -1212,16 +1240,69 @@ final class FeatSidebarTests: XCTestCase {
         grid.viewDidAppear(false)
         defer { grid.viewDidDisappear(false); renderer.finishAll() }
         let collection = try XCTUnwrap(grid.view as? UICollectionView)
+        let cells = collection.visibleCells.compactMap { $0 as? ThumbnailCell }
+        XCTAssertFalse(cells.isEmpty)
+        try await waitUntil { renderer.calls.count >= cells.count }
+        renderer.finishAll()
+        try await waitUntil { cells.allSatisfy { cell in
+            guard let page = cell.page else { return false }
+            return model.thumbnail(page) != nil
+        } }
+        for cell in cells {
+            if let page = cell.page { grid.configure(cell, raw: page.raw) }
+            XCTAssertFalse(cell.hasThumbnailImage)
+        }
+        XCTAssertNil(model.thumbnailReadiness)
+        XCTAssertNil(h.session.toolOptions["nib.qa.thumbnails"])
+    }
+
+    #if DEBUG
+    func testGridReadinessUpdatesAfterImageInstallationAndDisappearance() async throws {
+        let h = harness()
+        let renderer = GatedRenderer()
+        h.app.services.renderer = renderer
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        model.fixtureReadinessForTesting = true
+        model.thumbnails.coalescingDelay = 0
+        let grid = laidOutGrid(model)
+        grid.viewDidAppear(false)
+        defer { grid.viewDidDisappear(false); renderer.finishAll() }
+        let collection = try XCTUnwrap(grid.view as? UICollectionView)
         let count = collection.visibleCells.compactMap { ($0 as? ThumbnailCell)?.page }.count
         XCTAssertGreaterThan(count, 0)
-        XCTAssertEqual(model.thumbnailReadiness["visible"]?.doubleValue, Double(count))
-        XCTAssertEqual(model.thumbnailReadiness["loaded"]?.doubleValue, 0)
+        XCTAssertEqual(model.thumbnailReadiness?["visible"]?.doubleValue, Double(count))
+        XCTAssertEqual(model.thumbnailReadiness?["loaded"]?.doubleValue, 0)
         try await waitUntil { renderer.calls.count >= count }
         renderer.finishAll()
-        try await waitUntil { model.thumbnailReadiness["loaded"]?.doubleValue == Double(count) }
+        try await waitUntil { model.thumbnailReadiness?["loaded"]?.doubleValue == Double(count) }
         grid.viewDidDisappear(false)
         XCTAssertEqual(model.thumbnailReadiness, ["visible": 0, "loaded": 0])
     }
+
+    func testBlankAndReusedThumbnailCellsLeaveTheDisplayedFactsImmediately() throws {
+        for reuse in [false, true] {
+            let h = harness()
+            let model = PagesPanelModel(app: h.app, session: h.session)
+            model.fixtureReadinessForTesting = true
+            let grid = laidOutGrid(model)
+            grid.viewDidAppear(false)
+            defer { grid.viewDidDisappear(false); model.thumbnails.removeAll() }
+            let collection = try XCTUnwrap(grid.view as? UICollectionView)
+            let cell = try XCTUnwrap(collection.visibleCells.compactMap { $0 as? ThumbnailCell }.first)
+            let index = try XCTUnwrap(collection.indexPath(for: cell))
+            cell.hasThumbnailImage = true
+            grid.collectionView(collection, willDisplay: cell, forItemAt: index)
+            let visible = try XCTUnwrap(model.thumbnailReadiness?["visible"]?.doubleValue)
+            XCTAssertEqual(model.thumbnailReadiness?["loaded"], 1)
+            if reuse { cell.prepareForReuse() } else { grid.configure(cell, raw: "missing-page") }
+            XCTAssertNil(cell.page)
+            XCTAssertFalse(cell.hasThumbnailImage)
+            XCTAssertEqual(model.thumbnailReadiness?["visible"]?.doubleValue, visible - 1)
+            XCTAssertEqual(model.thumbnailReadiness?["loaded"], 0)
+            XCTAssertEqual(h.session.toolOptions["nib.qa.thumbnails"], model.thumbnailReadiness)
+        }
+    }
+    #endif
 
     func testThumbnailActivationAndTouchUseTheCollectionCell() async throws {
         let h = harness()
