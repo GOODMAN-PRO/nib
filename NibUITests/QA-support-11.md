@@ -84,3 +84,11 @@ Confirmed R12:chrome-timer-ruler#3 verifier's passing-run StaticText evidence an
 | --- | --- | --- |
 | Ruler menu callers | Ruler menu row missing | What transient menu tree existed immediately after double-tap if the typed row was absent? |
 
+### C5 - release the page scroll without momentum
+
+Confirmed R12:chrome-singles#2: the current-page change was correct for the fling's final offset (595.5), so deleting the original-page assertion would change coverage. Per this job's instruction, added opt-in held release to twoFingerScroll: the movement remains 0.4 s, then both fingers remain at the endpoint for 0.4 s before lifting. This uses the existing equal-time synthesis samples, not a sleep. All other callers retain two points and original duration. PageScrollCollapsesOptionsAndChoosingToolRestoresThem retains the exact page identity, visible Page 1 drawing, stroke +1, Undo and strip assertions. CI must show a stopped scroll with the original page current, followed by ink on its clipped visible frame.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| PageScrollCollapsesOptionsAndChoosingToolRestoresThem | Page scroll held release / Page scroll ink geometry | Was stationary contact delivered before lift, and did the counted page receive the stroke? |
+

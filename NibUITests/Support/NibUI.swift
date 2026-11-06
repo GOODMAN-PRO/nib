@@ -2427,10 +2427,17 @@ final class NibUI {
         }
     }
 
-    func twoFingerScroll(from: CGPoint, to: CGPoint, duration: TimeInterval = 0.4) throws {
+    func twoFingerScroll(from: CGPoint, to: CGPoint, duration: TimeInterval = 0.4, holdAtEnd: Bool = false) throws {
         let spacing = min(0.035, 24 / canvas.frame.width)
-        try synthesize([[CGPoint(x: from.x - spacing, y: from.y), CGPoint(x: to.x - spacing, y: to.y)],
-                        [CGPoint(x: from.x + spacing, y: from.y), CGPoint(x: to.x + spacing, y: to.y)]], duration: duration)
+        let paths = [CGFloat(-1), CGFloat(1)].map { side -> [CGPoint] in
+            let start = CGPoint(x: from.x + side * spacing, y: from.y)
+            let end = CGPoint(x: to.x + side * spacing, y: to.y)
+            // Equal-time samples: preserve the original movement duration, then stay in
+            // contact at the destination for the same duration before lifting both fingers.
+            return holdAtEnd ? [start, end, end] : [start, end]
+        }
+        if holdAtEnd { logQA("Page scroll held release", "from=\(from) to=\(to) movement=\(duration) hold=\(duration)") }
+        try synthesize(paths, duration: holdAtEnd ? duration * 2 : duration)
     }
 
     /// Native context menus do not reliably let XCTest reach idle. Every menu contact is synthesized.

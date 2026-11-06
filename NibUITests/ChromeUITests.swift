@@ -695,7 +695,7 @@ final class ChromeUITests: XCTestCase {
     func testPageScrollCollapsesOptionsAndChoosingToolRestoresThem() throws {
         try open(); try ui.selectTool("pen"); let before = try ui.state()
         _ = try reachable("menu.toolSettings")
-        try ui.twoFingerScroll(from: CGPoint(x: 0.12, y: 0.75), to: CGPoint(x: 0.12, y: 0.45))
+        try ui.twoFingerScroll(from: CGPoint(x: 0.12, y: 0.75), to: CGPoint(x: 0.12, y: 0.45), holdAtEnd: true)
         _ = try ui.waitForState { abs($0.contentOffset.y - before.contentOffset.y) > 20 }
         try wait("Page scrolling must collapse the secondary options bar") {
             !self.query("menu.toolSettings").firstMatch.exists
