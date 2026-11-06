@@ -634,10 +634,9 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
             let onPage = mode.isWorld || pageRect.intersects(Rect(x: f.x - origin.x, y: f.y - origin.y,
                                                                   width: f.width, height: f.height))
             if onPage {
-                let viewport = Rect(x: visible.x - origin.x, y: visible.y - origin.y,
-                                    width: visible.width, height: visible.height)
                 v.updateCoverage(visible: pageRect, level: level, bake: !isZoomingNow && !isZooming,
-                                 viewport: viewport)
+                                 viewport: Rect(x: visible.x - origin.x, y: visible.y - origin.y,
+                                                width: visible.width, height: visible.height))
             }
         }
     }

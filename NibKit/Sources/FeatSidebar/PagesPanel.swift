@@ -157,7 +157,10 @@ final class ThumbnailStore {
                 if attempt > 0 {
                     guard let retryDelay = self?.retryDelay else { return }
                     if retryDelay > 0 { try? await Task.sleep(nanoseconds: retryDelay) }
-                    guard !Task.isCancelled, self?.displayed.contains(page) == true else { return }
+                    guard !Task.isCancelled, self?.displayed.contains(page) == true else {
+                        if let store = self, store.loads[page]?.token == token { store.loads[page] = nil }
+                        return
+                    }
                 }
                 let cgImage = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: pixelSize)
                 guard let store = self, !Task.isCancelled, store.loads[page]?.token == token else { return }
@@ -247,8 +250,10 @@ final class PagesPanelModel: ObservableObject {
         self.app = app
         self.session = session
         thumbnails.onLoad = { [weak self] page in self?.noteThumbnails([page]) }
-        thumbnails.onFailure = { [weak self] _ in
-            self?.fail("render.page", NibError(.unavailable,
+        thumbnails.onFailure = { [weak self] page in
+            guard let self, let doc = self.doc else { return }
+            if let content = try? self.app.workspace.content(doc), content.page(page)?.deleted != false { return }
+            self.fail("render.page", NibError(.unavailable,
                 String(localized: "Couldn't load a page preview. Reopen Pages to try again.")))
         }
         session?.$document.dropFirst().sink { [weak self] _ in self?.schedule() }.store(in: &cancellables)

@@ -118,6 +118,16 @@ final class PageTileView: UIView {
     var onRenderDiagnosticChange: (() -> Void)?
     #endif
 
+    /// The controller installs the readiness observer only in UI-test mode. Diagnostics are compiled separately.
+    private var tracksRenderedCoverage: Bool {
+        if onRenderStateChange != nil { return true }
+        #if DEBUG
+        return onRenderDiagnosticChange != nil
+        #else
+        return false
+        #endif
+    }
+
     private func renderStateChanged() {
         onRenderStateChange?()
         #if DEBUG
@@ -159,7 +169,7 @@ final class PageTileView: UIView {
     private var tokenCounter = 0
     /// Region of the page the last coverage pass asked for (page coordinates).
     private var covered: Rect?
-    private var visibleCoverage: Rect?
+    private(set) var visibleCoverage: Rect?
     private var isWorld: Bool { record?.size == nil }
 
     override init(frame: CGRect) {
@@ -324,12 +334,15 @@ final class PageTileView: UIView {
     /// Makes sure the tiles at `level` covering `visible` (page coordinates, already grown by the prefetch margin)
     /// are on screen or on their way. When the level changes, the previous level's tiles stay underneath as a
     /// fallback until the new ones land. `bake` false (a pinch in progress) keeps the current level.
-    func updateCoverage(visible: Rect, level newLevel: Int, bake: Bool, viewport: Rect? = nil) {
+    func updateCoverage(visible: Rect, level newLevel: Int, bake: Bool,
+                        viewport: @autoclosure () -> Rect? = nil) {
         defer { renderStateChanged() }
         guard let pageID = pageID, source != nil else { return }
         let region = isWorld ? visible : intersect(visible, pageRect)
-        let viewportRegion = viewport ?? visible
-        visibleCoverage = isWorld ? viewportRegion : intersect(viewportRegion, pageRect)
+        if tracksRenderedCoverage {
+            let viewportRegion = viewport() ?? visible
+            visibleCoverage = isWorld ? viewportRegion : intersect(viewportRegion, pageRect)
+        }
         if !isWorld { requestPreviewIfNeeded(pageID) }
         guard let region = region, region.width > 0, region.height > 0 else { return }
         if bake && newLevel != level {

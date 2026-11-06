@@ -2680,6 +2680,7 @@ final class FeatCanvasTests: XCTestCase {
         let source = ReadinessTileSource()
         let page = PageTileView(frame: .zero)
         page.source = source
+        page.onRenderStateChange = {} // Observe readiness, as the UI-test controller does.
         page.configure(PageRecord(id: Fixtures.page1, order: "a", size: PageSize(512, 512)),
                        pageRect: Rect(x: 0, y: 0, width: 512, height: 512), paper: .white)
         defer { page.reset(); source.finishAll() }
@@ -2692,6 +2693,33 @@ final class FeatCanvasTests: XCTestCase {
         await waitUntil("sharp tile shown") { page.hasRenderedCoverage }
     }
 
+    func testCoverageEvaluatesAndStoresViewportOnlyWithAnObserver() {
+        XCTAssertFalse(NibUITestMode.isEnabled)
+        for world in [false, true] {
+            let source = ReadinessTileSource()
+            let page = PageTileView(frame: .zero)
+            page.source = source
+            let region = Rect(x: 0, y: 0, width: 512, height: 512)
+            page.configure(PageRecord(id: Fixtures.page1, order: "a", size: world ? nil : PageSize(512, 512)),
+                           pageRect: region, paper: .white)
+            defer { page.reset(); source.finishAll() }
+            var evaluations = 0
+            func viewport() -> Rect {
+                evaluations += 1
+                return Rect(x: -10, y: 0, width: 512, height: 512)
+            }
+            page.updateCoverage(visible: region, level: 0, bake: true, viewport: viewport())
+            XCTAssertEqual(evaluations, 0, "even constructing the readiness viewport must be gated")
+            XCTAssertNil(page.visibleCoverage, "neither board nor notebook may store readiness geometry")
+            XCTAssertFalse(page.tileKeys.isEmpty, "ordinary render coverage is still requested")
+            page.onRenderStateChange = {} // UI-test readiness subscriber.
+            page.updateCoverage(visible: region, level: 0, bake: true, viewport: viewport())
+            XCTAssertEqual(evaluations, 1)
+            XCTAssertEqual(page.visibleCoverage?.x, world ? -10 : 0)
+            XCTAssertEqual(page.visibleCoverage?.width, world ? 512 : 502)
+        }
+    }
+
     func testNormalCanvasNeverEvaluatesOrUpdatesFixtureReadiness() async throws {
         XCTAssertFalse(NibUITestMode.isEnabled, "package tests must use normal launch arguments")
         let h = Harness(features: [FeatCanvasFeature.self])
@@ -2699,7 +2727,14 @@ final class FeatCanvasTests: XCTestCase {
         let vc = try makeCanvas(h)
         defer { vc.closeCanvas() }
         let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
-        await waitUntil("rendered page") { page.hasRenderedCoverage }
+        #if DEBUG
+        page.onRenderDiagnosticChange = nil // Exercise the Release tracking path in Debug test jobs too.
+        #endif
+        page.reset()
+        vc.scrollView.updateTiles()
+        await waitUntil("rendered page") { page.hasShownContent && page.isSettled }
+        XCTAssertNil(page.visibleCoverage, "normal scrolling must not store a readiness viewport")
+        XCTAssertFalse(page.hasRenderedCoverage)
         XCTAssertFalse(vc.fixtureReadinessEnabled)
         XCTAssertTrue(vc.fixtureSubscriptions.isEmpty)
         XCTAssertNil(page.onRenderStateChange, "only the separate DEBUG diagnostic may observe normal renders")
@@ -2718,6 +2753,21 @@ final class FeatCanvasTests: XCTestCase {
     }
 
     #if DEBUG
+    func testRenderTimingsAreRemovedWhenPageViewsAreRecycled() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        XCTAssertFalse(vc.renderTimingPages.isEmpty)
+        XCTAssertEqual(vc.renderTimingPages, Set(vc.scrollView.pageViews.keys))
+        vc.scrollView.recycleAll()
+        XCTAssertTrue(vc.renderTimingPages.isEmpty)
+        vc.scrollView.updateVisiblePages()
+        XCTAssertFalse(vc.renderTimingPages.isEmpty)
+        XCTAssertEqual(vc.renderTimingPages, Set(vc.scrollView.pageViews.keys))
+        vc.closeCanvas()
+        XCTAssertTrue(vc.renderTimingPages.isEmpty)
+    }
+
     func testCanvasReadinessClearsImmediatelyForPageAndDocumentSwitches() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         h.app.services.renderer = RecordingRenderer()

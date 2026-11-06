@@ -1105,6 +1105,30 @@ final class FeatSidebarTests: XCTestCase {
         XCTAssertFalse(store.needsRender(p1, pixelSize: 100))
     }
 
+    func testThumbnailFailureOnlyNotifiesForAPageStillInTheWorkspace() async throws {
+        let h = harness()
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        var failures = 0
+        let observer = NotificationCenter.default.publisher(for: .nibCommandFailed, object: h.app)
+            .sink { _ in failures += 1 }
+        defer { observer.cancel() }
+        model.thumbnails.onFailure?(p1)
+        XCTAssertEqual(failures, 1, "an existing page's exhausted retry remains user-visible")
+        h.app.commands.register(CommandDescriptor(id: "test.deletePreviewPage", title: "Delete Page",
+                                                  summary: "Test helper.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                guard var page = try tx.content(Fixtures.docID).page(Fixtures.page1) else { return }
+                page.deleted = true
+                try tx.put(page, doc: Fixtures.docID)
+            }
+            return .null
+        }
+        try await h.run("test.deletePreviewPage")
+        model.thumbnails.onFailure?(p1)
+        model.thumbnails.onFailure?(Fixtures.boardID)
+        XCTAssertEqual(failures, 1, "deleted or absent pages cannot produce a preview error")
+    }
+
     func testThumbnailRetryIsCancelledWhenItLeavesOrTheDocumentChanges() async throws {
         for changeDocument in [false, true] {
             let renderer = GatedRenderer()
@@ -1123,6 +1147,27 @@ final class FeatSidebarTests: XCTestCase {
             XCTAssertFalse(store.isLoading(p1))
             XCTAssertNil(store.image(p1))
         }
+    }
+
+    func testCancelledThumbnailRetryCannotClearAReplacementLoad() async throws {
+        let renderer = GatedRenderer()
+        let store = ThumbnailStore()
+        store.coalescingDelay = 0
+        store.retryDelay = 100_000_000
+        store.setDisplayed([p1])
+        store.request(doc: doc, page: p1, pixelSize: 100, renderer: renderer)
+        try await waitUntil { renderer.calls.count == 1 }
+        renderer.fail()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        store.cancel(p1)
+        store.request(doc: doc, page: p1, pixelSize: 100, renderer: renderer)
+        try await waitUntil { renderer.calls.count == 2 }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(store.isLoading(p1), "the cancelled retry may only clear its own token")
+        XCTAssertEqual(renderer.calls.count, 2)
+        renderer.finish(size: 100)
+        try await waitUntil { store.image(self.p1) != nil }
+        XCTAssertFalse(store.isLoading(p1))
     }
 
     func testNormalThumbnailVisibilityRetriesWithoutEvaluatingFixtureReadiness() async throws {

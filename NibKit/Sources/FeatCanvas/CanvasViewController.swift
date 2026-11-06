@@ -1338,6 +1338,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     func documentScrollView(_ view: DocumentScrollView, didRecycle pageView: PageTileView, for page: PageID) {
+        #if DEBUG
+        renderTimings[page] = nil
+        #endif
         host.flushWaitersIfReady(page)
         canvasRenderStateChanged()
         #if DEBUG
@@ -1463,6 +1466,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         var settled = false
     }
     private var renderTimings: [PageID: RenderTiming] = [:]
+    var renderTimingPages: Set<PageID> { Set(renderTimings.keys) }
 
     private func beginRenderTiming(_ page: PageID) {
         guard renderTimings[page] == nil else { return }
