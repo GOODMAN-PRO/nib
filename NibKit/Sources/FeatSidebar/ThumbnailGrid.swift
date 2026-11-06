@@ -246,6 +246,7 @@ struct ThumbnailGridView: UIViewControllerRepresentable {
 /// A thumbnail cell; remembers its page, so ending display cancels the render of the page it showed (index paths are
 /// stale while a snapshot is being applied).
 final class ThumbnailCell: UICollectionViewCell {
+    var hasThumbnailImage = false
     var page: PageID?
     var activate: (() -> Void)?
 
@@ -375,6 +376,28 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         collectionView.accessibilityLabel = String(localized: "Page thumbnails")
         self.collectionView = collectionView
         view = collectionView
+    }
+
+    private var displayedThumbnails: [ObjectIdentifier: (PageID, Bool)] = [:]
+    private var hasDisappeared = false
+
+    private func publishDisplayedThumbnails() {
+        var pages: [PageID: Bool] = [:]
+        for (page, loaded) in displayedThumbnails.values {
+            pages[page] = (pages[page] ?? false) || loaded
+        }
+        model.updateDisplayedThumbnails(pages)
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        hasDisappeared = false
+        for cell in collectionView?.visibleCells ?? [] {
+            guard let cell = cell as? ThumbnailCell, let page = cell.page else { continue }
+            displayedThumbnails[ObjectIdentifier(cell)] = (page, cell.hasThumbnailImage)
+        }
+        publishDisplayedThumbnails()
+        reconfigure(visibleOnly: true)
     }
 
     override func viewDidLoad() {
@@ -634,6 +657,11 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         cell.contentConfiguration = UIHostingConfiguration { ThumbnailCellView(state: state, actions: actions) }
             .margins(.all, 0)
         cell.contentView.isUserInteractionEnabled = false
+        cell.hasThumbnailImage = state.image != nil
+        if displayedThumbnails[ObjectIdentifier(cell)] != nil {
+            displayedThumbnails[ObjectIdentifier(cell)] = (page, cell.hasThumbnailImage)
+            publishDisplayedThumbnails()
+        }
     }
 
     private func requestThumbnail(_ row: PageRow) {
@@ -750,11 +778,17 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     func collectionView(_ collectionView: UICollectionView, willDisplay cell: UICollectionViewCell,
                         forItemAt indexPath: IndexPath) {
         guard let page = (cell as? ThumbnailCell)?.page, let row = rowByID[page.raw] else { return }
+        if !hasDisappeared, let thumbnail = cell as? ThumbnailCell {
+            displayedThumbnails[ObjectIdentifier(cell)] = (page, thumbnail.hasThumbnailImage)
+            publishDisplayedThumbnails()
+        }
         requestThumbnail(row)
     }
 
     func collectionView(_ collectionView: UICollectionView, didEndDisplaying cell: UICollectionViewCell,
                         forItemAt indexPath: IndexPath) {
+        displayedThumbnails.removeValue(forKey: ObjectIdentifier(cell))
+        publishDisplayedThumbnails()
         guard let page = (cell as? ThumbnailCell)?.page else { return }
         // After a reorder another cell may show the page now.
         let stillShown = collectionView.visibleCells.contains { $0 !== cell && ($0 as? ThumbnailCell)?.page == page }
@@ -1120,6 +1154,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        hasDisappeared = true
+        displayedThumbnails.removeAll()
+        publishDisplayedThumbnails()
         highlightedPages.removeAll()
         swipe = nil
         swipeLocation = nil

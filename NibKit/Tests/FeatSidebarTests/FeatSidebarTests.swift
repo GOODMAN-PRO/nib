@@ -1072,6 +1072,81 @@ final class FeatSidebarTests: XCTestCase {
         try await waitUntil { store.image(self.p3) != nil }
     }
 
+    func testThumbnailFailureRetriesOnceWhileDisplayedAndThenStops() async throws {
+        let renderer = GatedRenderer()
+        let store = ThumbnailStore()
+        store.coalescingDelay = 0
+        store.retryDelay = 0
+        store.setDisplayed([p1])
+        var failures = 0
+        store.onFailure = { _ in failures += 1 }
+        store.request(doc: doc, page: p1, pixelSize: 100, renderer: renderer)
+        try await waitUntil { renderer.calls.count == 1 }
+        renderer.fail()
+        try await waitUntil { renderer.calls.count == 2 }
+        renderer.fail()
+        try await waitUntil { !store.isLoading(self.p1) }
+        XCTAssertEqual(failures, 1)
+        XCTAssertNil(store.image(p1))
+        // Reconfiguring the still-displayed cell must not restart an unbounded retry loop.
+        store.request(doc: doc, page: p1, pixelSize: 100, renderer: renderer)
+        XCTAssertFalse(store.isLoading(p1))
+        XCTAssertEqual(renderer.calls.count, 2)
+
+        store.setDisplayed([])
+        store.setDisplayed([p1])
+        store.request(doc: doc, page: p1, pixelSize: 100, renderer: renderer)
+        try await waitUntil { renderer.calls.count == 3 }
+        renderer.fail()
+        try await waitUntil { renderer.calls.count == 4 }
+        renderer.finish(size: 100)
+        try await waitUntil { store.image(self.p1) != nil }
+        XCTAssertEqual(failures, 1)
+        XCTAssertFalse(store.needsRender(p1, pixelSize: 100))
+    }
+
+    func testThumbnailRetryIsCancelledWhenItLeavesOrTheDocumentChanges() async throws {
+        for changeDocument in [false, true] {
+            let renderer = GatedRenderer()
+            let store = ThumbnailStore()
+            store.coalescingDelay = 0
+            store.retryDelay = 100_000_000
+            store.setDisplayed([p1])
+            store.request(doc: doc, page: p1, pixelSize: 100, renderer: renderer)
+            try await waitUntil { renderer.calls.count == 1 }
+            renderer.fail()
+            // Let the nil result schedule its delayed retry.
+            try await Task.sleep(nanoseconds: 30_000_000)
+            if changeDocument { store.removeAll() } else { store.setDisplayed([]) }
+            try await Task.sleep(nanoseconds: 150_000_000)
+            XCTAssertEqual(renderer.calls.count, 1)
+            XCTAssertFalse(store.isLoading(p1))
+            XCTAssertNil(store.image(p1))
+        }
+    }
+
+    func testThumbnailReadinessCountsOnlyImagesInstalledInVisibleCells() async throws {
+        let h = harness()
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        let renderer = GatedRenderer()
+        model.thumbnails.coalescingDelay = 0
+        model.updateDisplayedThumbnails([p1: false, p2: false])
+        XCTAssertEqual(model.thumbnailReadiness, ["visible": 2, "loaded": 0])
+        model.thumbnails.request(doc: doc, page: p1, pixelSize: 100, renderer: renderer)
+        try await waitUntil { renderer.calls.count == 1 }
+        renderer.finish(size: 100)
+        try await waitUntil { model.thumbnail(self.p1) != nil }
+        XCTAssertEqual(model.thumbnailReadiness, ["visible": 2, "loaded": 0],
+                       "a cached image has not yet been installed in the cell")
+        model.updateDisplayedThumbnails([p1: true, p2: false])
+        XCTAssertEqual(model.thumbnailReadiness, ["visible": 2, "loaded": 1])
+        model.updateDisplayedThumbnails([p2: false])
+        XCTAssertEqual(model.thumbnailReadiness, ["visible": 1, "loaded": 0])
+        model.updateDisplayedThumbnails([:])
+        XCTAssertEqual(model.thumbnailReadiness, ["visible": 0, "loaded": 0])
+        if !NibUITestMode.isEnabled { XCTAssertNil(h.session.toolOptions["nib.qa.thumbnails"]) }
+    }
+
     // MARK: Unseen changes
 
     func testMarkingSeenIgnoresPreviewsAndDefaultsToTheOpenPage() async throws {
@@ -1125,6 +1200,27 @@ final class FeatSidebarTests: XCTestCase {
         grid.view.frame = CGRect(x: 0, y: 0, width: 240, height: 900)
         grid.view.layoutIfNeeded()
         return grid
+    }
+
+    func testGridReadinessUpdatesAfterImageInstallationAndDisappearance() async throws {
+        let h = harness()
+        let renderer = GatedRenderer()
+        h.app.services.renderer = renderer
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        model.thumbnails.coalescingDelay = 0
+        let grid = laidOutGrid(model)
+        grid.viewDidAppear(false)
+        defer { grid.viewDidDisappear(false); renderer.finishAll() }
+        let collection = try XCTUnwrap(grid.view as? UICollectionView)
+        let count = collection.visibleCells.compactMap { ($0 as? ThumbnailCell)?.page }.count
+        XCTAssertGreaterThan(count, 0)
+        XCTAssertEqual(model.thumbnailReadiness["visible"]?.doubleValue, Double(count))
+        XCTAssertEqual(model.thumbnailReadiness["loaded"]?.doubleValue, 0)
+        try await waitUntil { renderer.calls.count >= count }
+        renderer.finishAll()
+        try await waitUntil { model.thumbnailReadiness["loaded"]?.doubleValue == Double(count) }
+        grid.viewDidDisappear(false)
+        XCTAssertEqual(model.thumbnailReadiness, ["visible": 0, "loaded": 0])
     }
 
     func testThumbnailActivationAndTouchUseTheCollectionCell() async throws {
@@ -1402,6 +1498,21 @@ final class GatedRenderer: PageRenderer {
         let next = waiting.isEmpty ? nil : waiting.removeFirst()
         lock.unlock()
         next?.resume(returning: FakeRenderer.blank(CGSize(width: size, height: size)))
+    }
+
+    func finishAll() {
+        lock.lock()
+        let pending = waiting
+        waiting.removeAll()
+        lock.unlock()
+        for next in pending { next.resume(returning: FakeRenderer.blank(CGSize(width: 1024, height: 1024))) }
+    }
+
+    func fail() {
+        lock.lock()
+        let next = waiting.isEmpty ? nil : waiting.removeFirst()
+        lock.unlock()
+        next?.resume(returning: nil)
     }
 
     func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}

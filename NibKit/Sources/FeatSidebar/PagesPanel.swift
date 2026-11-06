@@ -82,6 +82,16 @@ final class ThumbnailStore {
     private var stale: Set<PageID> = []
     private var generations: [PageID: Int] = [:]
     private var nextToken = 0
+    private var exhausted: Set<PageID> = []
+    private(set) var displayed: Set<PageID> = []
+    var retryDelay: UInt64 = 150_000_000
+    var onFailure: (@MainActor (PageID) -> Void)?
+
+    func setDisplayed(_ pages: Set<PageID>) {
+        for page in displayed.subtracting(pages) { cancel(page) }
+        displayed = pages
+    }
+
     /// How long a request waits before rendering (40 ms: about three frames of a fling).
     var coalescingDelay: UInt64 = 40_000_000
     /// A page's image arrived.
@@ -109,6 +119,7 @@ final class ThumbnailStore {
         for page in pages {
             generations[page, default: 0] += 1
             stale.insert(page)
+            exhausted.remove(page)
         }
     }
 
@@ -119,16 +130,20 @@ final class ThumbnailStore {
         images.removeAllObjects()
         stale.removeAll()
         generations.removeAll()
+        exhausted.removeAll()
+        displayed.removeAll()
     }
 
     /// Drops the render of `page` if it has not landed yet (its thumbnail scrolled away); the next request starts over.
     func cancel(_ page: PageID) {
+        exhausted.remove(page)
         guard let load = loads.removeValue(forKey: page) else { return }
         load.task.cancel()
     }
 
     func request(doc: DocumentID, page: PageID, pixelSize: Int, renderer: PageRenderer?) {
-        guard pixelSize > 0, loads[page] == nil, needsRender(page, pixelSize: pixelSize), let renderer = renderer else {
+        guard pixelSize > 0, loads[page] == nil, !exhausted.contains(page),
+              needsRender(page, pixelSize: pixelSize), let renderer = renderer else {
             return
         }
         nextToken += 1
@@ -138,18 +153,40 @@ final class ThumbnailStore {
         let task = Task { @MainActor [weak self] in
             if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
             guard !Task.isCancelled else { return }
-            let cgImage = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: pixelSize)
-            guard let self = self, self.loads[page]?.token == token else { return }
-            self.loads[page] = nil
-            guard (self.generations[page] ?? 0) == generation else {
-                self.request(doc: doc, page: page, pixelSize: pixelSize, renderer: renderer)
-                return
+            for attempt in 0...1 {
+                if attempt > 0 {
+                    guard let retryDelay = self?.retryDelay else { return }
+                    if retryDelay > 0 { try? await Task.sleep(nanoseconds: retryDelay) }
+                    guard !Task.isCancelled, self?.displayed.contains(page) == true else { return }
+                }
+                let cgImage = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: pixelSize)
+                guard let self = self, !Task.isCancelled, self.loads[page]?.token == token else { return }
+                guard (self.generations[page] ?? 0) == generation else {
+                    self.loads[page] = nil
+                    self.request(doc: doc, page: page, pixelSize: pixelSize, renderer: renderer)
+                    return
+                }
+                if let cgImage = cgImage {
+                    self.loads[page] = nil
+                    self.stale.remove(page)
+                    self.images.setObject(UIImage(cgImage: cgImage), forKey: page.raw as NSString,
+                                          cost: cgImage.bytesPerRow * cgImage.height)
+                    self.onLoad?(page)
+                    return
+                }
+                #if DEBUG
+                NSLog("%@", "[Nib QA render] thumbnail failed doc=\(doc.raw) page=\(page.raw) attempt=\(attempt + 1)")
+                #endif
+                // Keep stale images visible. Only a displayed page gets one automatic retry.
+                if attempt == 1 || !self.displayed.contains(page) {
+                    self.loads[page] = nil
+                    if attempt == 1 {
+                        self.exhausted.insert(page)
+                        self.onFailure?(page)
+                    }
+                    return
+                }
             }
-            self.stale.remove(page)
-            guard let cgImage = cgImage else { return }
-            self.images.setObject(UIImage(cgImage: cgImage), forKey: page.raw as NSString,
-                                  cost: cgImage.bytesPerRow * cgImage.height)
-            self.onLoad?(page)
         }
         loads[page] = Load(token: token, task: task)
     }
@@ -210,6 +247,10 @@ final class PagesPanelModel: ObservableObject {
         self.app = app
         self.session = session
         thumbnails.onLoad = { [weak self] page in self?.noteThumbnails([page]) }
+        thumbnails.onFailure = { [weak self] _ in
+            self?.fail("render.page", NibError(.unavailable,
+                String(localized: "Couldn't load a page preview. Reopen Pages to try again.")))
+        }
         session?.$document.dropFirst().sink { [weak self] _ in self?.schedule() }.store(in: &cancellables)
         session?.$page.dropFirst().sink { [weak self] _ in self?.schedule() }.store(in: &cancellables)
         session?.$readOnly.dropFirst().sink { [weak self] _ in self?.schedule() }.store(in: &cancellables)
@@ -265,6 +306,7 @@ final class PagesPanelModel: ObservableObject {
         if next != doc {
             doc = next
             thumbnails.removeAll()
+            updateDisplayedThumbnails([:])
             changedThumbnails = []
             if pendingTrash != nil { pendingTrash = nil }
             if !selection.isEmpty { selection = [] }
@@ -327,6 +369,19 @@ final class PagesPanelModel: ObservableObject {
         let changed = changedThumbnails
         changedThumbnails = []
         return changed
+    }
+
+    /// Images actually installed in displayed cells, not merely present in the cache.
+    private(set) var thumbnailReadiness: JSONValue = ["visible": 0, "loaded": 0]
+
+    func updateDisplayedThumbnails(_ cells: [PageID: Bool]) {
+        thumbnails.setDisplayed(Set(cells.keys))
+        thumbnailReadiness = ["visible": .number(Double(cells.count)),
+                              "loaded": .number(Double(cells.values.filter { $0 }.count))]
+        guard NibUITestMode.isEnabled, let session = session else { return }
+        if session.toolOptions["nib.qa.thumbnails"] != thumbnailReadiness {
+            session.toolOptions["nib.qa.thumbnails"] = thumbnailReadiness
+        }
     }
 
     func thumbnail(_ page: PageID) -> UIImage? { thumbnails.image(page) }
