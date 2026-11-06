@@ -125,6 +125,13 @@ final class CaptureUITests: XCTestCase {
                 ($0 as? Bool) == true
             }
         }
+        if screen == "page-sidebar" {
+            try captureFact("thumbnails", deadline: deadline, reason: "Pages thumbnails did not load") {
+                guard let counts = $0 as? [String: Any], let visible = counts["visible"] as? Int,
+                      let loaded = counts["loaded"] as? Int else { return false }
+                return visible > 0 && loaded == visible
+            }
+        }
         let stem = String(format: "%02d", number) + "-\(screen)-\(appearance)-\(orientation)"
         // XCTest waits for UI idleness before taking the full device screenshot.
         attach(XCTAttachment(screenshot: XCUIScreen.main.screenshot()), name: stem)

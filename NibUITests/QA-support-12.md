@@ -23,3 +23,11 @@ Text/study documents have no pages and retain their own content gates. The delib
 | Tests | Log prefix | Question answered |
 | --- | --- | --- |
 | Every page-bearing Capture screenshot except intentional render error | Capture fact ready / Capture fact timeout | Did the app report settled tiles within the shared 15-second budget, or was the last fact false, malformed or missing? |
+
+### G3 - sidebar thumbnail images
+
+Confirmed V3:sidebar#0 and its holds=true verdict: the light landscape shot followed the tap at t=16.92 by about 1.75 seconds, between the cache probes at 05:25:16.086 and 16.273-16.372. Current capture12 waits only for sidebar.pages. The Pages screenshot now also requires qa.thumbnails visible > 0 and loaded == visible, after state/canvas readiness and within the same capture deadline. Missing/malformed facts fail with their last value; no test-side thumbnail reconstruction or retry. Outline keeps its separate No outline yet gate. Should unblock all four capture12 variants. Next CI must show a positive complete thumbnail count before attachment18, or a named failure rather than a blank-thumbnail review image. Why that pipeline started late and the app's nil-image retry policy remain app-owned questions.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Capture test12, all variants, Pages shot | Capture fact ready / Capture fact timeout (fact=thumbnails) | How many visible cells had images at the capture boundary; was the fact absent? |
