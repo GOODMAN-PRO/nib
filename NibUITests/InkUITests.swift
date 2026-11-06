@@ -695,17 +695,58 @@ final class InkUITests: XCTestCase {
         }
     }
 
-    func testHighlighterThicknessStabilisationAndDrawHoldPersist() throws {
+    private func highlighterSettingsStep<T>(_ part: String, _ body: () throws -> T) rethrows -> T {
+        let started = ProcessInfo.processInfo.systemUptime
+        ui.logQA("Highlighter settings timing", "test=\(name) part=\(part) begin uptime=\(started)")
+        defer {
+            let seconds = ProcessInfo.processInfo.systemUptime - started
+            ui.logQA("Highlighter settings timing", "test=\(name) part=\(part) end seconds=\(seconds)")
+        }
+        return try body()
+    }
+
+    /// Both split tests exercise the same real width, smoothing and toggle changes.
+    private func configureHighlighterThicknessAndStabilisation() throws -> String {
         try ui.selectTool("highlighter")
         try width(3)
         try settings("highlighter")
         _ = try slider("Thickness", to: 0.7)
         let smoothing = try slider("Stabilisation", to: 0.8)
         try toggle("Draw and hold", to: false); closePopover()
-        try settings("highlighter")
-        XCTAssertEqual(String(describing: try control("Stabilisation", type: .slider, scroll: true).value), smoothing)
-        XCTAssertEqual(try control("Draw and hold", type: .switch, scroll: true).value as? String, "0")
-        closePopover(); try draw()
+        return smoothing
+    }
+
+    func testHighlighterThicknessStabilisationAndDrawHoldPersist() throws {
+        let smoothing = try highlighterSettingsStep("configure") {
+            try configureHighlighterThicknessAndStabilisation()
+        }
+        try highlighterSettingsStep("reopen without reveal") {
+            try settings("highlighter", alreadySelected: true, revealTop: false)
+        }
+        highlighterSettingsStep("read persisted values") {
+            // The popover restores its offset. Query its labelled controls directly:
+            // no Lemon homing, scrolling reveal, frame or hittability re-resolution.
+            // An empty retained Highlighter shell has no matching slider/switch.
+            let panels = ui.app.scrollViews.matching(NSPredicate(format: "label == %@", "Highlighter"))
+            let actualSmoothing = panels.sliders.matching(NSPredicate(format: "label == %@", "Stabilisation")).firstMatch.value
+            let drawAndHold = panels.switches.matching(NSPredicate(format: "label == %@", "Draw and hold")).firstMatch.value
+            XCTAssertEqual(String(describing: actualSmoothing), smoothing)
+            XCTAssertEqual(drawAndHold as? String, "0")
+        }
+        closePopover()
+    }
+
+    func testHighlighterDrawsAfterThicknessStabilisationAndDrawHoldChanges() throws {
+        _ = try highlighterSettingsStep("configure") {
+            try configureHighlighterThicknessAndStabilisation()
+        }
+        try highlighterSettingsStep("reopen without reveal") {
+            try settings("highlighter", alreadySelected: true, revealTop: false)
+        }
+        closePopover()
+        // Preserve the old tail's exact +1 stroke, +1 item and undoAvailable oracle,
+        // after the same settings changes and close/reopen cycle on a fresh fixture.
+        try highlighterSettingsStep("draw and verify") { try draw() }
     }
 
     func testHighlighterDrawHoldToggleChangesSubsequentHeldStroke() throws {
