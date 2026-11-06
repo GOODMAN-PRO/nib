@@ -186,3 +186,9 @@ Confirmed R12:ink-colours#3's holds=false verdict against addColour/open and Col
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | AddColourPreservesExistingSlotsAndStopsAtTwelve; AddedColourDigits tests | Add Colour opened no palette | Did the first plus tap produce any palette; what were its frame and QA state? |
+
+### I4 - resolve and reveal each eraser chip afresh
+
+Confirmed R12:ink-tools#0 and verdict against the four-upfront lookup and current horizontal chip row. EraserFiltersEraseOnlyEnabledPenPencilHighlighterAndTape now resolves each chip within the current Eraser popover and uses H6 with the Pen sibling to identify its row. No chip array survives a reopen; each activation can move either direction to the current target. Enable-first ordering, every isSelected assertion, all four exact item-count decrements and Undo restoration remain. CI must reach Tape through a held horizontal drag (rather than the old 13.3 s vertical search) and complete all four filter iterations. Offset reset on reopen is handled without relying on it.
+
+Diagnostics use H6's Horizontal reveal prefix for every chip, including zero-move hits. Runtime savings are unmeasured; successful coverage adds real horizontal navigation that the old failing path never completed.

@@ -1075,14 +1075,17 @@ final class InkUITests: XCTestCase {
         let mixed = try ui.state()
         XCTAssertEqual(mixed.itemCountOnPage, initial.itemCountOnPage + 4)
         try settings("eraser"); try tap("Whole stroke")
-        let chips = try labels.map { try control($0, type: .button, scroll: true) }
+        func revealChip(_ label: String) throws -> XCUIElement {
+            let eraser = ui.app.scrollViews.matching(NSPredicate(format: "label == 'Eraser'")).firstMatch
+            return try ui.revealInHorizontalRow(label, in: eraser, containing: "Pen")
+        }
         for (index, enabled) in labels.enumerated() {
             if index > 0 { try settings("eraser", alreadySelected: true, revealTop: false) }
             // Enable target first, so the last-enabled-filter guard is respected.
-            let target = chips[index]
+            let target = try revealChip(enabled)
             if !target.isSelected { target.tap() }
-            for (chipIndex, label) in labels.enumerated() where label != enabled {
-                let chip = chips[chipIndex]
+            for label in labels where label != enabled {
+                let chip = try revealChip(label)
                 if chip.isSelected { chip.tap() }
                 XCTAssertFalse(chip.isSelected)
             }
