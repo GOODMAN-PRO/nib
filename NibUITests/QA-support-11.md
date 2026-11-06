@@ -92,3 +92,7 @@ Confirmed R12:chrome-singles#2: the current-page change was correct for the flin
 | --- | --- | --- |
 | PageScrollCollapsesOptionsAndChoosingToolRestoresThem | Page scroll held release / Page scroll ink geometry | Was stationary contact delivered before lift, and did the counted page receive the stroke? |
 
+### C6 - iOS 26 dictionary close identity
+
+Confirmed R12:chrome-singles#3 against its tree (DDUIDone, label close), current PDFTextMenu's system UIReferenceLibraryViewController and the stale Done lookup. PDFDefineOpensDictionaryForSelectedText now requires the typed DDUIDone button, retains the navigation-bar assertion, taps it, requires dismissal and retains sameContent. CI must reach the system dictionary and close it without expecting installed dictionary content. This lane runs iOS 26.5; no unverified older-OS fallback is added.
+

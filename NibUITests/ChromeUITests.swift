@@ -1510,9 +1510,11 @@ final class ChromeUITests: XCTestCase {
     }
     func testPDFDefineOpensDictionaryForSelectedText() throws {
         try importTextPDF(); let before = try ui.state(); try selectPDFText(); try pdfAction("Define")
-        _ = try require("Done")
+        let close = try ui.requireControl("DDUIDone", type: .button, timeout: 8)
         XCTAssertTrue(ui.app.navigationBars.count > 0, "Define must present the system dictionary")
-        try tap("Done"); try sameContent(before)
+        close.tap()
+        try wait("Dictionary must close") { !close.exists || !close.isHittable }
+        try sameContent(before)
     }
     func testPDFSpeakStartsSpeechAndOffersStopSpeaking() throws {
         try importTextPDF(); let before = try ui.state(); try selectPDFText(); try pdfAction("Speak")
