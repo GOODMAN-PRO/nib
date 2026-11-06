@@ -372,7 +372,9 @@ final class ChromeWindow {
             registered: app.ui.toolbarItems(for: snapshot.kind),
             commandExists: { [weak self] in self?.has($0) ?? false },
             hasMenu: { [weak self] in !(self?.menuItems($0).isEmpty ?? true) },
-            session: session)
+            session: session,
+            statusContext: ChromeContext(app: app, session: session, navigator: navigator,
+                                         kind: snapshot.kind, isCompact: compact))
         return NavBarModel.split(NavBarModel.build(input), compact: compact)
     }
 
