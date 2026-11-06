@@ -738,7 +738,19 @@ final class PagesUITests: XCTestCase {
         let grid = ui.app.collectionViews.matching(NSPredicate(format: "label == 'Page thumbnails'")).firstMatch
         for _ in 0..<8 {
             if element.exists && element.isHittable { break }
-            grid.swipeUp()
+            guard let viewport = NibUITestScrollGeometry.viewport(scroll: grid.frame,
+                      window: ui.app.windows.firstMatch.frame,
+                      obstructions: ui.app.keyboards.allElementsBoundByIndex.map(\.frame)) else {
+                throw NibUI.Failure.message("Thumbnail reveal has no visible scrolling viewport")
+            }
+            let drag = NibUITestScrollGeometry.drag(in: viewport, toward: nil)
+            let origin = ui.app.coordinate(withNormalizedOffset: .zero)
+            let appFrame = ui.app.frame
+            try ui.guardRevealDrag(in: grid, from: drag.start, to: drag.end)
+            origin.withOffset(CGVector(dx: drag.start.x - appFrame.minX, dy: drag.start.y - appFrame.minY))
+                .press(forDuration: 0.01, thenDragTo: origin.withOffset(CGVector(
+                    dx: drag.end.x - appFrame.minX, dy: drag.end.y - appFrame.minY)),
+                    withVelocity: .slow, thenHoldForDuration: 0)
         }
         try require(element)
         let palette = ui.app.otherElements.matching(NSPredicate(format: "label == 'Tools'"))

@@ -401,6 +401,9 @@ final class NibUI {
         }
         var seen = Set<String>()
         var facts = "target=\(name) anchor=\(anchor)"
+        var foreground: CGRect?
+        var presentationResolved = false
+        var presentedRowFrame: CGRect?
         for attempt in 0...8 {
             guard row.exists, let snapshot = try? measuredSnapshot(row, named: "horizontal row " + anchor) else { break }
             let viewport = snapshot.frame.intersection(root.frame).intersection(app.windows.firstMatch.frame)
@@ -429,8 +432,20 @@ final class NibUI {
             let appFrame = app.frame
             let start = origin.withOffset(CGVector(dx: startX - appFrame.minX, dy: viewport.midY - appFrame.minY))
             let end = origin.withOffset(CGVector(dx: endX - appFrame.minX, dy: viewport.midY - appFrame.minY))
-            let surfaceRoot = try measuredSnapshot(app, named: "horizontal reveal presentation")
-            let foreground = presentedScrollingSurface(row, snapshot: surfaceRoot)
+            if canvas.exists {
+                // Resolve ancestry once per reveal, then recheck the row's live content
+                // and geometry at each contact. Library rows need no presentation walk.
+                if !presentationResolved {
+                    let surfaceRoot = try measuredSnapshot(app, named: "horizontal reveal presentation")
+                    foreground = presentedScrollingSurface(row, snapshot: surfaceRoot)
+                    presentedRowFrame = snapshot.frame
+                    presentationResolved = true
+                }
+                guard row.frame == presentedRowFrame,
+                      hasHittableContent(row, snapshot: snapshot, requiringDescendant: true) else {
+                    throw Failure.message("Horizontal reveal surface closed or moved before drag")
+                }
+            }
             try requireNonCanvasDrag(from: CGPoint(x: startX, y: viewport.midY),
                                      to: CGPoint(x: endX, y: viewport.midY), foreground: foreground)
             start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.4)
@@ -440,15 +455,26 @@ final class NibUI {
         throw Failure.message("Horizontal row must reveal a hittable control: " + facts)
     }
 
-    private func hasHittableContent(_ element: XCUIElement) -> Bool {
-        if element.isHittable { return true }
-        // Hittability is an XCUIElement calculation, not a snapshot query attribute.
-        // Probe a bounded set of real controls only when the host itself is not hittable.
-        let controls = element.descendants(matching: .any).matching(NSPredicate(
-            format: "elementType IN %@", [XCUIElement.ElementType.button.rawValue,
-                                          XCUIElement.ElementType.textField.rawValue,
-                                          XCUIElement.ElementType.slider.rawValue]))
-        return controls.allElementsBoundByIndex.prefix(24).contains { $0.exists && $0.isHittable }
+    private func hasHittableContent(_ element: XCUIElement, snapshot supplied: XCUIElementSnapshot? = nil,
+                                    requiringDescendant: Bool = false) -> Bool {
+        if !requiringDescendant && element.isHittable { return true }
+        guard let snapshot = supplied ?? (try? measuredSnapshot(element, named: "visible scrolling content")) else { return false }
+        let viewport = snapshot.frame.intersection(app.windows.firstMatch.frame)
+        guard !viewport.isNull, !viewport.isEmpty else { return false }
+        let types: [XCUIElement.ElementType] = [.button, .textField, .textView, .slider, .switch, .staticText]
+        func liveDescendant(_ node: XCUIElementSnapshot) -> Bool {
+            // Filter the snapshot by visible geometry BEFORE querying hittability. A
+            // non-lazy form can retain hundreds of off-screen rows before its live ones.
+            if types.contains(node.elementType), !node.frame.isEmpty, node.frame.intersects(viewport) {
+                let matches = element.descendants(matching: node.elementType).matching(NSPredicate(
+                    format: "identifier == %@ AND label == %@", node.identifier, node.label))
+                if matches.allElementsBoundByIndex.contains(where: {
+                    $0.exists && $0.frame == node.frame && $0.isHittable
+                }) { return true }
+            }
+            return node.children.contains { liveDescendant($0) }
+        }
+        return snapshot.children.contains { liveDescendant($0) }
     }
 
     /// A canvas rectangle can extend behind a popover. Only a live presented ancestor
@@ -464,19 +490,20 @@ final class NibUI {
             node.identifier == "nib.canvas" || node.children.contains { containsCanvas($0) }
         }
         func liveCustomSurface(_ node: XCUIElementSnapshot) -> CGRect? {
-            guard node.elementType == .scrollView, !containsCanvas(node) else { return nil }
-            let matches = app.scrollViews.matching(NSPredicate(format: "identifier == %@ AND label == %@",
-                                                               node.identifier, node.label))
-            for host in matches.allElementsBoundByIndex.prefix(16) where host.frame == node.frame && host.isHittable {
+            guard [.scrollView, .collectionView, .table].contains(node.elementType), !containsCanvas(node) else { return nil }
+            let matches = app.descendants(matching: node.elementType).matching(NSPredicate(
+                format: "identifier == %@ AND label == %@", node.identifier, node.label))
+            for host in matches.allElementsBoundByIndex where host.frame == node.frame {
                 // Chrome/palette buds have AX-hidden DismissCatcher, not PopoverDismissRegion.
-                // Existing menu closure uses row presence; also require the host hittable here.
-                if menuHasActiveContent(host) { return node.frame }
+                // Live visible content distinguishes them from retained empty shells,
+                // including switch-only panels and docked thumbnail collections.
+                if hasHittableContent(host, snapshot: node, requiringDescendant: true) { return node.frame }
             }
             return nil
         }
         func visit(_ node: XCUIElementSnapshot, surface: CGRect?, scrolling: XCUIElementSnapshot?) -> CGRect? {
             var foreground = surface
-            let scroll = node.elementType == .scrollView && !containsCanvas(node) ? node : scrolling
+            let scroll = [.scrollView, .collectionView, .table].contains(node.elementType) && !containsCanvas(node) ? node : scrolling
             if [.popover, .sheet, .alert, .menu].contains(node.elementType)
                 || (node.elementType == .other && node.children.contains { $0.label == "Preview" }) {
                 foreground = node.frame
@@ -516,10 +543,10 @@ final class NibUI {
 
     /// Shared guard for class-local form/list reveals. No snapshot cost when the canvas is absent.
     func guardRevealDrag(in container: XCUIElement, from start: CGPoint, to end: CGPoint) throws {
-        guard container.exists && container.isHittable else {
+        guard canvas.exists else { return }
+        guard container.exists && hasHittableContent(container) else {
             throw Failure.message("Reveal requires a live hittable scrolling container")
         }
-        guard canvas.exists else { return }
         let root = try measuredSnapshot(app, named: "drag presentation")
         try requireNonCanvasDrag(from: start, to: end,
                                  foreground: presentedScrollingSurface(container, snapshot: root))
@@ -866,14 +893,12 @@ final class NibUI {
             let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
             // Revalidate presentation before EACH contact. A custom bud can retain its
             // frame after closing, so cached foreground geometry alone is insufficient.
-            let contentTypes = [XCUIElement.ElementType.button.rawValue, XCUIElement.ElementType.textField.rawValue,
-                                XCUIElement.ElementType.textView.rawValue, XCUIElement.ElementType.staticText.rawValue,
-                                XCUIElement.ElementType.slider.rawValue, XCUIElement.ElementType.switch.rawValue]
-            let hasRows = list.descendants(matching: .any).matching(NSPredicate(
-                format: "elementType IN %@", contentTypes)).firstMatch.exists
-            guard list.exists && hasHittableContent(list) && hasRows else {
-                containerLost("scrolling surface is no longer live before drag")
-                return
+            if foregroundSurface != nil || canvas.exists {
+                guard list.exists, list.frame == snapshot.frame,
+                      hasHittableContent(list, snapshot: snapshot, requiringDescendant: true) else {
+                    containerLost("scrolling surface is no longer live before drag")
+                    return
+                }
             }
             do { try requireNonCanvasDrag(from: start, to: end, foreground: foregroundSurface) }
             catch {
@@ -2200,6 +2225,14 @@ final class NibUI {
             if hasInertHeader {
                 let frame: CGRect
                 if let cached = inertHeaderFrame {
+                    guard let inertHeader, inertHeader.exists, inertHeader.elementType == .staticText else {
+                        throw Failure.message("Cached keyboard dismissal frame requires its live inert heading")
+                    }
+                    let current = inertHeader.frame
+                    guard abs(current.minX - cached.minX) <= 1, abs(current.minY - cached.minY) <= 1,
+                          abs(current.maxX - cached.maxX) <= 1, abs(current.maxY - cached.maxY) <= 1 else {
+                        throw Failure.message("Numeric keyboard heading moved from cached frame: \(cached) -> \(current)")
+                    }
                     frame = cached
                 } else if let inertHeader {
                     guard hasVisibleFrame(inertHeader), inertHeader.elementType == .staticText else {

@@ -232,14 +232,29 @@ final class CreateUITests: XCTestCase {
         try newMenu("Notebook")
         try tap("No cover")
         try chooseSize("Custom")
+        try replace(ui.app.textFields["Width in millimetres"], with: "100", diagnoseClear: false, matching: numericValueMatches)
         let heading = ui.app.staticTexts["New Notebook"].firstMatch
         try require(heading, "Custom size needs the inert New Notebook heading")
-        let headingFrame = heading.frame
-        ui.logQA("Custom size heading", "cachedFrame=\(headingFrame); reused for both dismissals")
-        try replace(ui.app.textFields["Width in millimetres"], with: "100", diagnoseClear: false, matching: numericValueMatches)
-        try ui.dismissNativeKeyboard(inertHeaderFrame: headingFrame)
+        var headingFrame = CGRect.null
+        var keyboardFrame = CGRect.null
+        var stableSince = ProcessInfo.processInfo.systemUptime
+        try wait("Custom size heading must settle above the visible keyboard", timeout: 5) {
+            guard heading.exists, self.ui.app.keyboards.firstMatch.exists else { return false }
+            let current = heading.frame
+            let keyboard = self.ui.app.keyboards.firstMatch.frame
+            let now = ProcessInfo.processInfo.systemUptime
+            if current != headingFrame || keyboard != keyboardFrame {
+                headingFrame = current; keyboardFrame = keyboard; stableSince = now
+                return false
+            }
+            return !current.isEmpty && !current.isNull && !current.isInfinite
+                && self.ui.app.windows.firstMatch.frame.contains(current)
+                && !current.intersects(keyboard) && now - stableSince >= 0.3
+        }
+        ui.logQA("Custom size heading", "keyboardVisibleCachedFrame=\(headingFrame); checked before both dismissals")
+        try ui.dismissNativeKeyboard(inertHeader: heading, inertHeaderFrame: headingFrame)
         try replace(ui.app.textFields["Height in millimetres"], with: "150", diagnoseClear: false, matching: numericValueMatches)
-        try ui.dismissNativeKeyboard(inertHeaderFrame: headingFrame)
+        try ui.dismissNativeKeyboard(inertHeader: heading, inertHeaderFrame: headingFrame)
         try assertSize(try create(), width: 100 * 72 / 25.4, height: 150 * 72 / 25.4)
     }
 
