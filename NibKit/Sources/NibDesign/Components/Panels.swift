@@ -4,26 +4,30 @@ import UIKit
 /// Popover content chrome on Deep water: title (headline) and optional subtitle, 16 pt insets, scrolls past 520 pt.
 /// Put it in a droplet: `.droplet(id, style: .popover).budsFrom(source, isPresented:)`, or use `NibBudPopover`.
 /// One ScrollView that only bounces when it must: the content keeps its identity (and its @State and focus) when it
-/// crosses 520 pt.
+/// crosses its height cap (520 pt by default). A dialog can explicitly request more room.
 public struct NibPopoverPanel<Content: View>: View {
     let title: String
     let subtitle: String?
     let width: CGFloat
     let content: Content
     let maxHeight: CGFloat
+    let heightCap: CGFloat
     let onClose: (() -> Void)?
     let scrollsContent: Bool
-    @State private var contentHeight: CGFloat = NibMetrics.popoverMaxHeight
+    @State private var contentHeight: CGFloat
     @Environment(DropletField.self) private var field: DropletField?
     @Environment(\.nibBud) private var bud
 
     public init(title: String, subtitle: String? = nil, width: CGFloat = NibMetrics.popoverWidth,
                 maxHeight: CGFloat = NibMetrics.popoverMaxHeight, onClose: (() -> Void)? = nil,
-                scrollsContent: Bool = true, @ViewBuilder content: () -> Content) {
+                scrollsContent: Bool = true, heightCap: CGFloat = NibMetrics.popoverMaxHeight,
+                @ViewBuilder content: () -> Content) {
         self.title = title
         self.subtitle = subtitle
         self.width = width
         self.maxHeight = maxHeight
+        self.heightCap = heightCap
+        _contentHeight = State(initialValue: heightCap)
         self.onClose = onClose
         self.scrollsContent = scrollsContent
         self.content = content()
@@ -42,7 +46,7 @@ public struct NibPopoverPanel<Content: View>: View {
                 }
                 .padding(NibSpacing.l)
                 .frame(width: min(width, viewport.width))
-                .frame(height: min(maxHeight, NibMetrics.popoverMaxHeight, viewport.height))
+                .frame(height: min(maxHeight, heightCap, viewport.height))
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel(title)
             }
@@ -98,7 +102,7 @@ public struct NibPopoverPanel<Content: View>: View {
         .allowsHitTesting(isPresented)
         .scrollBounceBehavior(.basedOnSize)
         .frame(width: min(width, viewport.width))
-        .frame(height: min(contentHeight, maxHeight, NibMetrics.popoverMaxHeight, viewport.height))
+        .frame(height: min(contentHeight, maxHeight, heightCap, viewport.height))
     }
 
     private var viewport: CGSize {
@@ -207,8 +211,8 @@ public enum NibBudPlacement: Sendable {
     /// Resolve obstruction and available space before measuring content. Never feed the resulting
     /// viewport back into this decision: a short viewport can otherwise undo its own avoidance.
     func layout(beside source: CGRect, width: CGFloat, gap: CGFloat, in bounds: CGRect,
-                avoiding obstacles: [CGRect]) -> (anchor: CGRect, available: CGSize) {
-        let ideal = CGSize(width: max(0, NibGeometry.finite(width)), height: NibMetrics.popoverMaxHeight)
+                avoiding obstacles: [CGRect], heightCap: CGFloat = NibMetrics.popoverMaxHeight) -> (anchor: CGRect, available: CGSize) {
+        let ideal = CGSize(width: max(0, NibGeometry.finite(width)), height: max(0, NibGeometry.finite(heightCap)))
         let anchor = unobstructedAnchor(source, size: ideal, gap: gap, in: bounds, avoiding: obstacles)
         let available = availableSize(beside: anchor, gap: gap, in: bounds)
         // Only centre() chooses the final side, using measured content. A short popover
@@ -264,6 +268,7 @@ public struct NibBudPopover<Content: View>: View {
     let title: String
     let subtitle: String?
     let width: CGFloat
+    let heightCap: CGFloat
     let placement: NibBudPlacement
     let sourceRect: CGRect?
     let fallbackSourceRect: CGRect?
@@ -279,6 +284,7 @@ public struct NibBudPopover<Content: View>: View {
                 width: CGFloat = NibMetrics.popoverWidth, placement: NibBudPlacement = .below,
                 sourceRect: CGRect? = nil, fallbackSourceRect: CGRect? = nil, instant: Bool = false,
                 onClose: (() -> Void)? = nil, scrollsContent: Bool = true,
+                heightCap: CGFloat = NibMetrics.popoverMaxHeight,
                 @ViewBuilder content: () -> Content) {
         self.id = id
         self.source = source
@@ -286,6 +292,7 @@ public struct NibBudPopover<Content: View>: View {
         self.title = title
         self.subtitle = subtitle
         self.width = width
+        self.heightCap = heightCap
         self.placement = placement
         self.sourceRect = sourceRect
         self.fallbackSourceRect = fallbackSourceRect
@@ -307,12 +314,14 @@ public struct NibBudPopover<Content: View>: View {
                                 height: max(0, frame.height - safe.top - safe.bottom))
             let palettes = field?.worldAnchors.filter { $0.key.hasPrefix(NibPalettePresentation.anchorPrefix) }
                 .sorted { $0.key < $1.key }.map(\.value) ?? []
-            let layout = placement.layout(beside: sourceAnchor, width: width, gap: gap, in: bounds, avoiding: palettes)
+            let layout = placement.layout(beside: sourceAnchor, width: width, gap: gap, in: bounds, avoiding: palettes,
+                                          heightCap: heightCap)
             let fitted = CGSize(width: min(size.width, layout.available.width),
                                 height: min(size.height, layout.available.height))
             let centre = placement.centre(size: fitted, beside: layout.anchor, gap: gap, in: bounds)
             NibPopoverPanel(title: title, subtitle: subtitle, width: layout.available.width,
-                            maxHeight: layout.available.height, onClose: onClose, scrollsContent: scrollsContent) { content }
+                            maxHeight: layout.available.height, onClose: onClose, scrollsContent: scrollsContent,
+                            heightCap: heightCap) { content }
                 .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
                 .droplet(id, style: .popover)
                 .budsFrom(source, isPresented: $isPresented, instant: instant)

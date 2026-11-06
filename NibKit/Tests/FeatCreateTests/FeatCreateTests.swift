@@ -1931,10 +1931,25 @@ final class FeatCreateTests: XCTestCase {
                 let paper = try XCTUnwrap(frames["paper." + firstPaper.id])
                 let preview = try XCTUnwrap(frames["preview"])
                 let cue = try XCTUnwrap(frames["cue"], "Overflow must announce more options")
-                XCTAssertGreaterThan(sheetFrame.height, NibMetrics.newDocumentSheetSize.height)
+                let expectedHeight = size.height > size.width
+                    ? min(size.height - 4 * NibSpacing.xxl, 1000)
+                    : min(NibMetrics.newDocumentSheetSize.height + NibMetrics.paperTileSize.height + NibSpacing.xl,
+                          size.height - 2 * NibSpacing.xl)
+                XCTAssertEqual(sheetFrame.height, expectedHeight, accuracy: 1)
                 XCTAssertGreaterThan(paper.height, NibMetrics.paperTileSize.height)
-                XCTAssertLessThanOrEqual(paper.maxY, viewport.maxY - NibSpacing.l + 1,
-                    "The first paper tile and label must clear the bottom fade on opening")
+                let openingMargin = viewport.maxY - paper.maxY
+                let openingDiagnostic = "size=\(size), variant=\(variant), first-row clearance=\(openingMargin), frames=\(frames)"
+                if size.height > size.width {
+                    XCTAssertGreaterThanOrEqual(openingMargin, NibSpacing.xxl - 1,
+                        "The taller portrait sheet must clear the first paper label; \(openingDiagnostic)")
+                } else {
+                    // Landscape keeps its 794 pt sheet in this window. It exposes Paper,
+                    // but does not promise an entire row above the 24 pt fade until scrolling.
+                    // At nominal Large line heights (footnote 16, caption 15), the viewport
+                    // is 794 - 60 - (16 + 16) = 702 pt and the first row ends about 716 pt
+                    // below its top. Bottom content padding cannot change that opening offset.
+                    XCTAssertLessThan(paper.minY, viewport.maxY - NibSpacing.xxl, openingDiagnostic)
+                }
                 XCTAssertGreaterThan(paper.minY, preview.maxY)
                 XCTAssertTrue(sheetFrame.contains(cue))
                 XCTAssertGreaterThanOrEqual(cue.minY, viewport.maxY)
@@ -1957,6 +1972,11 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertEqual((try XCTUnwrap(frames["documentType"])).minY - viewport.minY,
                                NibSpacing.xl, accuracy: 1, diagnostics())
                 let strip = try XCTUnwrap(frames["coverStrip"])
+                let ring = NibStroke.ring + NibStroke.ringOutset
+                let tileCount = (strip.width - NibSpacing.l - 2 * ring + NibSpacing.l)
+                    / (NibMetrics.coverStripSize.width + NibSpacing.l)
+                XCTAssertEqual(tileCount, tileCount.rounded(), accuracy: 0.01,
+                               "The initial cover viewport must end between complete tiles")
                 let horizontal = try XCTUnwrap(scrollViews(host.view).first {
                     $0.contentSize.width > $0.bounds.width + 1
                         && abs($0.convert($0.bounds, to: window).minY - strip.minY) < 2
@@ -1968,7 +1988,7 @@ final class FeatCreateTests: XCTestCase {
                 let finalStrip = try XCTUnwrap(frames["coverStrip"])
                 XCTAssertGreaterThanOrEqual(finalCover.minX, finalStrip.minX)
                 XCTAssertLessThanOrEqual(finalCover.maxX, finalStrip.maxX - NibSpacing.l + 0.5,
-                    "The final cover name must clear the entire trailing fade")
+                    "The final cover name must clear the reserved overflow cue")
                 XCTAssertGreaterThan(finalCover.height, NibMetrics.coverStripSize.height)
                 let resting = vertical.contentOffset.y
                 vertical.setContentOffset(CGPoint(x: vertical.contentOffset.x, y: resting + 100), animated: false)
@@ -1977,6 +1997,10 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertEqual(vertical.adjustedContentInset, inset, diagnostics())
                 XCTAssertEqual(frames["viewport"], viewport, diagnostics())
                 XCTAssertEqual(frames["cue"], cue, diagnostics())
+                let scrolledPaper = try XCTUnwrap(frames["paper." + firstPaper.id])
+                XCTAssertGreaterThanOrEqual(scrolledPaper.minY, viewport.minY, diagnostics())
+                XCTAssertLessThanOrEqual(scrolledPaper.maxY, viewport.maxY - NibSpacing.xxl + 1,
+                    "Scrolling must expose the complete first row above the fade; \(diagnostics())")
             }
         }
     }
@@ -2223,8 +2247,12 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertEqual(categoryFrame.minY, NibSpacing.m, accuracy: 1)
                 XCTAssertGreaterThanOrEqual(tileFrame.minY, categoryFrame.maxY)
                 XCTAssertGreaterThanOrEqual(tileFrame.height, NibMetrics.paperTileSize.height)
-                XCTAssertLessThan(tileFrame.maxY, viewport.maxY - NibSpacing.l,
-                                  "The entire first tile and its name must be above the continuation fade")
+                // The shortest compact fixture is 520 pt. At Large, its clearance after
+                // scrolling is 520 - 32 (cue) - 12 (offset) - 44 (category) - 8 (gap)
+                // - (135 + 6 + 15) (tile and caption) = 268 pt, comfortably beyond 24.
+                // Keep the frame assertion for actual font metrics, including accessibility3.
+                XCTAssertLessThan(tileFrame.maxY, viewport.maxY - NibSpacing.xxl,
+                                  "The entire first tile and its name must clear the fade; clearance=\(viewport.maxY - tileFrame.maxY)")
                 XCTAssertGreaterThanOrEqual(categoryFrame.minX, NibSpacing.l)
                 XCTAssertLessThanOrEqual(categoryFrame.maxX, size.width - NibSpacing.l)
 
@@ -2242,9 +2270,11 @@ final class FeatCreateTests: XCTestCase {
                     "adjusted=\(region.adjustedContentInset), safeArea=\(region.safeAreaInsets)"
                 ].joined(separator: "; ")
                 XCTAssertEqual(fadeViewport, viewport, diagnostics)
-                XCTAssertGreaterThan(fadeViewport.height, 20, diagnostics)
+                // S3 lengthens this form's edge to 24 pt; other nibFadeBottomEdge callers keep 16.
+                let fadeHeight = NibSpacing.xxl
+                XCTAssertGreaterThan(fadeViewport.height, fadeHeight + NibSpacing.xs, diagnostics)
                 let sampleX = captureViewport.midX
-                for distance in [CGFloat(20), 16, 8, 1] {
+                for distance in [fadeHeight + NibSpacing.xs, fadeHeight, 20, fadeHeight / 2, 1] {
                     let point = CGPoint(x: sampleX, y: captureViewport.maxY - distance)
                     XCTAssertTrue(host.view.bounds.contains(point), diagnostics)
                     XCTAssertTrue(captureInk.contains(point), "The fade samples must lie over ink; \(diagnostics)")
@@ -2264,13 +2294,20 @@ final class FeatCreateTests: XCTestCase {
                     return abs(Int(pixel.r) - Int(background.r))
                         + abs(Int(pixel.g) - Int(background.g)) + abs(Int(pixel.b) - Int(background.b))
                 }
-                let solid = try contrast(at: 20)
-                let fadeStart = try contrast(at: 16)
-                let fadeMiddle = try contrast(at: 8)
+                let solid = try contrast(at: fadeHeight + NibSpacing.xs)
+                let fadeStart = try contrast(at: fadeHeight)
+                let extendedBand = try contrast(at: 20)
+                let fadeMiddle = try contrast(at: fadeHeight / 2)
                 let fadeEnd = try contrast(at: 1)
                 XCTAssertGreaterThan(solid, 100, "The scrolling content must actually render; \(diagnostics)")
                 XCTAssertEqual(Double(fadeStart), Double(solid), accuracy: 20,
-                               "Only the final 16 pt should fade; \(diagnostics)")
+                               "Only the final 24 pt of this form should fade; \(diagnostics)")
+                // At 20 pt a 24 pt ramp has 5/6 coverage; the old 16 pt ramp is fully opaque.
+                // Allow colour-space conversion/rounding, but never accept the opaque result.
+                let extendedBandRatio = Double(extendedBand) / Double(max(solid, 1))
+                XCTAssertGreaterThan(extendedBandRatio, 0.5, diagnostics)
+                XCTAssertLessThan(extendedBandRatio, 0.97,
+                                  "The newly faded 16–24 pt band must lose contrast; \(diagnostics)")
                 XCTAssertGreaterThan(fadeStart, fadeMiddle, diagnostics)
                 XCTAssertGreaterThan(fadeMiddle, fadeEnd, diagnostics)
                 XCTAssertLessThan(fadeEnd, solid / 4, diagnostics)

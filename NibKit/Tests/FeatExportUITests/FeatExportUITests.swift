@@ -216,6 +216,97 @@ final class FeatExportUITests: XCTestCase {
         }
     }
 
+    func testProductionExportPopoverUsesMeasuredHeightAndShrinksToWindowRoom() async throws {
+        let (h, presenter, _) = harness()
+        _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"]])
+        let selection = try XCTUnwrap(presenter.selection)
+        let draft = try XCTUnwrap(presenter.draft)
+        for printing in [false, true] {
+            var expandedHeight: CGFloat?
+            for height in [CGFloat(1366), 700] {
+                let bounds = CGRect(x: 0, y: 0, width: 1024, height: height)
+                let source = CGRect(x: 900, y: 32, width: 44, height: 44)
+                let field = DropletField()
+                field.mode = .off
+                field.reduceMotion = true
+                field.updateBounds(bounds.size)
+                let popover = ExportPopover(selection: selection, draft: draft, printing: printing,
+                    app: h.app, session: h.session, host: AttachingExportHost(), source: "share",
+                    sourceRect: source, updateSourceRect: { source }, instant: true)
+                    .environment(field)
+                    .environment(\.horizontalSizeClass, .regular)
+                    .environment(\.dynamicTypeSize, .large)
+                    .environment(\.nibLiquidMode, .off)
+                    .coordinateSpace(NibLiquid.space)
+                    .transaction { $0.disablesAnimations = true; $0.animation = nil }
+                let host = UIHostingController(rootView: popover)
+                host.safeAreaRegions = []
+                let window = UIWindow(frame: bounds)
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil; field.setActive(false) }
+                host.view.frame = bounds
+                for _ in 0..<15 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+                let surface = try XCTUnwrap(field.anchorRect("exportui.popover"))
+                let room = height - NibMetrics.chromeInset - source.maxY - NibMetrics.popoverGap
+                if !printing { XCTAssertGreaterThan(surface.height, NibMetrics.popoverMaxHeight) }
+                XCTAssertGreaterThan(surface.height, 0)
+                XCTAssertLessThanOrEqual(surface.height, room + 0.5)
+                XCTAssertGreaterThanOrEqual(surface.minY, source.maxY + NibMetrics.popoverGap - 0.5)
+                func scrolls(_ view: UIView) -> [UIScrollView] {
+                    ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap(scrolls)
+                }
+                let native = try XCTUnwrap(scrolls(host.view).first)
+                let viewport = native.bounds.height - native.adjustedContentInset.top - native.adjustedContentInset.bottom
+                if height == 1366 {
+                    expandedHeight = surface.height
+                    XCTAssertLessThan(surface.height, room, "The dialog should fit its form, not fill the window")
+                    XCTAssertLessThanOrEqual(native.contentSize.height, viewport + 1)
+                } else {
+                    let requiredHeight = try XCTUnwrap(expandedHeight)
+                    XCTAssertEqual(surface.height, min(requiredHeight, room), accuracy: 0.5,
+                                   "Print and Export must both fit their content or the available room")
+                    if requiredHeight > room + 1 {
+                        XCTAssertGreaterThan(native.contentSize.height, viewport + 1)
+                    } else {
+                        XCTAssertLessThanOrEqual(native.contentSize.height, viewport + 1)
+                    }
+                }
+            }
+        }
+    }
+
+    func testExportMeasuresItsFormBeyondTheOrdinaryPopoverCap() async throws {
+        let (h, presenter, _) = harness()
+        _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"]])
+        let selection = try XCTUnwrap(presenter.selection)
+        let draft = try XCTUnwrap(presenter.draft)
+        var requiredHeight: CGFloat = 0
+        let dialog = ExportDialog(selection: selection, printing: false, app: h.app, session: h.session,
+            dismiss: {}, draft: draft, scrollsOptions: true, onContentHeightChange: { requiredHeight = $0 })
+            .environment(\.dynamicTypeSize, .large)
+        let host = UIHostingController(rootView: dialog)
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 280, height: 432))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for _ in 0..<10 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        // Intrinsic options plus pinned actions, not the constrained GeometryReader's 432 pt.
+        XCTAssertGreaterThan(requiredHeight, 432)
+        let measured = requiredHeight
+        window.frame.size.height = ceil(measured)
+        host.view.frame = window.bounds
+        for _ in 0..<10 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertEqual(requiredHeight, measured, accuracy: 1, "The height request must not depend on its viewport")
+        func scrolls(_ view: UIView) -> [UIScrollView] {
+            ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap(scrolls)
+        }
+        let scroll = try XCTUnwrap(scrolls(host.view).first)
+        let viewport = scroll.bounds.height - scroll.adjustedContentInset.top - scroll.adjustedContentInset.bottom
+        XCTAssertLessThanOrEqual(scroll.contentSize.height, viewport + 1, "With room for the measured form, no option is cut")
+    }
+
     func testPopoverDialogPinsPrimaryActionsBelowItsSingleOptionsScroller() async throws {
         let (h, presenter, _) = harness()
         _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"]])
