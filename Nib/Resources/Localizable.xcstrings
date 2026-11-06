@@ -93239,6 +93239,95 @@
         }
       }
     },
+    "Couldn't read the shared file. Share it again and allow pasting." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die geteilte Datei konnte nicht gelesen werden. Teile sie erneut und erlaube das Einsetzen."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se ha podido leer el archivo compartido. Vuelve a compartirlo y permite pegar."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossible de lire le fichier partagé. Partagez-le à nouveau et autorisez le collage."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile leggere il file condiviso. Condividilo di nuovo e consenti di incollare."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "共有されたファイルを読み込めませんでした。もう一度共有して、ペーストを許可してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공유된 파일을 읽을 수 없습니다. 다시 공유하고 붙여넣기를 허용하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kan het gedeelde bestand niet lezen. Deel het opnieuw en sta plakken toe."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nie udało się odczytać udostępnionego pliku. Udostępnij go ponownie i zezwól na wklejanie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não foi possível ler o arquivo compartilhado. Compartilhe-o novamente e permita colar."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось прочитать файл, которым вы поделились. Поделитесь им ещё раз и разрешите вставку."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Det gick inte att läsa den delade filen. Dela den igen och tillåt inklistring."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Paylaşılan dosya okunamadı. Dosyayı yeniden paylaşın ve yapıştırmaya izin verin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法读取共享的文件。请再次共享，并允许粘贴。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法讀取分享的檔案。請再分享一次，並允許貼上。"
+          }
+        }
+      }
+    },
     "Couldn't read this page" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -353820,6 +353909,95 @@
         }
       }
     },
+    "The clipboard changed. Share the file with Nib again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Zwischenablage hat sich geändert. Teile die Datei erneut mit Nib."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El portapapeles ha cambiado. Vuelve a compartir el archivo con Nib."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le presse-papiers a changé. Partagez à nouveau le fichier avec Nib."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gli appunti sono cambiati. Condividi di nuovo il file con Nib."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "クリップボードが変更されました。ファイルをもう一度Nibと共有してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "클립보드가 변경되었습니다. 파일을 Nib과 다시 공유하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Het klembord is gewijzigd. Deel het bestand opnieuw met Nib."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schowek uległ zmianie. Udostępnij plik aplikacji Nib ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A área de transferência mudou. Compartilhe o arquivo com o Nib novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Буфер обмена изменился. Поделитесь файлом с Nib ещё раз."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Urklipp har ändrats. Dela filen med Nib igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pano değişti. Dosyayı Nib ile yeniden paylaşın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "剪贴板已更改。请再次与 Nib 共享该文件。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "剪貼板已更改。請再次與 Nib 分享該檔案。"
+          }
+        }
+      }
+    },
     "The commented text was deleted." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -364753,6 +364931,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "共享的文件太大，無法打開。"
+          }
+        }
+      }
+    },
+    "The shared file didn't arrive. Share it with Nib again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die geteilte Datei ist nicht angekommen. Teile sie erneut mit Nib."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El archivo compartido no ha llegado. Vuelve a compartirlo con Nib."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le fichier partagé n’est pas arrivé. Partagez-le à nouveau avec Nib."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il file condiviso non è arrivato. Condividilo di nuovo con Nib."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "共有されたファイルが届きませんでした。もう一度Nibと共有してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "공유된 파일이 도착하지 않았습니다. Nib과 다시 공유하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Het gedeelde bestand is niet aangekomen. Deel het opnieuw met Nib."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Udostępniony plik nie dotarł. Udostępnij go aplikacji Nib ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O arquivo compartilhado não chegou. Compartilhe-o com o Nib novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Файл, которым вы поделились, не дошёл. Поделитесь им с Nib ещё раз."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Den delade filen kom inte fram. Dela den med Nib igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Paylaşılan dosya ulaşmadı. Dosyayı Nib ile yeniden paylaşın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "共享的文件未送达。请再次与 Nib 共享。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "分享的檔案未送達。請再次與 Nib 分享。"
           }
         }
       }
