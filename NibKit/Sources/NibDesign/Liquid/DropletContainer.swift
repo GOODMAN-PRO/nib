@@ -20,8 +20,12 @@ public struct NibDropletContainer<Content: View>: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.self) private var environment
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.displayScale) private var displayScale
     @Environment(\.scenePhase) private var scenePhase
     @State private var isVisible = false
+    #if DEBUG
+    @State private var searchLayoutTrace = NibSearchContainerTrace()
+    #endif
     private let inking: NibInkingState?
     private let content: Content
 
@@ -39,7 +43,7 @@ public struct NibDropletContainer<Content: View>: View {
     private var usesSystemGlass: Bool { Self.systemGlassAvailable && mode != .off }
 
     public var body: some View {
-        containerBody
+        measuredContainerBody
             .onAppear { isVisible = true; field.setActive(scenePhase == .active) }
             .onDisappear { isVisible = false; field.setActive(false) }
             .onChange(of: scenePhase) { _, phase in field.setActive(isVisible && phase == .active) }
@@ -59,6 +63,23 @@ public struct NibDropletContainer<Content: View>: View {
             #endif
     }
 
+    @ViewBuilder private var measuredContainerBody: some View {
+        #if DEBUG
+        containerBody
+            .onChange(of: field.clusters.map(\.frame), initial: true) { old, new in
+                searchLayoutTrace.write("cluster frames", old: old, new: new)
+            }
+            .onChange(of: field.node("searchui.libraryField").presentation, initial: true) { old, new in
+                searchLayoutTrace.presentation("field rest/body", old: old, new: new)
+            }
+            .onChange(of: field.node("searchui.libraryResults").presentation, initial: true) { old, new in
+                searchLayoutTrace.presentation("results rest/body", old: old, new: new)
+            }
+        #else
+        containerBody
+        #endif
+    }
+
     private var containerBody: some View {
         ZStack {
             if field.hasOpenBud {
@@ -71,8 +92,8 @@ public struct NibDropletContainer<Content: View>: View {
         .background {
             GeometryReader { proxy in
                 Color.clear
-                    .onAppear { field.updateBounds(proxy.size) }
-                    .onChange(of: proxy.size) { _, size in field.updateBounds(size) }
+                    .onAppear { updateBounds(proxy.size) }
+                    .onChange(of: proxy.size) { _, size in updateBounds(size) }
             }
         }
         .transaction { if NibUITestMode.isEnabled { $0.disablesAnimations = true; $0.animation = nil } }
@@ -94,6 +115,14 @@ public struct NibDropletContainer<Content: View>: View {
         .onChange(of: sizeClass, initial: true) { _, value in
             field.metrics = value == .compact ? .compact : .regular
         }
+    }
+
+    private func updateBounds(_ size: CGSize) {
+        guard DropletContainerMeasurement.changed(field.bounds.size, size, scale: displayScale) else { return }
+        #if DEBUG
+        searchLayoutTrace.write("container bounds", old: field.bounds.size, new: size)
+        #endif
+        field.updateBounds(size)
     }
 
     @ViewBuilder private var layers: some View {
@@ -134,6 +163,31 @@ public struct NibDropletContainer<Content: View>: View {
         }
     }
 }
+
+enum DropletContainerMeasurement {
+    static func changed(_ old: CGSize, _ new: CGSize, scale: CGFloat) -> Bool {
+        guard NibGeometry.isUsable(CGRect(origin: .zero, size: new)) else { return false }
+        let pixel = 1 / max(1, scale)
+        return abs(old.width - new.width) > pixel || abs(old.height - new.height) > pixel
+    }
+}
+
+#if DEBUG
+private final class NibSearchContainerTrace {
+    private var count = 0
+    func write<T>(_ name: String, old: T, new: T) {
+        guard count < 40 else { return }
+        count += 1
+        let message = "[Nib QA search layout] \(name) #\(count) old=\(old) new=\(new)"
+        NSLog("%@", message)
+    }
+    func presentation(_ name: String, old: DropletPresentation, new: DropletPresentation) {
+        let before = "rest=\(old.restSize) body=\(old.bodySize) offset=\(old.bodyOffset)"
+        let after = "rest=\(new.restSize) body=\(new.bodySize) offset=\(new.bodyOffset)"
+        write(name, old: before, new: after)
+    }
+}
+#endif
 
 /// The actual native host bounds, captured before its outer translation and reciprocal padding. Resolving
 /// this anchor outside GlassEffectContainer includes layout, safe-area placement and presentation transforms.
@@ -225,16 +279,22 @@ struct ClusterLayer<Cell: View>: View {
     let cell: (WaterCluster) -> Cell
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            ForEach(field.clusters.filter { NibGeometry.isUsable($0.frame) }) { c in
-                cell(c)
-                    .frame(width: c.frame.width, height: c.frame.height)
-                    .offset(x: c.frame.minX, y: c.frame.minY)
-                    .opacity(c.opacity)
-                    .animation(field.isInking ? NibMotion.recede : NibMotion.enter, value: c.opacity)
+        // Cluster frames include the blur envelope, even with Liquid Off. They are paint bounds,
+        // not layout requirements: letting their ideal size escape this layer enlarges the ZStack
+        // that proposed the droplets' rest frames (compact search: W - 32 + 2 * 19.5 = W + 7).
+        // GeometryReader accepts the parent's proposal without consulting those measured children.
+        GeometryReader { proxy in
+            ZStack(alignment: .topLeading) {
+                ForEach(field.clusters.filter { NibGeometry.isUsable($0.frame) }) { c in
+                    cell(c)
+                        .frame(width: c.frame.width, height: c.frame.height)
+                        .offset(x: c.frame.minX, y: c.frame.minY)
+                        .opacity(c.opacity)
+                        .animation(field.isInking ? NibMotion.recede : NibMotion.enter, value: c.opacity)
+                }
             }
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }

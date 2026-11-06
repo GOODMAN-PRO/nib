@@ -4,12 +4,31 @@ import Combine
 import NibContracts
 import NibDesign
 
+enum SearchLayoutMeasurement {
+    /// Compare against the retained value, so subpixel noise is ignored but real movement accumulates.
+    static func changed(_ old: CGRect?, _ new: CGRect?, scale: CGFloat) -> Bool {
+        guard let old, let new else { return old != new }
+        let pixel = 1 / max(1, scale)
+        return abs(old.minX - new.minX) > pixel || abs(old.minY - new.minY) > pixel
+            || abs(old.width - new.width) > pixel || abs(old.height - new.height) > pixel
+    }
+}
+
 /// Measurements in the presenting window, unaffected by the keyboard changing the visible aspect ratio.
 struct SearchViewport: Equatable {
     var windowSize: CGSize
     var availableHeight: CGFloat
     /// The visible part of the host, expressed in the host's own coordinates.
     var visibleBounds: CGRect
+
+    func differs(from old: SearchViewport?, scale: CGFloat) -> Bool {
+        guard let old else { return true }
+        let window = CGRect(origin: .zero, size: windowSize)
+        let oldWindow = CGRect(origin: .zero, size: old.windowSize)
+        return SearchLayoutMeasurement.changed(oldWindow, window, scale: scale)
+            || SearchLayoutMeasurement.changed(old.visibleBounds, visibleBounds, scale: scale)
+            || abs(old.availableHeight - availableHeight) > 1 / max(1, scale)
+    }
 
     static var idealHeight: CGFloat {
         NibMetrics.barHeight + NibMetrics.minimumRestingGap + NibMetrics.searchResultsMaxHeight
@@ -65,6 +84,9 @@ struct SearchViewportReader: UIViewRepresentable {
         var onChange: (SearchViewport) -> Void
         private var keyboardScreenFrame: CGRect?
         private var last: SearchViewport?
+        #if DEBUG
+        private let layoutTrace = SearchLayoutTrace()
+        #endif
 
         init(onChange: @escaping (SearchViewport) -> Void) {
             self.onChange = onChange
@@ -81,6 +103,10 @@ struct SearchViewportReader: UIViewRepresentable {
         override func layoutSubviews() { super.layoutSubviews(); report() }
 
         @objc private func keyboardChanged(_ note: Notification) {
+            #if DEBUG
+            let next = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue
+            layoutTrace.write("sensor keyboard", old: keyboardScreenFrame, new: next)
+            #endif
             keyboardScreenFrame = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue
             report()
         }
@@ -95,7 +121,10 @@ struct SearchViewportReader: UIViewRepresentable {
                 height: max(0, window.bounds.maxY - frame.minY))
             let next = SearchViewport.measure(windowBounds: window.bounds, safeArea: window.safeAreaInsets,
                 frame: column, keyboard: keyboard)
-            guard next != last else { return }
+            guard next.differs(from: last, scale: window.screen.scale) else { return }
+            #if DEBUG
+            layoutTrace.write("sensor viewport", old: last, new: Optional(next))
+            #endif
             last = next
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.last == next else { return }
@@ -107,10 +136,14 @@ struct SearchViewportReader: UIViewRepresentable {
 
 @MainActor
 struct DocumentSearchPanel: View {
+    @Environment(\.displayScale) private var displayScale
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
     @State private var viewport: SearchViewport?
+    #if DEBUG
+    @State private var layoutTrace = SearchLayoutTrace()
+    #endif
 
     var body: some View {
         // The chrome host supplies the column below the bars. Its natural-height proposal does
@@ -130,7 +163,13 @@ struct DocumentSearchPanel: View {
             }
             .frame(width: width)
             .background(alignment: .top) {
-                SearchViewportReader { viewport = $0 }
+                SearchViewportReader { next in
+                    guard next.differs(from: viewport, scale: displayScale) else { return }
+                    #if DEBUG
+                    layoutTrace.write("document viewport", old: viewport, new: Optional(next))
+                    #endif
+                    viewport = next
+                }
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
