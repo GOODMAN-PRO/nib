@@ -176,18 +176,27 @@ jobs:
           test_start = None
           # Stall sampler: a thread sample of the app shows what its main thread is doing when XCTest reports
           # that the app never became idle, or when xcodebuild has printed nothing for 40 s during testing.
+          # A shorter silence (8 s) gets an app-only sample, at most one every 150 s: single accessibility
+          # queries of 7 to 15 s cost several tests their allowance and no log says which side is slow.
           os.makedirs('samples', exist_ok=True)
-          watch = {'last': time.time(), 'line': '', 'count': 0, 'quiet': 0, 'next': 0.0, 'done': False}
+          watch = {'last': time.time(), 'line': '', 'count': 0, 'quiet': 0, 'next': 0.0, 'done': False, 'short': 0, 'shortNext': 0.0, 'shortSeen': 0.0}
           lock = threading.Lock()
-          def sample(reason):
+          def sample(reason, app_only=False):
               with lock:
-                  if watch['count'] >= 12 or time.time() < watch['next']:
+                  if app_only:
+                      if watch['short'] >= 40 or time.time() < watch['shortNext']:
+                          return
+                  elif watch['count'] - watch['short'] >= 12 or time.time() < watch['next']:
                       return
                   pids = subprocess.run(['pgrep', '-x', 'Nib'], capture_output=True, text=True).stdout.split()
                   if not pids:
                       return
                   watch['count'] += 1
-                  watch['next'] = time.time() + 20
+                  if app_only:
+                      watch['short'] += 1
+                      watch['shortNext'] = time.time() + 150
+                  else:
+                      watch['next'] = time.time() + 20
                   name = 'samples/sample-%02d' % watch['count']
               with open(name + '.txt', 'w') as note:
                   note.write(time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime()) + ' UTC pid ' + pids[-1] + '\n' + reason + '\n')
@@ -196,6 +205,8 @@ jobs:
               except Exception as error:
                   with open(name + '.txt', 'a') as note:
                       note.write('sample failed: ' + str(error) + '\n')
+              if app_only:
+                  return
               # The app can be idle while XCTest's requests no longer reach it: the test runner and the
               # test manager daemon show which side is waiting.
               for label, finder in (('runner', ['pgrep', '-f', 'NibUITests-Runner']), ('testmanagerd', ['pgrep', '-x', 'testmanagerd'])):
@@ -208,8 +219,11 @@ jobs:
                           note.write(label + ' sample failed: ' + str(error) + '\n')
           def watchdog():
               while not watch['done']:
-                  time.sleep(5)
+                  time.sleep(2)
                   quiet = time.time() - watch['last']
+                  if test_start is not None and 8 < quiet <= 40 and watch['shortSeen'] != watch['last']:
+                      watch['shortSeen'] = watch['last']
+                      sample('no xcodebuild output for %.0f s after: %s' % (quiet, watch['line']), app_only=True)
                   if test_start is not None and quiet > 40 and watch['quiet'] < 5:
                       watch['quiet'] += 1
                       sample('no xcodebuild output for %.0f s after: %s' % (quiet, watch['line']))
@@ -297,7 +311,8 @@ jobs:
           for key, message in messages.items():
               failures.setdefault(key, message)
           report = {'class': cls, 'tests': summary.get('totalTestCount', 0), 'passed': summary.get('passedTests', 0),
-                    'failed': summary.get('failedTests', 0),
+                    'failed': summary.get('failedTests', 0), 'skipped': summary.get('skippedTests', 0),
+                    'expectedFailures': summary.get('expectedFailures', 0),
                     'failures': [{'test': key, 'message': ' '.join(message.split()) + (', ' + locations[key] if key in locations else '')}
                                  for key, message in failures.items()]}
           pathlib.Path('summary.json').write_text(json.dumps(report, indent=2) + '\n')
