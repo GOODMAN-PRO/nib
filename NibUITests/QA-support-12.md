@@ -203,3 +203,13 @@ Should protect Chrome's registered-sidebar test and Insert Comments/Audio routin
 | Tests | Log prefix | Question answered |
 | --- | --- | --- |
 | RegisteredSidebarPanelsAndCloseButton | Sidebar placement menu | Which selected tab supplied the menu, and were all placement actions present in it? |
+
+### K8 - verify the existing alert text route
+
+Confirmed R13:chrome-new-failures#1 and holds=true: at t=46.16 the second Set Angle replacement used public typeText(45), the default interruption handler cancelled at t=47.92, and the field no longer existed. Current code already contains job 11c's repair. All three loop values 0/45/90 in RulerMoveAndAngleControlsSnapToZeroFortyFiveNinety take Chrome.replace -> fillNativeForm -> replaceNativeText -> typeNativeText. nativeFormContainer selects the exposed Alert; default scopes do not fall through to the app. While that alert is up, typeNativeText calls focusedText, which invokes NibTouchPaths.sendKey(text, modifiers: 0, route: 3) with the exact signature declared in NibTouchPaths.h. The public field.typeText branch only runs with no exposed Alert. Clear uses runner key SPI for Select All in an Alert and HID Delete, then exact empty and replacement-value waits. Other Set Angle replacements in rotation/ruler-ink tests take the same path.
+
+No further Swift change is warranted; this cluster is a committed source-verification record. The test should be unblocked by 11c, not by a speculative new input route. Next CI must show Native alert text route=runner text SPI for characters=1,2,2, no default interruption cancellation, and all exact 0/45/90-degree waits followed by sameContent. Local compilation/runtime remain unavailable.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| RulerMoveAndAngleControlsSnapToZeroFortyFiveNinety | Native alert text / Native clear HID (existing) | Did every replacement bypass interruption-monitored public text input while retaining exact clear/value verification? |
