@@ -189,3 +189,17 @@ Should make the repaired app's T-109 test readable against its own scroll lines;
 | Tests | Log prefix | Question answered |
 | --- | --- | --- |
 | PageScrollCollapsesOptionsAndChoosingToolRestoresThem | Page scroll boundary | What exact endpoints and canvas frame were used, and how did the actual offset/page change before the fold wait finished or failed? |
+
+### K7 - the selected sidebar owns its menu
+
+Confirmed context 4 against current SidebarHost.hostsOwnPlacementMenu/panelContext and OutlineHeaderMenu: Outline receives chrome.panelOptions in its own Outline Options, with Panels and Panel Options sections below its outline items; the redundant tab-row host button is absent. Pages, Bookmarks and History keep Panel Options. PanelPlacementMenu.actions supplies the mode and left/right/floating actions; the current side is disabled, not absent.
+
+RegisteredSidebarPanelsAndCloseButton now visits all four panels, opens each selected panel's correct menu, and asserts Show as Window, Move to Left Side, Move to Right Side and Float Panel are present. It selects the next tab from that open menu, then deterministically closes History's menu before the original panel-close/content/drawing assertions. All existing panel ID and title checks remain. Insert.panel recognises either header before deciding to reopen the sidebar, uses Outline Options when exposed, checks its three placement actions without demanding the disabled current side be enabled, and then chooses the requested panel. Primary-tab direct selection remains unchanged.
+
+Grepped both labels in every class. Chrome's separate placement test remains on Pages, Ink's History test starts from fresh Pages, and Pages' Show as Window callers explicitly select Pages first; they correctly retain Panel Options. Pages' outline-sort test already uses Outline Options. Capture selects Outline directly and has no stale header label. No other class has either label.
+
+Should protect Chrome's registered-sidebar test and Insert Comments/Audio routing when the current panel is Outline. Next CI must log each matching menu, find all placement rows on Outline, reach Bookmarks and History, close the final panel and preserve content/drawing. Section headings are source-confirmed; tests assert their real actions rather than assume native menus expose section-header AX nodes.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| RegisteredSidebarPanelsAndCloseButton | Sidebar placement menu | Which selected tab supplied the menu, and were all placement actions present in it? |

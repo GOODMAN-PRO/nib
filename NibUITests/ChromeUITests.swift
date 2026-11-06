@@ -366,9 +366,29 @@ final class ChromeUITests: XCTestCase {
     func testRegisteredSidebarPanelsAndCloseButton() throws {
         try open(); let before = try ui.state()
         try ui.tapCommand("sidebar.toggle")
-        for (title, id) in [("Pages", "sidebar.pages"), ("Outline", "outline.tab"), ("Bookmarks", "outline.bookmarks"), ("History", "undo.history")] {
-            try tap("Panel Options"); try tap(title); try panel(id)
+        let tabs = [("Pages", "sidebar.pages"), ("Outline", "outline.tab"),
+                    ("Bookmarks", "outline.bookmarks"), ("History", "undo.history")]
+        try tap("Panel Options"); try tap("Pages"); try panel("sidebar.pages")
+        for (index, tab) in tabs.enumerated() {
+            let (title, _) = tab
             _ = try require(title)
+            let options = title == "Outline" ? "Outline Options" : "Panel Options"
+            try tap(options, type: .button)
+            for action in ["Show as Window", "Move to Left Side", "Move to Right Side", "Float Panel"] {
+                // Current-side placement is disabled, but must still be present in this menu.
+                XCTAssertTrue(try require(action).exists, options + " must contain " + action)
+            }
+            ui.logQA("Sidebar placement menu", "tab=\(title) menu=\(options) placementActions=present")
+            if index + 1 < tabs.count {
+                let next = tabs[index + 1]
+                try tap(next.0); try panel(next.1)
+            } else {
+                try escape {
+                    try self.wait("Panel options must close before the sidebar Close") {
+                        !self.query("Float Panel").firstMatch.exists
+                    }
+                }
+            }
         }
         try tap("cmd.panel.close")
         _ = try ui.waitForState { $0.openPanels.isEmpty }
