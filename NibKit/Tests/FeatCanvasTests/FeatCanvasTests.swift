@@ -225,6 +225,9 @@ final class FeatCanvasTests: XCTestCase {
                 let h = Harness(features: [FeatCanvasFeature.self])
                 // Stand in for the toolbar screen without importing another feature's implementation.
                 h.app.ui.screens.toolbarView = { _, _ in AnyView(EmptyView()) }
+                h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                    id: "test.topOptions", title: "Options", icon: "", group: .lasso, order: 0,
+                    owner: "test", toolID: h.session.tool, settings: { _ in AnyView(EmptyView()) }))
                 h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
                 let vc = try makeCanvas(h, page: Fixtures.page2, size: size)
                 defer { vc.closeCanvas() }
@@ -250,7 +253,7 @@ final class FeatCanvasTests: XCTestCase {
                     compact: compact)
                 let pageTop = windowPoint(vc, .zero, Fixtures.page2).y
                 XCTAssertGreaterThanOrEqual(pageTop, paletteRegion.minY + NibMetrics.paletteThickness
-                                            + NibMetrics.barHeight + NibSpacing.m - 0.5)
+                                            + NibSpacing.l + NibMetrics.barHeight + NibSpacing.m - 0.5)
                 XCTAssertEqual(pageTop, vc.scrollView.chromeInsets.top, accuracy: 0.5)
                 XCTAssertEqual(vc.zoom, vc.fitZoom, accuracy: 1e-9)
                 XCTAssertEqual(h.session.page, Fixtures.page2)
@@ -298,7 +301,7 @@ final class FeatCanvasTests: XCTestCase {
                 vc.view.layoutIfNeeded()
                 let region = DropletDockModel.region(size: size, safeArea: EdgeInsets(), compact: true)
                 XCTAssertGreaterThanOrEqual(vc.scrollView.chromeInsets.bottom,
-                    size.height - region.maxY + NibMetrics.paletteThickness + NibMetrics.barHeight + NibSpacing.l,
+                    size.height - region.maxY + NibMetrics.paletteThickness + NibSpacing.l + NibMetrics.barHeight + NibSpacing.l,
                     "both a full options bar and a settings-only chevron reserve the entire arm before measurement")
                 // Apply EditorHost's measured landscape geometry directly so this regression is independent of
                 // the test runner's physical device/orientation. Hosted automatic refits are tested below.

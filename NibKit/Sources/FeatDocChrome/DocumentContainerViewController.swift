@@ -174,21 +174,23 @@ struct ChromeLayout: Equatable {
         let palette = model.frame(for: dock).offsetBy(dx: toolbar.minX + toolbarInsets.leading,
                                                     dy: toolbar.minY + toolbarInsets.top)
         let options = optionsSize ?? CGSize(width: optionsHeight, height: optionsHeight)
+        // Mirrors NibToolOptionsPlacement.gap (internal to NibDesign).
+        let optionsGap = NibSpacing.l
         var occupied = palette
         if options.width > 0 && options.height > 0 {
             let frame: CGRect
             switch dock.edge {
             case .top:
-                frame = CGRect(x: palette.midX - options.width / 2, y: palette.maxY - 1,
+                frame = CGRect(x: palette.midX - options.width / 2, y: palette.maxY + optionsGap,
                                width: options.width, height: options.height)
             case .bottom:
-                frame = CGRect(x: palette.midX - options.width / 2, y: palette.minY - options.height + 1,
+                frame = CGRect(x: palette.midX - options.width / 2, y: palette.minY - options.height - optionsGap,
                                width: options.width, height: options.height)
             case .leading:
-                frame = CGRect(x: palette.maxX - 1, y: palette.midY - options.height / 2,
+                frame = CGRect(x: palette.maxX + optionsGap, y: palette.midY - options.height / 2,
                                width: options.width, height: options.height)
             case .trailing:
-                frame = CGRect(x: palette.minX - options.width + 1, y: palette.midY - options.height / 2,
+                frame = CGRect(x: palette.minX - options.width - optionsGap, y: palette.midY - options.height / 2,
                                width: options.width, height: options.height)
             }
             occupied = palette.union(frame)

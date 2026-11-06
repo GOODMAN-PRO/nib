@@ -377,17 +377,20 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
                 let thickness = min(NibMetrics.paletteThicknessMax, max(NibMetrics.paletteThickness,
                     UIFontMetrics(forTextStyle: .body)
                         .scaledValue(for: NibMetrics.paletteThickness, compatibleWith: traitCollection)))
+                let active = app.ui.toolbarItems(for: kind).first { ($0.toolID ?? $0.id) == session.tool }
+                let hasOptions = app.ui.toolMenus.get(session.tool) != nil
+                    || active?.activeToolMenu != nil || active?.settings != nil
+                // Mirrors NibToolOptionsPlacement.gap (internal to NibDesign).
+                let optionsGap = NibSpacing.l
                 // Standalone editors have no measured chrome; use the shared dock metrics as a fallback.
                 if topDocked {
-                    fallbackTop = region.minY + thickness + NibMetrics.barHeight + NibSpacing.m
+                    fallbackTop = region.minY + thickness + (hasOptions ? optionsGap : 0)
+                        + NibMetrics.barHeight + NibSpacing.m
                 } else {
-                    let active = app.ui.toolbarItems(for: kind).first { ($0.toolID ?? $0.id) == session.tool }
-                    let hasOptions = app.ui.toolMenus.get(session.tool) != nil
-                        || active?.activeToolMenu != nil || active?.settings != nil
                     // Settings-only tools (including lasso) still have an options chevron above the palette.
                     // Reserve the complete arm, plus paper clearance; measured host bounds take precedence.
                     fallbackBottom = view.bounds.height - region.maxY + thickness
-                        + (hasOptions ? NibMetrics.barHeight : 0) + NibSpacing.l
+                        + (hasOptions ? optionsGap + NibMetrics.barHeight : 0) + NibSpacing.l
                 }
             }
         }
