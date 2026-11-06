@@ -203,15 +203,19 @@ struct LibrarySearchFloatingContent: View {
                     .accessibilityHidden(true)
                 VStack(spacing: NibSpacing.l) {
                     HStack(spacing: NibSpacing.s) {
-                        SearchInput(app: app, session: session, state: state, style: .filled)
+                        // The pill is the only glass surface; the close control stays outside it.
+                        SearchInput(app: app, session: session, state: state, style: .onDroplet)
                             .frame(minWidth: 0, maxWidth: .infinity)
-                        NibIconButton(.xmark, label: String(localized: "Close search"), action: close)
+                            .droplet("searchui.libraryField", style: .bar)
+                            .budsFrom("library.controls", isPresented: presentationBinding, instant: state.instant)
+                        NibIconButton(.xmark, label: String(localized: "Close search"), size: .round, action: close)
+                            // NibIconButton.round draws a 30 pt disc inside its 44 pt target.
+                            .offset(x: (NibMetrics.hitTarget - 30) / 2)
                     }
-                    .padding(.trailing, NibSpacing.xs)
+                    // Match the panel content without putting its chips against the clipped rim.
+                    .padding(.leading, NibSpacing.l)
                     .frame(width: width)
                     .nibChromeTypeCap()
-                    .droplet("searchui.libraryField", style: .bar)
-                    .budsFrom("library.controls", isPresented: presentationBinding, instant: state.instant)
                     #if DEBUG
                     .background(layoutDiagnostic("library field rest frame"))
                     #endif
