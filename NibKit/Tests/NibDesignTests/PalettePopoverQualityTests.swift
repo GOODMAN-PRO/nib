@@ -3,6 +3,50 @@ import SwiftUI
 @testable import NibDesign
 
 final class PalettePopoverQualityTests: XCTestCase {
+    func testDialogHeightCapUsesContentHeightOrAvailableRoomWithoutCoveringSource() {
+        for windowHeight in [CGFloat(1366), 700] {
+            let bounds = CGRect(x: 0, y: 0, width: 1024, height: windowHeight)
+            for sourceY in [CGFloat(32), windowHeight - 76] {
+                let source = CGRect(x: 900, y: sourceY, width: 44, height: 44)
+                let standard = NibBudPlacement.below.layout(beside: source, width: 312, gap: 20,
+                                                            in: bounds, avoiding: [])
+                XCTAssertEqual(standard.available.height, NibMetrics.popoverMaxHeight)
+                let contentHeight: CGFloat = 880
+                let layout = NibBudPlacement.below.layout(beside: source, width: 312, gap: 20,
+                    in: bounds, avoiding: [], heightCap: contentHeight)
+                let expected = min(contentHeight, windowHeight - 76 - 20 - NibMetrics.chromeInset)
+                XCTAssertEqual(layout.available.height, expected)
+                let centre = NibBudPlacement.below.centre(size: layout.available, beside: layout.anchor,
+                                                         gap: 20, in: bounds)
+                let frame = CGRect(x: centre.x - layout.available.width / 2,
+                                   y: centre.y - layout.available.height / 2,
+                                   width: layout.available.width, height: layout.available.height)
+                XCTAssertTrue(bounds.insetBy(dx: NibMetrics.chromeInset, dy: NibMetrics.chromeInset).contains(frame))
+                XCTAssertFalse(frame.intersects(source))
+                XCTAssertTrue(frame.minY >= source.maxY + 20 || frame.maxY <= source.minY - 20)
+            }
+        }
+    }
+
+    @MainActor
+    func testPanelDefaultCapAndDialogOverrideApplyToBothScrollOwners() {
+        for scrollsContent in [false, true] {
+            for cap in [NibMetrics.popoverMaxHeight, CGFloat(880)] {
+                let panel = NibPopoverPanel(title: "Dialog", maxHeight: 1200,
+                    scrollsContent: scrollsContent, heightCap: cap) {
+                        Text("Options").frame(height: 1100)
+                    }
+                let host = UIHostingController(rootView: panel)
+                host.safeAreaRegions = []
+                XCTAssertEqual(host.sizeThatFits(in: CGSize(width: 312, height: 1366)).height, cap, accuracy: 1)
+            }
+        }
+        let standard = NibPopoverPanel(title: "Tool", maxHeight: 1200) { Text("Tool") }
+        XCTAssertEqual(standard.heightCap, 520)
+        let bud = NibBudPopover(id: "tool", source: "source", isPresented: .constant(true), title: "Tool") { Text("Tool") }
+        XCTAssertEqual(bud.heightCap, 520)
+    }
+
     func testSelectedToolDecisionForEveryStripFoldAndSettingsCombination() {
         for hasStrip in [false, true] {
             for userFold in [false, true] {
