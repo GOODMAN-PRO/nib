@@ -390,7 +390,7 @@ final class NibUI {
         let anchor = sibling ?? name
         let rows = root.scrollViews.containing(NSPredicate(format: "label == %@ OR identifier == %@", anchor, anchor))
         // Choose the innermost scroll view, not its enclosing vertical tool popover.
-        let candidates = rows.allElementsBoundByIndex.prefix(16).filter { hasVisibleFrame($0) }
+        let candidates = rows.allElementsBoundByIndex.prefix(16).filter { hasVisibleFrame($0) && $0.isHittable }
         guard let row = candidates.min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else {
             throw Failure.message("Horizontal row missing for \(name), anchor=\(anchor)")
         }
@@ -429,11 +429,74 @@ final class NibUI {
             let appFrame = app.frame
             let start = origin.withOffset(CGVector(dx: startX - appFrame.minX, dy: viewport.midY - appFrame.minY))
             let end = origin.withOffset(CGVector(dx: endX - appFrame.minX, dy: viewport.midY - appFrame.minY))
+            let surfaceRoot = try measuredSnapshot(app, named: "horizontal reveal presentation")
+            let foreground = presentedScrollingSurface(row, snapshot: surfaceRoot)
+            try requireNonCanvasDrag(from: CGPoint(x: startX, y: viewport.midY),
+                                     to: CGPoint(x: endX, y: viewport.midY), foreground: foreground)
             start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.4)
             moves += 1
         }
         logQA("Horizontal reveal failed", facts)
         throw Failure.message("Horizontal row must reveal a hittable control: " + facts)
+    }
+
+    /// A canvas rectangle can extend behind a popover. Only a live presented ancestor
+    /// may occlude it; an arbitrary retained scroll-view rectangle never does.
+    private func presentedScrollingSurface(_ element: XCUIElement, snapshot root: XCUIElementSnapshot) -> CGRect? {
+        guard element.exists else { return nil }
+        let frame = element.frame
+        let identifier = element.identifier
+        let label = element.label
+        let type = element.elementType
+        let modal = presentedFormContext(snapshot: root).form
+        func visit(_ node: XCUIElementSnapshot, surface: CGRect?) -> CGRect? {
+            var foreground = surface
+            if [.popover, .sheet, .alert, .menu].contains(node.elementType)
+                || (node.elementType == .other && node.children.contains { $0.label == "Preview" }) {
+                foreground = node.frame
+            }
+            if let modal, node.elementType == modal.elementType && node.frame == modal.frame
+                && node.identifier == modal.identifier && node.label == modal.label { foreground = modal.frame }
+            if node.elementType == type && node.identifier == identifier && node.label == label && node.frame == frame {
+                return foreground.map { $0.intersection(frame) }
+            }
+            for child in node.children {
+                if let found = visit(child, surface: foreground) { return found }
+            }
+            return nil
+        }
+        guard let surface = visit(root, surface: nil), !surface.isEmpty, !surface.isNull else { return nil }
+        // Native forms can mark the host non-hittable while an actual row accepts input.
+        let live = element.isHittable || element.descendants(matching: .any)
+            .matching(NSPredicate(format: "isHittable == true")).firstMatch.exists
+        return live ? surface : nil
+    }
+
+    /// Check the entire straight gesture, including its endpoint. Foreground geometry
+    /// must come from a live presented surface, not from the candidate container alone.
+    private func requireNonCanvasDrag(from start: CGPoint, to end: CGPoint,
+                                      foreground: CGRect? = nil) throws {
+        guard canvas.exists else { return }
+        let canvasFrame = canvas.frame
+        let travel = CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
+                            width: max(0.01, abs(end.x - start.x)), height: max(0.01, abs(end.y - start.y)))
+        let protected = foreground?.insetBy(dx: 2, dy: 2)
+        if canvasFrame.intersects(travel) && !(protected?.contains(start) == true && protected?.contains(end) == true) {
+            let message = "Reveal refused: drag points lie on nib.canvas; no presented scrolling surface covers them"
+            logQA("Canvas drag prevented", "start=\(start) end=\(end) canvas=\(canvasFrame) foreground=\(String(describing: foreground))")
+            throw Failure.message(message)
+        }
+    }
+
+    /// Shared guard for class-local form/list reveals. No snapshot cost when the canvas is absent.
+    func guardRevealDrag(in container: XCUIElement, from start: CGPoint, to end: CGPoint) throws {
+        guard container.exists && container.isHittable else {
+            throw Failure.message("Reveal requires a live hittable scrolling container")
+        }
+        guard canvas.exists else { return }
+        let root = try measuredSnapshot(app, named: "drag presentation")
+        try requireNonCanvasDrag(from: start, to: end,
+                                 foreground: presentedScrollingSurface(container, snapshot: root))
     }
 
     /// Reveals in the actual list: home only from a proven nonzero scroll position.
@@ -456,6 +519,8 @@ final class NibUI {
         var moves = 0
         defer { logQA("Form reveal timing", "moves=\(moves) seconds=\(Date().timeIntervalSince(revealStarted))") }
         var ancestorClip: CGRect?
+        var foregroundSurface: CGRect?
+        var presentation: (form: XCUIElementSnapshot?, coverVisible: Bool) = (nil, false)
         var containerIsTransient = false
         func ancestry(_ target: XCUIElementSnapshot, in root: XCUIElementSnapshot) -> (clip: CGRect, transient: Bool)? {
             func visit(_ node: XCUIElementSnapshot, clip: CGRect, transient: Bool) -> (clip: CGRect, transient: Bool)? {
@@ -485,32 +550,19 @@ final class NibUI {
         // Unlabelled native thumbs are not unique identities; keep the caller's scoped query.
         let identity = initialSnapshot.flatMap { $0.identifier.isEmpty && $0.label.isEmpty ? nil : $0 }
         func liveList() -> XCUIElement? {
-            if let form, form.exists, hasVisibleFrame(form) {
-                ancestorClip = nil
-                containerIsTransient = false
-                // Ordinary explicit forms keep the cheap window clip. Only inspect ancestry
-                // within a presented transient surface; native UIKit menus use a Preview sibling.
-                let surfaces = app.popovers.allElementsBoundByIndex + app.menus.allElementsBoundByIndex
-                let hasNativeMenu = app.otherElements["Preview"].firstMatch.exists
-                if !surfaces.isEmpty || hasNativeMenu, let node = try? measuredSnapshot(form, named: "form snapshot") {
-                    for surface in surfaces where hasVisibleFrame(surface) {
-                        if let root = try? measuredSnapshot(surface, named: "surface snapshot"), let context = ancestry(node, in: root) {
-                            ancestorClip = context.clip
-                            containerIsTransient = context.transient
-                            break
-                        }
-                    }
-                    if ancestorClip == nil, hasNativeMenu, let root = try? measuredSnapshot(app, named: "app snapshot"),
-                       let context = ancestry(node, in: root), context.transient {
-                        ancestorClip = context.clip
-                        containerIsTransient = true
-                    }
-                }
-                return form
-            }
-            guard let root = try? measuredSnapshot(app, named: "app snapshot") else {
-                logQA("Form reveal unavailable", "snapshotCandidates=0; app snapshot unavailable; candidates not collected")
+            guard let root = try? measuredSnapshot(app, named: "reveal presentation snapshot") else {
+                logQA("Form reveal unavailable", "No presentation snapshot; no drag")
                 return nil
+            }
+            presentation = presentedFormContext(snapshot: root)
+            if let form, form !== app, form.exists, hasVisibleFrame(form) {
+                foregroundSurface = presentedScrollingSurface(form, snapshot: root)
+                guard form.isHittable || foregroundSurface != nil else { return nil }
+                // An explicit retained host is still unsafe over the document.
+                if canvas.exists && form.frame.intersects(canvas.frame) && foregroundSurface == nil { return nil }
+                ancestorClip = foregroundSurface
+                containerIsTransient = foregroundSurface != nil
+                return form
             }
             let window = app.windows.firstMatch.frame
             var candidates: [(node: XCUIElementSnapshot, surface: Int, contains: Bool, overflow: Bool)] = []
@@ -572,11 +624,12 @@ final class NibUI {
                 return firstArea > secondArea
             }
             var diagnostics: [String] = []
-            var fallback: (element: XCUIElement, rank: Int, frame: CGRect)?
+            var rejectedCanvas = false
             func chosen(_ element: XCUIElement, rank: Int, frame: CGRect, hittable: Bool) -> XCUIElement {
                 let node = ranked[rank].node
                 let context = ancestry(node, in: root)
                 ancestorClip = context?.clip
+                foregroundSurface = presentedScrollingSurface(element, snapshot: root)
                 containerIsTransient = context?.transient ?? false
                 logQA("Form reveal container", "type=\(node.elementType) label=\(node.label) frame=\(frame) rank=\(rank + 1)/\(ranked.count) hittable=\(hittable)")
                 return element
@@ -618,21 +671,22 @@ final class NibUI {
                     diagnostics.append([nodeFacts, rankFacts, probeFacts].joined(separator: " "))
                 }
                 guard let resolved else { continue }
-                if resolved.hittable {
-                    return chosen(resolved.element, rank: rank, frame: resolved.frame, hittable: true)
+                // Existing controls must actually belong to the scrolling host. Lazy targets
+                // may be absent, but only a presented surface (or live library list) can scroll.
+                if identity != nil && !candidate.contains { continue }
+                let foreground = presentedScrollingSurface(resolved.element, snapshot: root)
+                guard resolved.hittable || foreground != nil else { continue }
+                if canvas.exists && resolved.frame.intersects(canvas.frame) && foreground == nil {
+                    rejectedCanvas = true
+                    continue
                 }
-                let visible = resolved.frame.intersection(window)
-                if fallback == nil, !visible.isNull, visible.width > 1, visible.height > 1 {
-                    fallback = (resolved.element, rank, resolved.frame)
-                }
+                return chosen(resolved.element, rank: rank, frame: resolved.frame, hittable: resolved.hittable)
             }
-            // Some native forms report a non-hittable container while their rows accept input.
-            // Drags use app coordinates; this element supplies only snapshots and scoped queries.
-            // Verified frame identity/window overlap replaces the retained off-screen-copy filter.
-            if let fallback {
-                return chosen(fallback.element, rank: fallback.rank, frame: fallback.frame, hittable: false)
+            if rejectedCanvas {
+                formRevealFailure = "Reveal refused: only candidate drag points are on nib.canvas without a presented surface"
+                XCTFail(formRevealFailure!)
             }
-            logQA("Form reveal unavailable", "snapshotCandidates=\(ranked.count); no resolved hittable or in-window container\n"
+            logQA("Form reveal unavailable", "snapshotCandidates=\(ranked.count); no live scrolling surface; retained closed popovers rejected\n"
                 + diagnostics.joined(separator: "\n"))
             return nil
         }
@@ -651,7 +705,6 @@ final class NibUI {
         // A missing Sheet node says nothing about Nib's plain-Other forms. Decide from
         // this list's own scroll position; unknown positions must never start by pulling down.
         let lazySearch = initialSnapshot == nil
-        let presentation = presentedFormContext()
         let modal = presentation.form
         let coverVisible = presentation.coverVisible
         if let modal, let context = ancestry(firstSnapshot, in: modal) {
@@ -758,6 +811,12 @@ final class NibUI {
             guard let start = formDragStart(snapshot, viewport: viewport, down: down,
                                             minimumY: down ? contentStart : viewport.minY + 24) else { return }
             let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
+            do { try requireNonCanvasDrag(from: start, to: end, foreground: foregroundSurface) }
+            catch {
+                formRevealFailure = String(describing: error)
+                XCTFail("Reveal refused: only candidate drag points are on nib.canvas: \(error)")
+                return
+            }
             let values = formControlValues(snapshot)
             let wasTransient = containerIsTransient
             logQA("Form drag before", "point=\(start) container=\(listFrame) dragDown=\(down) top=\(top.evidence) minimumY=\(contentStart) rows=\(signature)")
@@ -1228,7 +1287,7 @@ final class NibUI {
         func resolveAnchors() -> Bool {
             let palettes = app.otherElements.matching(NSPredicate(format: "label == 'Tools'"))
             for palette in palettes.allElementsBoundByIndex.prefix(8) {
-                guard palette.exists, let snapshot = try? palette.snapshot() else { continue }
+                guard palette.exists && palette.isHittable, let snapshot = try? palette.snapshot() else { continue }
                 let frame = snapshot.frame
                 guard !frame.isNull, !frame.isInfinite, frame.width > 1, frame.height > 1,
                       before.contains(frame) else { continue }
@@ -2662,6 +2721,16 @@ final class NibUI {
         if let control = candidate(id) { activate(control); return }
         let target = app.buttons.matching(identifier: id).firstMatch
         if target.exists {
+            if !target.isHittable {
+                let started = ProcessInfo.processInfo.systemUptime
+                let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                    target.exists && target.isHittable
+                }, object: target)
+                let result = XCTWaiter.wait(for: [ready], timeout: 3)
+                let elapsed = ProcessInfo.processInfo.systemUptime - started
+                logQA("Control hittable wait", "id=\(id) seconds=\(elapsed) result=\(result.rawValue)")
+                if result == .completed && target.isEnabled { activate(target); return }
+            }
             revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
             if let failure = formRevealFailure { throw Failure.message(failure) }
             if let control = candidate(id) { activate(control); return }
@@ -3019,7 +3088,18 @@ final class NibUI {
     }
 
     /// Round 9b system-drag contact: retain lift/travel, then dwell while UIKit accepts the proposal.
-    func dragWithHold(from start: XCUICoordinate, to end: XCUICoordinate) {
+    func dragWithHold(from start: XCUICoordinate, to end: XCUICoordinate,
+                      source: XCUIElement? = nil, allowCanvasStart: Bool = false) throws {
+        if !allowCanvasStart {
+            guard let source, source.exists && source.isHittable,
+                  source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).screenPoint == start.screenPoint else {
+                throw Failure.message("System drag requires a live source containing its start; refusing accidental canvas contact")
+            }
+            // The destination may intentionally be canvas (element insertion); only the source
+            // is protected for system drags. Reveals protect the complete path separately.
+            let centre = CGPoint(x: source.frame.midX, y: source.frame.midY)
+            try guardRevealDrag(in: source, from: centre, to: centre)
+        }
         logQA("System drag contact", "lift=0.8 velocity=500 destinationHold=1.5")
         start.press(forDuration: 0.8, thenDragTo: end,
                     withVelocity: XCUIGestureVelocity(rawValue: 500), thenHoldForDuration: 1.5)
@@ -3229,11 +3309,11 @@ final class NibUI {
         presentedFormContext().form
     }
 
-    private func presentedFormContext() -> (form: XCUIElementSnapshot?, coverVisible: Bool) {
+    private func presentedFormContext(snapshot supplied: XCUIElementSnapshot? = nil) -> (form: XCUIElementSnapshot?, coverVisible: Bool) {
         let region = app.otherElements["PopoverDismissRegion"].firstMatch
-        guard hasVisibleFrame(region) else { return (nil, false) }
+        guard supplied != nil || hasVisibleFrame(region) else { return (nil, false) }
         // Keep the observed cover on a failed snapshot: loss of evidence must not permit a modal pull-down.
-        guard let root = try? measuredSnapshot(app, named: "app snapshot") else { return (nil, true) }
+        guard let root = supplied ?? (try? measuredSnapshot(app, named: "app snapshot")) else { return (nil, true) }
         let window = app.windows.firstMatch.frame
         func containsVisibleCover(_ node: XCUIElementSnapshot) -> Bool {
             if node.identifier == "PopoverDismissRegion" {
@@ -3244,6 +3324,7 @@ final class NibUI {
             return node.children.contains { containsVisibleCover($0) }
         }
         let coverVisible = containsVisibleCover(root)
+        guard coverVisible else { return (nil, false) }
         func containsBackground(_ node: XCUIElementSnapshot) -> Bool {
             ["nib.canvas", "nib.qa.state", "nib.qa.clipboard", "PopoverDismissRegion",
              "inputView", "inputAssistantView", "SystemInputAssistantView"].contains(node.identifier)

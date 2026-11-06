@@ -674,6 +674,7 @@ final class PagesUITests: XCTestCase {
                 return
             }
             let drag = NibUITestScrollGeometry.drag(in: viewport, toward: row.frame.midY)
+            try ui.guardRevealDrag(in: host, from: drag.start, to: drag.end)
             let origin = ui.app.coordinate(withNormalizedOffset: .zero)
             origin.withOffset(CGVector(dx: drag.start.x - ui.app.frame.minX, dy: drag.start.y - ui.app.frame.minY))
                 .press(forDuration: 0.01, thenDragTo: origin.withOffset(CGVector(dx: drag.end.x - ui.app.frame.minX, dy: drag.end.y - ui.app.frame.minY)),
@@ -720,8 +721,8 @@ final class PagesUITests: XCTestCase {
     private func dragThumbnail(_ source: XCUIElement, to target: XCUIElement, offset: CGVector) throws {
         // Baseline session startup took 1.7-1.9s after touch-down. Keep the original lift/travel
         // and add 1.5s of contact at the destination for startup and move-proposal acceptance.
-        ui.dragWithHold(from: source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
-                        to: target.coordinate(withNormalizedOffset: offset))
+        try ui.dragWithHold(from: source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
+                        to: target.coordinate(withNormalizedOffset: offset), source: source)
         let menus = ui.app.menus.count
         let preview = ui.app.otherElements["Preview"].firstMatch.exists
         let actions = ui.app.buttons["cmd.page.duplicate"].firstMatch.exists
@@ -905,6 +906,7 @@ final class PagesUITests: XCTestCase {
                   let viewport = NibUITestScrollGeometry.viewport(scroll: host.frame, window: ui.app.frame, obstructions: []) else { break }
             if target.exists && target.isHittable && viewport.contains(CGPoint(x: target.frame.midX, y: target.frame.midY)) { return }
             let drag = NibUITestScrollGeometry.drag(in: viewport, toward: target.exists ? target.frame.midY : nil)
+            try ui.guardRevealDrag(in: host, from: drag.start, to: drag.end)
             let origin = ui.app.coordinate(withNormalizedOffset: .zero)
             origin.withOffset(CGVector(dx: drag.start.x - ui.app.frame.minX, dy: drag.start.y - ui.app.frame.minY))
                 .press(forDuration: 0.01, thenDragTo: origin.withOffset(CGVector(dx: drag.end.x - ui.app.frame.minX, dy: drag.end.y - ui.app.frame.minY)), withVelocity: .slow, thenHoldForDuration: 0.15)

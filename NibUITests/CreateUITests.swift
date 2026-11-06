@@ -853,6 +853,7 @@ final class CreateUITests: XCTestCase {
             let beforeRows = visibleRows(scroll, viewport: visible)
             let drag = NibUITestScrollGeometry.drag(in: visible, toward: targetY)
             let startY = unchanged > 0 ? drag.start.y + (drag.start.y > visible.midY ? -16 : 16) : drag.start.y
+            try ui.guardRevealDrag(in: scroll, from: CGPoint(x: drag.start.x, y: startY), to: drag.end)
             let origin = app.coordinate(withNormalizedOffset: .zero)
             origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: startY - app.frame.minY))
                 .press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(

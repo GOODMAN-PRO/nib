@@ -257,3 +257,26 @@ Validation: python Scripts/lint.py reports **0 errors, 25 warnings**; **git diff
 | Both timer history tests | Timer history inventory | Which heading-relative viewport ranges were scanned, which scroll percentages prove the bottom, and which physical row positions make up the exact inventory? |
 
 Validation: `python Scripts/lint.py` reports **0 errors, 25 warnings**; `git diff --check` passes. Reviewed changed Swift APIs, throwing paths, both helper callers and preservation of all pre-existing history assertions. Only ChromeUITests.swift and this support record changed; job 12a and app sources are untouched. No sleep, skip, allowance increase, test removal or fixture substitution. Swift compilation and real AX traversal remain for macOS CI: the non-lazy heading must remain in snapshots while offscreen, content scroll indicators must expose their percentage, and row-relative geometry must remain stable. Missing evidence fails explicitly. Synchronous AX calls can exceed the outer deadline; no runtime saving is claimed for this additional verification. The companion timerHistory scenario remains another branch's responsibility.
+
+
+## Round 12c
+
+Merged integration ff8eeefc cleanly (fast-forward). Read both prior prompts, README, Round 11a-11c and Round 12a/12b, and both complete R14 families (findings and verdicts). Corrections govern. Windows source-only: compilation and simulator results belong to the next macOS CI run. The removed app sampler is not compensated for by a test allowance, delay or environment change.
+
+### H15 - reveals cannot draw
+
+Confirmed R14:canvas#0 and its holds=true verdict against current tapControl/liveList: an existing non-hittable sidebar toggle went immediately to reveal; a non-hittable retained Fountain Pen scroll view was accepted solely for window overlap. Meeting's t=13.10 drag and Rename's t=15.74 drag correspond to native pen strokes in the app log. The exact reason the toggle was briefly non-hittable remains unproven.
+
+An existing control now gets a three-second element-predicate hittability wait before reveal, with elapsed time/result logged. Existing targets must belong to the chosen list. Non-hittable containers need live presented ancestry/descendants; window intersection alone is no longer a fallback. Presentation/cover classification reuses the same root snapshot. Explicit retained containers are checked too. Every form/horizontal reveal checks the whole straight travel against nib.canvas before contact. A canvas rectangle behind a proven live foreground popover/form is occluded; only that proven foreground intersection can protect a drag. With no foreground protection, candidate points on canvas fail explicitly instead of drawing. No canvas-scroll opt-in is exposed on reveal helpers: intentional canvas scrolling uses the existing dedicated gesture paths.
+
+Audited all class-local drags and shared callers. Create's local form reveal and Pages' More/template reveals use the same guard. Held drags now require a hittable actual source and its centre (coordinate-space equality is checked before mapping to interface geometry): Ink swatch slots, Pages thumbnails and Insert Star supply it. Selection's deliberate canvas-source transfer opts in explicitly. Only the source is guarded for these system transfers because Insert intentionally drops on canvas. Palette grip resolution now rejects non-hittable retained Tools copies; its existing same-snapshot anchor/gap checks remain. Slider dragging already requires a hittable track. Canvas writing/scrolling, item manipulations and Library card transfers are intentional actions, not reveal fallbacks. No test assertion, skip or allowance changes.
+
+Should unblock BoardFrameworkMeeting and BoardRenamePersistsAfterReopeningDocument and protect all reveal callers. Next CI must show the hittability wait resolving the toggle, no reveal drag/pen-native-stroke before either board operation, and successful real form/horizontal reveals in Ink/Insert/Create/Pages. Foreground AX ancestry/hittability and landscape coordinates need runtime verification; failure is conservative, never a canvas fallback.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Shared command taps, especially both board failures | Control hittable wait | How long did an existing control take to become hittable before reveal was considered? |
+| Shared and class-local reveals | Canvas drag prevented / Form reveal unavailable | Was the proposed path on exposed canvas or backed by a live presented scrolling surface? |
+| Held-drag callers | System drag requires a live source (failure) | Was the start the actual hittable source centre rather than a retained container coordinate? |
+
+Validation: python Scripts/lint.py: 0 errors, 25 warnings; git diff --check passes. No local compilation/runtime claim.
