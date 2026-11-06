@@ -126,3 +126,13 @@ Should unblock ActiveLayerRoutesNewInkAndKeyboardChangesSelectionScope, LayerVis
 | Tests | Log prefix | Question answered |
 | --- | --- | --- |
 | All shared chord callers, especially the four R13 regressions | Chord lost context | How long since the previous delivered key, which key was it, and which recorded action preceded this failed delivery? |
+
+### K2 - Cancel under the decimal pad
+
+Confirmed R13:chrome-still-failing#1 and holds=true: reopened Set Position's Cancel was polled t=84.69-98.99 under a full-window PopoverDismissRegion and decimal-pad Popover, although values 4 and 5 had already persisted. Current prepareCoveredControl only recognised Move Ruler. Its number-pad branch now requires the named button to belong to the exposed alert, plus the existing cover and Popover. Other covered-control cases (Insert Ivory/Save Style and Library Emoji) keep their keyboard-overlap logic. All callers were grepped.
+
+RulerUnitsDigitsAndPositionChoicesPersist now sends Cancel through confirmRulerAlert, which already scopes its button to the alert, prepares keyboard coverage, requires stable enabled/hittable geometry and permits one retry only after observed alert/button movement. Both persisted-value assertions and the following sameContent remain. Should unblock that test. Next CI must show name=Cancel numberPad=true when covered, Ruler alert after tap action=Cancel alerts=0, then unchanged document content. The hit-test explanation remains inferred from geometry; no app change.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| RulerUnitsDigitsAndPositionChoicesPersist | Covered control preparation / Ruler alert confirm / Ruler alert shifted retry / Ruler alert after tap (existing, now Cancel) | Was the pad dismissed, did the alert shift, and did scoped Cancel close it before the content assertion? |

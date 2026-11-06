@@ -1244,7 +1244,7 @@ final class ChromeUITests: XCTestCase {
         try rulerMenu("Set Position…")
         XCTAssertEqual(try require("Horizontal position").value as? String, "4")
         XCTAssertEqual(try require("Vertical position").value as? String, "5")
-        try tap("Cancel"); try sameContent(before)
+        try confirmRulerAlert("Cancel"); try sameContent(before)
     }
     func testRulerEdgeConstrainsRealInkAndStrokeIsUndoable() throws {
         try showRuler(); try rulerMenu("Set Angle…"); try replace("Angle in degrees", "0"); try confirmRulerAlert("Set Angle")

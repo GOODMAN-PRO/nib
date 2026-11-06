@@ -2116,13 +2116,14 @@ final class NibUI {
         }
     }
 
-    /// Explicit opt-in for four known covered controls, not a global tap policy.
+    /// Explicit opt-in for covered controls, including alert buttons; not a global tap policy.
     func prepareCoveredControl(_ name: String) throws {
         let target = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", name)).firstMatch
         let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
         let alert = app.alerts.firstMatch
         let region = app.otherElements["PopoverDismissRegion"].firstMatch
-        let numberPad = name == "Move Ruler" && alert.exists && region.exists && app.popovers.firstMatch.exists
+        let numberPad = alert.exists && alert.buttons[name].firstMatch.exists
+            && region.exists && app.popovers.firstMatch.exists
         let frame = target.exists ? target.frame : nil
         let covered = frame.map { rect in keyboards.contains { $0.intersects(rect) } } ?? false
         // Ivory is lazy: its Format container, rather than the absent swatch, proves the obstruction.
