@@ -668,11 +668,35 @@ struct TextStyleNamePrompt: UIViewControllerRepresentable {
         }
 
         private func presentIfNeeded() {
+            #if DEBUG
+            let facts = "naming=\(isPresented.wrappedValue) window=\(viewIfLoaded?.window != nil)"
+                + " prompt=\(prompt != nil) presented=\(String(describing: presentedViewController.map { type(of: $0) }))"
+            #endif
             guard isPresented.wrappedValue else {
+                #if DEBUG
+                NSLog("%@", "[Nib QA format] prompt outcome=not-requested \(facts)")
+                #endif
                 prompt?.dismiss(animated: true)
                 return
             }
-            guard viewIfLoaded?.window != nil, prompt == nil, presentedViewController == nil else { return }
+            guard viewIfLoaded?.window != nil else {
+                #if DEBUG
+                NSLog("%@", "[Nib QA format] prompt outcome=no-window \(facts)")
+                #endif
+                return
+            }
+            guard prompt == nil else {
+                #if DEBUG
+                NSLog("%@", "[Nib QA format] prompt outcome=existing-prompt \(facts)")
+                #endif
+                return
+            }
+            guard presentedViewController == nil else {
+                #if DEBUG
+                NSLog("%@", "[Nib QA format] prompt outcome=presenter-busy \(facts)")
+                #endif
+                return
+            }
             let alert = UIAlertController(title: String(localized: "Save Text Style"),
                 message: String(localized: "Saved styles appear in the Style row of every text box. Names use up to 40 letters, digits, spaces, hyphens or underscores."),
                 preferredStyle: .alert)
@@ -697,6 +721,9 @@ struct TextStyleNamePrompt: UIViewControllerRepresentable {
             })
             self.save = save
             prompt = alert
+            #if DEBUG
+            NSLog("%@", "[Nib QA format] prompt outcome=present \(facts)")
+            #endif
             present(alert, animated: true)
         }
 
@@ -866,6 +893,9 @@ struct TextFormatPopover: View {
             // NibBudPopover owns the vertical scroll view. Nesting a fixed-height scroll view
             // here traps edge drags in the outer panel and strands the lower box controls.
             TextFormatPanelContent(panel: state.panel, model: model) { state.isPresented = false }
+                #if DEBUG
+                .background(NibFloatingHitDiagnostics.surface(TextPopoverIDs.popover))
+                #endif
         }
     }
 }
@@ -875,7 +905,12 @@ private struct TextStylesSection: View {
     @Binding var naming: Bool
 
     var body: some View {
-        NibInspectorSection(String(localized: "Style"), action: NibAction(String(localized: "Save Style…")) { naming = true }) {
+        NibInspectorSection(String(localized: "Style"), action: NibAction(String(localized: "Save Style…")) {
+            naming = true
+            #if DEBUG
+            NSLog("%@", "[Nib QA format] Save Style action naming=\(naming) enabled=\(model.state.enabled)")
+            #endif
+        }) {
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: NibSpacing.s) {

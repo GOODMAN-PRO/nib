@@ -151,12 +151,18 @@ public struct NibFloatingLayer: View {
 /// A plain view the size of the layer, the reference UIKit rects are converted through.
 struct FloatingReference: UIViewRepresentable {
     let host: NibFloatingHost
+    #if DEBUG
+    @Environment(DropletField.self) private var field: DropletField?
+    #endif
 
     func makeUIView(context: Context) -> UIView {
         let view = CoordinateReferenceView()
         view.isUserInteractionEnabled = false
         view.backgroundColor = .clear
         #if DEBUG
+        view.host = host
+        view.field = field
+        NibFloatingHitDiagnostics.registerReference(view)
         host.noteSearchLayout("reference", old: host.referenceView.map { ObjectIdentifier($0) }, new: Optional(ObjectIdentifier(view)))
         #endif
         host.referenceView = view
@@ -166,6 +172,10 @@ struct FloatingReference: UIViewRepresentable {
     func updateUIView(_ view: UIView, context: Context) {
         view.isUserInteractionEnabled = false
         #if DEBUG
+        if let reference = view as? CoordinateReferenceView {
+            reference.host = host
+            reference.field = field
+        }
         if host.referenceView !== view {
             host.noteSearchLayout("reference", old: host.referenceView.map { ObjectIdentifier($0) }, new: Optional(ObjectIdentifier(view)))
         }
@@ -178,5 +188,107 @@ struct FloatingReference: UIViewRepresentable {
 /// Native hosting can restore interaction flags when reattaching representables,
 /// so enforce pass-through at UIKit's hit-test boundary as well as in SwiftUI.
 private final class CoordinateReferenceView: UIView {
+    #if DEBUG
+    weak var host: NibFloatingHost?
+    weak var field: DropletField?
+    #endif
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
 }
+
+#if DEBUG
+/// Observes native hit testing without creating a second input region. In particular, the
+/// coordinate reference above is deliberately NOT a cached rectangle that admits touches.
+@MainActor
+public enum NibFloatingHitDiagnostics {
+    private static let references = NSHashTable<UIView>.weakObjects()
+    private static let surfaces = NSHashTable<UIView>.weakObjects()
+    private static var probing = false
+
+    fileprivate static func registerReference(_ view: UIView) { references.add(view) }
+    fileprivate static func registerSurface(_ view: UIView) { surfaces.add(view) }
+
+    /// Place inside the surface's scrolling content to observe its actual UIKit viewport.
+    public static func surface(_ id: String) -> some View {
+        FloatingSurfaceProbe(id: id).allowsHitTesting(false).accessibilityHidden(true)
+    }
+
+    /// Called from a canvas hit-test diagnostic, which can itself be reached by window.hitTest.
+    /// The re-entry guard is essential: the diagnostic must never recurse into another probe.
+    public static func contactDetails(at point: CGPoint, in view: UIView?, event: UIEvent?) -> String {
+        guard let view, let window = view.window else { return " windowPoint=nil windowHit=nil (no-window)" }
+        let location = view.convert(point, to: window)
+        guard !probing else { return " windowPoint=\(location) windowHit=probe-in-progress" }
+        probing = true
+        defer { probing = false }
+        let hit = window.hitTest(location, with: event)
+        let hitClass = hit.map { NSStringFromClass(type(of: $0)) } ?? "nil"
+        for case let surface as FloatingSurfaceProbe.Probe in surfaces.allObjects where surface.window === window {
+            for case let reference as CoordinateReferenceView in references.allObjects where reference.window === window {
+                guard let host = reference.host, host.isPresenting(surface.id),
+                      let field = reference.field, field === surface.field,
+                      let frame = field.visualFrame(surface.id) else { continue }
+                let presentation = field.node(surface.id).presentation
+                guard presentation.isDrawn, !presentation.hidden else { continue }
+                let visibleFrame = reference.convert(frame.offsetBy(dx: -host.layerOrigin.x, dy: -host.layerOrigin.y), to: window)
+                let scroll = surface.scrollView
+                let scrollFrame = scroll.map { $0.convert($0.bounds, to: window) } ?? .null
+                let claimed = scroll.map { hit?.isDescendant(of: $0) == true } ?? false
+                guard visibleFrame.contains(location), !claimed else { continue }
+                let contentFrame = surface.convert(surface.bounds, to: window)
+                let geometry = "visibleFrame=\(visibleFrame) scrollFrame=\(scrollFrame) contentFrame=\(contentFrame)"
+                let input = "scrollEnabled=\(scroll?.isUserInteractionEnabled ?? false) windowHit=\(hitClass)"
+                let ancestors = surface.ancestorFrames(in: window, at: location)
+                NSLog("%@", "[Nib QA format] floating unclaimed id=\(surface.id) windowPoint=\(location) \(geometry) \(input) ancestors=\(ancestors)")
+            }
+        }
+        let touchPoint = event?.allTouches?.first?.location(in: window)
+        return " windowPoint=\(location) windowHit=\(hitClass) firstTouchWindowPoint=\(String(describing: touchPoint))"
+    }
+}
+
+private struct FloatingSurfaceProbe: UIViewRepresentable {
+    let id: String
+    @Environment(DropletField.self) private var field: DropletField?
+
+    func makeUIView(context: Context) -> Probe {
+        let view = Probe()
+        view.isUserInteractionEnabled = false
+        view.id = id
+        view.field = field
+        NibFloatingHitDiagnostics.registerSurface(view)
+        return view
+    }
+
+    func updateUIView(_ view: Probe, context: Context) {
+        view.isUserInteractionEnabled = false
+        view.id = id
+        view.field = field
+    }
+
+    final class Probe: UIView {
+        var id = ""
+        weak var field: DropletField?
+        var scrollView: UIScrollView? {
+            var ancestor = superview
+            while let view = ancestor {
+                if let scroll = view as? UIScrollView { return scroll }
+                ancestor = view.superview
+            }
+            return nil
+        }
+        func ancestorFrames(in window: UIWindow, at point: CGPoint) -> String {
+            var frames: [String] = []
+            var ancestor = superview
+            while let view = ancestor, frames.count < 32 {
+                let frame = view.convert(view.bounds, to: window)
+                let contains = view.bounds.contains(view.convert(point, from: window))
+                let flags = "contains=\(contains) enabled=\(view.isUserInteractionEnabled) hidden=\(view.isHidden)"
+                frames.append("\(NSStringFromClass(type(of: view))) frame=\(frame) \(flags)")
+                ancestor = view.superview
+            }
+            return frames.joined(separator: "; ")
+        }
+        override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
+    }
+}
+#endif
