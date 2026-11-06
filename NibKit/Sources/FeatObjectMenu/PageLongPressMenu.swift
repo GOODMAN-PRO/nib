@@ -375,11 +375,21 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         }
         model.show(entries, context: context, facts: facts, header: PageMenus.header(facts, app: app))
         let selected = Set(facts.items.map(\.id))
-        let pageItems = (try? app.workspace.items(facts.doc, page: facts.page)) ?? []
+        // ponytail: one linear pass per rebuild over the page's cached items (`allItems` hands out the cached array;
+        // `items` would first build a filtered copy of the whole page), keeping the 64 nearest neighbours.
+        // A spatial index is the upgrade when pages outgrow a linear pass.
+        #if DEBUG
+        let scanStart = CFAbsoluteTimeGetCurrent()
+        #endif
+        let pageItems = (try? app.workspace.allItems(facts.doc, page: facts.page)) ?? []
         let neighbours = pageItems.lazy.filter {
             !$0.deleted && !selected.contains($0.id) && !session.hiddenLayers.contains($0.layer)
         }.map { app.content.hitBounds(for: $0).cg }
         obstacleBounds = ObjectMenuPlacement.nearestObstacles(neighbours, selection: facts.bounds.cg)
+        #if DEBUG
+        let scanMs = String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - scanStart) * 1000)
+        NSLog("%@", "[Nib QA menu] obstacle scan items=\(pageItems.count) kept=\(obstacleBounds.count) ms=\(scanMs)")
+        #endif
     }
 
     private func reposition(contentChanged: Bool) {
