@@ -31,3 +31,13 @@ Confirmed V3:sidebar#0 and its holds=true verdict: the light landscape shot foll
 | Tests | Log prefix | Question answered |
 | --- | --- | --- |
 | Capture test12, all variants, Pages shot | Capture fact ready / Capture fact timeout (fact=thumbnails) | How many visible cells had images at the capture boundary; was the fact absent? |
+
+### G4 - Settings bar evidence
+
+Confirmed V3:sheets#0 with holds=false correction. Done is blurred in three editing screenshots, but the double declaration and push structure also existed in the crisp build; cause remains UNKNOWN. Current source still pushes SettingsPageHost and supplies sheet.dismiss in its navigation toolbar. After both Document Editing and Stylus pushes, capture16 now requires the containing navigation bar and hittable sheet.dismiss, plus identical full-resolution RGBA crops from two screenshots at least 300 ms apart, within five seconds. Reuses the assistant's uprightImage and CaptureReadiness.cropRect infrastructure; its existing checker is contrast plus stable geometry, not pixel equality, so a reusable region equality check is added without weakening that assistant policy. XCTest predicate polling determines the actual sample interval (logged), with a 300 ms minimum; no sleep/fixed delay.
+
+A timeout throws 'Settings bar did not settle', logs geometry/byte count/interval/equality, and preserves the last two full frames as keepAlways screenshot attachments before further diagnostics. No normal settings shot follows a failure. Should unblock capture16's pushed-page images if transient; a persistently changing bar fails for the app investigation. A stable blurred bar can still pass equality: this gate proves stability, not correct typography; the next visual review must inspect it. Next CI must show stable bar pairs or deliver both failed frames to the companion job, without claiming a UIKit/app cause.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Capture test16, Editing and Stylus, all variants | Capture pixel settle / Capture pixel timeout | Was the actual navigation bar hittable and pixel-identical across the logged interval, or did it keep changing/miss its region? |

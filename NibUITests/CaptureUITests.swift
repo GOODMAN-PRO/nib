@@ -310,6 +310,82 @@ final class CaptureUITests: XCTestCase {
         return drawn ? pixels : []
     }
 
+    /// Reuse the assistant's upright bitmap/crop mapping, but compare every RGBA pixel:
+    /// a downsampled contrast or geometry check cannot establish an identical bar image.
+    private func regionPixels(_ image: CGImage?, frame: CGRect, screen: CGRect) -> [UInt8] {
+        guard let image, let rect = CaptureReadiness.cropRect(frame: frame, screen: screen,
+                    pixelWidth: image.width, pixelHeight: image.height),
+              let crop = image.cropping(to: rect) else { return [] }
+        let width = crop.width, height = crop.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let drawn = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: width, height: height,
+                    bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            context.draw(crop, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+            return true
+        }
+        return drawn ? pixels : []
+    }
+
+    /// A time-separated pair of real screen crops, polled without a fixed delay. Invalid or
+    /// changing geometry resets the comparison. On failure retain both sampled full frames.
+    private func settledPixels(_ reason: String, timeout: TimeInterval,
+                               region: @escaping () -> CGRect?) throws {
+        let started = ProcessInfo.processInfo.systemUptime
+        let deadline = started + timeout
+        var sampledAt: TimeInterval?
+        var previousFrame: CGRect?
+        var previousPixels: [UInt8] = []
+        var earlierShot: XCUIScreenshot?
+        var latestShot: XCUIScreenshot?
+        var facts = "no samples"
+        var pass = 0
+        do {
+            guard timeout > 0 else { throw NibUI.Failure.message(reason) }
+            try wait(reason, timeout: timeout) {
+                let now = ProcessInfo.processInfo.systemUptime
+                if let sampledAt, now - sampledAt < 0.3 { return false }
+                let frame = region()
+                let screen = self.ui.app.frame
+                let shot = XCUIScreen.main.screenshot()
+                earlierShot = latestShot
+                latestShot = shot
+                let takenAt = ProcessInfo.processInfo.systemUptime
+                let pixels = self.regionPixels(self.uprightImage(shot.image), frame: frame ?? .zero, screen: screen)
+                let separation = sampledAt.map { takenAt - $0 } ?? 0
+                let identical = !pixels.isEmpty && frame == previousFrame && pixels == previousPixels
+                pass += 1
+                facts = "reason=\(reason) pass=\(pass) frame=\(String(describing: frame)) bytes=\(pixels.count)"
+                facts += " separation=\(separation) identical=\(identical) seconds=\(takenAt - started)"
+                self.ui.logQA("Capture pixel settle", facts)
+                previousFrame = frame
+                previousPixels = pixels
+                sampledAt = takenAt
+                return identical && separation >= 0.3 && takenAt <= deadline
+            }
+        } catch {
+            // Even a missing/hittability-failing bar needs images, not discarded text attachments.
+            let latest = latestShot ?? XCUIScreen.main.screenshot()
+            let earlier = earlierShot ?? latest
+            attach(XCTAttachment(screenshot: earlier), name: reason + "-frame-1")
+            attach(XCTAttachment(screenshot: latest), name: reason + "-frame-2")
+            ui.logQA("Capture pixel timeout", facts)
+            throw NibUI.Failure.message(reason + "; " + facts)
+        }
+    }
+
+    private func settledSettingsBar(_ title: String) throws {
+        try settledPixels("Settings bar did not settle", timeout: 5) {
+            let bars = self.ui.app.navigationBars.containing(.button, identifier: "sheet.dismiss")
+            guard let bar = bars.allElementsBoundByIndex.first(where: {
+                self.ui.hasVisibleFrame($0) && $0.staticTexts[title].firstMatch.exists
+                    && $0.buttons["sheet.dismiss"].firstMatch.isHittable
+            }) else { return nil }
+            return bar.frame
+        }
+    }
+
     private func folder(_ title: String) throws {
         let row = ui.app.descendants(matching: .any).matching(identifier: "cmd.library.setView")
             .matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", title, title + ",")).firstMatch
@@ -522,9 +598,11 @@ final class CaptureUITests: XCTestCase {
             try self.tap("Editing", scroll: true)
             try self.tap("Document Editing", scroll: true)
             _ = try self.require("Open documents in tabs")
+            try self.settledSettingsBar("Document Editing")
             try self.libraryCapture(24, "settings-editing")
             try self.tap("Stylus", scroll: true)
             try self.tap("Stylus & Palm Rejection", scroll: true)
+            try self.settledSettingsBar("Stylus & Palm Rejection")
             try self.libraryCapture(25, "settings-stylus")
         }
     }
