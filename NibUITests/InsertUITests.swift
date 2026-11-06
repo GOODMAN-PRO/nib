@@ -1123,6 +1123,8 @@ final class InsertUITests: XCTestCase {
         try ui.dismissSheets(requireClosedPopover: true); try elements(); try tap("GIFs")
         let search = try ui.fillNativeForm([("Search GIPHY", "physics")])
         try ui.typeNativeText("\n", in: search)
+        let retry = ui.app.buttons["Try Again"].firstMatch
+        try wait("GIPHY failure must expose Try Again before reveal") { retry.exists }
         try tap("Try Again", scroll: true)
         XCTAssertEqual(search.value as? String, "physics")
         outside(); try ui.chord(",", .command) { _ = try self.settingsControl("Editing", scroll: false, timeout: 3) }

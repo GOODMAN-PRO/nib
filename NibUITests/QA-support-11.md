@@ -336,3 +336,7 @@ Confirmed insert-controls#0 correction: final playback lasted 31 ms with both op
 ### N4 - collection strip
 
 Confirmed insert-controls#1 against ElementsCollectionBar and the vertical My Objects reveal. Use 11b H6 within Elements, anchored by Stickers, for the chip tap after reopen. The app owns selected-chip scrolling; the test still taps and verifies the actual saved/deleted element. CI must log Horizontal reveal and finish all source/reuse/delete checks.
+
+### N5 - GIPHY readiness
+
+Confirmed insert-controls#2: reveal ran while the network-dependent row did not exist. The companion app job supplies immediate fixture failure; wait boundedly for the actual Try Again button before reveal/tap. Query-retention and key removal remain. CI must expose it within about one second without network activity or an absent-row drag.
