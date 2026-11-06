@@ -332,15 +332,34 @@ final class PagesUITests: XCTestCase {
     func testDragPagesBetweenWindowsCopiesIntoDestination() throws {
         let sourceDoc = doc, before = try ids(), sourceKinds = try itemKinds(try ids()[0])
         let targetDoc = try documentID(titled: "Lecture notes")
+        func sceneEvidence() -> (count: Int, showsSource: Bool) {
+            var count = 0, showsSource = false
+            for window in ui.app.windows.allElementsBoundByIndex {
+                let probe = window.otherElements["nib.qa.state"].firstMatch
+                guard probe.exists, let raw = probe.value as? String,
+                      let root = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] else { continue }
+                count += 1
+                if root["document"] as? String == sourceDoc { showsSource = true }
+            }
+            return (count, showsSource)
+        }
+        let initialScenes = sceneEvidence().count
         // Open the source in a separate OS scene through the library's actual context menu.
         try ui.tapCommand("window.showLibrary")
         let card = ui.app.buttons.matching(identifier: "cmd.doc.open").matching(NSPredicate(format: "label BEGINSWITH %@", notebook)).firstMatch
         try require(card).press(forDuration: 0.8); try tap("Open in New Window")
         try wait("Open in New Window must expose the source document") { self.ui.app.buttons["cmd.sidebar.toggle"].exists }
-        ui.logWindowScenes("after Open in New Window, before Pages chord")
-        try pages()
-        // iPadOS windowing control places this scene beside the other Nib scene.
+        try wait("A new probe-bearing scene must show the source document") {
+            let evidence = sceneEvidence()
+            return evidence.count > initialScenes && evidence.showsSource
+        }
+        ui.logWindowScenes("after Open in New Window, before capability check")
+        // Check before arranging or preparing both thumbnail grids.
         let multitasking = ui.systemWindowControls()
+        guard multitasking.exists else {
+            throw XCTSkip("Device-only: side-by-side Nib window controls are missing; verified here: Open in New Window created another scene showing the source document")
+        }
+        try pages()
         try require(multitasking, "Window controls must allow arranging two Nib windows for page drag").tap()
         try tap("Split View", prefix: true)
         let other = XCUIApplication(bundleIdentifier: "com.apple.springboard").icons["Nib"].firstMatch

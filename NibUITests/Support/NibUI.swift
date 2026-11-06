@@ -104,6 +104,17 @@ final class NibUI {
         logQA("slow query", timing + " " + tree)
     }
 
+    /// Fixture facts evolve independently of QAState. Missing facts fail explicitly;
+    /// extra keys and unrelated value shapes never affect the strict state decoder.
+    func qaFact(_ name: String) throws -> Any {
+        guard probe.exists, let raw = probe.value as? String,
+              let root = try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              let facts = root["qa"] as? [String: Any], let fact = facts[name], !(fact is NSNull) else {
+            throw Failure.message("QA fact is missing: " + name)
+        }
+        return fact
+    }
+
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
     enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards, tabsOverflow }
     enum FormEdge { case top, bottom, nearest }

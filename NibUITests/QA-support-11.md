@@ -386,3 +386,7 @@ Confirmed selection#3: Vision returned IH; the screenshot showed a hairline H cr
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | NeatenHandwritingChangesInkAndUndoRestoresMeaningfulSource | Neaten recognised source / Neaten recognised result | What text did Vision expose before and after neaten with the clearer four-stroke pair? |
+
+### P4 - two-window capability boundary
+
+Confirmed pages-drag-photos#1. Retain Open in New Window and the original sidebar readiness check; additionally require more probe-bearing windows than before and a source-document probe, using lenient per-window JSON. Only then query existing systemWindowControls and skip when absent, before Pages/Split View preparation. With controls, the complete two-window drag and copy/source assertions remain. Added the device-only coverage table and a lenient qaFact accessor for the remaining capability tests; missing facts throw explicitly. CI must report a skip after proven second-scene creation, never a pass for cross-window transfer.
