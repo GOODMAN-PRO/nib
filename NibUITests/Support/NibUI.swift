@@ -186,27 +186,45 @@ final class NibUI {
     }
 
     /// Full vertical containment; horizontal strips retain the existing hittable result.
-    private func controlFitsScroller(_ target: XCUIElement, in scope: XCUIElement?) -> Bool {
+    /// nil means geometry is unresolved, never permission to accept or drag the control.
+    private func controlFitsScroller(_ target: XCUIElement, in scope: XCUIElement?) -> Bool? {
         guard let control = try? measuredSnapshot(target, named: "scroll control"),
-              let root = try? measuredSnapshot(scope ?? app, named: "scroll control ancestry") else { return true }
-        func find(_ node: XCUIElementSnapshot, ancestors: [XCUIElementSnapshot]) -> [XCUIElementSnapshot]? {
-            if node.elementType == control.elementType && node.identifier == control.identifier
-                && node.label == control.label && node.frame == control.frame { return ancestors }
-            let next = node.elementType == .scrollView ? ancestors + [node] : ancestors
-            for child in node.children { if let result = find(child, ancestors: next) { return result } }
+              let root = try? measuredSnapshot(scope ?? app, named: "scroll control ancestry") else {
+            logQA("Control containment unresolved", "target or ancestry snapshot unavailable")
             return nil
         }
-        // Separate snapshots can straddle a layout change. An unmatched frame is not
-        // evidence of clipping: retain findControl's existing hittable result.
-        guard let ancestors = find(root, ancestors: []) else { return true }
+        var matches: [(node: XCUIElementSnapshot, ancestors: [XCUIElementSnapshot], window: CGRect)] = []
+        func find(_ node: XCUIElementSnapshot, ancestors: [XCUIElementSnapshot], window: CGRect) {
+            let clip = node.elementType == .window ? window.intersection(node.frame) : window
+            if node.elementType == control.elementType && node.identifier == control.identifier
+                && node.label == control.label { matches.append((node, ancestors, clip)) }
+            let next = node.elementType == .scrollView ? ancestors + [node] : ancestors
+            for child in node.children { find(child, ancestors: next, window: clip) }
+        }
+        find(root, ancestors: [], window: root.frame)
+        // Use identity across snapshots, then geometry entirely from the ancestry snapshot.
+        // A unique identity survives relayout; duplicate identities require an exact frame match.
+        let resolved = matches.count == 1 ? matches : matches.filter { $0.node.frame == control.frame }
+        guard resolved.count == 1, let match = resolved.first else {
+            let facts = "id=\(control.identifier) label=\(control.label) frame=\(control.frame)"
+            logQA("Control containment unresolved", facts + " identityMatches=\(matches.count) frameMatches=\(resolved.count)")
+            return nil
+        }
+        let ancestors = match.ancestors
+        let frames = [match.node.frame, match.window] + ancestors.map { $0.frame }
+        guard frames.allSatisfy({ !$0.isEmpty && !$0.isNull && !$0.isInfinite
+            && $0.minX.isFinite && $0.minY.isFinite && $0.maxX.isFinite && $0.maxY.isFinite }) else {
+            logQA("Control containment unresolved", "label=\(control.label) invalid frames=\(frames)")
+            return nil
+        }
         guard let nearest = ancestors.last else { return true }
         if isHorizontalOnlyScroller(nearest) { return true }
-        var viewport = nearest.frame.intersection(app.windows.firstMatch.frame)
+        var viewport = nearest.frame.intersection(match.window)
         for ancestor in ancestors.dropLast() { viewport = viewport.intersection(ancestor.frame) }
         viewport = verticalCueViewport(nearest, viewport: viewport)
-        let fits = fitsVerticalViewport(control.frame, viewport: viewport)
+        let fits = fitsVerticalViewport(match.node.frame, viewport: viewport)
         if !fits {
-            logQA("Clipped control reveal", "label=\(control.label) target=\(control.frame) scroller=\(nearest.frame) viewport=\(viewport)")
+            logQA("Clipped control reveal", "label=\(control.label) target=\(match.node.frame) scroller=\(nearest.frame) viewport=\(viewport)")
         }
         return fits
     }
@@ -258,8 +276,20 @@ final class NibUI {
     func requireControl(_ name: String, type: XCUIElement.ElementType = .any,
                         scroll: Bool = false, timeout: TimeInterval = 3,
                         in scope: XCUIElement? = nil, edge: FormEdge? = nil) throws -> XCUIElement {
-        if let found = findControl(name, type: type, in: scope),
-           !scroll || controlFitsScroller(found, in: scope) { return found }
+        if let found = findControl(name, type: type, in: scope) {
+            if !scroll { return found }
+            var fits = controlFitsScroller(found, in: scope)
+            if fits == nil {
+                let resolved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                    fits = controlFitsScroller(found, in: scope)
+                    return fits != nil
+                }, object: nil)
+                guard XCTWaiter.wait(for: [resolved], timeout: timeout) == .completed, fits != nil else {
+                    throw Failure.message("Control containment unresolved: \(name); no reveal attempted")
+                }
+            }
+            if fits == true { return found }
+        }
         if scroll {
             // Virtualized native rows do not exist until their collection view scrolls.
             // Preserve the typed editor/control priority once, then reuse the query while scrolling.
@@ -268,16 +298,23 @@ final class NibUI {
                     format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
             revealFormElement(in: scope, edge: edge, named: name, type: type, fullyVisible: true) { revealTarget }
             if let failure = formRevealFailure { throw Failure.message(failure) }
-            if let found = findControl(name, type: type, in: scope),
-               controlFitsScroller(found, in: scope) { return found }
         }
         var found: XCUIElement?
+        var unresolvedGeometry = false
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
             found = findControl(name, type: type, in: scope)
-            if let found { return !scroll || controlFitsScroller(found, in: scope) }
+            if let found {
+                if !scroll { return true }
+                let fits = controlFitsScroller(found, in: scope)
+                unresolvedGeometry = fits == nil
+                return fits == true
+            }
             return false
         }, object: nil)
         guard XCTWaiter.wait(for: [ready], timeout: timeout) == .completed, let found else {
+            if unresolvedGeometry {
+                throw Failure.message("Control containment unresolved: \(name); see Control containment unresolved log")
+            }
             throw Failure.message("Missing hittable control: \(name)\n\(app.debugDescription)")
         }
         return found
@@ -2879,19 +2916,16 @@ final class NibUI {
             logQA("Native menu row tap", facts)
             try tapWithoutIdle(item)
         }
-        // Keep the small container check, but require two consecutive absent observations
-        // so ordinary input cannot race a transient absence during dismissal animation.
-        var absentObservations = 0
+        // H9: accept the first absence of the resolved container within eight seconds.
+        // Callers separately verify the successor alert, form or state after this delivery check.
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            let absent: Bool
-            if let container = closingContainer { absent = !container.exists }
+            if let container = closingContainer { return !container.exists }
             // Some native trees expose only the row. Keep the existing successor-frame
             // rule there without three app-wide walks.
-            else if let action = lastAction {
-                absent = !action.item.exists || action.item.frame != action.frame
-            } else { absent = false }
-            absentObservations = absent ? absentObservations + 1 : 0
-            return absentObservations >= 2
+            if let action = lastAction {
+                return !action.item.exists || action.item.frame != action.frame
+            }
+            return false
         }, object: nil)
         guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
             recordDiagnostics("Native menu dismissal failed")

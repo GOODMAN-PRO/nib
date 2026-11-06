@@ -433,3 +433,21 @@ Confirmed the four review findings against job 11c and the shared-helper callers
 - D1: catch presentation variant errors, attach the same unreachable text/app hierarchy and diagnostic screenshot as ordinary variants for non-XCTSkip errors, then rethrow every error. The four presentation skips and all prerequisite/capability checks remain unchanged; CI must retain evidence for genuine failures and count only the authorized device-only skips.
 
 Validation: python Scripts/lint.py reports **0 errors, 25 existing warnings**; git diff --check passes. Reviewed the changed Swift signatures, closure state and shared callers. No Swift toolchain or simulator is available here; compilation, AX axis exposure, dismissal timing and capture attachments require GitHub Actions verification.
+
+### Review fixes - round 7 (2026-11-06)
+
+Confirmed the two majors against H9/H11, R12 pages-menus-outline#0 and insert-menus-alerts-forms#0 (including the verifier corrections), and insert-controls#4. These corrections supersede round 6's two-observation gate and unknown-geometry acceptance. Only test support and this log change.
+
+- H9 (major): accept the first absent observation of the menu container resolved before the tap. Retain the single-container query, row fallback, eight-second wait and callers' successor-state assertions. No tap retry or second observation is added. CI must reach the template form, Audio Rename alert and comment composer even when one AX evaluation takes about seven seconds.
+- H11 (major): containment now has three results: contained, clipped and unresolved. Resolve the target by type/identifier/label in the ancestry snapshot; a unique identity survives relayout, while duplicate identities require one exact frame match. Target, window and scroller geometry then come from that same snapshot. Failed snapshots, unmatched/ambiguous identity or invalid frames return unresolved and log why. Before revealing an already-hittable control, retry unresolved geometry within the caller's existing timeout and fail explicitly if it remains unresolved, without a drag. The final readiness poll likewise cannot accept unknown geometry. Proven clipping retains the full vertical extent, horizontal centre, cue lane and existing reveal path; observed horizontal-only strips retain their prior behavior. CI must reveal Fit Height to Text before its value assertion and show explicit containment diagnostics if geometry cannot be resolved.
+- Oversized rows (minor): no change requested or made to the containment policy. If CI reports a new Missing hittable control failure, inspect Clipped control reveal first; a row taller than its viewport still cannot satisfy full containment.
+- Share-sheet probe cost (minor): retained the current probe. No evidence justifies adding a sheet/popover precondition that could miss an out-of-process surface.
+
+| Diagnostic | Log prefix | Question answered |
+| --- | --- | --- |
+| scroll:true lookup with unavailable geometry | Control containment unresolved | Did snapshot acquisition fail, did identity/frame matching fail, or were frames invalid before accepting or revealing the control? |
+| Proven vertical clipping | Clipped control reveal | What target, nearest scroller and clipped viewport from the same snapshot require reveal? |
+
+Caller audit: requireControl signatures/defaults remain compatible across Canvas, Capture, Chrome, Ink, Insert, Selection and internal provider/tool paths. Non-scrolling lookups are unchanged. Re-read Pages and Insert nativeContextMenu callers; successor alert/form, content and state checks remain intact. No test body, assertion, allowance, sleep, capability check or XCTSkip site changes; all seven authorized device-only boundaries remain as before. No app file changes.
+
+Validation: python Scripts/lint.py reports **0 errors, 25 warnings**; git diff --check passes. Static review covers optional Bool handling, snapshot tuple types, closure state, predicate return paths and bounded waits. No Swift compiler or simulator is available on Windows; CI must verify compilation, relayout/duplicate-identity behavior and runtime costs. XCTest synchronous snapshot calls can exceed an outer wait's deadline; no runtime pass or speedup is claimed.
