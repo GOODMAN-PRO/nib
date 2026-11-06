@@ -96,10 +96,62 @@ final class SearchLayoutTests: XCTestCase {
             let top = try XCTUnwrap(state.navigationCounterTop)
             XCTAssertEqual(top, expectedTop, accuracy: 1)
             let viewport = SearchViewport(windowSize: size, availableHeight: size.height - NibMetrics.chromeInset,
-                visibleBounds: window.bounds)
+                visibleBounds: window.bounds, windowGeometry: state.navigationCounterPlacement?.windowGeometry)
             XCTAssertEqual(viewport.navigationRows(counterTop: top), rows,
                 "The same wide window may stack HUDs when its usable column narrows")
+            XCTAssertEqual(viewport.navigationRows(counterPlacement: state.navigationCounterPlacement), rows,
+                "Fresh measurements must still track the actual HUD placement")
         }
+    }
+
+    func testNoHitCounterPlacementIsRejectedAfterWindowOrKeyboardGeometryChanges() {
+        let bounds = CGRect(x: 0, y: 0, width: 1366, height: 1024)
+        let column = CGRect(x: 16, y: 100, width: 560, height: 780)
+        let keyboard = CGRect(x: 500, y: 535, width: 400, height: 300)
+        let original = SearchViewport.measure(windowBounds: bounds, safeArea: .zero,
+            frame: column, keyboard: keyboard)
+        let counter = SearchViewport.measure(windowBounds: bounds, safeArea: .zero,
+            frame: CGRect(x: 600, y: 479, width: 166, height: 40), keyboard: keyboard)
+        let state = SearchState()
+        state.isPresented = true
+        state.query = "Missing"
+        state.navigationCounterPlacement = counter
+        XCTAssertEqual(original.navigationRows(counterPlacement: state.navigationCounterPlacement), 1)
+        XCTAssertEqual(state.emptyPresentation, .noResults("Missing"))
+
+        let rotated = CGRect(x: 0, y: 0, width: 834, height: 1194)
+        let geometries: [(CGRect, UIEdgeInsets, CGRect?)] = [
+            (rotated, .zero, keyboard), // Rotation while the keyboard is still up.
+            (CGRect(x: 0, y: 0, width: 900, height: 1200), .zero, keyboard), // Stage Manager resize.
+            (bounds, .zero, nil), // Keyboard dismissal without rotating.
+            (rotated, UIEdgeInsets(top: 0, left: 0, bottom: 34, right: 0), nil),
+            (bounds, UIEdgeInsets(top: 0, left: 0, bottom: 34, right: 0), keyboard),
+            (bounds, .zero, keyboard.offsetBy(dx: -20, dy: 0)) // Floating keyboard movement.
+        ]
+        for (window, safeArea, keyboardFrame) in geometries {
+            let viewport = SearchViewport.measure(windowBounds: window, safeArea: safeArea,
+                frame: column, keyboard: keyboardFrame)
+            let rows = viewport.navigationRows(counterPlacement: state.navigationCounterPlacement)
+            XCTAssertEqual(rows, 2, "An absent counter cannot validate its old coordinate")
+            let height = SearchViewport.resultsHeight(availableHeight: min(780, viewport.availableHeight),
+                reservesNavigation: true, navigationRows: rows)
+            XCTAssertGreaterThanOrEqual(height, 239, "Keep space for filters and the empty/error message")
+            // When matches return, the new counter reader replaces the stale geometry and
+            // the actual placement must still select either one or two rows.
+            for expected in [1, 2] {
+                var freshCounter = viewport
+                freshCounter.columnTop = viewport.columnTop + viewport.availableHeight
+                    - NibMetrics.hudHeight
+                    - CGFloat(expected - 1) * (NibMetrics.hudHeight + NibMetrics.minimumRestingGap)
+                XCTAssertEqual(viewport.navigationRows(counterPlacement: freshCounter), expected)
+            }
+        }
+        let dismissed = SearchViewport.measure(windowBounds: rotated,
+            safeArea: UIEdgeInsets(top: 0, left: 0, bottom: 34, right: 0), frame: column, keyboard: nil)
+        XCTAssertEqual(dismissed.navigationRows(counterTop: 479), 12,
+            "This is the stale-coordinate regression: the old calculation collapses a 780 pt host")
+        XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 780, reservesNavigation: true,
+            navigationRows: dismissed.navigationRows(counterPlacement: counter)), 600)
     }
 
     func testCounterPlacementSurvivesNoHitsAndResetsWhenSearchCloses() async throws {

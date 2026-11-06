@@ -1457,13 +1457,78 @@ final class FeatSearchUITests: XCTestCase {
         XCTAssertTrue(closed, "Cancel dismisses even with an empty query")
     }
 
+    func testDocumentNoHitsAndErrorStayVisibleAfterResizeAndKeyboardDismissal() async throws {
+        executionTimeAllowance = 60
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let state = SearchState()
+        state.scope = NodeRef.document(Fixtures.docID).description
+        state.query = "Hello"
+        state.matches = [hit()]
+        state.isPresented = true
+        state.instant = true
+        var frames: [String: CGRect] = [:]
+        let root = DocumentSearchPanel(app: h.app, session: h.session, state: state)
+            .frame(width: 560, height: 780)
+            .environment(\.searchLayoutDiagnostics, true)
+            .onPreferenceChange(SearchLayoutFrames.self) { frames = $0 }
+        let host = UIHostingController(rootView: root)
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1366, height: 1024))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = CGRect(x: 16, y: 100, width: 560, height: 780)
+        host.view.layoutIfNeeded()
+        let keyboard = CGRect(x: 500, y: 535, width: 400, height: 300)
+        let screenKeyboard = window.convert(keyboard, to: window.screen.coordinateSpace)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil,
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: screenKeyboard)])
+        state.navigationCounterPlacement = SearchViewport.measure(windowBounds: window.bounds,
+            safeArea: window.safeAreaInsets, frame: CGRect(x: 600, y: 479, width: 166, height: 40),
+            keyboard: keyboard)
+        for _ in 0..<50 {
+            if frames["firstRow.typed"] != nil { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNotNil(frames["firstRow.typed"], "Begin with matches and a measured counter")
+        state.query = "Missing"
+        state.matches = [] // Production removes the counter overlay at this point.
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 900, height: 1200)] {
+            window.frame.size = size
+            host.view.frame = CGRect(x: 16, y: 100, width: 560, height: 780)
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            let hiddenKeyboard = window.convert(CGRect(x: 0, y: size.height, width: size.width, height: 0),
+                to: window.screen.coordinateSpace)
+            NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil,
+                userInfo: [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: hiddenKeyboard)])
+            for message in ["results.empty", "results.error"] {
+                state.error = message == "results.error" ? "Search unavailable" : nil
+                for _ in 0..<100 {
+                    if let panel = frames["document.results"], panel.height >= 599,
+                       let content = frames[message], content.height > 0,
+                       panel.insetBy(dx: -1, dy: -1).contains(content) { break }
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                let panel = try XCTUnwrap(frames["document.results"])
+                let content = try XCTUnwrap(frames[message])
+                let filter = try XCTUnwrap(frames["filter.all"])
+                XCTAssertEqual(panel.height, 600, accuracy: 1)
+                XCTAssertGreaterThan(content.height, 0)
+                XCTAssertTrue(panel.insetBy(dx: -1, dy: -1).contains(content), "Keep the complete message visible")
+                XCTAssertTrue(panel.insetBy(dx: -1, dy: -1).contains(filter), "Keep the filter header visible")
+                XCTAssertGreaterThanOrEqual(content.minY, filter.maxY)
+            }
+        }
+    }
+
     func testResultsHideOrphanHeadingAndRestoreItWhenFirstRowScrollsIntoView() async throws {
         executionTimeAllowance = 60
         let h = Harness(features: [FeatSearchUIFeature.self])
         let state = SearchState()
         state.query = "Hello"
         state.matches = [hit(kind: "title"), hit()]
-        var headings: Set<SearchGroup> = []
+        var headings: [SearchGroup: Bool] = [:]
         var frames: [String: CGRect] = [:]
         let results = SearchResults(app: h.app, session: h.session, state: state)
             .onPreferenceChange(SearchVisibleGroupHeadings.self) { headings = $0 }
@@ -1478,12 +1543,12 @@ final class FeatSearchUITests: XCTestCase {
         host.view.frame = window.bounds
         host.view.layoutIfNeeded()
         for _ in 0..<50 {
-            if headings.contains(.titles), headings.contains(.typed), frames["group.typed"] != nil { break }
+            if headings[.titles] == true, headings[.typed] == true, frames["group.typed"] != nil { break }
             try await Task.sleep(for: .milliseconds(20))
         }
         let first = try XCTUnwrap(frames["group.titles"])
         let second = try XCTUnwrap(frames["group.typed"])
-        XCTAssertTrue(headings.contains(.typed), "Start with both complete groups visible")
+        XCTAssertTrue(headings[.typed] == true, "Start with both complete groups visible")
         // Derive clipping from the real heading/row fonts and filter header. Leave half
         // the second block below the window instead of assuming a 240 pt device region.
         window.frame.size.height = first.maxY + second.height / 2
@@ -1491,11 +1556,11 @@ final class FeatSearchUITests: XCTestCase {
         host.view.setNeedsLayout()
         host.view.layoutIfNeeded()
         for _ in 0..<50 {
-            if headings.contains(.titles), !headings.contains(.typed) { break }
+            if headings[.titles] == true, headings[.typed] == false { break }
             try await Task.sleep(for: .milliseconds(20))
         }
-        XCTAssertTrue(headings.contains(.titles))
-        XCTAssertFalse(headings.contains(.typed), "Typed Notes must not appear without its first result")
+        XCTAssertTrue(headings[.titles] == true)
+        XCTAssertEqual(headings[.typed], false, "Typed Notes must not appear without its first result")
         let list = try XCTUnwrap(searchDescendants(UIScrollView.self, in: host.view)
             .first { $0.contentSize.height > $0.bounds.height + 1
                 && $0.contentSize.width <= $0.bounds.width + 1 })
@@ -1503,10 +1568,10 @@ final class FeatSearchUITests: XCTestCase {
         list.setContentOffset(CGPoint(x: 0, y: bottom), animated: false)
         host.view.layoutIfNeeded()
         for _ in 0..<50 {
-            if headings.contains(.typed) { break }
+            if headings[.typed] == true { break }
             try await Task.sleep(for: .milliseconds(20))
         }
-        XCTAssertTrue(headings.contains(.typed), "The heading must return when scrolling reveals its complete row")
+        XCTAssertTrue(headings[.typed] == true, "The heading must return when scrolling reveals its complete row")
         XCTAssertEqual(state.visibleMatches.count, 2, "Clipping a heading must not remove a result")
     }
 

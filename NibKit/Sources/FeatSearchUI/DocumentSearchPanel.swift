@@ -14,6 +14,13 @@ enum SearchLayoutMeasurement {
     }
 }
 
+/// Geometry shared by the panel and counter, independent of their measured sizes/positions.
+struct SearchWindowGeometry: Equatable {
+    var bounds: CGRect
+    var safeArea: UIEdgeInsets
+    var keyboard: CGRect?
+}
+
 /// Measurements in the presenting window, unaffected by the keyboard changing the visible aspect ratio.
 struct SearchViewport: Equatable {
     var windowSize: CGSize
@@ -21,12 +28,14 @@ struct SearchViewport: Equatable {
     /// The visible part of the host, expressed in the host's own coordinates.
     var visibleBounds: CGRect
     var columnTop: CGFloat = 0
+    var windowGeometry: SearchWindowGeometry?
 
     func differs(from old: SearchViewport?, scale: CGFloat) -> Bool {
         guard let old else { return true }
         let window = CGRect(origin: .zero, size: windowSize)
         let oldWindow = CGRect(origin: .zero, size: old.windowSize)
         return SearchLayoutMeasurement.changed(oldWindow, window, scale: scale)
+            || old.windowGeometry != windowGeometry
             || SearchLayoutMeasurement.changed(old.visibleBounds, visibleBounds, scale: scale)
             || abs(old.availableHeight - availableHeight) > 1 / max(1, scale)
             || abs(old.columnTop - columnTop) > 1 / max(1, scale)
@@ -71,6 +80,13 @@ struct SearchViewport: Equatable {
         // results but not the narrower counter. Both positions are in window coordinates.
         return Self.navigationRows(counterAvailableHeight: columnTop + availableHeight - counterTop)
     }
+    func navigationRows(counterPlacement: SearchViewport?) -> Int {
+        // A no-hit query removes the counter's reader. Never combine its old absolute
+        // coordinate with a resized window, changed safe area or dismissed/moved keyboard.
+        guard let counterPlacement, counterPlacement.windowGeometry == windowGeometry,
+              counterPlacement.windowSize == windowSize else { return 2 }
+        return navigationRows(counterTop: counterPlacement.columnTop)
+    }
     static func resultsHeight(availableHeight: CGFloat, reservesNavigation: Bool,
                               navigationRows: Int = 2) -> CGFloat {
         let reserve = CGFloat(max(0, navigationRows)) * (NibMetrics.hitTarget + NibMetrics.minimumRestingGap)
@@ -87,7 +103,8 @@ struct SearchViewport: Equatable {
         let visible = windowBounds.intersection(frame)
         return SearchViewport(windowSize: windowBounds.size, availableHeight: max(0, bottom - frame.minY),
             visibleBounds: visible.isEmpty ? .zero : visible.offsetBy(dx: -frame.minX, dy: -frame.minY),
-            columnTop: frame.minY)
+            columnTop: frame.minY,
+            windowGeometry: SearchWindowGeometry(bounds: windowBounds, safeArea: safeArea, keyboard: keyboard))
     }
 }
 
@@ -174,11 +191,12 @@ struct DocumentSearchPanel: View {
                 windowSize: viewport?.windowSize)
             let height = SearchViewport.resultsHeight(availableHeight: min(geometry.size.height,
                 viewport?.availableHeight ?? geometry.size.height), reservesNavigation: true,
-                navigationRows: viewport?.navigationRows(counterTop: state.navigationCounterTop) ?? 2)
+                navigationRows: viewport?.navigationRows(counterPlacement: state.navigationCounterPlacement) ?? 2)
             VStack(spacing: NibMetrics.minimumRestingGap) {
                 DocumentSearchField(app: app, session: session, state: state)
                 SearchResults(app: app, session: session, state: state)
                     .frame(height: height, alignment: .top)
+                    .searchLayoutFrame("document.results")
                     .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
                     .droplet("searchui.documentResults", style: .panel)
                     .budsFrom("searchui.documentField", isPresented: presentationBinding, instant: state.instant)
@@ -264,8 +282,8 @@ struct SearchCounter: View {
                         GeometryReader { geometry in
                             SearchViewportReader(layoutPosition: geometry.frame(in: .global).origin) { viewport in
                                 guard state.isPresented else { return }
-                                if state.navigationCounterTop != viewport.columnTop {
-                                    state.navigationCounterTop = viewport.columnTop
+                                if state.navigationCounterPlacement != viewport {
+                                    state.navigationCounterPlacement = viewport
                                 }
                             }
                         }

@@ -334,7 +334,7 @@ struct SearchResults: View {
     let session: EditorSession
     @ObservedObject var state: SearchState
     @State private var overflows = false
-    @State private var visibleGroupHeadings: Set<SearchGroup> = []
+    @State private var visibleGroupHeadings: [SearchGroup: Bool] = [:]
     #if DEBUG
     @State private var layoutTrace = SearchLayoutTrace()
     #endif
@@ -355,6 +355,7 @@ struct SearchResults: View {
                             NibBanner(error, style: .warning, action: NibAction(String(localized: "Try search again"), command: CommandIDs.searchOpen) {
                                 app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "refresh": true], session: session)
                             })
+                            .searchLayoutFrame("results.error")
                         } else if state.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             if state.scope == "lib" {
                                 Text(String(localized: "Recently opened")).font(NibFont.headline).accessibilityAddTraits(.isHeader)
@@ -386,6 +387,7 @@ struct SearchResults: View {
                         } else if let empty = state.emptyPresentation {
                             NibEmptyState(symbol: .search, title: empty.title, message: empty.message)
                                 .frame(maxWidth: .infinity)
+                                .searchLayoutFrame("results.empty")
                         } else {
                             ForEach(SearchGroup.allCases) { group in
                                 resultGroup(group)
@@ -462,8 +464,9 @@ struct SearchResults: View {
             VStack(alignment: .leading, spacing: NibSpacing.l) {
                 Text(group.title).font(NibFont.headline).accessibilityAddTraits(.isHeader)
                     .searchLayoutFrame("heading." + group.rawValue)
-                    .opacity(visibleGroupHeadings.contains(group) ? 1 : 0)
-                    .accessibilityHidden(!visibleGroupHeadings.contains(group))
+                    // A new group stays visible until its first measurement arrives.
+                    .opacity(visibleGroupHeadings[group] == false ? 0 : 1)
+                    .accessibilityHidden(visibleGroupHeadings[group] == false)
                 SearchResultRow(app: app, session: session, state: state, hit: first)
                     .searchLayoutFrame("firstRow." + group.rawValue)
                     .id(first.id)
@@ -500,10 +503,9 @@ private struct SearchGroupHeadingReader: View {
             // safeAreaInset reserves the continuation cue; it is not usable row space.
             let height = max(0, geometry.size.height - geometry.safeAreaInsets.bottom)
             let viewport = CGRect(x: 0, y: 0, width: geometry.size.width, height: height)
-            let visible = Set(anchors.compactMap { group, anchor -> SearchGroup? in
+            let visible = anchors.mapValues { anchor in
                 SearchGroupHeadingVisibility.isVisible(groupStart: geometry[anchor], viewport: viewport)
-                    ? group : nil
-            })
+            }
             Color.clear.preference(key: SearchVisibleGroupHeadings.self, value: visible)
         }
         .allowsHitTesting(false)
@@ -512,9 +514,9 @@ private struct SearchGroupHeadingReader: View {
 }
 
 struct SearchVisibleGroupHeadings: PreferenceKey {
-    static let defaultValue: Set<SearchGroup> = []
-    static func reduce(value: inout Set<SearchGroup>, nextValue: () -> Set<SearchGroup>) {
-        value.formUnion(nextValue())
+    static let defaultValue: [SearchGroup: Bool] = [:]
+    static func reduce(value: inout [SearchGroup: Bool], nextValue: () -> [SearchGroup: Bool]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 

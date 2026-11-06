@@ -196,13 +196,14 @@ final class SearchState: ObservableObject {
     @Published var progress: IndexProgressPayload?
     @Published var isPresented = false {
         didSet {
-            if !isPresented { navigationCounterTop = nil }
+            if !isPresented { navigationCounterPlacement = nil }
         }
     }
     @Published var instant = false
     @Published var focusGeneration = 0
-    // Conservative until chrome places the HUD; retain through no-hit queries until search closes.
-    @Published var navigationCounterTop: CGFloat?
+    // Retain through no-hit queries, but only reuse within the measured window/keyboard geometry.
+    @Published var navigationCounterPlacement: SearchViewport?
+    var navigationCounterTop: CGFloat? { navigationCounterPlacement?.columnTop }
     var generation = 0
     var cursor: String?
     var seenCursors = Set<String>()
