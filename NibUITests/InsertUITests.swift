@@ -408,10 +408,15 @@ final class InsertUITests: XCTestCase {
         XCTAssertTrue(CGImageDestinationFinalize(destination))
         return data as Data
     }
-    private func image(_ gif: Bool = false) throws {
+    private func image(_ gif: Bool = false, scopedMenus: Bool = false) throws {
         let before = try ui.state().itemCountOnPage
         UIPasteboard.general.setData(try gif ? gifData() : imageData(), forPasteboardType: gif ? UTType.gif.identifier : UTType.png.identifier)
-        try ui.selectTool("image"); ui.coordinate(point).tap(); try tap("Paste")
+        try ui.selectTool("image", scopedOverflow: scopedMenus)
+        ui.coordinate(point).tap()
+        if scopedMenus {
+            let popover = ui.app.scrollViews["Insert Image"].firstMatch
+            try ui.requireControl("Paste", type: .button, timeout: 8, in: popover).tap()
+        } else { try tap("Paste") }
         try allowSystemPermissionIfPresented(timeout: 3)
         if try ui.state().itemCountOnPage == before { outside() }
         try counts(before + 1)
@@ -864,7 +869,7 @@ final class InsertUITests: XCTestCase {
         }
     }
     func testImagePasteAspectAssetSurvivesReopening() throws {
-        try image(); let inserted = try item("image"), frame = try XCTUnwrap(inserted["frame"] as? JSON)
+        try image(scopedMenus: true); let inserted = try item("image"), frame = try XCTUnwrap(inserted["frame"] as? JSON)
         XCTAssertEqual(try XCTUnwrap(frame["w"] as? Double) / XCTUnwrap(frame["h"] as? Double), 160.0 / 90, accuracy: 0.01)
         let assets = try XCTUnwrap(fragment()["assets"] as? JSON)
         XCTAssertFalse(assets.isEmpty)

@@ -374,3 +374,7 @@ Confirmed insert-providers-timeouts#3/#4: Sticky completed all assertions in 190
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | StickySevenColoursAndSelectedOnlyRecolour | Sticky colour timing | What remains of colour delivery/copy time without interruption handling? |
+
+### N11 - scoped image queries, undiagnosed stall
+
+Confirmed insert-providers-timeouts#5 verdict: slow AX bursts consumed about 62 of 205 seconds; no evidence identifies host versus app. ImagePaste opts into scoped tool-overflow lookup inside More tools and Paste lookup inside Insert Image (current ImageMenuController uses NibPopoverPanel with that title). All persistence/aspect/asset assertions remain. Other selectTool/image callers retain defaults. This reduces tree exposure, not a proven stall cure. CI now samples the app after eight seconds of log silence (at most once per 150 seconds); the next run must correlate samples and existing slow query logs before assigning a cause.

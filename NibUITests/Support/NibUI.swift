@@ -2483,9 +2483,9 @@ final class NibUI {
         return fragment
     }
 
-    func selectTool(_ id: String) throws {
+    func selectTool(_ id: String, scopedOverflow: Bool = false) throws {
         // Reselecting toggles its options strip (or settings for a tool without a strip).
-        if try state().tool != id { try tapControl("tool." + id, overflow: ["tool.more"]) }
+        if try state().tool != id { try tapControl("tool." + id, overflow: ["tool.more"], scopedOverflow: scopedOverflow) }
         _ = try waitForState { $0.tool == id }
     }
 
@@ -2505,7 +2505,7 @@ final class NibUI {
         _ = try waitForState { $0.toolSettingsOpen == id }
     }
 
-    private func tapControl(_ id: String, overflow: [String], diagnostics: Bool = false) throws {
+    private func tapControl(_ id: String, overflow: [String], diagnostics: Bool = false, scopedOverflow: Bool = false) throws {
         func activate(_ control: XCUIElement) {
             if diagnostics { recordDiagnostics("Command tap resolved", facts: elementFacts(control, includeOverlaps: true)) }
             control.tap()
@@ -2527,6 +2527,14 @@ final class NibUI {
         for identifier in overflow {
             guard let menu = candidate(identifier) else { continue }
             menu.tap()
+            if scopedOverflow {
+                let title = identifier == "tool.more" ? "More tools" : "More"
+                let surface = app.scrollViews.matching(NSPredicate(format: "label == %@ OR identifier == %@", title, title)).firstMatch
+                let control = try requireControl(id, type: .button, scroll: true, in: surface)
+                activate(control)
+                try waitForMenuClosed(surface, named: title + " after " + id)
+                return
+            }
             let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
                 app.buttons.matching(identifier: id).firstMatch.exists
             }, object: nil)
