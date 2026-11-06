@@ -172,6 +172,10 @@ final class PresetMenuModel {
     }
 
     func open(_ next: PresetPopover) {
+        #if DEBUG
+        logPresentation("open before next=\(next)")
+        defer { logPresentation("open after") }
+        #endif
         commitWidth()
         arranging = false
         shown = next
@@ -227,8 +231,19 @@ final class PresetMenuModel {
     }
 
     func addColour() {
+        #if DEBUG
+        logPresentation("addColour before")
+        defer { logPresentation("addColour after") }
+        #endif
         popover == .colour(.add) ? close() : open(.colour(.add))
     }
+
+    #if DEBUG
+    private func logPresentation(_ event: String) {
+        let state = "popover=\(String(describing: popover)) shown=\(shown) arranging=\(arranging) slots=\(presets.swatches.count)"
+        NSLog("%@", "[Nib QA preset] \(event) tool=\(tool) \(state)")
+    }
+    #endif
 
     func remove(_ i: Int) {
         run([PresetActions.call("preset.removeSwatch", tool, ["index": .number(Double(i))])])

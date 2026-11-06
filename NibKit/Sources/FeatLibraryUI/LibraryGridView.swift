@@ -425,6 +425,11 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibR
         }
     }
     private func dismissMenuForLift(_ interaction: UIContextMenuInteraction, phase: String) {
+        #if DEBUG
+        if NibQAMenuDiagnostics.isPresented(in: window) {
+            NSLog("%@", "[Nib QA menu] lift guard while menu presented phase=\(phase) lifted=\(liftRecognized) view=\(ObjectIdentifier(self)) sequence=\(touchSequence)")
+        }
+        #endif
         guard liftRecognized else { return }
         #if DEBUG
         NSLog("%@", "[Nib QA reflow] menu dismissal requested phase=\(phase) view=\(ObjectIdentifier(self)) sequence=\(touchSequence)")
@@ -452,6 +457,8 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibR
                                 willDisplayMenuFor configuration: UIContextMenuConfiguration,
                                 animator: UIContextMenuInteractionAnimating?) {
         #if DEBUG
+        NibQAMenuDiagnostics.setPresented(true, owner: self)
+        NSLog("%@", "[Nib QA menu] will display item=\(accessibilityLabel ?? "unknown") view=\(ObjectIdentifier(self))")
         NSLog("%@", "[Nib QA reflow] menu will present view=\(ObjectIdentifier(self)) lifted=\(liftRecognized) sequence=\(touchSequence)")
         #endif
         dismissMenuForLift(interaction, phase: "menu will present")
@@ -472,8 +479,11 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibR
                                 willEndFor configuration: UIContextMenuConfiguration,
                                 animator: UIContextMenuInteractionAnimating?) {
         NSLog("%@", "[Nib QA reflow] native-menu willEnd view=\(ObjectIdentifier(self))")
+        NSLog("%@", "[Nib QA menu] will end item=\(accessibilityLabel ?? "unknown") view=\(ObjectIdentifier(self))")
+        if animator == nil { NibQAMenuDiagnostics.setPresented(false, owner: self) }
         if animator == nil { NSLog("%@", "[Nib QA reflow] menu dismissed lifted=\(liftRecognized) animated=false") }
         animator?.addCompletion { [weak self] in
+            if let self { NibQAMenuDiagnostics.setPresented(false, owner: self) }
             NSLog("%@", "[Nib QA reflow] native-menu ended view=\(String(describing: self.map { ObjectIdentifier($0) }))")
             NSLog("%@", "[Nib QA reflow] menu dismissed lifted=\(self?.liftRecognized ?? false)")
         }

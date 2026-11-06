@@ -807,6 +807,9 @@ public struct NibToolPalette<Settings: View>: View {
         let available = placement.availableSize(beside: anchor, gap: gap, in: bounds)
         let width = min(popoverWidth(bounds), available.width)
         return NibPopoverPanel(title: tool.label, width: width, maxHeight: available.height) { settings(tool.id) }
+            // The panel owns its scroller and content state per tool. Height changes
+            // (including crossing 520 pt) keep that identity; the outer bud stays put.
+            .id(tool.id)
             .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
                 // Native glass rounds fractional sizes during placement. Do not feed that
                 // subpixel noise back into the placement cache and start another layout pass.

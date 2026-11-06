@@ -666,6 +666,16 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
             gesture.view?.removeGestureRecognizer(gesture)
         }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            #if DEBUG
+            let menuPresented = NibQAMenuDiagnostics.isPresented(in: probe?.window)
+            var qaDecision = "rejected: disabled, detached, hidden or outside owning controller"
+            defer {
+                if menuPresented {
+                    let hit = touch.view.map { String(describing: type(of: $0)) } ?? "nil"
+                    NSLog("%@", "[Nib QA menu] reflow receive while menu presented recognizer=\(ObjectIdentifier(gestureRecognizer)) hit=\(hit) \(qaDecision)")
+                }
+            }
+            #endif
             guard target.isEnabled, let probe, probe.window != nil, !probe.isHidden else { return false }
             // Window-level recognisers must not receive touches in a sheet or an
             // occluded/removed library. Geometry alone overlaps those surfaces.
@@ -684,6 +694,7 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
             }
             let receives = probe.bounds.contains(touch.location(in: probe))
             #if DEBUG
+            qaDecision = receives ? "accepted: inside owning controller and probe bounds" : "rejected: outside probe bounds"
             if receives { NSLog("%@", "[Reflow diagnostic] touch in \(probe.bounds)") }
             #endif
             return receives
@@ -747,6 +758,21 @@ public enum NibReflowArbitration {
     public static func permitsContextMenu(liftRecognized: Bool) -> Bool { !liftRecognized }
 }
 
+#if DEBUG
+/// Window-scoped observation only; never participates in gesture arbitration.
+@MainActor
+public enum NibQAMenuDiagnostics {
+    private static let owners = NSHashTable<UIView>.weakObjects()
+    public static func setPresented(_ presented: Bool, owner: UIView) {
+        if presented { owners.add(owner) } else { owners.remove(owner) }
+    }
+    public static func isPresented(in window: UIWindow?) -> Bool {
+        guard let window else { return false }
+        return owners.allObjects.contains { $0.window === window }
+    }
+}
+#endif
+
 /// The touched card can retire its native menu synchronously, before rendering
 /// the carrier. A SwiftUI onChange runs too late if that first render stalls.
 @MainActor
@@ -783,6 +809,9 @@ final class LiftRecognizer: UIGestureRecognizer {
         let timeout = DispatchWorkItem { [weak self] in
             guard let self, self.state == .possible else { return }
             #if DEBUG
+            if NibQAMenuDiagnostics.isPresented(in: self.view as? UIWindow ?? self.view?.window) {
+                NSLog("%@", "[Nib QA menu] hold decision while menu presented recognizer=\(ObjectIdentifier(self)) delay=\(ReflowLiftIntent.menuDelay) owner=\(String(describing: self.touchOwner))")
+            }
             NSLog("%@", "[Nib QA reflow] hold decision recognizer=\(ObjectIdentifier(self)) eventElapsed=\(self.sampledAt - self.beganAt) wallElapsed=\(CACurrentMediaTime() - self.beganAt) distance=\(hypot(self.point.x - self.start.x, self.point.y - self.start.y)) sinceSample=\(CACurrentMediaTime() - self.sampledAt)")
             #endif
             guard ReflowLiftIntent.yieldsToMenu(distance: hypot(self.point.x - self.start.x, self.point.y - self.start.y),
