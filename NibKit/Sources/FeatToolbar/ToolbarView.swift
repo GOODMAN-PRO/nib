@@ -174,7 +174,7 @@ final class ToolbarModel: ObservableObject {
     private var lastRectPage: PageID?
     private var scrollTravel: Double = 0
     /// The canvas scroll view's offset and viewport, and the zoom, at the last publication (see `canvasDidScroll`).
-    private var lastCanvasSample: (offset: CGPoint, zoom: Double, size: CGSize)?
+    private var lastCanvasSample: (offset: CGPoint, zoom: Double, size: CGSize, user: Bool)?
     #if DEBUG
     private var scrollLogCount = 0
     #endif
@@ -432,11 +432,17 @@ final class ToolbarModel: ObservableObject {
         // page is inside the window its size changes although the user only scrolled, so a fast scroll past a page
         // edge never gave two comparable samples and the bar stayed (UI run 42163879315). Where the editor has a
         // scroll view, travel is read from its content offset, which has no such jumps: a zoom changes the zoom, a
-        // rotation changes the viewport, and a jump to another page changes the page; none of them counts.
-        // ponytail: sampled when the rect is published (every 100 ms while it changes), not per frame; a caret
-        // reveal that scrolls the canvas counts as a scroll. Observe the scroll view if either matters.
+        // rotation changes the viewport, and a jump to another page changes the page; none of them counts. Nor
+        // does an offset the app set itself (opening a document, restoring a position, revealing a caret): only
+        // while the user drags or the scroll decelerates. UI run 42198837481 showed the bar folded right after a
+        // document opened when every offset change counted.
+        // ponytail: sampled when the rect is published (every 100 ms while it changes), not per frame. Observe
+        // the scroll view if a short flick between two publications must count.
         let scroll = session.editor?.canvasHost?.canvasView as? UIScrollView
-        let sample = scroll.map { (offset: $0.contentOffset, zoom: session.zoom, size: $0.bounds.size) }
+        let sample = scroll.map {
+            (offset: $0.contentOffset, zoom: session.zoom, size: $0.bounds.size,
+             user: $0.isTracking || $0.isDragging || $0.isDecelerating)
+        }
         let samePage = lastRectPage == session.page
         let previousRect = lastRect, previousSample = lastCanvasSample
         defer {
@@ -447,7 +453,8 @@ final class ToolbarModel: ObservableObject {
         guard !optionsCollapsed else { return }
         var moved: Double?
         if let sample {
-            if samePage, let last = previousSample, abs(sample.zoom - last.zoom) < 0.0005, sample.size == last.size {
+            if sample.user, samePage, let last = previousSample, abs(sample.zoom - last.zoom) < 0.0005,
+               sample.size == last.size {
                 let points = abs(sample.offset.x - last.offset.x) + abs(sample.offset.y - last.offset.y)
                 moved = Double(points) / max(sample.zoom, 0.01)
             }
@@ -461,7 +468,8 @@ final class ToolbarModel: ObservableObject {
             scrollLogCount += 1
             let movedText = moved.map { String(format: "%.1f", $0) } ?? "dropped"
             let offsetText = sample.map { "\($0.offset)" } ?? "none"
-            NSLog("%@", "[Nib QA toolbar] scroll moved=\(movedText) travel=\(scrollTravel) samePage=\(samePage) offset=\(offsetText) zoom=\(session.zoom)")
+            let userText = sample.map { "\($0.user)" } ?? "none"
+            NSLog("%@", "[Nib QA toolbar] scroll moved=\(movedText) travel=\(scrollTravel) samePage=\(samePage) user=\(userText) offset=\(offsetText) zoom=\(session.zoom)")
         }
         #endif
         guard let moved else { return }
