@@ -155,11 +155,11 @@ final class ChromeUITests: XCTestCase {
         try openMenu("more")
         try selectMoreRow(action)
     }
-    private func selectMoreRow(_ action: String) throws {
+    private func selectMoreRow(_ action: String, edge: NibUI.FormEdge? = nil) throws {
         ui.noteActivity("Chrome More row " + action)
         let menu = ui.app.scrollViews["More"].firstMatch
         XCTAssertTrue(menu.waitForExistence(timeout: 8), "More must expose its own row container")
-        let row = try ui.requireControl(action, type: .button, scroll: true, timeout: 8, in: menu)
+        let row = try ui.requireControl(action, type: .button, scroll: true, timeout: 8, in: menu, edge: edge)
         ui.logQA("More scoped row", "action=\(action) row=\(row.frame) menu=\(menu.frame)")
         guard row.isEnabled else { throw NibUI.Failure.message("More row disabled: " + action) }
         row.tap()
@@ -313,23 +313,34 @@ final class ChromeUITests: XCTestCase {
         }
     }
 
+    // Historical test name retained as the portrait leg; siblings cover landscape and whiteboard.
     func testMoreActionsStayScopedAcrossNotebookAndWhiteboardAndRotation() throws {
+        try moreActionsInNotebook(orientation: .portrait)
+    }
+
+    func testMoreActionsStayScopedInLandscape() throws {
+        try moreActionsInNotebook(orientation: .landscapeLeft)
+    }
+
+    private func moreActionsInNotebook(orientation: UIDeviceOrientation) throws {
         try open()
-        for orientation in [UIDeviceOrientation.portrait, .landscapeLeft] {
-            XCUIDevice.shared.orientation = orientation
-            ui.logQA("Stall boundary", "Rotated More tap orientation=\(orientation.rawValue)")
-            do { try tap("menu.more") }
-            catch {
-                ui.recordDiagnostics("Rotated More failed", facts: ui.elementFacts(ui.app.buttons["menu.more"].firstMatch))
-                throw error
-            }
-            try selectMoreRow("Go to Page…")
-            try panel("pages.goToPage"); try ui.dismissSheets(requireClosedPopover: true)
-            try more("Hide Tools")
-            try wait("More Hide Tools must retract palette") { !self.query("tool.pen").firstMatch.exists }
-            try more("Show Tools"); _ = try reachable("tool.pen")
+        if XCUIDevice.shared.orientation != orientation { XCUIDevice.shared.orientation = orientation }
+        ui.logQA("Stall boundary", "Rotated More tap orientation=\(orientation.rawValue)")
+        do { try tap("menu.more") }
+        catch {
+            ui.recordDiagnostics("Rotated More failed", facts: ui.elementFacts(ui.app.buttons["menu.more"].firstMatch))
+            throw error
         }
-        try ui.tapCommand("window.showLibrary"); try open("Concept map")
+        try selectMoreRow("Go to Page…")
+        try panel("pages.goToPage"); try ui.dismissSheets(requireClosedPopover: true)
+        try more("Hide Tools")
+        try wait("More Hide Tools must retract palette") { !self.query("tool.pen").firstMatch.exists }
+        try openMenu("more")
+        try selectMoreRow("Show Tools", edge: .bottom); _ = try reachable("tool.pen")
+    }
+
+    func testMoreActionsStayScopedInWhiteboard() throws {
+        try open("Concept map")
         try tap("menu.more")
         XCTAssertFalse(query("Go to Page…").firstMatch.exists, "Page navigation must not leak into whiteboard overflow")
         outside()

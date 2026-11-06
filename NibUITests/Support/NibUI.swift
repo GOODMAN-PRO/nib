@@ -651,8 +651,9 @@ final class NibUI {
         // A missing Sheet node says nothing about Nib's plain-Other forms. Decide from
         // this list's own scroll position; unknown positions must never start by pulling down.
         let lazySearch = initialSnapshot == nil
-        let modal = presentedFormSnapshot()
-        let coverVisible = hasVisibleFrame(app.otherElements["PopoverDismissRegion"].firstMatch)
+        let presentation = presentedFormContext()
+        let modal = presentation.form
+        let coverVisible = presentation.coverVisible
         if let modal, let context = ancestry(firstSnapshot, in: modal) {
             ancestorClip = (ancestorClip ?? window).intersection(context.clip)
         }
@@ -3225,9 +3226,24 @@ final class NibUI {
     /// Exclude the underlying document/library and the cover itself before choosing the last
     /// presented subtree. Keep snapshots for ancestry; never use child ordinals as live indices.
     private func presentedFormSnapshot() -> XCUIElementSnapshot? {
+        presentedFormContext().form
+    }
+
+    private func presentedFormContext() -> (form: XCUIElementSnapshot?, coverVisible: Bool) {
         let region = app.otherElements["PopoverDismissRegion"].firstMatch
-        guard hasVisibleFrame(region), let root = try? measuredSnapshot(app, named: "app snapshot") else { return nil }
+        guard hasVisibleFrame(region) else { return (nil, false) }
+        // Keep the observed cover on a failed snapshot: loss of evidence must not permit a modal pull-down.
+        guard let root = try? measuredSnapshot(app, named: "app snapshot") else { return (nil, true) }
         let window = app.windows.firstMatch.frame
+        func containsVisibleCover(_ node: XCUIElementSnapshot) -> Bool {
+            if node.identifier == "PopoverDismissRegion" {
+                let visible = node.frame.intersection(window)
+                return !node.frame.isNull && !node.frame.isInfinite && !visible.isNull
+                    && visible.width > 1 && visible.height > 1
+            }
+            return node.children.contains { containsVisibleCover($0) }
+        }
+        let coverVisible = containsVisibleCover(root)
         func containsBackground(_ node: XCUIElementSnapshot) -> Bool {
             ["nib.canvas", "nib.qa.state", "nib.qa.clipboard", "PopoverDismissRegion",
              "inputView", "inputAssistantView", "SystemInputAssistantView"].contains(node.identifier)
@@ -3264,7 +3280,7 @@ final class NibUI {
             let reason = withClose != nil ? "foreground subtree with close control" : "foreground content without close control"
             logQA("Modal form chosen", "type=\(chosen.elementType) label=\(chosen.label) frame=\(chosen.frame) reason=\(reason); keyboard subtrees excluded")
         }
-        return chosen
+        return (chosen, coverVisible)
     }
 
     private func formCloseControl(_ form: XCUIElementSnapshot) -> XCUIElement? {

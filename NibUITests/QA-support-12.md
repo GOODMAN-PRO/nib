@@ -136,3 +136,17 @@ RulerUnitsDigitsAndPositionChoicesPersist now sends Cancel through confirmRulerA
 | Tests | Log prefix | Question answered |
 | --- | --- | --- |
 | RulerUnitsDigitsAndPositionChoicesPersist | Covered control preparation / Ruler alert confirm / Ruler alert shifted retry / Ruler alert after tap (existing, now Cancel) | Was the pad dismissed, did the alert shift, and did scoped Cancel close it before the content assertion? |
+
+### K3 - More assertions in three bounded tests
+
+Confirmed R13:chrome-still-failing#2 and holds=true: the portrait leg ran from t=16.07 to 151.68, Show Tools reveal alone logged 40.567 seconds, including redundant cover queries at t=87.13/92.75 followed by the 14.5-second gap. Landscape then exhausted 180 seconds; estimated whole flow was about 310 seconds. Current reveal still fetched a form snapshot then queried cover existence/frame again.
+
+Preserved the original test declaration as portrait, extracted the identical notebook checks into a helper, and added landscape and whiteboard tests. Both notebook legs retain Go to Page, panel/dismissal, Hide Tools/palette absence, Show Tools and reachable Pen; whiteboard retains no Go to Page, outside dismissal and real drawing/count/Undo readiness. Fresh fixtures replace only cross-leg setup. Show Tools supplies the known bottom hint through the existing scoped More row helper; menu closure and row enabled checks remain.
+
+presentedFormContext now returns the chosen form and visible cover from the same already-fetched application tree. revealFormElement consumes both instead of two more live cover queries. The existing presentedFormSnapshot wrapper preserves dismissal callers and form selection/keyboard pruning; failed snapshots conservatively retain the already-observed cover. All reveal/requireControl callers in every class retain default hints and modal protection. This removes the diagnosed redundant AX work; the cause of slow AX requests remains unknown.
+
+Should unblock all three More legs. Next CI must retain all assertions, finish each below about 150 seconds and show Show Tools Form reveal timing near/below 15 seconds. Estimated saving is about 20 seconds for the observed expensive cover-query pair, plus shorter hint-directed traversal; splitting itself redistributes work and adds fixture setup, not a suite-total speedup.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Three More tests / shared reveal callers | Form reveal path / Form reveal timing / More scoped row (existing) | Was the cached cover retained, was Show Tools bottom-directed, and how many moves/seconds did reveal cost? |
