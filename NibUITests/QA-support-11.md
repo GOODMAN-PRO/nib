@@ -160,3 +160,11 @@ Should locate the failure in FavouriteOpenAndUnstarUpdatesMembership instead of 
 | --- | --- | --- |
 | FavouriteOpenAndUnstarUpdatesMembership; Library card menus; shared nativeContextMenu callers | Native menu row tap / Native menu row tap not delivered | Which row identity and menu/row frames received the one tap, and did that menu end? |
 | FavouriteOpenAndUnstarUpdatesMembership | Library action first poll / Library action timeout | Were both Add and Remove Favourites rows available before delivery? |
+
+### I1 - retain contact at the swatch drop destination
+
+Confirmed R12:ink-colours#0 and correction against the raw test drag and PresetReorderButton's performDrop-only move: this run released seven milliseconds after destination activation and never performed the drop. Timing supports the dwell change but is not proof of the precise cancellation mechanism. RearrangeColoursDragPersistsOrderAndActiveColour now uses existing dragWithHold between slot centres (0.8 s lift, velocity 500, 1.5 s destination contact), as Insert/Pages do. All label-order, active-colour, reopen and drawing checks remain. Next run must show performDropWithItemCollection, dragEndedWithOperation:16 and the expected persisted order. A further cancellation needs app sessionDidUpdate/drop-point evidence, not another test retry.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| RearrangeColoursDragPersistsOrderAndActiveColour | System drag contact | Did the held system drag run before the unchanged order wait? |
