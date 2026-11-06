@@ -19,7 +19,9 @@ final class KeyProbeUITests: XCTestCase {
         case one = "1", two = "2", three = "3", app = "app.typeKey", field = "field.typeKey", hid = "hid"
         // Run 41986732631: route 2 does not exist in this XCTest and route 3 delivers nothing, not even "a".
         static let canvas: [Route] = [.one, .app, .hid]
-        static let text: [Route] = [.hid, .one, .app, .field]
+        // Public app/field typeKey share unbounded caret-idle waits in focused input.
+        // Their non-text comparison remains in canvas; text uses the two non-idle routes.
+        static let text: [Route] = [.hid, .one]
     }
 
     private enum ProbeError: Error {
@@ -109,12 +111,14 @@ final class KeyProbeUITests: XCTestCase {
         let textKeys: [(String, String, UInt)] = [("Delete", XCUIKeyboardKey.delete.rawValue, 0x2A),
                                                   ("Return", "\n", 0x28),
                                                   ("Escape", XCUIKeyboardKey.escape.rawValue, 0x29)]
+        var activeField: XCUIElement?
         textMatrix: for (name, key, usage) in textKeys {
             for route in Route.text {
                 guard hasBudget(until: matrixDeadline, context: "text", reserve: 20) else { break textMatrix }
                 let field: XCUIElement
                 do {
-                    field = try openPageField()
+                    if let current = activeField { field = current }
+                    else { field = try openPageField(); activeField = field }
                 } catch {
                     log("skipped", "context=text key=\(name) route=\(route.rawValue) reason=\(quoted(String(describing: error)))")
                     continue
@@ -124,9 +128,14 @@ final class KeyProbeUITests: XCTestCase {
                 // An undelivered key leaves the input prepared for the next route. Avoid repeating
                 // public XCUI idle waits in that expected case; reset only when the value differs.
                 if fieldValue(field) != input {
-                    field.typeKey("a", modifierFlags: .command)
-                    guard hasBudget(until: matrixDeadline, context: "text.typeText", reserve: 10) else { break textMatrix }
-                    field.typeText(input)
+                    if let error = send("a", route: .one, modifiers: .command) {
+                        throw ProbeError.prerequisite("Select All SPI failed: " + error)
+                    }
+                    for digit in input {
+                        if let error = send(String(digit), route: .one) {
+                            throw ProbeError.prerequisite("Text preparation SPI failed: " + error)
+                        }
+                    }
                 }
                 let prepared = waitUntil({ self.fieldValue(field) == input }, timeout: 1)
                 guard hasBudget(until: matrixDeadline, context: "text.send", reserve: 5) else { break textMatrix }
@@ -142,6 +151,7 @@ final class KeyProbeUITests: XCTestCase {
                 }, timeout: 1)
                 let after = try state()
                 let closed = !after.openPanels.contains(panelID)
+                if closed { activeField = nil }
                 let afterValue = closed ? "<panel closed>" : fieldValue(field)
                 log("result", ["context=text key=\(name) scalars=\(scalars(key)) route=\(route.rawValue) ",
                     "error=\(quoted(error ?? "nil")) delivered=\(after.keyLogTotal > before.keyLogTotal) ",
@@ -155,7 +165,7 @@ final class KeyProbeUITests: XCTestCase {
 
     private func state() throws -> State {
         let probe = ui.app.otherElements["nib.qa.state"].firstMatch
-        guard let value = probe.value as? String else {
+        guard let value = ui.measuredQuery("KeyProbe state value", { probe.value as? String }) else {
             throw ProbeError.prerequisite("nib.qa.state has no JSON value")
         }
         return try JSONDecoder().decode(State.self, from: Data(value.utf8))
@@ -246,8 +256,8 @@ final class KeyProbeUITests: XCTestCase {
     }
 
     private func fieldValue(_ field: XCUIElement) -> String {
-        guard field.exists else { return "<missing>" }
-        return field.value as? String ?? "<no value>"
+        guard let snapshot = try? ui.measuredSnapshot(field, named: "KeyProbe page field value") else { return "<missing>" }
+        return snapshot.value as? String ?? "<no value>"
     }
 
     private func delta(_ before: State, _ after: State) -> String {

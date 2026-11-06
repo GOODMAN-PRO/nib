@@ -33,3 +33,16 @@ Confirmed R12:chrome-singles#1 against presentedFormSnapshot: containsBackground
 | --- | --- | --- |
 | Strict dismissal / rotated More | Modal form chosen | Which subtree was selected, and was it preferred for its close control after keyboard exclusion? |
 
+### H4 - focused input and slow AX diagnostics
+
+Confirmed R12:canvas#1: go() ran three identical focus passes, each scanning Alert/Sheet/Popover. It now binds the typed Page field, checks focus once with explicit app scope, waits again only after an actual focus tap, and prepares digits using the existing runner SPI. Exact field value, panel closure, requested-page HUD and paper assertions remain.
+
+Confirmed R12:capture-and-probe#2 correction: public input paid two 60 s idle waits, while app-side window children fetching separately blocked about 33 s. KeyProbe reuses its field until the panel closes, prepares with SPI Select All/digits, and samples HID/SPI routes in the text matrix. The public app/field routes that wait for idle are no longer invoked on focused input; non-text public comparison and the control-delivery assertion remain. No assertion is skipped and no allowance grows.
+
+Added measuredSnapshot and measuredQuery around shared list/form snapshots, findControl's existence query, focus lookup, probe reads and the Canvas/KeyProbe field reads. Over 10 s logs the request and duration, returned tree count and exposed keyboard-focus attributes. Scalar queries log immediately before taking one diagnostic app snapshot, explicitly labelled diagnosticTree=true; missing/failed trees say unavailable. This does not time out or fix XCTest's internal blocking call. R12:chrome-customise#1 and canvas#3 remain unexplained; no speculative app/host fix. Next run must correlate slow query lines with app AX logs/thread samples, and show no public focused-input idle waits. Expected go() saving about 16 s/call (about 128 s over RotateAllPages' eight calls), unmeasured and dependent on AX latency.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| KeyProbe text matrix; Canvas go(); Chrome Customise and shared queries | slow query | Which AX request exceeded 10 s, how many elements returned, and which keyboard-focus attributes were exposed? |
+| Canvas go() callers | Go to Page focus | Was autofocus reused once and was input sent through SPI? |
+

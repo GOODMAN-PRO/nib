@@ -151,20 +151,28 @@ final class CanvasUITests: XCTestCase {
         let count = try ui.state().pageCount
         if shortcut { try key("g", [.command, .option]) { try self.ui.waitForState { $0.openPanels.contains("pages.goToPage") } } }
         else { try more("Go to Page…") }
-        let field = try require("Page number or title")
-        let autofocus = ui.isKeyboardFocused(field, allowingAttributeFallback: true)
-        if !autofocus { field.tap() }
-        ui.logQA("Go to Page focus", "page=\(number) autofocus=\(autofocus) afterTap=\(ui.isKeyboardFocused(field, allowingAttributeFallback: true))")
-        func focused() -> Bool { ui.isKeyboardFocused(field, allowingAttributeFallback: true) }
-        if !focused() {
-            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in focused() }, object: nil)
-            if XCTWaiter.wait(for: [ready], timeout: 3) != .completed {
-                field.tap()
-                ui.logQA("Go to Page focus retap", "page=\(number) focused=\(focused())")
+        let field = ui.app.textFields.matching(NSPredicate(
+            format: "identifier == %@ OR label == %@ OR placeholderValue == %@",
+            "Page number or title", "Page", "Page number or title")).firstMatch
+        guard ui.measuredQuery("Go to Page typed field", { field.waitForExistence(timeout: 8) }) else {
+            throw NibUI.Failure.message("Go to Page native field missing")
+        }
+        let autofocus = ui.isKeyboardFocused(field, allowingAttributeFallback: true, in: ui.app)
+        if !autofocus {
+            field.tap()
+            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                self.ui.isKeyboardFocused(field, allowingAttributeFallback: true, in: self.ui.app)
+            }, object: nil)
+            guard XCTWaiter.wait(for: [ready], timeout: 3) == .completed else {
+                throw NibUI.Failure.message("Go to Page field did not focus")
             }
         }
-        // Preserve app autofocus; do not tap it away or type the requested value twice.
-        if field.value as? String != String(number) { field.typeText(String(number)) }
+        ui.logQA("Go to Page focus", "page=\(number) autofocus=\(autofocus) verifiedOnce=true route=SPI")
+        if ui.measuredQuery("Go to Page value", { field.value as? String }) != String(number) {
+            try ui.focusedKey("a", .command)
+            for digit in String(number) { try ui.focusedKey(String(digit)) }
+        }
+        try ui.waitForNativeText(in: field, equals: String(number))
         try tap("Go")
         _ = try ui.waitForState { !$0.openPanels.contains("pages.goToPage") }
         eventually("Go must activate page \(number)") {
