@@ -269,8 +269,17 @@ final class InkUITests: XCTestCase {
 
     private var colourPicker: XCUIElement { ui.app.otherElements["UIColorPicker"].firstMatch }
 
+    private func waitForPicker(_ description: String, timeout: TimeInterval = 8,
+                               _ condition: () -> Bool) throws {
+        let started = ProcessInfo.processInfo.systemUptime
+        let ready = ui.pollUntil(timeout: timeout, condition)
+        let seconds = ProcessInfo.processInfo.systemUptime - started
+        ui.logQA("Colour picker wait", "step=\(description) ready=\(ready) seconds=\(seconds) budget=\(timeout)")
+        guard ready else { throw NibUI.Failure.message(description) }
+    }
+
     private func waitForColourSliders() throws {
-        try wait("Remote colour picker and Sliders must be ready") {
+        try waitForPicker("Remote colour picker and Sliders must be ready") {
             let picker = self.colourPicker
             let sliders = picker.buttons["Sliders"].firstMatch
             return picker.exists && sliders.exists && sliders.isHittable
@@ -281,38 +290,8 @@ final class InkUITests: XCTestCase {
         let picker = colourPicker
         guard picker.exists else { throw NibUI.Failure.message("Native colour picker is not presented") }
         let popover = ui.app.popovers.containing(.other, identifier: "UIColorPicker").firstMatch
-        let sheet = ui.app.sheets.containing(.other, identifier: "UIColorPicker").firstMatch
-        let isPopover = popover.exists
-        let surface = isPopover ? popover : (sheet.exists ? sheet : picker)
-        if let snapshot = try? surface.snapshot() {
-            func controls(_ node: XCUIElementSnapshot) -> [String] {
-                let own = "type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) frame=\(node.frame)"
-                return [own] + node.children.flatMap { controls($0) }
-            }
-            ui.logQA("Colour picker controls", controls(snapshot).joined(separator: "\n"))
-        }
-        // Remote picker snapshots can omit a close button that the app-level tree exposes.
-        // Match its frame to this picker surface so background chrome cannot win.
-        let closes = ui.app.buttons.matching(NSPredicate(format: "label ==[c] 'close'"))
-        let dones = ui.app.buttons.matching(NSPredicate(format: "label ==[c] 'done'"))
-        var dismissal: XCUIElement?
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            let panel = surface.frame
-            for query in [closes, dones] {
-                if let button = query.allElementsBoundByIndex.prefix(16).first(where: {
-                    panel.contains($0.frame) && $0.isEnabled && $0.isHittable
-                }) { dismissal = button; return true }
-            }
-            return false
-        }, object: nil)
-        let foundControl = XCTWaiter.wait(for: [ready], timeout: isPopover ? 2 : 8) == .completed
-        guard foundControl || isPopover else {
-            throw NibUI.Failure.message("Native colour picker must expose close, Done or a popover dismissal surface")
-        }
-        if let dismissal {
-            ui.logQA("Colour picker dismissal", ui.elementFacts(dismissal))
-            dismissal.tap()
-        } else {
+        if popover.exists {
+            // The popover's AX-only close button is not a usable control. Do not query it.
             let window = ui.app.windows.firstMatch.frame
             let panel = popover.frame
             let region = ui.app.otherElements["PopoverDismissRegion"].firstMatch
@@ -342,13 +321,41 @@ final class InkUITests: XCTestCase {
             ui.logQA("Colour picker dismissal", "outside=\(point) popover=\(panel) dismissRegion=\(regionFrame)")
             ui.app.coordinate(withNormalizedOffset: .zero).withOffset(
                 CGVector(dx: point.x - ui.app.frame.minX, dy: point.y - ui.app.frame.minY)).tap()
+        } else {
+            // Callers have already asserted their typed HEX value. End editing before
+            // resolving the close control: the keyboard clips it at the card's top edge.
+            try ui.dismissNativeKeyboard()
+            let closes = picker.buttons.matching(NSPredicate(format: "label ==[c] 'close' OR label ==[c] 'done'"))
+            var contact: CGPoint?
+            try waitForPicker("Native colour picker must expose a hittable close control") {
+                let panel = picker.frame
+                let window = self.ui.app.windows.firstMatch.frame
+                guard !window.isNull, !window.isInfinite, window.width > 2, window.height > 2 else { return false }
+                for button in closes.allElementsBoundByIndex.prefix(16) {
+                    let frame = button.frame
+                    let enabled = button.isEnabled
+                    let hittable = button.isHittable
+                    let geometry = "picker=\(panel) button=\(frame) window=\(window)"
+                    self.ui.logQA("Colour picker close geometry", geometry + " enabled=\(enabled) hittable=\(hittable)")
+                    guard enabled, hittable, !frame.isNull, !frame.isInfinite, !frame.isEmpty else { continue }
+                    contact = CGPoint(x: min(max(frame.midX, window.minX + 1), window.maxX - 1),
+                                      y: min(max(frame.midY, window.minY + 1), window.maxY - 1))
+                    return true
+                }
+                return false
+            }
+            guard let contact else { throw NibUI.Failure.message("Native colour picker close point missing") }
+            ui.logQA("Colour picker dismissal", "route=descendant close centre point=\(contact)")
+            let origin = ui.app.frame.origin
+            ui.app.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(dx: contact.x - origin.x, dy: contact.y - origin.y)).tap()
         }
-        try wait("Native colour picker must dismiss") { !picker.exists }
+        try waitForPicker("Native colour picker must dismiss") { !picker.exists }
     }
 
     private func hexField() throws -> XCUIElement {
         let picker = colourPicker
-        guard picker.waitForExistence(timeout: 3) else { throw NibUI.Failure.message("Native colour picker missing") }
+        try waitForPicker("Native colour picker missing", timeout: 3) { picker.exists }
         let labelled = picker.textFields.matching(NSPredicate(
             format: "label CONTAINS[c] 'hex' OR identifier CONTAINS[c] 'hex' OR placeholderValue CONTAINS[c] 'hex'")).firstMatch
         if ui.hasVisibleFrame(labelled) && labelled.isHittable { return labelled }
@@ -688,17 +695,58 @@ final class InkUITests: XCTestCase {
         }
     }
 
-    func testHighlighterThicknessStabilisationAndDrawHoldPersist() throws {
+    private func highlighterSettingsStep<T>(_ part: String, _ body: () throws -> T) rethrows -> T {
+        let started = ProcessInfo.processInfo.systemUptime
+        ui.logQA("Highlighter settings timing", "test=\(name) part=\(part) begin uptime=\(started)")
+        defer {
+            let seconds = ProcessInfo.processInfo.systemUptime - started
+            ui.logQA("Highlighter settings timing", "test=\(name) part=\(part) end seconds=\(seconds)")
+        }
+        return try body()
+    }
+
+    /// Both split tests exercise the same real width, smoothing and toggle changes.
+    private func configureHighlighterThicknessAndStabilisation() throws -> String {
         try ui.selectTool("highlighter")
         try width(3)
         try settings("highlighter")
         _ = try slider("Thickness", to: 0.7)
         let smoothing = try slider("Stabilisation", to: 0.8)
         try toggle("Draw and hold", to: false); closePopover()
-        try settings("highlighter")
-        XCTAssertEqual(String(describing: try control("Stabilisation", type: .slider, scroll: true).value), smoothing)
-        XCTAssertEqual(try control("Draw and hold", type: .switch, scroll: true).value as? String, "0")
-        closePopover(); try draw()
+        return smoothing
+    }
+
+    func testHighlighterThicknessStabilisationAndDrawHoldPersist() throws {
+        let smoothing = try highlighterSettingsStep("configure") {
+            try configureHighlighterThicknessAndStabilisation()
+        }
+        try highlighterSettingsStep("reopen without reveal") {
+            try settings("highlighter", alreadySelected: true, revealTop: false)
+        }
+        highlighterSettingsStep("read persisted values") {
+            // The popover restores its offset. Query its labelled controls directly:
+            // no Lemon homing, scrolling reveal, frame or hittability re-resolution.
+            // An empty retained Highlighter shell has no matching slider/switch.
+            let panels = ui.app.scrollViews.matching(NSPredicate(format: "label == %@", "Highlighter"))
+            let actualSmoothing = panels.sliders.matching(NSPredicate(format: "label == %@", "Stabilisation")).firstMatch.value
+            let drawAndHold = panels.switches.matching(NSPredicate(format: "label == %@", "Draw and hold")).firstMatch.value
+            XCTAssertEqual(String(describing: actualSmoothing), smoothing)
+            XCTAssertEqual(drawAndHold as? String, "0")
+        }
+        closePopover()
+    }
+
+    func testHighlighterDrawsAfterThicknessStabilisationAndDrawHoldChanges() throws {
+        _ = try highlighterSettingsStep("configure") {
+            try configureHighlighterThicknessAndStabilisation()
+        }
+        try highlighterSettingsStep("reopen without reveal") {
+            try settings("highlighter", alreadySelected: true, revealTop: false)
+        }
+        closePopover()
+        // Preserve the old tail's exact +1 stroke, +1 item and undoAvailable oracle,
+        // after the same settings changes and close/reopen cycle on a fresh fixture.
+        try highlighterSettingsStep("draw and verify") { try draw() }
     }
 
     func testHighlighterDrawHoldToggleChangesSubsequentHeldStroke() throws {
@@ -758,7 +806,7 @@ final class InkUITests: XCTestCase {
     /// Waits for the native spectrum surface's observed label so colour taps reach the picker.
     private func colourSpectrum() throws -> XCUIElement {
         let spectrum = ui.app.otherElements.matching(NSPredicate(format: "label ==[c] 'Color Spectrum'")).firstMatch
-        try wait("Native Color Spectrum must be visible") { spectrum.exists && spectrum.isHittable }
+        try waitForPicker("Native Color Spectrum must be visible") { spectrum.exists && spectrum.isHittable }
         return spectrum
     }
 
@@ -857,9 +905,9 @@ final class InkUITests: XCTestCase {
         let hex = try hexField()
         let selection = try ui.state().selectionCount
         hex.tap()
-        try wait("HEX field must be editable with its keyboard before Select All") { hex.isHittable && self.ui.app.keyboards.firstMatch.exists }
+        try waitForPicker("HEX field must be editable with its keyboard before Select All") { hex.isHittable && self.ui.app.keyboards.firstMatch.exists }
         try ui.clearNativeText(in: hex); try ui.typeNativeText("D03080", in: hex)
-        try wait("HEX field must contain D03080 before closing") {
+        try waitForPicker("HEX field must contain D03080 before closing") {
             (hex.value as? String)?.replacingOccurrences(of: "#", with: "").uppercased() == "D03080"
         }
         XCTAssertEqual(try ui.state().selectionCount, selection, "HEX Select All must not select document contents")
@@ -876,7 +924,7 @@ final class InkUITests: XCTestCase {
         }
         let invalid = try hexField()
         invalid.tap()
-        try wait("Invalid HEX attempt must retain field focus") { invalid.isHittable && self.ui.app.keyboards.firstMatch.exists }
+        try waitForPicker("Invalid HEX attempt must retain field focus") { invalid.isHittable && self.ui.app.keyboards.firstMatch.exists }
         try ui.clearNativeText(in: invalid); try ui.typeNativeText("ZZZZZZ", in: invalid)
         XCTAssertNotNil(invalid.value as? String, "Native HEX editor must still expose its value")
         XCTAssertEqual(try ui.state().selectionCount, selection, "Invalid HEX edit must not select document contents")

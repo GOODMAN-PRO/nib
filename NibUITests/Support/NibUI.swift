@@ -290,6 +290,18 @@ final class NibUI {
                       height: max(0, min(viewport.maxY, scroller.frame.maxY - 16) - viewport.minY))
     }
 
+    /// Synchronous AX observations must finish before checking the deadline. An XCTest
+    /// predicate waiter can interrupt a remote service query and record a test failure.
+    /// This main-actor loop starts no further observation after the deadline; an in-flight
+    /// XCTest query retains its own timeout. No sleep or nested waiter is involved.
+    func pollUntil(timeout: TimeInterval, _ condition: () -> Bool) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        repeat {
+            if condition() { return true }
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        return false
+    }
+
     /// `fullyVisible` (with `scroll`) also requires the control's whole height inside its scroller's viewport, minus
     /// the cue lane, and reveals it otherwise: XCTest calls a row hittable when only a sliver shows, and a tap on
     /// the sliver does nothing (Fit Height to Text, run 42136488712). It is opt-in because the check costs two
@@ -302,11 +314,11 @@ final class NibUI {
             if !scroll || !fullyVisible { return found }
             var fits = controlFitsScroller(found, in: scope)
             if fits == nil {
-                let resolved = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                let resolved = pollUntil(timeout: timeout) {
                     fits = controlFitsScroller(found, in: scope)
                     return fits != nil
-                }, object: nil)
-                guard XCTWaiter.wait(for: [resolved], timeout: timeout) == .completed, fits != nil else {
+                }
+                guard resolved, fits != nil else {
                     throw Failure.message("Control containment unresolved: \(name); no reveal attempted")
                 }
             }
@@ -323,7 +335,7 @@ final class NibUI {
         }
         var found: XCUIElement?
         var unresolvedGeometry = false
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+        let ready = pollUntil(timeout: timeout) {
             found = findControl(name, type: type, in: scope)
             if let found {
                 if !scroll || !fullyVisible { return true }
@@ -332,8 +344,8 @@ final class NibUI {
                 return fits == true
             }
             return false
-        }, object: nil)
-        guard XCTWaiter.wait(for: [ready], timeout: timeout) == .completed, let found else {
+        }
+        guard ready, let found else {
             if unresolvedGeometry {
                 throw Failure.message("Control containment unresolved: \(name); see Control containment unresolved log")
             }
@@ -2257,9 +2269,8 @@ final class NibUI {
         inspect("after Hide")
         // In the custom-size decimal editor the first outside tap dismisses only the floating pad.
         // A second contact is justified only by a still-present keyboard, never by a fixed delay.
-        let firstDismissal = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
         if hasInertHeader, source.keyboards.firstMatch.exists,
-           XCTWaiter.wait(for: [firstDismissal], timeout: 2) != .completed,
+           !pollUntil(timeout: 2, { !source.keyboards.firstMatch.exists }),
            source.keyboards.firstMatch.exists {
             guard let dockedHide = source.keyboards.buttons.matching(NSPredicate(
                 format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).allElementsBoundByIndex.prefix(8).first(where: {
@@ -2274,8 +2285,7 @@ final class NibUI {
                 CGVector(dx: frame.midX - source.frame.minX, dy: frame.midY - source.frame.minY)).tap()
             inspect("after docked Hide")
         }
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
-        guard !source.keyboards.firstMatch.exists || XCTWaiter.wait(for: [gone], timeout: 5) == .completed else {
+        guard pollUntil(timeout: 5, { !source.keyboards.firstMatch.exists }) else {
             throw Failure.message("Keyboard did not dismiss after \(route)")
         }
     }
@@ -2458,10 +2468,10 @@ final class NibUI {
         field.tap()
         // Cheap evidence establishes text focus, not the identity of the editor. Exact text
         // postconditions remain with callers; remote editors retain the field-specific fallback.
-        let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+        let focused = pollUntil(timeout: 5) {
             app.keyboards.firstMatch.exists && (try? readState())?.keyResponderIsText == true
-        }, object: nil)
-        guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed
+        }
+        guard focused
                 || isKeyboardFocused(field, allowingAttributeFallback: true, in: scope) else {
             throw Failure.message("Native field did not gain keyboard focus: \(field.debugDescription)")
         }
@@ -2518,7 +2528,7 @@ final class NibUI {
         var previous: CGRect?
         var sampled = false
         var stableSince = ProcessInfo.processInfo.systemUptime
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+        let ready = pollUntil(timeout: 5) {
             observe?()
             let keyboard = app.keyboards.firstMatch
             let frame: CGRect? = keyboard.exists ? keyboard.frame : nil
@@ -2529,8 +2539,8 @@ final class NibUI {
                 return false
             }
             return focused && now - stableSince >= 0.3
-        }, object: nil)
-        guard XCTWaiter.wait(for: [ready], timeout: 5) == .completed else {
+        }
+        guard ready else {
             throw Failure.message("Native Delete recovery: field did not regain verified focus with a stable keyboard frame")
         }
     }
@@ -2648,11 +2658,11 @@ final class NibUI {
                 logQA("Native replacement selection", "route=focusedKey Select All; no Delete")
                 try focusedKey("a", .command)
                 observeKeyboard()
-                let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                let focused = pollUntil(timeout: 3) {
                     observeKeyboard()
                     return isKeyboardFocused(field, allowingAttributeFallback: true, in: scope)
-                }, object: nil)
-                guard XCTWaiter.wait(for: [focused], timeout: 3) == .completed else {
+                }
+                guard focused else {
                     throw Failure.message("Native replacement lost field focus after Select All")
                 }
             }
@@ -2671,8 +2681,7 @@ final class NibUI {
             return value == text || (text.isEmpty && value == field.placeholderValue)
         }
         if matches() { return }
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in matches() }, object: nil)
-        guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
+        guard pollUntil(timeout: 8, matches) else {
             throw Failure.message("Native replacement mismatch: expected \(text.debugDescription), got \(String(describing: field.value))")
         }
     }
