@@ -234,6 +234,9 @@ struct ExportDialog: View {
     let dismiss: () -> Void
     @State var draft: ExportDraft
     var scrollsOptions = false
+    var onContentHeightChange: ((CGFloat) -> Void)? = nil
+    @State private var optionsHeight: CGFloat = 0
+    @State private var actionsHeight: CGFloat = 0
     @State private var working = false
     @State private var error: String?
     @Environment(\.dynamicTypeSize) private var typeSize
@@ -247,19 +250,34 @@ struct ExportDialog: View {
                             NibScrollView {
                                 VStack(alignment: .leading, spacing: NibSpacing.l) { options; secondaryActions }
                                     .padding(.bottom, NibSpacing.l)
+                                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                                        if abs(optionsHeight - $0) > 0.5 { optionsHeight = $0 }
+                                    }
                             }
                             .scrollBounceBehavior(.basedOnSize)
                             primaryActions
+                                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                                    if abs(actionsHeight - $0) > 0.5 { actionsHeight = $0 }
+                                }
                         }
                     } else {
                         // Short windows and large text keep all actions reachable in one scroller.
-                        NibScrollView { form.padding(.bottom, NibSpacing.l) }
+                        NibScrollView {
+                            form.padding(.bottom, NibSpacing.l)
+                                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                                    onContentHeightChange?($0)
+                                }
+                        }
                             .scrollBounceBehavior(.basedOnSize)
                     }
                 }
             } else {
                 form
             }
+        }
+        .onChange(of: optionsHeight + actionsHeight) { _, _ in
+            guard optionsHeight > 0, actionsHeight > 0 else { return }
+            onContentHeightChange?(optionsHeight + NibSpacing.l + actionsHeight)
         }
         .foregroundStyle(NibColor.label)
         .tint(NibColor.accent)
@@ -545,6 +563,11 @@ struct ExportPopover: View {
     let instant: Bool
     @State private var presented = true
     @State private var currentSourceRect: CGRect?
+    // The options and the pinned actions report their height and the popover asks for that much; the placement
+    // caps the request to the room beside the source. It opens at the ordinary cap and takes the measured height
+    // in its first layout, the way a scrolling panel takes its content height.
+    // ponytail: no hidden first pass; add one only if the first frame is seen to jump on a device.
+    @State private var heightCap: CGFloat = NibMetrics.popoverMaxHeight
     var body: some View {
         ZStack {
             // Capture outside touches before they reach the canvas.
@@ -557,7 +580,7 @@ struct ExportPopover: View {
                 NibBudPopover(id: "exportui.popover", source: source, isPresented: $presented, title: title,
                               sourceRect: currentSourceRect ?? sourceRect,
                               fallbackSourceRect: Self.fallbackAnchor(in: bounds), instant: instant,
-                              onClose: close, scrollsContent: false) { contents }
+                              onClose: close, scrollsContent: false, heightCap: heightCap) { contents }
                     .onGeometryChange(for: CGRect.self) { _ in bounds } action: { _ in
                         currentSourceRect = updateSourceRect()
                     }
@@ -577,7 +600,11 @@ struct ExportPopover: View {
     private var title: String { printing ? String(localized: "Print") : String(localized: "Share & Export") }
     @ViewBuilder private var contents: some View {
         ExportDialog(selection: selection, printing: printing, app: app, session: session, dismiss: close,
-                     draft: draft, scrollsOptions: true)
+                     draft: draft, scrollsOptions: true, onContentHeightChange: { height in
+                         // The panel reserves a close-button header, its gap and two content insets.
+                         let requested = ceil(height + NibMetrics.hitTarget + NibSpacing.m + 2 * NibSpacing.l)
+                         if abs(heightCap - requested) > 0.5 { heightCap = requested }
+                     })
     }
     private func close() { host.dismiss("exportui.dialog"); host.removeAnchor("exportui.source") }
 }

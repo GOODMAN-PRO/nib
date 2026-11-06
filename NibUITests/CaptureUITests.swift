@@ -71,9 +71,12 @@ final class CaptureUITests: XCTestCase {
 
     private func wait(_ message: String, timeout: TimeInterval = 12,
                       _ predicate: @escaping () -> Bool) throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
         if predicate() { return }
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0 else { throw NibUI.Failure.message(message) }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
-        guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
+        guard XCTWaiter.wait(for: [expectation], timeout: remaining) == .completed else {
             throw NibUI.Failure.message(message)
         }
     }
@@ -116,11 +119,65 @@ final class CaptureUITests: XCTestCase {
     }
 
     private func capture(_ number: Int, _ screen: String, state: @escaping (QAState) -> Bool) throws {
-        _ = try ui.waitForState(timeout: 15, state)
+        let deadline = ProcessInfo.processInfo.systemUptime + 15
+        let current = try ui.waitForState(timeout: 15, state)
+        // Canvas documents have pages; text documents and study sets do not. The deliberate
+        // failedRender fixture captures the error UI, whose tiles cannot become settled.
+        if current.screen == "document", current.pageCount > 0, current.fixtureScenario != "failedRender" {
+            try captureFact("canvasSettled", deadline: deadline, reason: "canvas did not settle") {
+                ($0 as? Bool) == true
+            }
+        }
+        if screen == "page-sidebar" {
+            try captureFact("thumbnails", deadline: deadline, reason: "Pages thumbnails did not load") {
+                guard let counts = $0 as? [String: Any], let visible = counts["visible"] as? Int,
+                      let loaded = counts["loaded"] as? Int else { return false }
+                return visible > 0 && loaded == visible
+            }
+        }
+        let asynchronousSurfaces = ["library-grid", "library-list", "open-folder", "library-search",
+                                    "new-notebook", "plugin-manager", "study-session", "export-sheet"]
+        if asynchronousSurfaces.contains(screen) {
+            try settledPixels("\(screen) content did not settle",
+                              timeout: deadline - ProcessInfo.processInfo.systemUptime) {
+                self.captureContentRegion(screen)
+            }
+        }
         let stem = String(format: "%02d", number) + "-\(screen)-\(appearance)-\(orientation)"
         // XCTest waits for UI idleness before taking the full device screenshot.
         attach(XCTAttachment(screenshot: XCUIScreen.main.screenshot()), name: stem)
         attach(XCTAttachment(string: try XCTUnwrap(ui.probe.value as? String)), name: stem + "-qa-state")
+    }
+
+    /// Keep the state and rendering waits inside the capture's original budget. Missing facts
+    /// are unavailable observations, never success; preserve their exact error in ui.log.
+    private func captureFact(_ name: String, deadline: TimeInterval, reason: String,
+                             matches: @escaping (Any) -> Bool) throws {
+        let started = ProcessInfo.processInfo.systemUptime
+        var last = "QA fact is missing: " + name
+        func ready() -> Bool {
+            do {
+                let fact = try ui.qaFact(name)
+                last = String(describing: fact)
+                return matches(fact)
+            } catch { last = String(describing: error); return false }
+        }
+        do {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else {
+                _ = ready()
+                throw NibUI.Failure.message(reason)
+            }
+            try wait(reason, timeout: remaining, ready)
+            guard ProcessInfo.processInfo.systemUptime <= deadline else {
+                throw NibUI.Failure.message(reason)
+            }
+        } catch {
+            ui.logQA("Capture fact timeout", "fact=\(name) last=\(last) reason=\(reason)")
+            throw NibUI.Failure.message("\(reason); qa.\(name) last=\(last)")
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        ui.logQA("Capture fact ready", "fact=\(name) last=\(last) seconds=\(elapsed)")
     }
 
     private func libraryCapture(_ number: Int, _ screen: String) throws {
@@ -147,13 +204,14 @@ final class CaptureUITests: XCTestCase {
 
     /// Accessibility state can precede the canvas bitmaps and palette foreground. See QA-ui-app15-strip.md
     /// for the rendering paths and the unresolved diagnosis. A timeout fails the test and preserves the capture.
-    private func settledNotebookWithAssistant() {
+    private func settledNotebookWithAssistant() throws {
         var readiness = CaptureReadiness()
         var lastScreenshot: XCUIScreenshot?
         var lastSnapshot: XCUIElementSnapshot?
         var lastFacts = "No app snapshot obtained"
         var lastDiagnosis = "elements.missing; no observation"
         var pass = 0
+        var confirmed = false
         func find(_ root: XCUIElementSnapshot?, matching predicate: (XCUIElementSnapshot) -> Bool) -> XCUIElementSnapshot? {
             guard let root else { return nil }
             if predicate(root) { return root }
@@ -203,7 +261,7 @@ final class CaptureUITests: XCTestCase {
                 }.joined(separator: "; ")
                 let presence = "snapshot=\(root != nil) canvasExists=\(canvas != nil) windowExists=\(window != nil)"
                 ui.logQA("Assistant readiness pass", "pass=\(pass) \(presence) \(imageFacts); \(cropFacts); \(lastDiagnosis)")
-                if verdict.isReady { return }
+                if verdict.isReady { confirmed = true; return }
             }
             throw NibUI.Failure.message(lastDiagnosis)
         }, diagnose: { error in
@@ -221,6 +279,9 @@ final class CaptureUITests: XCTestCase {
             ui.logStateStep(stem) // Raw nib.qa.state value; text attachments are not exported by CI.
             attach(XCTAttachment(string: "Rendering readiness unconfirmed: \(error)"), name: stem + "-reason")
         })
+        guard confirmed else {
+            throw NibUI.Failure.message("Assistant rendering readiness failed: " + lastDiagnosis)
+        }
     }
 
     /// Shared by the real assistant wait and its regression tests. Keep gathering evidence after a timeout,
@@ -262,6 +323,160 @@ final class CaptureUITests: XCTestCase {
             return true
         }
         return drawn ? pixels : []
+    }
+
+    /// Reuse the assistant's upright bitmap/crop mapping, but compare every RGBA pixel:
+    /// a downsampled contrast or geometry check cannot establish an identical bar image.
+    private func regionPixels(_ image: CGImage?, frame: CGRect, screen: CGRect) -> [UInt8] {
+        guard let image, let rect = CaptureReadiness.cropRect(frame: frame, screen: screen,
+                    pixelWidth: image.width, pixelHeight: image.height),
+              let crop = image.cropping(to: rect) else { return [] }
+        let width = crop.width, height = crop.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let drawn = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: width, height: height,
+                    bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            context.draw(crop, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+            return true
+        }
+        return drawn ? pixels : []
+    }
+
+    /// A time-separated pair of real screen crops, polled without a fixed delay. Invalid or
+    /// changing geometry resets the comparison. On failure retain both sampled full frames.
+    private func settledPixels(_ reason: String, timeout: TimeInterval,
+                               region: @escaping () -> CGRect?) throws {
+        let started = ProcessInfo.processInfo.systemUptime
+        let deadline = started + timeout
+        var sampledAt: TimeInterval?
+        var previousFrame: CGRect?
+        var previousPixels: [UInt8] = []
+        var earlierShot: XCUIScreenshot?
+        var latestShot: XCUIScreenshot?
+        var facts = "no samples"
+        var pass = 0
+        do {
+            guard timeout > 0 else { throw NibUI.Failure.message(reason) }
+            try wait(reason, timeout: timeout) {
+                let now = ProcessInfo.processInfo.systemUptime
+                if let sampledAt, now - sampledAt < 0.3 { return false }
+                let frame = region()
+                let screen = self.ui.app.frame
+                let shot = XCUIScreen.main.screenshot()
+                earlierShot = latestShot
+                latestShot = shot
+                let takenAt = ProcessInfo.processInfo.systemUptime
+                let pixels = self.regionPixels(self.uprightImage(shot.image), frame: frame ?? .zero, screen: screen)
+                let separation = sampledAt.map { takenAt - $0 } ?? 0
+                let identical = !pixels.isEmpty && frame == previousFrame && pixels == previousPixels
+                pass += 1
+                facts = "reason=\(reason) pass=\(pass) frame=\(String(describing: frame)) bytes=\(pixels.count)"
+                facts += " separation=\(separation) identical=\(identical) seconds=\(takenAt - started)"
+                self.ui.logQA("Capture pixel settle", facts)
+                previousFrame = frame
+                previousPixels = pixels
+                sampledAt = takenAt
+                return identical && separation >= 0.3 && takenAt <= deadline
+            }
+        } catch {
+            // Even a missing/hittability-failing bar needs images, not discarded text attachments.
+            let latest = latestShot ?? XCUIScreen.main.screenshot()
+            let earlier = earlierShot ?? latest
+            attach(XCTAttachment(screenshot: earlier), name: reason + "-frame-1")
+            attach(XCTAttachment(screenshot: latest), name: reason + "-frame-2")
+            ui.logQA("Capture pixel timeout", facts)
+            throw NibUI.Failure.message(reason + "; " + facts)
+        }
+    }
+
+    private func settledSettingsBar(_ title: String) throws {
+        try settledPixels("Settings bar did not settle", timeout: 5) {
+            let bars = self.ui.app.navigationBars.containing(.button, identifier: "sheet.dismiss")
+            guard let bar = bars.allElementsBoundByIndex.first(where: {
+                self.ui.hasVisibleFrame($0) && $0.staticTexts[title].firstMatch.exists
+                    && $0.buttons["sheet.dismiss"].firstMatch.isHittable
+            }) else { return nil }
+            return bar.frame
+        }
+    }
+
+    /// Resolve the content from one fresh snapshot per sample. Crop to its actual viewport,
+    /// excluding the keyboard/search caret and unrelated animated chrome. AX content anchors
+    /// precede the pixel check; a toolbar/title alone is never the readiness signal.
+    private func captureContentRegion(_ screen: String) -> CGRect? {
+        guard let root = try? ui.app.snapshot() else {
+            ui.logQA("Capture content region", "screen=\(screen) snapshot missing")
+            return nil
+        }
+        typealias Node = (element: XCUIElementSnapshot, visible: CGRect)
+        var nodes: [Node] = []
+        func collect(_ node: XCUIElementSnapshot, viewport: CGRect) {
+            let clipped = node.frame.intersection(viewport)
+            if !clipped.isNull, !clipped.isEmpty { nodes.append((node, clipped)) }
+            let clips = [XCUIElement.ElementType.scrollView, .collectionView, .table, .window].contains(node.elementType)
+            for child in node.children { collect(child, viewport: clips ? clipped : viewport) }
+        }
+        collect(root, viewport: root.frame)
+        func contains(_ node: XCUIElementSnapshot, _ predicate: (XCUIElementSnapshot) -> Bool) -> Bool {
+            predicate(node) || node.children.contains { contains($0, predicate) }
+        }
+        func union(_ matches: [Node]) -> CGRect? {
+            guard let first = matches.first else { return nil }
+            return matches.dropFirst().reduce(first.visible) { $0.union($1.visible) }
+        }
+        func container(kinds: [XCUIElement.ElementType],
+                       first: (XCUIElementSnapshot) -> Bool,
+                       second: (XCUIElementSnapshot) -> Bool) -> CGRect? {
+            nodes.filter { kinds.contains($0.element.elementType) && contains($0.element, first)
+                && contains($0.element, second) }
+                .min { $0.visible.width * $0.visible.height < $1.visible.width * $1.visible.height }?.visible
+        }
+        let scrollers: [XCUIElement.ElementType] = [.scrollView, .collectionView, .table]
+        let region: CGRect?
+        switch screen {
+        case "library-grid", "library-list", "open-folder":
+            // LibraryItemTapTarget encloses the cover in grid and list layouts.
+            region = union(nodes.filter { $0.element.elementType == .button && $0.element.identifier == "cmd.doc.open" })
+        case "library-search":
+            // Unlike the underlying library card, SearchResultRow owns search.open and the hit heading.
+            region = union(nodes.filter {
+                $0.element.elementType == .button && $0.element.identifier == "cmd.search.open"
+                    && $0.element.label.contains(notebook)
+            })
+        case "new-notebook":
+            // The outer continuous form contains title/preview, cover strip AND the paper grid.
+            region = container(kinds: scrollers, first: { $0.label == "No cover" },
+                               second: { $0.label == "Paper" })
+        case "plugin-manager":
+            let loaded: (XCUIElementSnapshot) -> Bool = {
+                $0.label == "No plugins yet" || ($0.elementType == .switch && $0.label.hasPrefix("Enable "))
+            }
+            if nodes.contains(where: { $0.element.label == "Loading plugins" }) {
+                region = nil
+            } else {
+                region = container(kinds: scrollers, first: loaded, second: { $0.label == "Galleries" })
+            }
+        case "study-session":
+            // Fixture fronts are text, in any practice order. Flip Card is in the header and
+            // can exist before model.current; require the actual face and its fixture text.
+            let fronts = ["Velocity", "Acceleration", "Force"]
+            region = nodes.first { node in
+                guard node.element.label == "Question side" else { return false }
+                return contains(node.element) { child in
+                    child.elementType == .staticText && fronts.contains(child.label)
+                }
+            }?.visible
+        case "export-sheet":
+            // All is the default scope (no page-choice previews). If previews are present,
+            // the form encompassing File name and Save to Files includes them too.
+            region = container(kinds: scrollers + [.other, .sheet, .alert, .popover],
+                               first: { $0.label == "File name" }, second: { $0.label == "Save to Files" })
+        default:
+            region = nil
+        }
+        ui.logQA("Capture content region", "screen=\(screen) region=\(String(describing: region)) visibleNodes=\(nodes.count)")
+        return region
     }
 
     private func folder(_ title: String) throws {
@@ -437,7 +652,7 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook()
             try self.tap("Assistant")
             _ = try self.ui.waitForState { $0.openPanels.contains("aichat.panel") }
-            self.settledNotebookWithAssistant()
+            try self.settledNotebookWithAssistant()
             try self.capture(21, "ai-assistant") {
                 $0.screen == "document" && $0.document != nil && $0.itemCountOnPage > 0
                     && $0.openPanels.contains("aichat.panel")
@@ -476,9 +691,11 @@ final class CaptureUITests: XCTestCase {
             try self.tap("Editing", scroll: true)
             try self.tap("Document Editing", scroll: true)
             _ = try self.require("Open documents in tabs")
+            try self.settledSettingsBar("Document Editing")
             try self.libraryCapture(24, "settings-editing")
             try self.tap("Stylus", scroll: true)
             try self.tap("Stylus & Palm Rejection", scroll: true)
+            try self.settledSettingsBar("Stylus & Palm Rejection")
             try self.libraryCapture(25, "settings-stylus")
         }
     }

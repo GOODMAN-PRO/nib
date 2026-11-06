@@ -112,6 +112,28 @@ final class PageTileView: UIView {
     private(set) var pageRect: Rect = .zero
     private(set) var level: Int = 0
     weak var source: PageTileSource?
+    /// Coverage, task completion and the first-content fade drive readiness without a polling timer.
+    var onRenderStateChange: (() -> Void)?
+    #if DEBUG
+    var onRenderDiagnosticChange: (() -> Void)?
+    #endif
+
+    /// The controller installs the readiness observer only in UI-test mode. Diagnostics are compiled separately.
+    private var tracksRenderedCoverage: Bool {
+        if onRenderStateChange != nil { return true }
+        #if DEBUG
+        return onRenderDiagnosticChange != nil
+        #else
+        return false
+        #endif
+    }
+
+    private func renderStateChanged() {
+        onRenderStateChange?()
+        #if DEBUG
+        onRenderDiagnosticChange?()
+        #endif
+    }
 
     /// Holds the bitmap layers (page coordinates) so the page's first content can fade in as one.
     private let contentView = UIView()
@@ -147,6 +169,7 @@ final class PageTileView: UIView {
     private var tokenCounter = 0
     /// Region of the page the last coverage pass asked for (page coordinates).
     private var covered: Rect?
+    private(set) var visibleCoverage: Rect?
     private var isWorld: Bool { record?.size == nil }
 
     override init(frame: CGRect) {
@@ -217,6 +240,7 @@ final class PageTileView: UIView {
 
     /// Forgets every bitmap and cancels every render (the view is being recycled, or its page changed).
     func reset() {
+        defer { renderStateChanged() }
         for s in slots.values {
             s.task?.cancel()
             s.layer.removeFromSuperlayer()
@@ -236,6 +260,7 @@ final class PageTileView: UIView {
         failedSlots.removeAll()
         recoveryPending = true
         covered = nil
+        visibleCoverage = nil
         for v in liveViewContainer.subviews { v.removeFromSuperview() }
         // The board's placeholders sit outside this fade and stay visible until its bitmaps land.
         contentView.layer.removeAllAnimations()
@@ -257,6 +282,7 @@ final class PageTileView: UIView {
                 guard let self, self.contentGeneration == generation else { return }
                 self.isFadingContent = false
                 self.dropLandedPlaceholders()
+                self.renderStateChanged()
             })
         } else {
             contentView.alpha = 1
@@ -289,14 +315,34 @@ final class PageTileView: UIView {
     /// True when the visible part of the page has sharp tiles (or the preview) on screen.
     var isSettled: Bool { pendingRenders == 0 }
 
+    /// Idle is not enough: a failed/empty slot or an unfinished fade still shows a placeholder.
+    var hasRenderedCoverage: Bool {
+        guard hasShownContent, !isFadingContent, isSettled, let visible = visibleCoverage else { return false }
+        let wanted = CanvasTileGrid.keys(covering: visible, level: level)
+        return !wanted.isEmpty && wanted.allSatisfy { key in
+            guard let slot = slots[key] else { return false }
+            return slot.hasImage && slot.placeholder.contents == nil && !failedSlots.contains(key)
+        }
+    }
+
+    #if DEBUG
+    var landedTileCount: Int { slots.values.filter { $0.hasImage }.count }
+    #endif
+
     // MARK: Coverage
 
     /// Makes sure the tiles at `level` covering `visible` (page coordinates, already grown by the prefetch margin)
     /// are on screen or on their way. When the level changes, the previous level's tiles stay underneath as a
     /// fallback until the new ones land. `bake` false (a pinch in progress) keeps the current level.
-    func updateCoverage(visible: Rect, level newLevel: Int, bake: Bool) {
+    func updateCoverage(visible: Rect, level newLevel: Int, bake: Bool,
+                        viewport: @autoclosure () -> Rect? = nil) {
+        defer { renderStateChanged() }
         guard let pageID = pageID, source != nil else { return }
         let region = isWorld ? visible : intersect(visible, pageRect)
+        if tracksRenderedCoverage {
+            let viewportRegion = viewport() ?? visible
+            visibleCoverage = isWorld ? viewportRegion : intersect(viewportRegion, pageRect)
+        }
         if !isWorld { requestPreviewIfNeeded(pageID) }
         guard let region = region, region.width > 0, region.height > 0 else { return }
         if bake && newLevel != level {
@@ -342,6 +388,7 @@ final class PageTileView: UIView {
     /// Re-renders the tiles (and the preview) that intersect `rect` (page coordinates; nil = everything). What is on
     /// screen stays until the new bitmap lands, so a commit never flickers.
     func invalidate(_ rect: Rect?) {
+        defer { renderStateChanged() }
         guard let pageID = pageID else { return }
         if rect == nil {
             // A full re-render replaces even failed work from an older coverage/zoom level.
@@ -369,6 +416,7 @@ final class PageTileView: UIView {
 
     /// Drops the previous level's tiles and anything off screen (memory warning).
     func trim() {
+        defer { renderStateChanged() }
         clearFallback()
         guard let covered = covered else { return }
         for (key, slot) in slots where !CanvasTileGrid.rect(key).intersects(covered) {
@@ -470,6 +518,7 @@ final class PageTileView: UIView {
     }
 
     private func renderFinished() {
+        defer { renderStateChanged() }
         // A preview that went stale while tiles were rendering is refreshed once they are done (it only shows at
         // the edges while tiles load, so it never competes with them).
         if let id = pageID, previewStale, slots.values.allSatisfy({ $0.task == nil }) { requestPreviewIfNeeded(id) }

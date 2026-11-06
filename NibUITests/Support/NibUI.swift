@@ -2536,8 +2536,30 @@ final class NibUI {
         guard let point = NibUITestScrollGeometry.tapPoint(control: document.frame, viewport: visible) else {
             throw Failure.message("Document has no visible tap area: \(title)")
         }
+        let mountStarted = ProcessInfo.processInfo.systemUptime
         try pressWithoutIdle(at: point, duration: 0.05)
         _ = try waitForState { $0.screen == "document" && $0.document != nil }
+        // The probe follows EditorSession before the shell mounts its editor. Text documents
+        // expose a collection, and study sets expose their root header (no canvas/root ID).
+        let textRoot = app.collectionViews["Text document"].firstMatch
+        let studyHeader = app.staticTexts["Cards"].firstMatch
+        let studyLanguage = app.buttons["Language"].firstMatch
+        var mounted = "missing"
+        func editorMounted() -> Bool {
+            if hasVisibleFrame(canvas) { mounted = "nib.canvas"; return true }
+            if hasVisibleFrame(textRoot) { mounted = "Text document"; return true }
+            if hasVisibleFrame(studyHeader), hasVisibleFrame(studyLanguage) {
+                mounted = "StudySetEditorView header"; return true
+            }
+            return false
+        }
+        let editorReady = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in editorMounted() }, object: nil)
+        let didMount = editorMounted() || XCTWaiter.wait(for: [editorReady], timeout: 15) == .completed
+        let elapsed = ProcessInfo.processInfo.systemUptime - mountStarted
+        logQA("Document editor mount", "title=\(title) root=\(mounted) secondsFromTap=\(elapsed) ready=\(didMount)")
+        guard didMount else {
+            throw Failure.message("Document editor did not mount: \(title); expected nib.canvas, Text document collection, or study editor header")
+        }
     }
 
     func tapCommand(_ id: String, diagnostics: Bool = false) throws {

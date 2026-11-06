@@ -8,6 +8,92 @@ import NibTesting
 
 @MainActor
 final class FeatDocChromeTests: XCTestCase {
+    func testLongStatusHitRegionStopsAtCapAndNeighboursReceiveTheirActions() async throws {
+        // Native action probes let a hostless package test verify the exact hit recipient, then
+        // invoke its registered action without UIApplicationMain or synthetic/private UITouch APIs.
+        for compact in [false, true] {
+            var actions: [String] = []
+            func button(_ title: String, action: String) -> UIButton {
+                let button = UIButton(type: .system)
+                button.setTitle(title, for: .normal)
+                button.addAction(UIAction { _ in actions.append(action) }, for: .touchUpInside)
+                return button
+            }
+            let back = button("Back", action: "back")
+            let status = button(String(repeating: "Long bridge client ", count: 20), action: "status")
+            let next = button("Next", action: "next")
+            let cap: CGFloat = compact ? 120 : 160
+            let root = HStack(spacing: 8) {
+                NavStatusActionProbe(button: back).frame(width: 44, height: 44)
+                Button { actions.append("status") } label: {
+                    NavStatusActionProbe(button: status)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(NibPressStyle(shape: Capsule()))
+                .modifier(NavStatusSizing(compact: compact))
+                NavStatusActionProbe(button: next).frame(width: 44, height: 44)
+            }
+            .fixedSize()
+            .frame(width: 393, height: 100)
+            let host = UIHostingController(rootView: root)
+            host.safeAreaRegions = []
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 100))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            try await waitUntil {
+                host.view.layoutIfNeeded()
+                return status.window === window && status.bounds.width > 0
+            }
+            let frame = status.convert(status.bounds, to: window)
+            XCTAssertEqual(frame.width, cap, accuracy: 0.5)
+            func recipient(at point: CGPoint) -> UIControl? {
+                var hit = window.hitTest(point, with: nil)
+                while let view = hit {
+                    if let control = view as? UIControl { return control }
+                    hit = view.superview
+                }
+                return nil
+            }
+            // Check both gaps and both neighbouring targets, not merely membership in the host.
+            for x in [frame.minX - 4, frame.maxX + 4] {
+                XCTAssertFalse(recipient(at: CGPoint(x: x, y: frame.midY)) === status)
+            }
+            for (control, action) in [(back, "back"), (status, "status"), (next, "next")] {
+                let point = control.convert(CGPoint(x: control.bounds.midX, y: control.bounds.midY), to: window)
+                let hit = try XCTUnwrap(recipient(at: point))
+                XCTAssertTrue(hit === control, "The point must reach \(action), not the oversized status")
+                hit.enumerateEventHandlers { registeredAction, _, events, _ in
+                    if events.contains(.touchUpInside), let registeredAction { hit.sendAction(registeredAction) }
+                }
+                XCTAssertEqual(actions.last, action)
+            }
+            XCTAssertEqual(actions, ["back", "status", "next"])
+        }
+    }
+
+    func testStatusSizingKeepsMenuIntrinsicAndCapsLongPill() {
+        for compact in [false, true] {
+            let menu = Menu { Button("Document") {} } label: {
+                Image(nib: .templates).frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+            }
+            .menuIndicator(.hidden)
+            .menuStyle(.button)
+            .buttonStyle(NibPressStyle(shape: Capsule()))
+            .modifier(NavStatusSizing(compact: compact))
+            let pill = Button(String(repeating: "Long bridge client ", count: 20)) {}
+                .modifier(NavStatusSizing(compact: compact))
+            let proposal = CGSize(width: 800, height: NibMetrics.hitTarget)
+            let menuSize = UIHostingController(rootView: menu).sizeThatFits(in: proposal)
+            let pillSize = UIHostingController(rootView: pill).sizeThatFits(in: proposal)
+            XCTAssertEqual(menuSize.width, NibMetrics.hitTarget, accuracy: 0.5)
+            XCTAssertEqual(pillSize.width, compact ? 120 : 160, accuracy: 0.5)
+            XCTAssertGreaterThanOrEqual(menuSize.height, NibMetrics.hitTarget)
+            XCTAssertGreaterThanOrEqual(pillSize.height, NibMetrics.hitTarget)
+        }
+    }
+
     func testLongStatusKeepsEssentialNavigationVisibleAndHittableAt393Points() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         let chrome = try makeWindow(h)
@@ -425,7 +511,7 @@ final class FeatDocChromeTests: XCTestCase {
                         XCTAssertEqual(layout.editor, CGRect(origin: .zero, size: size))
                         XCTAssertEqual(layout.editorInsets.left + layout.editorInsets.right, 0)
                         XCTAssertEqual(layout.editorInsets.top,
-                            layout.bar.maxY + NibSpacing.l + thickness + options.height - 1 + NibSpacing.l)
+                            layout.bar.maxY + NibSpacing.l + thickness + options.height + NibSpacing.l + NibSpacing.l)
                         XCTAssertGreaterThanOrEqual(layout.overlayRegion.minY, layout.editorInsets.top)
                         XCTAssertGreaterThanOrEqual(layout.floatingRegion.minY, layout.editorInsets.top)
                         XCTAssertNil(ChromePalettePolicy.navigatorDockCorrection(dock, layout: layout),
@@ -687,14 +773,14 @@ final class FeatDocChromeTests: XCTestCase {
         let bar = layout.bar
         let toolbar = layout.toolbar
         layout.avoidPalette(NibPaletteDock(edge: .top), thickness: 56, optionsHeight: 44)
-        // Palette starts at 92, ends at 148; its fused options end at 191, then a 16 pt resting gap.
-        XCTAssertEqual(layout.overlayRegion.minY, 207)
-        XCTAssertEqual(layout.floatingRegion.minY, 207)
+        // Palette starts at 92, ends at 148; its separated options end at 208, then a 16 pt resting gap.
+        XCTAssertEqual(layout.overlayRegion.minY, 224)
+        XCTAssertEqual(layout.floatingRegion.minY, 224)
         XCTAssertEqual(layout.bar, bar)
         XCTAssertEqual(layout.toolbar, toolbar)
         layout.avoidPalette(NibPaletteDock(edge: .bottom), thickness: 56, optionsHeight: 44)
-        XCTAssertEqual(layout.overlayRegion.maxY, 683)
-        XCTAssertEqual(layout.floatingRegion.maxY, 683)
+        XCTAssertEqual(layout.overlayRegion.maxY, 666)
+        XCTAssertEqual(layout.floatingRegion.maxY, 666)
     }
 
     func testKeyboardOnlyShortensResultsAndMovesBottomHUDs() {
@@ -798,19 +884,41 @@ final class FeatDocChromeTests: XCTestCase {
                                 optionsSize: CGSize(width: 280, height: 44))
             switch edge {
             case .top:
-                XCTAssertEqual(layout.editorInsets.top, 68 + 56 + 44 - 1 + 16)
+                XCTAssertEqual(layout.editorInsets.top, 68 + 56 + 44 + 16 + 16)
                 XCTAssertEqual(layout.overlayRegion.minY, layout.editorInsets.top)
             case .bottom:
-                XCTAssertEqual(layout.editorInsets.bottom, 16 + 56 + 44 - 1 + 16)
+                XCTAssertEqual(layout.editorInsets.bottom, 16 + 56 + 44 + 16 + 16)
                 XCTAssertEqual(layout.overlayRegion.maxY, size.height - layout.editorInsets.bottom)
             case .leading:
                 XCTAssertEqual(layout.editorInsets.left, 16 + 56 + 16)
-                XCTAssertEqual(layout.overlayRegion.minX, 16 + 56 + 280 - 1 + 16)
+                XCTAssertEqual(layout.overlayRegion.minX, 16 + 56 + 280 + 16 + 16)
             case .trailing:
                 XCTAssertEqual(layout.editorInsets.right, 16 + 56 + 16)
-                XCTAssertEqual(layout.overlayRegion.maxX, size.width - (16 + 56 + 280 - 1 + 16))
+                XCTAssertEqual(layout.overlayRegion.maxX, size.width - (16 + 56 + 280 + 16 + 16))
             }
             XCTAssertEqual(layout.editor.size, size, "content still scrolls under the palette")
+        }
+    }
+
+    func testEveryPaletteDockWithoutOptionsReservesOnlyThePaletteAndPaperGap() {
+        let size = CGSize(width: 1194, height: 834)
+        for edge in NibDock.allCases {
+            var layout = ChromeLayout(size: size, safeArea: .zero, left: nil, right: nil, mode: .sidebar)
+            layout.avoidPalette(NibPaletteDock(edge: edge), thickness: 56, optionsSize: .zero)
+            switch edge {
+            case .top:
+                XCTAssertEqual(layout.editorInsets.top, 68 + 56 + 16)
+                XCTAssertEqual(layout.overlayRegion.minY, 68 + 56 + 16)
+            case .bottom:
+                XCTAssertEqual(layout.editorInsets.bottom, 16 + 56 + 16)
+                XCTAssertEqual(layout.overlayRegion.maxY, size.height - (16 + 56 + 16))
+            case .leading:
+                XCTAssertEqual(layout.editorInsets.left, 16 + 56 + 16)
+                XCTAssertEqual(layout.overlayRegion.minX, 16 + 56 + 16)
+            case .trailing:
+                XCTAssertEqual(layout.editorInsets.right, 16 + 56 + 16)
+                XCTAssertEqual(layout.overlayRegion.maxX, size.width - (16 + 56 + 16))
+            }
         }
     }
 
@@ -834,7 +942,7 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(rightSidebar.editorInsets.right, 16 + 56 + 16,
                        "the sidebar's reserved width is not counted again inside the editor")
         XCTAssertEqual(rightSidebar.overlayRegion.maxX,
-                       rightSidebar.editor.maxX - (16 + 56 + 200 - 1 + 16))
+                       rightSidebar.editor.maxX - (16 + 56 + 200 + 16 + 16))
     }
 
     func testPaletteEligibilityClearsReservationsForTextAndStudyEditors() {
@@ -897,14 +1005,16 @@ final class FeatDocChromeTests: XCTestCase {
         var layout = ChromeLayout(size: CGSize(width: 874, height: 402), safeArea: safe,
                                   left: nil, right: nil, mode: .sidebar, idiom: .phone, verticalSizeClass: .compact)
         layout.avoidPalette(NibPaletteDock(edge: .bottom), thickness: 56, optionsSize: CGSize(width: 280, height: 44))
-        XCTAssertEqual(layout.editorInsets.bottom, 21 + 8 + 56 + 44 - 1 + 16)
+        XCTAssertEqual(layout.editorInsets.bottom, 21 + 8 + 56 + 44 + 16 + 16)
         for compactCanvas in [true, false] {
             let additional = EditorHost.additionalInsets(layout.editorInsets, system: safe,
                                                           canvas: true, compactCanvas: compactCanvas)
             let bottom = additional.bottom + safe.bottom + (compactCanvas ? 80 : 16)
             XCTAssertEqual(bottom, layout.editorInsets.bottom)
             let top = additional.top + safe.top + 64
-            XCTAssertGreaterThan(layout.editor.height - top - bottom, 180)
+            // The intentional 16 pt separation replaces a 1 pt overlap: 17 pt more reservation.
+            // Assert the exact remaining viewport so neither clearance nor double-counting can drift.
+            XCTAssertEqual(layout.editor.height - top - bottom, 177)
             XCTAssertEqual(additional.left, 0)
             XCTAssertEqual(additional.right, 0)
         }
@@ -1445,7 +1555,7 @@ final class FeatDocChromeTests: XCTestCase {
         }
     }
 
-    func testSelfHeadedOutlineTabsKeepVisiblePanelOptionsAndReadableLabelsAt240Points() async throws {
+    func testSidebarTabsKeepTheSameFullWidthAndReadableLabelsOnEveryPanel() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         let chrome = try makeWindow(h)
         let titles = ["Pages", "Outline", "Bookmarks"]
@@ -1453,15 +1563,15 @@ final class FeatDocChromeTests: XCTestCase {
         let tabs = zip(ids, titles).map { id, title in
             var descriptor = PanelDescriptor(id: id, title: title, icon: NibSymbol.outline.name,
                 placement: .sidebarTab, order: 0, owner: "tests") { _ in
-                AnyView(NibPanelHeader(title: title, symbol: .outline, onClose: {}) {
+                guard id == "outline.tab" else { return AnyView(Color.clear) }
+                return AnyView(NibPanelHeader(title: title, symbol: .outline, onClose: {}) {
                     NibIconButton(.more, label: "Outline Options", size: .round) {}
                 })
             }
-            descriptor.providesHeader = true
+            descriptor.providesHeader = id == "outline.tab"
             return descriptor
         }
-        for selected in [tabs[1], tabs[2]] {
-            XCTAssertFalse(chrome.drawsHeader(selected), "Exercise both self-headed navigators")
+        for selected in tabs {
             for scheme in [ColorScheme.light, .dark] {
                 var frames: [String: CGRect] = [:]
                 let content = SidebarPanelView(chrome: chrome, side: .left, tabs: tabs, selected: selected,
@@ -1482,10 +1592,10 @@ final class FeatDocChromeTests: XCTestCase {
                 let row = segments.reduce(CGRect.null) { $0.union($1) }
                 let inset = NibSpacing.xs + 2 // Sidebar padding and segmented-track inset.
                 XCTAssertEqual(row.minX, inset, accuracy: 1)
-                XCTAssertEqual(row.maxX, 240 - NibMetrics.hitTarget - inset, accuracy: 1,
-                               "A visible 44 pt Panel Options button must remain beside self-headed tabs")
+                XCTAssertEqual(row.maxX, 240 - inset, accuracy: 1,
+                               "Every selected panel uses the full row; its header owns the only menu")
                 for segment in segments {
-                    XCTAssertEqual(segment.width, (240 - NibMetrics.hitTarget - 2 * inset) / 3, accuracy: 1)
+                    XCTAssertEqual(segment.width, (240 - 2 * inset) / 3, accuracy: 1)
                     XCTAssertEqual(segment.minY, row.minY, accuracy: 1, "All tabs stay in one row")
                     XCTAssertEqual(segment.height, NibMetrics.hitTarget, accuracy: 1)
                 }
@@ -1495,14 +1605,63 @@ final class FeatDocChromeTests: XCTestCase {
                 let font = selected.id == "outline.bookmarks"
                     ? UIFont.systemFont(ofSize: base.pointSize, weight: .semibold) : base
                 let labelWidth = ("Bookmarks" as NSString).size(withAttributes: [.font: font]).width
-                let sizing = NibSegmentedControl<String>.Sizing.compactFitting
+                let sizing = NibSegmentedControl<String>.Sizing.fitting
                 XCTAssertLessThanOrEqual(labelWidth * sizing.minimumLabelScale,
                                         bookmarks.width - 2 * sizing.labelPadding,
                                         "Bookmarks must fit its actual production segment without truncation")
-                // Removing the host menu fails the row width assertion. Restoring it
-                // without compact sizing fails the measured Bookmarks label budget.
             }
         }
+    }
+
+    func testSelfHeadedSidebarReceivesTheSamePlacementCommandsAsTheHostMenu() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        var outline = panel("outline.tab", .sidebarTab)
+        outline.providesHeader = true
+        let pages = panel("sidebar.pages", .sidebarTab)
+        let tabs = [pages, outline]
+        for tab in tabs { h.app.ui.panels.register(tab) }
+        chrome.state.open(outline.id, at: .left, params: ["entry": "keep-me"])
+        for side in [SidebarSide.left, .right] {
+            for mode in [SidebarMode.sidebar, .window] {
+                let view = SidebarPanelView(chrome: chrome, side: side, tabs: tabs, selected: outline,
+                                            mode: mode, presentation: .sidebar)
+                let context = view.panelContext
+                let menu = PanelPlacementMenu(chrome: chrome, panel: outline, current: side.spot,
+                                              mode: mode, additionalPanels: tabs)
+                XCTAssertEqual(context.params["entry"], "keep-me")
+                XCTAssertEqual(context.params["chrome.panelOptions"], .array(menu.actions.map(\.json)))
+                XCTAssertEqual(menu.actions.filter(\.isPanel).map(\.params),
+                               [["id": "sidebar.pages"], ["id": "outline.tab"]])
+                let toggle = try XCTUnwrap(menu.actions.first { $0.command == "sidebar.toggle" })
+                XCTAssertEqual(toggle.params, ["mode": .string(mode == .window ? "sidebar" : "window")])
+                XCTAssertFalse(try XCTUnwrap(menu.actions.first { $0.id == side.rawValue }).isEnabled)
+                XCTAssertEqual(menu.actions.filter { $0.command == "settings.set" }.count, 3)
+            }
+        }
+        let menu = PanelPlacementMenu(chrome: chrome, panel: outline, current: .left)
+        var nonObject = chrome.panelContext(outline.id, presentation: .sidebar)
+        nonObject.params = ["original", "array"]
+        XCTAssertEqual(menu.addingActions(to: nonObject).params, nonObject.params)
+        var plugin = panel("plugin.navigator", .sidebarTab)
+        plugin.providesHeader = true
+        h.app.ui.panels.register(plugin)
+        chrome.state.open(plugin.id, at: .right, params: ["plugin": "keep-me"])
+        let pluginView = SidebarPanelView(chrome: chrome, side: .right, tabs: [pages, plugin],
+            selected: plugin, mode: .sidebar, presentation: .sidebar)
+        XCTAssertEqual(pluginView.panelContext.params, ["plugin": "keep-me"])
+        let float = try XCTUnwrap(menu.actions.first { $0.id == "floating" })
+        _ = try await h.run(float.command, float.params)
+        XCTAssertEqual(h.app.settings.json(ChromeSettings.placementName(outline.id)), "floating")
+        let reset = try XCTUnwrap(menu.actions.first { $0.id == "default" })
+        XCTAssertEqual(reset.params["value"], .null)
+        _ = try await h.run(reset.command, reset.params)
+        XCTAssertNil(h.app.settings.json(ChromeSettings.placementName(outline.id)))
+        let sheet = SidebarPanelView(chrome: chrome, side: .left, tabs: tabs, selected: outline,
+                                     mode: .sidebar, presentation: .sheet, showsModeToggle: false)
+        XCTAssertEqual(sheet.panelContext.presentation, .sheet)
+        let actions = try XCTUnwrap(sheet.panelContext.params["chrome.panelOptions"]?.arrayValue)
+        XCTAssertFalse(actions.contains { $0["command"]?.stringValue == "sidebar.toggle" })
     }
 
     func testSidebarToggleShowsHidesAndSwitchesMode() async throws {
@@ -2112,6 +2271,19 @@ final class FeatDocChromeTests: XCTestCase {
         } catch {
             XCTFail("unexpected \(error)", file: file, line: line)
         }
+    }
+}
+
+/// A UIKit hit/action witness inside the real SwiftUI status sizing and press-style hierarchy.
+private struct NavStatusActionProbe: UIViewRepresentable {
+    let button: UIButton
+
+    func makeUIView(context: Context) -> UIButton { button }
+    func updateUIView(_ uiView: UIButton, context: Context) {}
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UIButton, context: Context) -> CGSize? {
+        CGSize(width: min(proposal.width ?? uiView.intrinsicContentSize.width, uiView.intrinsicContentSize.width),
+               height: NibMetrics.hitTarget)
     }
 }
 

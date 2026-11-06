@@ -991,7 +991,7 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
         .scrollIndicatorsFlash(onAppear: true)
         .contentMargins(.horizontal, contentInset, for: .scrollContent)
         .scrollDismissesKeyboard(.interactively)
-        .nibFadeBottomEdge()
+        .nibFadeBottomEdge(NibSpacing.xxl)
         // A drawing mask alone does not constrain SwiftUI's hit testing after scrolling.
         .contentShape(Rectangle())
         .notebookLayoutFrame("viewport")
@@ -1088,8 +1088,14 @@ struct NewNotebookSheet: View {
         guard let windowSize else {
             return CGSize(width: NibMetrics.newDocumentSheetSize.width, height: preferredHeight)
         }
+        // Portrait takes the room it is offered, up to 1000 pt, and is never shorter than the landscape rule gives
+        // (a short Stage Manager or Split View window keeps the 2 x 20 pt margin it had).
+        let standard = min(preferredHeight, windowSize.height - NibSpacing.xl * 2)
+        let height = !compact && windowSize.height > windowSize.width
+            ? max(standard, min(windowSize.height - 4 * NibSpacing.xxl, 1000))
+            : standard
         return CGSize(width: min(NibMetrics.newDocumentSheetSize.width, windowSize.width - NibSpacing.xl * 2),
-                      height: min(preferredHeight, windowSize.height - NibSpacing.xl * 2))
+                      height: max(0, height))
     }
     private var draft: NotebookDraft { model.draft }
 
@@ -1243,9 +1249,22 @@ struct NewNotebookSheet: View {
 
     // MARK: Cover
 
+    private var coverStripWidth: CGFloat {
+        let available = max(0, measuredWidth - 2 * contentInset)
+        let ring = NibStroke.ring + NibStroke.ringOutset
+        let tile = NibMetrics.coverStripSize.width
+        let pitch = tile + NibSpacing.l
+        let count = model.covers.count + 1
+        let fullWidth = CGFloat(count) * pitch - NibSpacing.l + 2 * ring
+        if fullWidth <= available { return fullWidth }
+        // Reserve the cue first, then end between whole tiles including the selection rings.
+        let visible = max(1, Int((available - NibSpacing.l - 2 * ring + NibSpacing.l) / pitch))
+        return min(available, CGFloat(visible) * pitch - NibSpacing.l + 2 * ring + NibSpacing.l)
+    }
+
     private var coverSection: some View {
         NibInspectorSection(String(localized: "Cover"), value: draft.hasCover ? nil : String(localized: "None")) {
-            ScrollView(.horizontal) {
+            NibScrollView(.horizontal) {
                 HStack(alignment: .top, spacing: NibSpacing.l) {
                     NibPaperTile(name: String(localized: "No cover"), isSelected: !draft.hasCover,
                                  size: NibMetrics.coverStripSize, action: { model.selectCover(nil) }) {
@@ -1263,16 +1282,8 @@ struct NewNotebookSheet: View {
                 }
                 .scrollTargetLayout()
                 .padding(NibStroke.ring + NibStroke.ringOutset)
-                // Let the final name clear the fade when scrolled all the way to the end.
-                .padding(.trailing, NibSpacing.l)
             }
-            .mask {
-                HStack(spacing: 0) {
-                    Rectangle()
-                    LinearGradient(colors: [NibColor.label, .clear], startPoint: .leading, endPoint: .trailing)
-                        .frame(width: NibSpacing.l)
-                }
-            }
+            .frame(width: coverStripWidth, alignment: .leading)
             .notebookLayoutFrame("coverStrip")
             .scrollTargetBehavior(.viewAligned)
             .scrollIndicators(.visible)
