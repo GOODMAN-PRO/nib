@@ -63,9 +63,12 @@ public struct NibScrollView<Content: View>: View {
     }
 
     private var cue: some View {
-        Image(nib: .chevronDown)
-            .font(NibFont.caption1Emphasis)
-            .foregroundStyle(NibColor.labelSecondary)
+        // A drawn chevron, not a symbol image. An image is an accessibility element of its own: VoiceOver read
+        // this one as "Go Down", hiding it did not take it out of the tree, and once the panel's title moved to
+        // the scroller its frame grew to the whole panel and covered the rows (UI run 42116137406, Canvas class).
+        NibScrollCue()
+            .stroke(NibColor.labelSecondary, style: StrokeStyle(lineWidth: 1.75, lineCap: .round, lineJoin: .round))
+            .frame(width: 10, height: 5)
             .rotationEffect(.degrees(cueAngle))
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .accessibilityHidden(true)
@@ -76,6 +79,17 @@ public struct NibScrollView<Content: View>: View {
         if axis == .vertical { return hasMore ? 0 : 180 }
         let forward = direction == .rightToLeft ? 90.0 : -90.0
         return hasMore ? forward : forward + 180
+    }
+}
+
+/// The overflow cue: a chevron pointing down in its own bounds.
+private struct NibScrollCue: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        return path
     }
 }
 

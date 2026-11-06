@@ -50,7 +50,9 @@ public struct NibPopoverPanel<Content: View>: View {
         .scrollDisabled(!isPresented)
         .allowsHitTesting(isPresented)
         // A scrolling panel names its scroll view (see `NibScrollView(label:)`): tools and UI tests find a
-        // popover as the scroll view that carries its title.
+        // popover as the scroll view that carries its title. The panel stays an explicit container around it,
+        // so nothing beside the scroller is promoted to an element with the panel's frame.
+        .accessibilityElement(children: .contain)
         .accessibilityHidden(!isPresented)
     }
 
