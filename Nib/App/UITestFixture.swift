@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import NibContracts
+import FeatTimeKeeper
 
 /// Uses the same command-driven seed path as onboarding's SampleNotebook, with real package persistence.
 @MainActor
@@ -72,6 +73,12 @@ enum UITestFixture {
         let scenario = NibUITestMode.scenario
         let physics = try await create("notebook", "Physics — Motion", pages: scenario.notebookPageCount)
         let paper = try page(physics)
+        if scenario == .timerHistory {
+            guard let raw = physics["ref"]?.stringValue, case let .document(doc)? = NodeRef(raw) else {
+                throw NibError.invalid("Timer history fixture creation returned no document reference")
+            }
+            try TimerHistoryFixture.seed(app: app, doc: doc, title: "Physics — Motion")
+        }
         try await run("text.createBox", ["page": paper, "frame": [72, 64, 350, 48], "text": "Motion and forces"])
         try await run("shape.create", ["page": paper, "shape": "rectangle", "frame": [100, 200, 160, 90]])
         try await run("sticky.create", ["page": paper, "at": [400, 120], "text": "Remember F = ma"])

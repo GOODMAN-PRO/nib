@@ -151,6 +151,121 @@ final class FeatTimeKeeperTests: XCTestCase {
         XCTAssertNotNil(h.app.settings.json("timer.history." + id), "one synced key per session")
     }
 
+    func testTimerHistoryFixtureStoresSixSyncedRecordsAndRefreshesThePanel() async throws {
+        let (h, keeper, notifier, _) = try make()
+        let prefs = SharedPrefs()
+        h.app.settings.syncedBackend = prefs
+        keeper.begin() // The app starts features before seeding; this keeper must refresh without a relaunch.
+        var published: [TimerRecord] = []
+        let watch = keeper.$history.sink { published = $0 }
+        defer { watch.cancel() }
+
+        try TimerHistoryFixture.seed(app: h.app, doc: Fixtures.docID, title: "Physics — Motion",
+                                     isEnabled: true, scenario: .timerHistory)
+        let records = keeper.loadHistory()
+        let names = ["Chrome history 6", "Chrome history 5", "Chrome history 4",
+                     "Chrome history 3", "Chrome history 2", "Chrome history 1"]
+        XCTAssertEqual(records.compactMap(\.label), names)
+        XCTAssertEqual(records.map(\.elapsed), [360, 300, 240, 180, 120, 60])
+        XCTAssertEqual(records.compactMap(\.duration), [720, 600, 480, 360, 240, 120])
+        XCTAssertEqual(Set(records.map(\.id)).count, 6)
+        XCTAssertEqual(records.count, 6)
+        XCTAssertEqual(prefs.names().count, 6, "Only six history keys; no UI timer construction or active session")
+        XCTAssertEqual(Set(prefs.names()), Set(records.map { TimeKeeper.Keys.history + $0.id }))
+        for record in records {
+            XCTAssertEqual(record.doc, NodeRef.document(Fixtures.docID).description)
+            XCTAssertEqual(record.docTitle, "Physics — Motion")
+            XCTAssertEqual(record.kind, .timer)
+            XCTAssertFalse(record.completed, "Stop and Save ended a partially run countdown")
+            XCTAssertTrue(record.laps.isEmpty)
+            XCTAssertEqual(record.endedAt - record.startedAt, 600, "Includes time paused before Stop and Save")
+            let key = TimeKeeper.Keys.history + record.id
+            XCTAssertEqual(h.app.settings.descriptor(key)?.synced, true)
+            let stored = try XCTUnwrap(prefs.value(key))
+            XCTAssertEqual(try stored.decode(TimerRecord.self), record)
+        }
+        for (newer, older) in zip(records, records.dropFirst()) {
+            XCTAssertEqual(newer.startedAt - older.startedAt, 60)
+            XCTAssertEqual(newer.endedAt - older.endedAt, 60)
+        }
+        XCTAssertEqual(keeper.history, records, "The panel observes this array, not a fresh load from storage")
+        XCTAssertEqual(published, records, "The existing panel is notified synchronously")
+        let section = TimeKeeperHistorySection(records: keeper.history)
+        XCTAssertGreaterThan(section.records.count, TimeKeeperHistorySection.collapsedCount, "Show All is available")
+        XCTAssertEqual(section.visibleRecords(showAll: false).compactMap(\.label), Array(names.prefix(5)))
+        XCTAssertEqual(section.visibleRecords(showAll: true).compactMap(\.label), names)
+        XCTAssertEqual(section.visibleRecords(showAll: false).count, 5, "Show Less restores the five newest")
+        XCTAssertEqual(section.visibleRecords(showAll: true).count, 6)
+        XCTAssertFalse(keeper.engine.isActive)
+        XCTAssertNil(h.app.settings.json(TimeKeeper.Keys.active.name))
+        XCTAssertTrue(notifier.scheduled.isEmpty)
+        XCTAssertTrue(notifier.cancelled.isEmpty)
+        let output = try await h.run("timer.history")
+        let sessions = try XCTUnwrap(output["sessions"]?.arrayValue)
+        XCTAssertEqual(try sessions.map { try $0.decode(TimerRecord.self) }, records)
+
+        let saved = prefs.values
+        try TimerHistoryFixture.seed(app: h.app, doc: Fixtures.docID, title: "Physics — Motion",
+                                     isEnabled: true, scenario: .timerHistory)
+        XCTAssertEqual(prefs.values, saved, "Retrying the fixture never adds duplicate rows")
+        XCTAssertEqual(keeper.history, records)
+    }
+
+    func testTimerHistoryFixtureMatchesRecordsSavedByStop() async throws {
+        let (h, keeper, _, clock) = try make()
+        try h.library.rename(Fixtures.docID, to: "Physics — Motion")
+        try TimerHistoryFixture.seed(app: h.app, doc: Fixtures.docID, title: "Physics — Motion",
+                                     isEnabled: true, scenario: .timerHistory)
+        let fixtures = keeper.history
+        for fixture in fixtures {
+            clock.now = Date(timeIntervalSince1970: fixture.startedAt)
+            let planned = try XCTUnwrap(fixture.duration)
+            let name = try XCTUnwrap(fixture.label)
+            try await h.run("timer.start", ["seconds": .number(planned), "label": .string(name)])
+            let id = keeper.engine.id
+            clock.advance(fixture.elapsed)
+            try await h.run("timer.control", ["action": "pause"])
+            clock.now = Date(timeIntervalSince1970: fixture.endedAt)
+            try await h.run("timer.control", ["action": "stop"])
+            var saved = try XCTUnwrap(keeper.loadHistory().first { $0.id == id })
+            saved.id = fixture.id // Only the fixture uses stable IDs; all persisted session fields must match.
+            XCTAssertEqual(saved, fixture)
+        }
+        let history = keeper.loadHistory()
+        XCTAssertEqual(history.count, 12)
+        try TimerHistoryFixture.seed(app: h.app, doc: Fixtures.docID, title: "Physics — Motion",
+                                     isEnabled: true, scenario: .timerHistory)
+        XCTAssertEqual(keeper.history, history, "Reseeding preserves sessions saved through real commands")
+    }
+
+    func testTimerHistoryFixtureGuardsWriteNothingAndRequireTheFeatureOnlyWhenEnabled() throws {
+        let (h, keeper, _, _) = try make()
+        let prefs = SharedPrefs()
+        h.app.settings.syncedBackend = prefs
+        let settingsBefore = h.app.settings.names(prefix: "")
+        for enabled in [false, true] {
+            for scenario in NibUITestScenario.allCases where !enabled || scenario != .timerHistory {
+                try TimerHistoryFixture.seed(app: h.app, doc: Fixtures.docID, title: "Physics — Motion",
+                                             isEnabled: enabled, scenario: scenario)
+                XCTAssertTrue(prefs.values.isEmpty)
+                XCTAssertEqual(h.app.settings.names(prefix: ""), settingsBefore)
+                XCTAssertTrue(keeper.loadHistory().isEmpty)
+                XCTAssertTrue(keeper.history.isEmpty)
+                XCTAssertEqual(keeper.engine, .idle)
+            }
+        }
+        let missing = Harness()
+        XCTAssertNoThrow(try TimerHistoryFixture.seed(app: missing.app, doc: Fixtures.docID, title: "Physics — Motion",
+                                                     isEnabled: false, scenario: .timerHistory))
+        XCTAssertNoThrow(try TimerHistoryFixture.seed(app: missing.app, doc: Fixtures.docID, title: "Physics — Motion",
+                                                     isEnabled: true, scenario: .standard))
+        XCTAssertThrowsError(try TimerHistoryFixture.seed(app: missing.app, doc: Fixtures.docID, title: "Physics — Motion",
+                                                         isEnabled: true, scenario: .timerHistory)) { error in
+            XCTAssertEqual((error as? NibError)?.code, .unavailable)
+        }
+        XCTAssertTrue(missing.app.settings.names(prefix: "timer.history.").isEmpty)
+    }
+
     func testCountdownFinishedInTheBackgroundIsSavedOnce() async throws {
         let (h, keeper, notifier, clock) = try make()
         let start = clock.now

@@ -320,6 +320,10 @@ struct TimeKeeperHistorySection: View, Equatable {
 
     static func == (a: TimeKeeperHistorySection, b: TimeKeeperHistorySection) -> Bool { a.records == b.records }
 
+    func visibleRecords(showAll: Bool) -> [TimerRecord] {
+        showAll ? records : Array(records.prefix(Self.collapsedCount))
+    }
+
     var body: some View {
         NibInspectorSection(String(localized: "History"), action: toggleAction) {
             if records.isEmpty {
@@ -328,7 +332,7 @@ struct TimeKeeperHistorySection: View, Equatable {
                     .foregroundStyle(NibColor.labelSecondary)
             }
             LazyVStack(alignment: .leading, spacing: NibSpacing.s) {
-                ForEach(showsAll ? records : Array(records.prefix(Self.collapsedCount))) { record in
+                ForEach(visibleRecords(showAll: showsAll)) { record in
                     TimeKeeperHistoryRow(record: record, expanded: expanded.contains(record.id)) {
                         if expanded.contains(record.id) { expanded.remove(record.id) } else { expanded.insert(record.id) }
                     }

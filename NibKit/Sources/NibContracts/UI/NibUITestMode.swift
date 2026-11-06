@@ -51,7 +51,7 @@ public enum NibUITestStorage {
 
 /// Extra prerequisites are explicit so ordinary canvas tests retain their four-page notebook and one board.
 public enum NibUITestScenario: String, CaseIterable {
-    case standard, failedRender, largeDocument, unseenBoards, tabsOverflow
+    case standard, failedRender, largeDocument, unseenBoards, tabsOverflow, timerHistory
 
     public static func parse(_ arguments: [String]) -> Self {
         guard arguments.contains("-NibUITestFixture"),
@@ -61,6 +61,11 @@ public enum NibUITestScenario: String, CaseIterable {
     }
 
     public var notebookPageCount: Int { self == .largeDocument ? 300 : 4 }
+
+    /// Oldest to newest; Time Keeper displays the saved sessions in reverse order.
+    public var timerHistoryNames: [String] {
+        self == .timerHistory ? (1...6).map { "Chrome history \($0)" } : []
+    }
 
     public var overflowTabTitles: [String] {
         self == .tabsOverflow ? (2...9).map { "Chrome tab \($0)" } : []
