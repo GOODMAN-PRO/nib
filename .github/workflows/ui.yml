@@ -176,8 +176,9 @@ jobs:
           test_start = None
           # Stall sampler: a thread sample of the app shows what its main thread is doing when XCTest reports
           # that the app never became idle, or when xcodebuild has printed nothing for 40 s during testing.
-          # A shorter silence (8 s) gets an app-only sample, at most one every 150 s: single accessibility
-          # queries of 7 to 15 s cost several tests their allowance and no log says which side is slow.
+          # Do NOT sample on short silences: run 42175781057 tried a sample after 8 s of silence, the tool hung on
+          # the app for up to 45 s (sample-06 timed out), and those hangs coincide with tests that then ran out of
+          # their allowance (CreateUITests testCustomSize, CanvasUITests testVerticalSinglePageLayout...).
           os.makedirs('samples', exist_ok=True)
           watch = {'last': time.time(), 'line': '', 'count': 0, 'quiet': 0, 'next': 0.0, 'done': False, 'short': 0, 'shortNext': 0.0, 'shortSeen': 0.0}
           lock = threading.Lock()
@@ -219,11 +220,8 @@ jobs:
                           note.write(label + ' sample failed: ' + str(error) + '\n')
           def watchdog():
               while not watch['done']:
-                  time.sleep(2)
+                  time.sleep(5)
                   quiet = time.time() - watch['last']
-                  if test_start is not None and 8 < quiet <= 40 and watch['shortSeen'] != watch['last']:
-                      watch['shortSeen'] = watch['last']
-                      sample('no xcodebuild output for %.0f s after: %s' % (quiet, watch['line']), app_only=True)
                   if test_start is not None and quiet > 40 and watch['quiet'] < 5:
                       watch['quiet'] += 1
                       sample('no xcodebuild output for %.0f s after: %s' % (quiet, watch['line']))
