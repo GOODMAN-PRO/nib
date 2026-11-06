@@ -155,7 +155,9 @@ final class InkUITests: XCTestCase {
             let native = element.switches.firstMatch
             let target = native.exists ? native : element
             for _ in 0..<4 {
-                if !scroll || (target.isHittable && ui.app.popovers.count == 0) { break }
+                // Only already-revealed Pencil preferences opt out. Tool popovers are
+                // labelled ScrollViews, so a zero native Popover count proves nothing.
+                if !scroll { break }
                 guard let panel = scrollPanels
                     .filter({ $0.switches.matching(NSPredicate(format: "label == %@", label)).count > 0 })
                     .min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else { break }
@@ -1542,8 +1544,8 @@ final class InkUITests: XCTestCase {
         let before = try ui.state()
         try pencilSettings()
         try revealPencilPreference("Show hover preview")
-        try toggle("Show hover preview", to: false)
-        try toggle("Show hover preview", to: true)
+        try toggle("Show hover preview", to: false, scroll: false)
+        try toggle("Show hover preview", to: true, scroll: false)
         try closePreferences()
         try assertNoNewInk(before)
         try pencilSettings()
@@ -1570,8 +1572,8 @@ final class InkUITests: XCTestCase {
         let before = try ui.state()
         try pencilSettings()
         try revealPencilPreference("Pencil haptics")
-        try toggle("Pencil haptics", to: false)
-        try toggle("Pencil haptics", to: true)
+        try toggle("Pencil haptics", to: false, scroll: false)
+        try toggle("Pencil haptics", to: true, scroll: false)
         try closePreferences()
         try assertNoNewInk(before)
         try pencilSettings()
