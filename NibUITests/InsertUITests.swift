@@ -1525,9 +1525,9 @@ final class InsertUITests: XCTestCase {
         try tap("Playback Options"); try tap("Back 10 Seconds")
         XCTAssertEqual(try playbackTimes().position, max(0, scrubbed.position - 10), accuracy: 1)
         // Duration is recorded, not assumed: enough bounded skips must reach each endpoint.
-        for _ in 0..<Int(ceil(scrubbed.duration / 10)) { try tap("Playback Options"); try tap("Back 10 Seconds") }
+        for _ in 0...Int(floor(max(0, scrubbed.position - 10) / 10)) { try tap("Playback Options"); try tap("Back 10 Seconds") }
         XCTAssertEqual(try playbackTimes().position, 0, accuracy: 1)
-        for _ in 0...Int(ceil(scrubbed.duration / 10)) { try tap("Playback Options"); try tap("Forward 10 Seconds") }
+        for _ in 0...Int(floor(scrubbed.duration / 10)) { try tap("Playback Options"); try tap("Forward 10 Seconds") }
         let bounded = try playbackTimes()
         XCTAssertEqual(bounded.position, bounded.duration, accuracy: 1)
         try ui.dragSlider(position, to: 0.25) {
@@ -1541,8 +1541,12 @@ final class InsertUITests: XCTestCase {
         XCTAssertTrue((try control("Playback Options").value as? String)?.contains("Skipping silence") == true)
         try tap("Playback Options"); try tap("Reduce Noise")
         XCTAssertTrue((try control("Playback Options").value as? String)?.contains("Reducing noise") == true)
-        ui.logQA("Audio enabled-settings playback", "before Play options=" + String(describing: try control("Playback Options").value))
-        ui.logStateStep("Audio before Play with Skip Silence and Reduce Noise")
+        try tap("Playback Options"); try tap("Skip Silence")
+        try tap("Playback Options"); try tap("Reduce Noise")
+        let disabledOptions = try control("Playback Options").value as? String ?? ""
+        XCTAssertFalse(disabledOptions.contains("Skipping silence"))
+        XCTAssertFalse(disabledOptions.contains("Reducing noise"))
+        ui.logQA("Audio settings-off playback", "before Play options=" + disabledOptions)
         try tap("Play"); try tap("Pause")
         try tap("Playback Options"); try tap("Close Player")
         try wait("Close Player unloads playback bar") { !self.query("Playback position").firstMatch.exists }

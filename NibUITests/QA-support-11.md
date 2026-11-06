@@ -324,3 +324,11 @@ Confirmed insert-menus-alerts-forms#3 verdict: touch reached canvas, but window 
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | NamedStyleAndDefaultAffectNewText | Save Style touch | Which fresh frame and exact interface point was sent to the runner? |
+
+### N3 - audio settings and playback budget
+
+Confirmed insert-controls#0 correction: final playback lasted 31 ms with both options enabled; silence versus noise processing is inferred. Retain both enabled-option assertions, turn both options off and verify their absence before the final Play/Pause. Shorten skip loops using the already verified scrubbed position minus the first ten-second skip and the recorded duration: floor + one deliberately crosses each endpoint once. Every seek/endpoint/speed/close assertion remains. For the observed 31-second clip this removes three menu/action pairs and adds two; estimated net saving 6-13 seconds, not measured. CI must reach Close Player with sustained settings-off playback under 300 seconds.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| AudioPlayPauseSeekSkipSettingsAndClose | Audio settings-off playback | Were both processing options off before the final Play/Pause? |
