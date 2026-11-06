@@ -2677,7 +2677,8 @@ final class NibUI {
         guard hasVisibleFrame(region), let root = try? app.snapshot() else { return nil }
         let window = app.windows.firstMatch.frame
         func containsBackground(_ node: XCUIElementSnapshot) -> Bool {
-            ["nib.canvas", "nib.qa.state", "nib.qa.clipboard", "PopoverDismissRegion"].contains(node.identifier)
+            ["nib.canvas", "nib.qa.state", "nib.qa.clipboard", "PopoverDismissRegion",
+             "inputView", "inputAssistantView", "SystemInputAssistantView"].contains(node.identifier)
                 || node.elementType == .keyboard || node.children.contains { containsBackground($0) }
         }
         func hasContent(_ node: XCUIElementSnapshot) -> Bool {
@@ -2687,6 +2688,9 @@ final class NibUI {
         var candidates: [XCUIElementSnapshot] = []
         var passedCover = false
         func visit(_ node: XCUIElementSnapshot) {
+            // Prune the subtree, not just ancestors containing Keyboard: its inner Others
+            // have buttons and otherwise look exactly like a plain modal form.
+            if node.elementType == .keyboard || ["inputView", "inputAssistantView", "SystemInputAssistantView"].contains(node.identifier) { return }
             if node.identifier == "PopoverDismissRegion" { passedCover = true; return }
             if passedCover, node.elementType == .other, node.frame.width > 100,
                node.frame.height > 100, window.contains(node.frame),
@@ -2697,7 +2701,18 @@ final class NibUI {
             for child in node.children { visit(child) }
         }
         visit(root)
-        return candidates.last
+        func hasClose(_ node: XCUIElementSnapshot) -> Bool {
+            let names = ["sheet.dismiss", "Cancel", "Done", "Close", "Close export options"]
+            if node.elementType == .button && (names.contains(node.identifier) || names.contains(node.label)) { return true }
+            return node.children.contains { hasClose($0) }
+        }
+        let withClose = candidates.last(where: { hasClose($0) })
+        let chosen = withClose ?? candidates.last
+        if let chosen {
+            let reason = withClose != nil ? "foreground subtree with close control" : "foreground content without close control"
+            logQA("Modal form chosen", "type=\(chosen.elementType) label=\(chosen.label) frame=\(chosen.frame) reason=\(reason); keyboard subtrees excluded")
+        }
+        return chosen
     }
 
     private func formCloseControl(_ form: XCUIElementSnapshot) -> XCUIElement? {

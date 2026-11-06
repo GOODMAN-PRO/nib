@@ -25,3 +25,11 @@ R12:chrome-timer-ruler#4 verifier correction wins: retained prepareCoveredContro
 | Native clear callers / Save Layout | Native clear HID | Did Delete use device synthesis instead of the interruption-monitored public route? |
 | Ruler confirmation tests | Ruler alert confirm / Ruler alert shifted retry / Ruler alert after tap | Did touch move the alert with the keyboard, which stable geometry received the retry, and did it close? |
 
+### H3 - keyboard ancestry is not a form
+
+Confirmed R12:chrome-singles#1 against presentedFormSnapshot: containsBackground rejected ancestors of Keyboard but traversal still admitted its inner Other at (0,1028,1032,345). Prune keyboard/input-view/assistant subtrees, then prefer the foreground candidate with its own close control using snapshot-only inspection. Plain Other forms and no-close popovers retain their routes. Should unblock MoreActionsStayScopedAcrossNotebookAndWhiteboardAndRotation. CI must choose Go to Page's Other with sheet.dismiss/Cancel, then log Modal form closed; no keyboard frame may be chosen.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Strict dismissal / rotated More | Modal form chosen | Which subtree was selected, and was it preferred for its close control after keyboard exclusion? |
+
