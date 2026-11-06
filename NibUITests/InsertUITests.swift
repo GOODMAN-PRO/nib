@@ -1012,7 +1012,7 @@ final class InsertUITests: XCTestCase {
         let drop = ui.coordinate(end)
         let dropPoint = ui.interfacePoint(end)
         ui.recordGeometry("Element drag start", touches: [CGPoint(x: star.frame.midX, y: star.frame.midY), dropPoint])
-        ui.dragWithHold(from: star.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)), to: drop)
+        try ui.dragWithHold(from: star.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)), to: drop, source: star)
         ui.logStateStep("testElementDragInsertsAtDropPoint drag returned")
         ui.recordDiagnostics("Element drag returned", includeHierarchy: false)
         try counts(5)

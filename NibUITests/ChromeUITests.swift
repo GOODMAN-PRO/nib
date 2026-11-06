@@ -1551,8 +1551,12 @@ final class ChromeUITests: XCTestCase {
             let start = CGPoint(x: viewport.minX + 8, y: viewport.minY + viewport.height * 0.75)
             let end = CGPoint(x: start.x, y: start.y - viewport.height * 0.4)
             let origin = ui.app.coordinate(withNormalizedOffset: .zero)
-            origin.withOffset(CGVector(dx: start.x, dy: start.y)).press(forDuration: 0.01,
-                thenDragTo: origin.withOffset(CGVector(dx: end.x, dy: end.y)),
+            let appFrame = ui.app.frame
+            // context.scroller is a snapshot; validate its live owning Time Keeper form
+            // immediately before contact, with both points clipped to that inner viewport.
+            try ui.guardRevealDrag(in: form, from: start, to: end)
+            origin.withOffset(CGVector(dx: start.x - appFrame.minX, dy: start.y - appFrame.minY)).press(forDuration: 0.01,
+                thenDragTo: origin.withOffset(CGVector(dx: end.x - appFrame.minX, dy: end.y - appFrame.minY)),
                 withVelocity: .slow, thenHoldForDuration: 0)
         }
         guard complete, Date() < deadline else {

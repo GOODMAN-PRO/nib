@@ -200,7 +200,29 @@ final class CanvasUITests: XCTestCase {
     }
 
     private func setDirection(_ direction: String) throws {
-        try more(direction)
+        let started = ProcessInfo.processInfo.systemUptime
+        defer { ui.logQA("Canvas direction row", "direction=\(direction) seconds=\(ProcessInfo.processInfo.systemUptime - started) edge=bottom; no homing") }
+        try tap("menu.more")
+        let menu = ui.app.scrollViews["More"].firstMatch
+        guard menu.waitForExistence(timeout: 8) else { throw NibUI.Failure.message("More scrolling surface missing") }
+        // Both options have the same command identifier. Resolve the actual button by
+        // identifier AND label once, retaining the menu's current offset on every open.
+        let row = menu.buttons.matching(NSPredicate(format: "identifier == %@ AND label == %@",
+                                                    "cmd.doc.setScrollDirection", direction)).firstMatch
+        if !row.isHittable {
+            ui.revealFormElement(in: menu, edge: .bottom, named: direction, type: .button) { row }
+            if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
+        }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            row.exists && row.isHittable && row.isEnabled
+        }, object: row)
+        guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
+            throw NibUI.Failure.message("More scroll direction must be reachable and enabled: " + direction)
+        }
+        row.tap()
+        // The action closes More. Reopen for the next choice, preserving any retained
+        // list position; never home the list or assume both choices share one presentation.
+        try ui.waitForMenuClosed(menu, named: "More direction " + direction)
     }
 
     private func pencilOnly() throws {
@@ -432,12 +454,14 @@ final class CanvasUITests: XCTestCase {
         try more("Go to Page…")
         let field = try require("Page number or title")
         for value in ["0", "5", "-1"] {
+            ui.logQA("Go to Page replacement", "value=\(value) expectedGoEnabled=false; selection replacement, no Delete")
             try ui.replaceNativeText(in: field, with: value)
             let goButton = ui.app.buttons.matching(NSPredicate(format: "label == %@", "Go")).firstMatch
             XCTAssertTrue(goButton.waitForExistence(timeout: 5))
             XCTAssertFalse(goButton.isEnabled, "Invalid page \(value) must disable the dialog Go button; field=\(String(describing: field.value))")
             XCTAssertEqual(try ui.state().page, before.page)
         }
+        ui.logQA("Go to Page replacement", "value=3 expectedTarget=3; selection replacement, no Delete")
         try ui.replaceNativeText(in: field, with: "3")
         try tap("Go")
         _ = try page(3)
@@ -693,6 +717,7 @@ final class CanvasUITests: XCTestCase {
         executionTimeAllowance = 300
         try open(whiteboard)
         try boards()
+        try assertNoHelperInkOnFixtureBoard()
         let row = try boardRow(1, count: 1)
         try openBoardMenu(row)
         try boardMenuTap("Rename")
@@ -712,11 +737,20 @@ final class CanvasUITests: XCTestCase {
         XCTAssertEqual(try ui.state().itemCountOnPage, 3)
     }
 
+    private func assertNoHelperInkOnFixtureBoard() throws {
+        // UITestFixture seeds Concept map with ellipse, text and sticky only: zero ink.
+        let state = try ui.state()
+        ui.logQA("Board helper ink guard", "expectedFixtureStrokes=0 actual=\(state.strokeCountOnPage) page=\(state.page ?? "missing")")
+        XCTAssertEqual(state.strokeCountOnPage, 0,
+                       "A helper drew on the page before the test's first board operation; fixture has no strokes")
+    }
+
     // board.insertTemplate; F044. Separate tests keep one missing framework from hiding the other seven.
     private func framework(_ title: String) throws {
         try open(whiteboard)
         let before = try ui.state()
         try boards()
+        if title == "Meeting Notes" { try assertNoHelperInkOnFixtureBoard() }
         try tap("Templates")
         // performTap reveals the requested row in its live container, including virtualized templates.
         try tap(title)

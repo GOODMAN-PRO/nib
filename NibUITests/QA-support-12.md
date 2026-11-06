@@ -257,3 +257,126 @@ Validation: python Scripts/lint.py reports **0 errors, 25 warnings**; **git diff
 | Both timer history tests | Timer history inventory | Which heading-relative viewport ranges were scanned, which scroll percentages prove the bottom, and which physical row positions make up the exact inventory? |
 
 Validation: `python Scripts/lint.py` reports **0 errors, 25 warnings**; `git diff --check` passes. Reviewed changed Swift APIs, throwing paths, both helper callers and preservation of all pre-existing history assertions. Only ChromeUITests.swift and this support record changed; job 12a and app sources are untouched. No sleep, skip, allowance increase, test removal or fixture substitution. Swift compilation and real AX traversal remain for macOS CI: the non-lazy heading must remain in snapshots while offscreen, content scroll indicators must expose their percentage, and row-relative geometry must remain stable. Missing evidence fails explicitly. Synchronous AX calls can exceed the outer deadline; no runtime saving is claimed for this additional verification. The companion timerHistory scenario remains another branch's responsibility.
+
+
+## Round 12c
+
+Merged integration ff8eeefc cleanly (fast-forward). Read both prior prompts, README, Round 11a-11c and Round 12a/12b, and both complete R14 families (findings and verdicts). Corrections govern. Windows source-only: compilation and simulator results belong to the next macOS CI run. The removed app sampler is not compensated for by a test allowance, delay or environment change.
+
+### H15 - reveals cannot draw
+
+Confirmed R14:canvas#0 and its holds=true verdict against current tapControl/liveList: an existing non-hittable sidebar toggle went immediately to reveal; a non-hittable retained Fountain Pen scroll view was accepted solely for window overlap. Meeting's t=13.10 drag and Rename's t=15.74 drag correspond to native pen strokes in the app log. The exact reason the toggle was briefly non-hittable remains unproven.
+
+An existing control now gets a three-second element-predicate hittability wait before reveal, with elapsed time/result logged. Existing targets must belong to the chosen list. Non-hittable containers need live presented ancestry/descendants; window intersection alone is no longer a fallback. Presentation/cover classification reuses the same root snapshot. Explicit retained containers are checked too. Every form/horizontal reveal checks the whole straight travel against nib.canvas before contact. A canvas rectangle behind a proven live foreground popover/form is occluded; only that proven foreground intersection can protect a drag. With no foreground protection, candidate points on canvas fail explicitly instead of drawing. No canvas-scroll opt-in is exposed on reveal helpers: intentional canvas scrolling uses the existing dedicated gesture paths.
+
+Audited all class-local drags and shared callers. Create's local form reveal and Pages' More/template reveals use the same guard. Held drags now require a hittable actual source and its centre (coordinate-space equality is checked before mapping to interface geometry): Ink swatch slots, Pages thumbnails and Insert Star supply it. Selection's deliberate canvas-source transfer opts in explicitly. Only the source is guarded for these system transfers because Insert intentionally drops on canvas. Palette grip resolution now rejects non-hittable retained Tools copies; its existing same-snapshot anchor/gap checks remain. Slider dragging already requires a hittable track. Canvas writing/scrolling, item manipulations and Library card transfers are intentional actions, not reveal fallbacks. No test assertion, skip or allowance changes.
+
+Should unblock BoardFrameworkMeeting and BoardRenamePersistsAfterReopeningDocument and protect all reveal callers. Next CI must show the hittability wait resolving the toggle, no reveal drag/pen-native-stroke before either board operation, and successful real form/horizontal reveals in Ink/Insert/Create/Pages. Foreground AX ancestry/hittability and landscape coordinates need runtime verification; failure is conservative, never a canvas fallback.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Shared command taps, especially both board failures | Control hittable wait | How long did an existing control take to become hittable before reveal was considered? |
+| Shared and class-local reveals | Canvas drag prevented / Form reveal unavailable | Was the proposed path on exposed canvas or backed by a live presented scrolling surface? |
+| Held-drag callers | System drag requires a live source (failure) | Was the start the actual hittable source centre rather than a retained container coordinate? |
+
+Validation: python Scripts/lint.py: 0 errors, 25 warnings; git diff --check passes. No local compilation/runtime claim.
+
+### H16 - replace a selection without Delete
+
+Confirmed R14:canvas#1's correction: type 5 began at t=43.14, idle waits ended at 103.16 and 164.54; HID Delete preceded hide/show and loss of field focus. The animation monitor's persistent non-idle cause is NOT proven. Merely switching typeText to SPI while retaining Delete would leave subsequent ordinary actions exposed to the same stall.
+
+replaceNativeText now proves this exact field's focus, uses focusedKey Command-A for existing text and focusedText's existing runner text-event SPI to type over the selection. No Delete is sent for a nonempty replacement, including the invalid-page loop. Exact waitForNativeText verification is retained. Selection focus is checked boundedly before typing without retapping or destroying the selection. Unicode/punctuation use the existing route 3 full-string API, not an ASCII-only key mapping. Empty replacements retain clearNativeText/HID Delete; immediately after every such Delete, the helper waits up to five seconds for exact field focus and an unchanged keyboard frame across at least 300 ms of predicate observations before further actions/value diagnostics. Explicit clearNativeText callers also get this recovery gate, with unchanged empty-value and decimal diagnostic checks.
+
+Keyboard visibility is observed at replacement boundaries and each focus/value/recovery poll. Logs include elapsed transition times and a flap line when multiple transitions are observed, plus the replacement start uptime. This is runner AX sampling, not a complete app-notification stream: a hide/show entirely between observations can be missed. No timer, sleep, swizzle, app change or claimed monitor-cause fix is added. Compare these observations with the app's existing idle/keyboard lines and missing idle replies in CI.
+
+Audited replacement/clear/type callers in all classes: Canvas, Chrome via fillNativeForm, Create, Ink, Insert, Library, Pages, Selection and internal Files naming. Existing signatures stay source-compatible through defaulted diagnostic parameters; explicit Return/commit paths and numeric-format callers retain their behavior. fillNativeForm's separately opted-in keyboard traversal already verifies explicit clearing and is unchanged. Should unblock GoToPageRejectsInvalidNumbersAndNavigatesValidTarget; next CI must show Select All/no Delete for 5, -1 and 3, exact text and every existing assertion, no repeated 60-second idle waits, and bounded recovery on intentional empty clears. Native SPI/focus AX exposure remains uncompiled here.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| All replaceNativeText callers, especially invalid-page loop | Native replacement selection | Was Select All followed by replacement typing with no Delete? |
+| Same | Native replacement keyboard / Native replacement keyboard flap | Which hide/show transitions were observed, at what elapsed times, during this replacement? |
+| Intentional empty clears | Native Delete recovery (failure) | Did the exact field regain focus and the keyboard frame stabilize before the next action? |
+
+Validation: python Scripts/lint.py: 0 errors, 25 warnings; git diff --check passes. Runtime saving is not measured; removing the observed 121-second idle stall is a CI hypothesis, not a guaranteed saving.
+
+### H17 - typed direction rows from the current offset
+
+Confirmed R14:canvas#2 with correction: the measured Horizontal reveal took four moves/21.22 seconds; the second choice was still in lookup when the test hit 180 seconds. Episodic environment slowness is supported; stderr blocking in THIS test is not proven. Current FeatDocChromeFeature gives both buttons cmd.doc.setScrollDirection and distinct exact labels, orders 100/110 at the list end. Selecting either closes More, so keeping a single presentation open is impossible.
+
+Canvas setDirection now binds a scoped Button query with identifier AND exact label, uses edge .bottom only if needed, then requires enabled/hittable and the existing menu-closure helper. Reopening for the second choice preserves the app's retained offset; the helper never homes or resets it. All layout/navigation/content assertions remain. No environment settings or sampler compensation. Next CI should log fewer queries/moves and lower per-choice time than the measured reveal, with both Horizontal and Vertical selected and all reopen/page-frame assertions passing. No fixed runtime saving is claimed; the app may rebuild at top, which still gets bottom-directed reveal rather than a test-side reset.
+
+Compatibility check found an important current-source distinction for H15: Chrome/palette buds use AX-hidden DismissCatcher (DropletContainer), not a native PopoverDismissRegion. The already-existing menuHasActiveContent closure policy distinguishes live rows from retained empty shells. The safety classifier now also accepts that source-backed custom scrolling surface ONLY with a matching live hittable host and actual button rows, excluding every subtree containing nib.canvas. Explicit More scopes use one list snapshot, reused for the reveal, instead of a whole-app ancestry walk; this source-defined custom bud has no native cover. Every reveal contact rechecks live content before trusting cached foreground geometry. Native modal ancestry remains supported. This preserves More/horizontal tool menus without reviving the non-hittable retained fallback implicated in R14.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Canvas layout tests using setDirection | Canvas direction row / Form reveal timing | What is the full per-choice cost, and how many bottom-directed moves were needed without homing? |
+
+Validation: source query uses two predicate placeholders/two arguments and current helper signatures. Compilation and timing await CI.
+
+### C8 - remove happy-path diagnostic work
+
+Confirmed R14:create#0 and correction against current code and remeasured the raw logs. Run 42136488712 has 525 timed activities, passes in 151.340 s; Width typing t=90.89 to Height tap t=113.31 is 22.42 s. Run 42175781057 has 472 timed activities before the allowance kill; the equivalent t=65.06 to 83.37 is 18.31 s. The latter heading-existence query stalls from 126.78 to 152.08 (25.30 s); the surrounding 115.82->126.78, 152.08->157.97 and 161.96->169.28 gaps measure 10.96, 5.89 and 7.32 s. Those four late gaps total 49.47 s, not a new measured app-hang claim. The sampler overlaps the late stalls and is already removed externally.
+
+CustomSize no longer requests either Width snapshots or millimetre clear diagnostics. InvalidCustomSizePreventsCreation retains both diagnostic modes and its existing allowance. The happy path resolves New Notebook's heading frame once after choosing Custom, reuses that immutable frame for both inert-header dismissals, and relies on the valid default draft title because it never asserts a title. This removes the title replace/dismiss cycle entirely. dismissNativeKeyboard accepts an additive optional cached frame, validates it against current window/keyboard geometry, skips the unused Hide lookup for an inert-header route, and keeps the observed conditional second-contact and keyboard-gone gates. Other callers retain their element/default routes.
+
+All creation/persistence/dimension assertions are unchanged. Expected saving is approximately 20-30 s per the verifier, NOT the finder's speculative 40-60 s, and is unmeasured on the changed code. The default-title shortcut additionally removes observed title work but is not double-counted in that estimate. H16's safety recovery can add polling cost. This reduces budget exposure and cannot guarantee immunity to another 25-31 s stall.
+
+Next CI must show no Width keyboard/Decimal clear logs for CustomSize, one cached heading frame, the unchanged exact size oracle, and a lower runtime without an allowance increase. InvalidCustomSize must retain diagnostic snapshots/clear logs and every rejection/package assertion.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Create testCustomSize | Custom size timing | What is the new body duration after removing happy-path diagnostics/title editing? |
+| Create testCustomSize | Custom size heading | Which single heading frame was reused for both numeric keyboard dismissals? |
+
+Validation: current dismissNativeKeyboard/replace callers audited; new arguments are defaulted. Runtime saving and cached-heading geometry need CI verification.
+
+### C9 - name helper ink at the board boundary
+
+Confirmed R14:canvas#0 and its verdict against current UITestFixture: Concept map has an ellipse, text and sticky, with zero strokes (the notebook's separate ink seed does not belong to this board). Meeting's extra stroke survived template Undo; Rename had four items without a Duplicate action. H15 owns the cause fix.
+
+Both BoardFrameworkMeeting and BoardRenamePersistsAfterReopeningDocument now assert strokeCountOnPage == 0 immediately after boards(), before Templates/rename actions. The message explicitly says a helper drew on the page. This uses the fixture's known count, not a baseline captured after the bad helper, and retains all original item-count, Undo/Redo, rename and reopen assertions. The framework guard is limited to Meeting Notes as requested; no added per-test cost for the other templates.
+
+Next CI must log zero before either first board operation, no native pen stroke from setup, and pass all original assertions. A regression should fail at the named helper boundary instead of a later count timeout.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| BoardFrameworkMeeting; BoardRenamePersistsAfterReopeningDocument | Board helper ink guard | Did setup leave any stroke beyond the fixture's zero before the first board operation? |
+
+### C10 - retain the complete invalid-page loop
+
+Confirmed R14:canvas#1 with the verifier correction and current test: 0, 5 and -1 must each disable Go and preserve the page; 3 must navigate, preserve four pages, and the final go(1)/unchanged check must hold. All these exact assertions and the loop remain. Each call now receives H16's nonempty selection replacement, so none sends HID Delete. Added lightweight value-boundary logs (no extra AX query) to align the four replacements with H16's keyboard observations and app idle logs. No speculative animation-monitor fix is claimed.
+
+Next CI must show all four boundaries, exact replacement values, every original invalid/valid/restoration assertion, no Delete between values and no repeated 60-second animation-idle timeout. A persistent failure without Delete refutes that trigger as a sufficient explanation; retain the runner/app idle evidence instead of adding a delay or allowance.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| GoToPageRejectsInvalidNumbersAndNavigatesValidTarget | Go to Page replacement | Which of 0/5/-1/3 preceded a keyboard transition or missing idle reply, and what result was expected? |
+
+### Final source review and validation
+
+Re-read every changed Swift hunk with its surrounding helper/caller flow, including Canvas/Create and the held-drag callers in Ink/Insert/Pages/Selection. Checked the unchanged NibTouchPaths.h and existing Objective-C SPI implementation/signatures: no Objective-C source changes or new SPI selector. Reviewed optional CGRect/snapshot inference, XCTest query/coordinate/wait APIs, field-specific focus, throwing call sites, closure captures, predicate argument counts and defaulted labels. Hittability is tested on live XCUIElement properties rather than an invented snapshot predicate attribute. Horizontal rows can be live through their hittable content when the container itself is non-hittable; retained empty shells remain rejected. Full gesture paths use interface coordinates; held-source coordinate equality is compared in screen space before mapping its known centre to interface space. Explicit More uses one scoped snapshot, and ordinary post-drag snapshots are retained.
+
+Grepped every class for changed replacement/clear/dismiss/reveal/held-drag APIs. All four held-drag callers supply their real source or explicit canvas intent and propagate errors; other signatures keep their defaults. No test was removed or split in this round. Python inventory confirms 603 test declarations, 14 allowance assignments and all existing sleep/skip sites unchanged, and every original XCTAssert source line retained. All eight changed files are under NibUITests. Required python Scripts/lint.py: **0 errors, 25 warnings**; git diff --check against ff8eeefc passes. Six cluster commits carry the requested exact two-line attribution; no push.
+
+Runtime/compile limits: Windows has no Swift/Objective-C compiler or simulator. Swift compilation, native focus/keyboard stability, custom/popover AX ancestry, actual drag hit-testing, cached heading geometry and new runtimes remain unverified until GitHub Actions. Synchronous XCTest AX calls can exceed outer predicate deadlines; no sleep or allowance compensates for that. Keyboard transition logs are sampled observations and cannot rule out an unobserved between-poll flap. Foreground protection fails conservatively if its identity/geometry cannot be proved. More may rebuild at top; the tests never home it. Safety checks add some queries, so only CI can establish net savings. CustomSize's expected saving remains **20-30 seconds, unmeasured**, against the remeasured 151.340-second baseline; no guaranteed immunity to stalls and no suite-total speedup is claimed. All H15-H17/C8-C10 clusters are complete; none left unstarted or partially committed.
+
+### Review fixes - round 5 (2026-11-06)
+
+Reviewed the six job 12c commits on this branch against the supplied round-5 findings, current helpers/callers and R14 evidence. Jobs 12a/12b are already integrated; this is one additional test-support review commit, with no app changes or integration merge.
+
+1. **Custom-size heading (major):** the C8 cache was captured before Width focus, when New Notebook still had its unkeyboarded layout. Capture now follows the first Width replacement and a bounded five-second predicate requiring unchanged heading/keyboard frames across at least 300 ms. Both dismissals reuse that keyboard-visible frame and the same heading query. The cached-frame route checks the live static-text heading's four edges within one point before contact, in addition to window containment and keyboard exclusion. A shifted heading fails before tapping paper controls. Happy-path Width/clear diagnostics remain off; the invalid-size test retains them.
+2. **Library reveal guard (major):** `guardRevealDrag` now returns immediately when `nib.canvas` is absent, before any container liveness requirement or snapshot. With a canvas, a non-hittable host can qualify through hittable visible content. This restores the safe Create/library route and non-hittable native scrolling hosts without accepting empty retained buds over canvas.
+3. **Class-local reveals (major):** Time Keeper history now calls the shared guard immediately before its drag. Its `context.scroller` is an `XCUIElementSnapshot`, so the guard receives the live owning Time Keeper form; the existing inner-scroller viewport still supplies both points. Coordinates now subtract the app-frame origin. Pages `tapThumb` also needed protection: replaced `grid.swipeUp()` with an explicit, window/keyboard-clipped upward path guarded immediately before contact. Existing Create and Pages More/template guards remain. The remaining Library menu swipes run on library surfaces; canvas scroll/writing, slider/scrubber actions, item manipulation and explicit transfers are deliberate gestures rather than reveal fallbacks.
+4. **Horizontal reveal cost (major):** no foreground snapshot or ancestry resolution occurs without a canvas. With a canvas, resolve presentation lazily once per call, then reuse it across moves. Every contact still verifies the row's live visible content and unchanged frame before checking the full path against exposed canvas. The existing per-move row snapshot is reused for content filtering. A four-move reveal now takes at most one whole-app presentation snapshot instead of four (zero when no canvas); elapsed savings require CI measurement.
+5. **Form liveness (major):** the per-contact check runs only for a classified foreground surface or when canvas exists. The shared content probe filters snapshot descendants by visible frame before live hittability queries, without the old first-24-row cutoff. Buttons, switches, sliders, fields, text views and static text qualify. It reuses the current list snapshot and checks live list geometry; missing/closed content still fails before any contact over canvas. This preserves long non-lazy and switch/text-only forms.
+6. **Custom panels without buttons (minor):** custom foreground classification now requires a real hittable visible descendant of any supported content type, rather than `menuHasActiveContent`'s button-only menu-closure heuristic. Empty retained shells still cannot qualify. Menu-closure behavior itself is unchanged.
+7. **System-drag sources (minor):** collection views and tables now qualify alongside scroll views as live foreground hosts, covering docked thumbnail and element panels. `dragWithHold` retains its actual hittable source-centre requirement and guards only that source; intentional canvas destinations and Selection's explicit canvas-source opt-in remain. The mandated three-second `tapControl` wait is unchanged. Pages thumbnail and Insert Star transfers must be confirmed in CI.
+
+| Tests / helper | Log or failure | Next-run question |
+| --- | --- | --- |
+| Create CustomSize | Custom size heading / Numeric keyboard heading moved | Was the cache acquired with the keyboard visible, and did both dismissal layouts match it? |
+| Ink/Insert horizontal rows | Horizontal reveal / Horizontal reveal surface closed or moved | Did the row stay live while presentation resolution happened at most once? |
+| Time Keeper inventory; Pages thumbnail reveal | Canvas drag prevented / Reveal requires a live hittable scrolling container | Did the foreground host still cover the complete path immediately before contact? |
+| Long native/custom forms | visible scrolling content snapshot / scrolling surface is no longer live before drag | Did an actually visible descendant qualify even beyond the first 24 rows or without buttons? |
+
+Source review covered every changed Swift block, all cached-header calls, horizontal and form reveals, the four held-drag callers, and class-local drag/swipe sites. No tests, assertions, skips or allowances were removed or relaxed; no sleep was added. Required validation: `python Scripts/lint.py` reports **0 errors, 25 warnings**; `git diff --check` passes. Only `NibUITests/**` changes. No local Swift/XCTest build or simulator run is possible on this Windows host. CI must verify compilation, keyboard layout equality, native/custom AX liveness, Time Keeper inventory within its existing deadline, Pages/Insert transfers, and net reveal timing. Safety queries still cost time and cannot make synchronous AX requests interruptible; no runtime improvement is claimed as measured.

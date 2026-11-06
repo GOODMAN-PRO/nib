@@ -226,13 +226,35 @@ final class CreateUITests: XCTestCase {
     func testSquareSize() throws { try sizeCase("Square", width: 595.28, height: 595.28) }
 
     func testCustomSize() throws {
-        try notebook("Custom dimensions")
+        let started = ProcessInfo.processInfo.systemUptime
+        defer { ui.logQA("Custom size timing", "seconds=\(ProcessInfo.processInfo.systemUptime - started) diagnostics=false; default draft title") }
+        // This test asserts dimensions, not the title; the draft's valid default is sufficient.
+        try newMenu("Notebook")
         try tap("No cover")
         try chooseSize("Custom")
-        try replace(ui.app.textFields["Width in millimetres"], with: "100", matching: numericValueMatches)
-        try ui.dismissNativeKeyboard(diagnoseWidth: true, inertHeader: ui.app.staticTexts["New Notebook"].firstMatch)
-        try replace(ui.app.textFields["Height in millimetres"], with: "150", matching: numericValueMatches)
-        try ui.dismissNativeKeyboard(diagnoseWidth: true, inertHeader: ui.app.staticTexts["New Notebook"].firstMatch)
+        try replace(ui.app.textFields["Width in millimetres"], with: "100", diagnoseClear: false, matching: numericValueMatches)
+        let heading = ui.app.staticTexts["New Notebook"].firstMatch
+        try require(heading, "Custom size needs the inert New Notebook heading")
+        var headingFrame = CGRect.null
+        var keyboardFrame = CGRect.null
+        var stableSince = ProcessInfo.processInfo.systemUptime
+        try wait("Custom size heading must settle above the visible keyboard", timeout: 5) {
+            guard heading.exists, self.ui.app.keyboards.firstMatch.exists else { return false }
+            let current = heading.frame
+            let keyboard = self.ui.app.keyboards.firstMatch.frame
+            let now = ProcessInfo.processInfo.systemUptime
+            if current != headingFrame || keyboard != keyboardFrame {
+                headingFrame = current; keyboardFrame = keyboard; stableSince = now
+                return false
+            }
+            return !current.isEmpty && !current.isNull && !current.isInfinite
+                && self.ui.app.windows.firstMatch.frame.contains(current)
+                && !current.intersects(keyboard) && now - stableSince >= 0.3
+        }
+        ui.logQA("Custom size heading", "keyboardVisibleCachedFrame=\(headingFrame); checked before both dismissals")
+        try ui.dismissNativeKeyboard(inertHeader: heading, inertHeaderFrame: headingFrame)
+        try replace(ui.app.textFields["Height in millimetres"], with: "150", diagnoseClear: false, matching: numericValueMatches)
+        try ui.dismissNativeKeyboard(inertHeader: heading, inertHeaderFrame: headingFrame)
         try assertSize(try create(), width: 100 * 72 / 25.4, height: 150 * 72 / 25.4)
     }
 
@@ -853,6 +875,7 @@ final class CreateUITests: XCTestCase {
             let beforeRows = visibleRows(scroll, viewport: visible)
             let drag = NibUITestScrollGeometry.drag(in: visible, toward: targetY)
             let startY = unchanged > 0 ? drag.start.y + (drag.start.y > visible.midY ? -16 : 16) : drag.start.y
+            try ui.guardRevealDrag(in: scroll, from: CGPoint(x: drag.start.x, y: startY), to: drag.end)
             let origin = app.coordinate(withNormalizedOffset: .zero)
             origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: startY - app.frame.minY))
                 .press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(
@@ -892,7 +915,7 @@ final class CreateUITests: XCTestCase {
 
     /// Waits for the edited value before dismissal; only explicitly formatted fields opt out of exact string comparison.
     private func replace(_ field: XCUIElement, with text: String, in application: XCUIApplication? = nil,
-                         matching matcher: ((String, String) -> Bool)? = nil) throws {
+                         diagnoseClear: Bool? = nil, matching matcher: ((String, String) -> Bool)? = nil) throws {
         try require(field, "Missing editable field: \(field)")
         try scrollTo(field, name: field.label, in: application)
         if name.contains("testSuggestedTitleUseReachesCreatedDocument") {
@@ -900,7 +923,7 @@ final class CreateUITests: XCTestCase {
         }
         ui.logQA("Stall boundary", "Create replacement field focus tap; field=\(field.label)")
         field.tap()
-        try ui.clearNativeText(in: field, diagnoseClear: field.label.contains("millimetres"))
+        try ui.clearNativeText(in: field, diagnoseClear: diagnoseClear ?? field.label.contains("millimetres"))
         if !text.isEmpty { try ui.typeNativeText(text, in: field) }
         try wait("Field must contain the replacement before dismissal: \(text)") {
             guard let actual = field.value as? String else { return false }

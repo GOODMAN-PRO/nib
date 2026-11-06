@@ -982,8 +982,8 @@ final class InkUITests: XCTestCase {
         try swatchMenu("Rearrange Colours")
         let slots = ui.app.buttons.matching(identifier: "cmd.preset.removeSwatch")
         XCTAssertEqual(slots.count, original.count)
-        ui.dragWithHold(from: slots.element(boundBy: 0).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
-                        to: slots.element(boundBy: 2).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)))
+        try ui.dragWithHold(from: slots.element(boundBy: 0).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
+                        to: slots.element(boundBy: 2).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)), source: slots.element(boundBy: 0))
         try tap("Done")
         let expected = [original[1], original[2], original[0]] + Array(original.dropFirst(3))
         try wait("Dragging a swatch must reorder the slots") { self.swatches.map(\.label) == expected }

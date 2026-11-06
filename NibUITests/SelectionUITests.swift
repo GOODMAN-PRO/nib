@@ -1136,7 +1136,7 @@ final class SelectionUITests: XCTestCase {
                 && !pages.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
         }, "Cancelled drag needs an in-window destination outside every page")
         ui.logQA("External drag source contact", "lifted=\(lifted) cancel=\(cancelledAt) window=\(window) pages=\(pages) previousSequence=\(sequenceBefore)")
-        ui.dragWithHold(from: screen(centre(lifted)), to: screen(cancelledAt))
+        try ui.dragWithHold(from: screen(centre(lifted)), to: screen(cancelledAt), allowCanvasStart: true)
         var fact = try XCTUnwrap(try ui.qaFact("dragSource") as? [String: Any], "QA fact dragSource must be an object")
         let sequence = try XCTUnwrap(fact["sequence"] as? Int, "dragSource.sequence is missing")
         XCTAssertGreaterThan(sequence, sequenceBefore, "System drag must publish a new sequence")

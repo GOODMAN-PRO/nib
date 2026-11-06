@@ -390,7 +390,7 @@ final class NibUI {
         let anchor = sibling ?? name
         let rows = root.scrollViews.containing(NSPredicate(format: "label == %@ OR identifier == %@", anchor, anchor))
         // Choose the innermost scroll view, not its enclosing vertical tool popover.
-        let candidates = rows.allElementsBoundByIndex.prefix(16).filter { hasVisibleFrame($0) }
+        let candidates = rows.allElementsBoundByIndex.prefix(16).filter { hasVisibleFrame($0) && hasHittableContent($0) }
         guard let row = candidates.min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else {
             throw Failure.message("Horizontal row missing for \(name), anchor=\(anchor)")
         }
@@ -401,6 +401,9 @@ final class NibUI {
         }
         var seen = Set<String>()
         var facts = "target=\(name) anchor=\(anchor)"
+        var foreground: CGRect?
+        var presentationResolved = false
+        var presentedRowFrame: CGRect?
         for attempt in 0...8 {
             guard row.exists, let snapshot = try? measuredSnapshot(row, named: "horizontal row " + anchor) else { break }
             let viewport = snapshot.frame.intersection(root.frame).intersection(app.windows.firstMatch.frame)
@@ -429,11 +432,124 @@ final class NibUI {
             let appFrame = app.frame
             let start = origin.withOffset(CGVector(dx: startX - appFrame.minX, dy: viewport.midY - appFrame.minY))
             let end = origin.withOffset(CGVector(dx: endX - appFrame.minX, dy: viewport.midY - appFrame.minY))
+            if canvas.exists {
+                // Resolve ancestry once per reveal, then recheck the row's live content
+                // and geometry at each contact. Library rows need no presentation walk.
+                if !presentationResolved {
+                    let surfaceRoot = try measuredSnapshot(app, named: "horizontal reveal presentation")
+                    foreground = presentedScrollingSurface(row, snapshot: surfaceRoot)
+                    presentedRowFrame = snapshot.frame
+                    presentationResolved = true
+                }
+                guard row.frame == presentedRowFrame,
+                      hasHittableContent(row, snapshot: snapshot, requiringDescendant: true) else {
+                    throw Failure.message("Horizontal reveal surface closed or moved before drag")
+                }
+            }
+            try requireNonCanvasDrag(from: CGPoint(x: startX, y: viewport.midY),
+                                     to: CGPoint(x: endX, y: viewport.midY), foreground: foreground)
             start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.4)
             moves += 1
         }
         logQA("Horizontal reveal failed", facts)
         throw Failure.message("Horizontal row must reveal a hittable control: " + facts)
+    }
+
+    private func hasHittableContent(_ element: XCUIElement, snapshot supplied: XCUIElementSnapshot? = nil,
+                                    requiringDescendant: Bool = false) -> Bool {
+        if !requiringDescendant && element.isHittable { return true }
+        guard let snapshot = supplied ?? (try? measuredSnapshot(element, named: "visible scrolling content")) else { return false }
+        let viewport = snapshot.frame.intersection(app.windows.firstMatch.frame)
+        guard !viewport.isNull, !viewport.isEmpty else { return false }
+        let types: [XCUIElement.ElementType] = [.button, .textField, .textView, .slider, .switch, .staticText]
+        func liveDescendant(_ node: XCUIElementSnapshot) -> Bool {
+            // Filter the snapshot by visible geometry BEFORE querying hittability. A
+            // non-lazy form can retain hundreds of off-screen rows before its live ones.
+            if types.contains(node.elementType), !node.frame.isEmpty, node.frame.intersects(viewport) {
+                let matches = element.descendants(matching: node.elementType).matching(NSPredicate(
+                    format: "identifier == %@ AND label == %@", node.identifier, node.label))
+                if matches.allElementsBoundByIndex.contains(where: {
+                    $0.exists && $0.frame == node.frame && $0.isHittable
+                }) { return true }
+            }
+            return node.children.contains { liveDescendant($0) }
+        }
+        return snapshot.children.contains { liveDescendant($0) }
+    }
+
+    /// A canvas rectangle can extend behind a popover. Only a live presented ancestor
+    /// may occlude it; an arbitrary retained scroll-view rectangle never does.
+    private func presentedScrollingSurface(_ element: XCUIElement, snapshot root: XCUIElementSnapshot) -> CGRect? {
+        guard element.exists else { return nil }
+        let frame = element.frame
+        let identifier = element.identifier
+        let label = element.label
+        let type = element.elementType
+        let modal = presentedFormContext(snapshot: root).form
+        func containsCanvas(_ node: XCUIElementSnapshot) -> Bool {
+            node.identifier == "nib.canvas" || node.children.contains { containsCanvas($0) }
+        }
+        func liveCustomSurface(_ node: XCUIElementSnapshot) -> CGRect? {
+            guard [.scrollView, .collectionView, .table].contains(node.elementType), !containsCanvas(node) else { return nil }
+            let matches = app.descendants(matching: node.elementType).matching(NSPredicate(
+                format: "identifier == %@ AND label == %@", node.identifier, node.label))
+            for host in matches.allElementsBoundByIndex where host.frame == node.frame {
+                // Chrome/palette buds have AX-hidden DismissCatcher, not PopoverDismissRegion.
+                // Live visible content distinguishes them from retained empty shells,
+                // including switch-only panels and docked thumbnail collections.
+                if hasHittableContent(host, snapshot: node, requiringDescendant: true) { return node.frame }
+            }
+            return nil
+        }
+        func visit(_ node: XCUIElementSnapshot, surface: CGRect?, scrolling: XCUIElementSnapshot?) -> CGRect? {
+            var foreground = surface
+            let scroll = [.scrollView, .collectionView, .table].contains(node.elementType) && !containsCanvas(node) ? node : scrolling
+            if [.popover, .sheet, .alert, .menu].contains(node.elementType)
+                || (node.elementType == .other && node.children.contains { $0.label == "Preview" }) {
+                foreground = node.frame
+            }
+            if let modal, node.elementType == modal.elementType && node.frame == modal.frame
+                && node.identifier == modal.identifier && node.label == modal.label { foreground = modal.frame }
+            if node.elementType == type && node.identifier == identifier && node.label == label && node.frame == frame {
+                let presented = foreground ?? scroll.flatMap { liveCustomSurface($0) }
+                return presented.map { $0.intersection(frame) }
+            }
+            for child in node.children {
+                if let found = visit(child, surface: foreground, scrolling: scroll) { return found }
+            }
+            return nil
+        }
+        guard let surface = visit(root, surface: nil, scrolling: nil), !surface.isEmpty, !surface.isNull else { return nil }
+        // Native forms can mark the host non-hittable while an actual row accepts input.
+        let live = hasHittableContent(element)
+        return live ? surface : nil
+    }
+
+    /// Check the entire straight gesture, including its endpoint. Foreground geometry
+    /// must come from a live presented surface, not from the candidate container alone.
+    private func requireNonCanvasDrag(from start: CGPoint, to end: CGPoint,
+                                      foreground: CGRect? = nil) throws {
+        guard canvas.exists else { return }
+        let canvasFrame = canvas.frame
+        let travel = CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
+                            width: max(0.01, abs(end.x - start.x)), height: max(0.01, abs(end.y - start.y)))
+        let protected = foreground?.insetBy(dx: 2, dy: 2)
+        if canvasFrame.intersects(travel) && !(protected?.contains(start) == true && protected?.contains(end) == true) {
+            let message = "Reveal refused: drag points lie on nib.canvas; no presented scrolling surface covers them"
+            logQA("Canvas drag prevented", "start=\(start) end=\(end) canvas=\(canvasFrame) foreground=\(String(describing: foreground))")
+            throw Failure.message(message)
+        }
+    }
+
+    /// Shared guard for class-local form/list reveals. No snapshot cost when the canvas is absent.
+    func guardRevealDrag(in container: XCUIElement, from start: CGPoint, to end: CGPoint) throws {
+        guard canvas.exists else { return }
+        guard container.exists && hasHittableContent(container) else {
+            throw Failure.message("Reveal requires a live hittable scrolling container")
+        }
+        let root = try measuredSnapshot(app, named: "drag presentation")
+        try requireNonCanvasDrag(from: start, to: end,
+                                 foreground: presentedScrollingSurface(container, snapshot: root))
     }
 
     /// Reveals in the actual list: home only from a proven nonzero scroll position.
@@ -456,6 +572,9 @@ final class NibUI {
         var moves = 0
         defer { logQA("Form reveal timing", "moves=\(moves) seconds=\(Date().timeIntervalSince(revealStarted))") }
         var ancestorClip: CGRect?
+        var foregroundSurface: CGRect?
+        var prefetchedListSnapshot: XCUIElementSnapshot?
+        var presentation: (form: XCUIElementSnapshot?, coverVisible: Bool) = (nil, false)
         var containerIsTransient = false
         func ancestry(_ target: XCUIElementSnapshot, in root: XCUIElementSnapshot) -> (clip: CGRect, transient: Bool)? {
             func visit(_ node: XCUIElementSnapshot, clip: CGRect, transient: Bool) -> (clip: CGRect, transient: Bool)? {
@@ -485,32 +604,42 @@ final class NibUI {
         // Unlabelled native thumbs are not unique identities; keep the caller's scoped query.
         let identity = initialSnapshot.flatMap { $0.identifier.isEmpty && $0.label.isEmpty ? nil : $0 }
         func liveList() -> XCUIElement? {
-            if let form, form.exists, hasVisibleFrame(form) {
-                ancestorClip = nil
-                containerIsTransient = false
-                // Ordinary explicit forms keep the cheap window clip. Only inspect ancestry
-                // within a presented transient surface; native UIKit menus use a Preview sibling.
-                let surfaces = app.popovers.allElementsBoundByIndex + app.menus.allElementsBoundByIndex
-                let hasNativeMenu = app.otherElements["Preview"].firstMatch.exists
-                if !surfaces.isEmpty || hasNativeMenu, let node = try? measuredSnapshot(form, named: "form snapshot") {
-                    for surface in surfaces where hasVisibleFrame(surface) {
-                        if let root = try? measuredSnapshot(surface, named: "surface snapshot"), let context = ancestry(node, in: root) {
-                            ancestorClip = context.clip
-                            containerIsTransient = context.transient
-                            break
-                        }
-                    }
-                    if ancestorClip == nil, hasNativeMenu, let root = try? measuredSnapshot(app, named: "app snapshot"),
-                       let context = ancestry(node, in: root), context.transient {
-                        ancestorClip = context.clip
-                        containerIsTransient = true
-                    }
+            // More is a source-defined custom bud with AX-hidden DismissCatcher.
+            // Its live rows and hittable host prove presentation without a whole-app walk.
+            if let form, form !== app, form.exists, form.isHittable, form.label == "More",
+               let node = try? measuredSnapshot(form, named: "explicit reveal surface"),
+               node.elementType == .scrollView, node.label == "More", node.identifier != "nib.canvas",
+               form.buttons.firstMatch.exists {
+                func containsCanvas(_ child: XCUIElementSnapshot) -> Bool {
+                    child.identifier == "nib.canvas" || child.children.contains { containsCanvas($0) }
                 }
-                return form
+                if !containsCanvas(node) {
+                    ancestorClip = node.frame
+                    foregroundSurface = node.frame
+                    prefetchedListSnapshot = node
+                    presentation = (nil, false)
+                    containerIsTransient = true
+                    return form
+                }
             }
-            guard let root = try? measuredSnapshot(app, named: "app snapshot") else {
-                logQA("Form reveal unavailable", "snapshotCandidates=0; app snapshot unavailable; candidates not collected")
+            guard let root = try? measuredSnapshot(app, named: "reveal presentation snapshot") else {
+                logQA("Form reveal unavailable", "No presentation snapshot; no drag")
                 return nil
+            }
+            presentation = presentedFormContext(snapshot: root)
+            if let form, form !== app, form.exists, hasVisibleFrame(form) {
+                foregroundSurface = presentedScrollingSurface(form, snapshot: root)
+                // An explicit retained host is still unsafe over the document.
+                if canvas.exists && form.frame.intersects(canvas.frame) && foregroundSurface == nil {
+                    let message = "Reveal refused: candidate drag points are on nib.canvas without a presented surface"
+                    formRevealFailure = message
+                    XCTFail(message)
+                    return nil
+                }
+                guard form.isHittable || foregroundSurface != nil else { return nil }
+                ancestorClip = foregroundSurface
+                containerIsTransient = foregroundSurface != nil
+                return form
             }
             let window = app.windows.firstMatch.frame
             var candidates: [(node: XCUIElementSnapshot, surface: Int, contains: Bool, overflow: Bool)] = []
@@ -572,12 +701,14 @@ final class NibUI {
                 return firstArea > secondArea
             }
             var diagnostics: [String] = []
-            var fallback: (element: XCUIElement, rank: Int, frame: CGRect)?
-            func chosen(_ element: XCUIElement, rank: Int, frame: CGRect, hittable: Bool) -> XCUIElement {
+            var rejectedCanvas = false
+            func chosen(_ element: XCUIElement, rank: Int, frame: CGRect, hittable: Bool,
+                        foreground: CGRect?) -> XCUIElement {
                 let node = ranked[rank].node
                 let context = ancestry(node, in: root)
                 ancestorClip = context?.clip
-                containerIsTransient = context?.transient ?? false
+                foregroundSurface = foreground
+                containerIsTransient = (context?.transient ?? false) || foreground != nil
                 logQA("Form reveal container", "type=\(node.elementType) label=\(node.label) frame=\(frame) rank=\(rank + 1)/\(ranked.count) hittable=\(hittable)")
                 return element
             }
@@ -618,25 +749,28 @@ final class NibUI {
                     diagnostics.append([nodeFacts, rankFacts, probeFacts].joined(separator: " "))
                 }
                 guard let resolved else { continue }
-                if resolved.hittable {
-                    return chosen(resolved.element, rank: rank, frame: resolved.frame, hittable: true)
+                // Existing controls must actually belong to the scrolling host. Lazy targets
+                // may be absent, but only a presented surface (or live library list) can scroll.
+                if identity != nil && !candidate.contains { continue }
+                let foreground = presentedScrollingSurface(resolved.element, snapshot: root)
+                if canvas.exists && resolved.frame.intersects(canvas.frame) && foreground == nil {
+                    rejectedCanvas = true
+                    continue
                 }
-                let visible = resolved.frame.intersection(window)
-                if fallback == nil, !visible.isNull, visible.width > 1, visible.height > 1 {
-                    fallback = (resolved.element, rank, resolved.frame)
-                }
+                guard resolved.hittable || foreground != nil else { continue }
+                return chosen(resolved.element, rank: rank, frame: resolved.frame, hittable: resolved.hittable, foreground: foreground)
             }
-            // Some native forms report a non-hittable container while their rows accept input.
-            // Drags use app coordinates; this element supplies only snapshots and scoped queries.
-            // Verified frame identity/window overlap replaces the retained off-screen-copy filter.
-            if let fallback {
-                return chosen(fallback.element, rank: fallback.rank, frame: fallback.frame, hittable: false)
+            if rejectedCanvas {
+                let message = "Reveal refused: only candidate drag points are on nib.canvas without a presented surface"
+                formRevealFailure = message
+                XCTFail(message)
             }
-            logQA("Form reveal unavailable", "snapshotCandidates=\(ranked.count); no resolved hittable or in-window container\n"
+            logQA("Form reveal unavailable", "snapshotCandidates=\(ranked.count); no live scrolling surface; retained closed popovers rejected\n"
                 + diagnostics.joined(separator: "\n"))
             return nil
         }
-        guard var list = liveList(), let firstSnapshot = try? measuredSnapshot(list, named: "list snapshot") else {
+        guard var list = liveList(),
+              let firstSnapshot = prefetchedListSnapshot ?? (try? measuredSnapshot(list, named: "list snapshot")) else {
             logQA("Form reveal unavailable", "No live container snapshot; caller retains its wait/fallback")
             return
         }
@@ -651,7 +785,6 @@ final class NibUI {
         // A missing Sheet node says nothing about Nib's plain-Other forms. Decide from
         // this list's own scroll position; unknown positions must never start by pulling down.
         let lazySearch = initialSnapshot == nil
-        let presentation = presentedFormContext()
         let modal = presentation.form
         let coverVisible = presentation.coverVisible
         if let modal, let context = ancestry(firstSnapshot, in: modal) {
@@ -758,6 +891,21 @@ final class NibUI {
             guard let start = formDragStart(snapshot, viewport: viewport, down: down,
                                             minimumY: down ? contentStart : viewport.minY + 24) else { return }
             let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
+            // Revalidate presentation before EACH contact. A custom bud can retain its
+            // frame after closing, so cached foreground geometry alone is insufficient.
+            if foregroundSurface != nil || canvas.exists {
+                guard list.exists, list.frame == snapshot.frame,
+                      hasHittableContent(list, snapshot: snapshot, requiringDescendant: true) else {
+                    containerLost("scrolling surface is no longer live before drag")
+                    return
+                }
+            }
+            do { try requireNonCanvasDrag(from: start, to: end, foreground: foregroundSurface) }
+            catch {
+                formRevealFailure = String(describing: error)
+                XCTFail("Reveal refused: only candidate drag points are on nib.canvas: \(error)")
+                return
+            }
             let values = formControlValues(snapshot)
             let wasTransient = containerIsTransient
             logQA("Form drag before", "point=\(start) container=\(listFrame) dragDown=\(down) top=\(top.evidence) minimumY=\(contentStart) rows=\(signature)")
@@ -1228,7 +1376,7 @@ final class NibUI {
         func resolveAnchors() -> Bool {
             let palettes = app.otherElements.matching(NSPredicate(format: "label == 'Tools'"))
             for palette in palettes.allElementsBoundByIndex.prefix(8) {
-                guard palette.exists, let snapshot = try? palette.snapshot() else { continue }
+                guard palette.exists && palette.isHittable, let snapshot = try? palette.snapshot() else { continue }
                 let frame = snapshot.frame
                 guard !frame.isNull, !frame.isInfinite, frame.width > 1, frame.height > 1,
                       before.contains(frame) else { continue }
@@ -2030,15 +2178,16 @@ final class NibUI {
     /// Prefer the native dismissal control; floating number pads can expose an unusable AX frame.
     /// Escape is a fallback only. Synthesis completion is not proof that the keyboard disappeared.
     func dismissNativeKeyboard(in application: XCUIApplication? = nil, diagnoseWidth: Bool = false,
-                               inertHeader: XCUIElement? = nil) throws {
+                               inertHeader: XCUIElement? = nil, inertHeaderFrame: CGRect? = nil) throws {
         let source = application ?? app
         guard source.keyboards.firstMatch.exists else { return }
         let viewport = source.windows.firstMatch.frame
-        let hide = source.keyboards.buttons.matching(NSPredicate(
+        let hasInertHeader = inertHeader != nil || inertHeaderFrame != nil
+        let hide = hasInertHeader ? nil : source.keyboards.buttons.matching(NSPredicate(
             format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).allElementsBoundByIndex.prefix(8).first {
                 hasVisibleFrame($0, in: viewport)
             }
-        let route = inertHeader != nil ? "inert sheet header" :
+        let route = hasInertHeader ? "inert sheet header" :
             (hide == nil ? "hardware Escape (no hittable dismissal control)" : "native Hide/Dismiss keyboard button")
         let keyboardBefore = source.keyboards.firstMatch.frame
         func inspect(_ stage: String) {
@@ -2073,13 +2222,27 @@ final class NibUI {
         try XCTContext.runActivity(named: "Dismiss native keyboard") { activity in
             let attachment = XCTAttachment(string: "route=\(route)")
             attachment.lifetime = .keepAlways; activity.add(attachment)
-            if let inertHeader {
-                guard hasVisibleFrame(inertHeader), inertHeader.elementType == .staticText else {
-                    throw Failure.message("Numeric keyboard dismissal requires the inert sheet heading")
-                }
-                let frame = inertHeader.frame
-                guard !frame.intersects(keyboardBefore) else {
-                    throw Failure.message("Numeric keyboard covers the sheet heading")
+            if hasInertHeader {
+                let frame: CGRect
+                if let cached = inertHeaderFrame {
+                    guard let inertHeader, inertHeader.exists, inertHeader.elementType == .staticText else {
+                        throw Failure.message("Cached keyboard dismissal frame requires its live inert heading")
+                    }
+                    let current = inertHeader.frame
+                    guard abs(current.minX - cached.minX) <= 1, abs(current.minY - cached.minY) <= 1,
+                          abs(current.maxX - cached.maxX) <= 1, abs(current.maxY - cached.maxY) <= 1 else {
+                        throw Failure.message("Numeric keyboard heading moved from cached frame: \(cached) -> \(current)")
+                    }
+                    frame = cached
+                } else if let inertHeader {
+                    guard hasVisibleFrame(inertHeader), inertHeader.elementType == .staticText else {
+                        throw Failure.message("Numeric keyboard dismissal requires the inert sheet heading")
+                    }
+                    frame = inertHeader.frame
+                } else { throw Failure.message("Numeric keyboard dismissal heading missing") }
+                guard !frame.isNull, !frame.isInfinite, !frame.isEmpty, viewport.contains(frame),
+                      !frame.intersects(keyboardBefore) else {
+                    throw Failure.message("Numeric keyboard covers the sheet heading or its cached frame is invalid")
                 }
                 source.coordinate(withNormalizedOffset: .zero).withOffset(
                     CGVector(dx: frame.midX - source.frame.minX, dy: frame.midY - source.frame.minY)).tap()
@@ -2095,7 +2258,7 @@ final class NibUI {
         // In the custom-size decimal editor the first outside tap dismisses only the floating pad.
         // A second contact is justified only by a still-present keyboard, never by a fixed delay.
         let firstDismissal = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
-        if inertHeader != nil, source.keyboards.firstMatch.exists,
+        if hasInertHeader, source.keyboards.firstMatch.exists,
            XCTWaiter.wait(for: [firstDismissal], timeout: 2) != .completed,
            source.keyboards.firstMatch.exists {
             guard let dockedHide = source.keyboards.buttons.matching(NSPredicate(
@@ -2347,8 +2510,34 @@ final class NibUI {
         }
     }
 
+    /// After HID Delete, observe only AX attributes until this exact editor is first
+    /// responder again and the keyboard frame is unchanged across a polling interval.
+    private func waitForNativeKeyboardRecovery(in field: XCUIElement, container: XCUIElement?,
+                                                observing observe: (() -> Void)? = nil) throws {
+        let scope = container ?? nativeFormContainer()
+        var previous: CGRect?
+        var sampled = false
+        var stableSince = ProcessInfo.processInfo.systemUptime
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            observe?()
+            let keyboard = app.keyboards.firstMatch
+            let frame: CGRect? = keyboard.exists ? keyboard.frame : nil
+            let now = ProcessInfo.processInfo.systemUptime
+            let focused = isKeyboardFocused(field, allowingAttributeFallback: true, in: scope)
+            if !sampled || frame != previous || !focused {
+                previous = frame; sampled = true; stableSince = now
+                return false
+            }
+            return focused && now - stableSince >= 0.3
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 5) == .completed else {
+            throw Failure.message("Native Delete recovery: field did not regain verified focus with a stable keyboard frame")
+        }
+    }
+
     /// Clear is an observable prerequisite, so a failed Select All can never append replacement text.
-    func clearNativeText(in field: XCUIElement, container: XCUIElement? = nil, diagnoseClear: Bool = false) throws {
+    func clearNativeText(in field: XCUIElement, container: XCUIElement? = nil, diagnoseClear: Bool = false,
+                         observingKeyboard observe: (() -> Void)? = nil) throws {
         func inspectClear(_ stage: String) {
             guard diagnoseClear else { return }
             let value = field.value as? String
@@ -2366,6 +2555,7 @@ final class NibUI {
         logQA("Native clear HID", "Delete after Select All; field=\(field.label)")
         logQA("Stall boundary", "native clear Delete after Select All; route=HID")
         try sendHIDKey(0x2A)
+        try waitForNativeKeyboardRecovery(in: field, container: container, observing: observe)
         inspectClear("after first Delete")
         let remainingValue = field.value as? String
         guard let remaining = remainingValue ?? (field.elementType == .textView ? "" : nil) else {
@@ -2378,7 +2568,10 @@ final class NibUI {
                   current.count <= 4096 else { throw Failure.message("Native clear needs a readable bounded value after caret tap") }
             logQA("Native clear", "field=\(field.identifier) frame=\(field.frame) deleteCount=\(current.count)")
             if !current.isEmpty {
-                for _ in 0..<current.count { try sendHIDKey(0x2A) }
+                for _ in 0..<current.count {
+                    try sendHIDKey(0x2A)
+                    try waitForNativeKeyboardRecovery(in: field, container: container, observing: observe)
+                }
                 inspectClear("after fallback Delete batch count=\(current.count)")
             }
         }
@@ -2412,20 +2605,67 @@ final class NibUI {
         if let failure { throw failure }
     }
 
-    /// Waits for exact replacement, including empty fields, after proving the old content is gone.
+    /// Nonempty replacement types over Select All, without a HID Delete or an
+    /// idle-waiting XCUIElement key/text action. Exact value verification remains mandatory.
     func replaceNativeText(in field: XCUIElement, with text: String, container: XCUIElement? = nil) throws {
-        let started = Date()
-        defer { logQA("Native replacement duration", "seconds=\(Date().timeIntervalSince(started))") }
-        try clearNativeText(in: field, container: container)
-        if !text.isEmpty {
-            try timedAction("Native replacement delivery (\(text.count) characters)") { try typeNativeText(text, in: field) }
+        let started = ProcessInfo.processInfo.systemUptime
+        var visibility: Bool?
+        var transitions: [String] = []
+        var samples = 0
+        func observeKeyboard() {
+            let keyboard = app.keyboards.firstMatch
+            let visible = keyboard.exists && !keyboard.frame.isEmpty
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            samples += 1
+            if let visibility, visibility != visible {
+                transitions.append("\(visible ? "show" : "hide")@\(elapsed)s")
+            }
+            visibility = visible
         }
-        try waitForNativeText(in: field, equals: text)
+        defer {
+            observeKeyboard()
+            let elapsed = ProcessInfo.processInfo.systemUptime - started
+            logQA("Native replacement duration", "seconds=\(elapsed)")
+            logQA("Native replacement keyboard", "samples=\(samples) transitions=\(transitions) seconds=\(elapsed); AX observations, not app notification history")
+            if transitions.count > 1 {
+                logQA("Native replacement keyboard flap", "transitions=\(transitions) replacementStartUptime=\(started)")
+            }
+        }
+        observeKeyboard()
+        let scope = container ?? nativeFormContainer()
+        try focusField(field, in: scope)
+        observeKeyboard()
+        guard isKeyboardFocused(field, allowingAttributeFallback: true, in: scope) else {
+            throw Failure.message("Native replacement requires this field's verified keyboard focus")
+        }
+        guard let value = field.value as? String else { throw Failure.message("Native editor has no readable value") }
+        if text.isEmpty {
+            // Explicit clearing is the only replacement route that needs Delete. Recovery
+            // runs before value queries, fallback caret taps or any later ordinary action.
+            try clearNativeText(in: field, container: scope, observingKeyboard: observeKeyboard)
+        } else if value != text {
+            if !value.isEmpty && value != field.placeholderValue {
+                logQA("Native replacement selection", "route=focusedKey Select All; no Delete")
+                try focusedKey("a", .command)
+                observeKeyboard()
+                let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                    observeKeyboard()
+                    return isKeyboardFocused(field, allowingAttributeFallback: true, in: scope)
+                }, object: nil)
+                guard XCTWaiter.wait(for: [focused], timeout: 3) == .completed else {
+                    throw Failure.message("Native replacement lost field focus after Select All")
+                }
+            }
+            try timedAction("Native replacement delivery (\(text.count) characters)") { try focusedText(text) }
+            observeKeyboard()
+        }
+        try waitForNativeText(in: field, equals: text, observing: observeKeyboard)
     }
 
     /// Waits for the native editor's actual text; a placeholder represents an empty value, not user content.
-    func waitForNativeText(in field: XCUIElement, equals text: String) throws {
+    func waitForNativeText(in field: XCUIElement, equals text: String, observing observe: (() -> Void)? = nil) throws {
         func matches() -> Bool {
+            observe?()
             guard field.exists else { return false }
             guard let value = field.value as? String else { return text.isEmpty && field.elementType == .textView }
             return value == text || (text.isEmpty && value == field.placeholderValue)
@@ -2662,6 +2902,16 @@ final class NibUI {
         if let control = candidate(id) { activate(control); return }
         let target = app.buttons.matching(identifier: id).firstMatch
         if target.exists {
+            if !target.isHittable {
+                let started = ProcessInfo.processInfo.systemUptime
+                let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                    target.exists && target.isHittable
+                }, object: target)
+                let result = XCTWaiter.wait(for: [ready], timeout: 3)
+                let elapsed = ProcessInfo.processInfo.systemUptime - started
+                logQA("Control hittable wait", "id=\(id) seconds=\(elapsed) result=\(result.rawValue)")
+                if result == .completed && target.isEnabled { activate(target); return }
+            }
             revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
             if let failure = formRevealFailure { throw Failure.message(failure) }
             if let control = candidate(id) { activate(control); return }
@@ -3019,7 +3269,18 @@ final class NibUI {
     }
 
     /// Round 9b system-drag contact: retain lift/travel, then dwell while UIKit accepts the proposal.
-    func dragWithHold(from start: XCUICoordinate, to end: XCUICoordinate) {
+    func dragWithHold(from start: XCUICoordinate, to end: XCUICoordinate,
+                      source: XCUIElement? = nil, allowCanvasStart: Bool = false) throws {
+        if !allowCanvasStart {
+            guard let source, source.exists && source.isHittable,
+                  source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).screenPoint == start.screenPoint else {
+                throw Failure.message("System drag requires a live source containing its start; refusing accidental canvas contact")
+            }
+            // The destination may intentionally be canvas (element insertion); only the source
+            // is protected for system drags. Reveals protect the complete path separately.
+            let centre = CGPoint(x: source.frame.midX, y: source.frame.midY)
+            try guardRevealDrag(in: source, from: centre, to: centre)
+        }
         logQA("System drag contact", "lift=0.8 velocity=500 destinationHold=1.5")
         start.press(forDuration: 0.8, thenDragTo: end,
                     withVelocity: XCUIGestureVelocity(rawValue: 500), thenHoldForDuration: 1.5)
@@ -3229,11 +3490,11 @@ final class NibUI {
         presentedFormContext().form
     }
 
-    private func presentedFormContext() -> (form: XCUIElementSnapshot?, coverVisible: Bool) {
+    private func presentedFormContext(snapshot supplied: XCUIElementSnapshot? = nil) -> (form: XCUIElementSnapshot?, coverVisible: Bool) {
         let region = app.otherElements["PopoverDismissRegion"].firstMatch
-        guard hasVisibleFrame(region) else { return (nil, false) }
+        guard supplied != nil || hasVisibleFrame(region) else { return (nil, false) }
         // Keep the observed cover on a failed snapshot: loss of evidence must not permit a modal pull-down.
-        guard let root = try? measuredSnapshot(app, named: "app snapshot") else { return (nil, true) }
+        guard let root = supplied ?? (try? measuredSnapshot(app, named: "app snapshot")) else { return (nil, true) }
         let window = app.windows.firstMatch.frame
         func containsVisibleCover(_ node: XCUIElementSnapshot) -> Bool {
             if node.identifier == "PopoverDismissRegion" {
@@ -3244,6 +3505,7 @@ final class NibUI {
             return node.children.contains { containsVisibleCover($0) }
         }
         let coverVisible = containsVisibleCover(root)
+        guard coverVisible else { return (nil, false) }
         func containsBackground(_ node: XCUIElementSnapshot) -> Bool {
             ["nib.canvas", "nib.qa.state", "nib.qa.clipboard", "PopoverDismissRegion",
              "inputView", "inputAssistantView", "SystemInputAssistantView"].contains(node.identifier)
