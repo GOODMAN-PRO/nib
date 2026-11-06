@@ -454,12 +454,14 @@ final class CanvasUITests: XCTestCase {
         try more("Go to Page…")
         let field = try require("Page number or title")
         for value in ["0", "5", "-1"] {
+            ui.logQA("Go to Page replacement", "value=\(value) expectedGoEnabled=false; selection replacement, no Delete")
             try ui.replaceNativeText(in: field, with: value)
             let goButton = ui.app.buttons.matching(NSPredicate(format: "label == %@", "Go")).firstMatch
             XCTAssertTrue(goButton.waitForExistence(timeout: 5))
             XCTAssertFalse(goButton.isEnabled, "Invalid page \(value) must disable the dialog Go button; field=\(String(describing: field.value))")
             XCTAssertEqual(try ui.state().page, before.page)
         }
+        ui.logQA("Go to Page replacement", "value=3 expectedTarget=3; selection replacement, no Delete")
         try ui.replaceNativeText(in: field, with: "3")
         try tap("Go")
         _ = try page(3)

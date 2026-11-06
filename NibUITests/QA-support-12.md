@@ -341,3 +341,21 @@ Next CI must log zero before either first board operation, no native pen stroke 
 | Tests | Log prefix | Question answered |
 | --- | --- | --- |
 | BoardFrameworkMeeting; BoardRenamePersistsAfterReopeningDocument | Board helper ink guard | Did setup leave any stroke beyond the fixture's zero before the first board operation? |
+
+### C10 - retain the complete invalid-page loop
+
+Confirmed R14:canvas#1 with the verifier correction and current test: 0, 5 and -1 must each disable Go and preserve the page; 3 must navigate, preserve four pages, and the final go(1)/unchanged check must hold. All these exact assertions and the loop remain. Each call now receives H16's nonempty selection replacement, so none sends HID Delete. Added lightweight value-boundary logs (no extra AX query) to align the four replacements with H16's keyboard observations and app idle logs. No speculative animation-monitor fix is claimed.
+
+Next CI must show all four boundaries, exact replacement values, every original invalid/valid/restoration assertion, no Delete between values and no repeated 60-second animation-idle timeout. A persistent failure without Delete refutes that trigger as a sufficient explanation; retain the runner/app idle evidence instead of adding a delay or allowance.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| GoToPageRejectsInvalidNumbersAndNavigatesValidTarget | Go to Page replacement | Which of 0/5/-1/3 preceded a keyboard transition or missing idle reply, and what result was expected? |
+
+### Final source review and validation
+
+Re-read every changed Swift hunk with its surrounding helper/caller flow, including Canvas/Create and the held-drag callers in Ink/Insert/Pages/Selection. Checked the unchanged NibTouchPaths.h and existing Objective-C SPI implementation/signatures: no Objective-C source changes or new SPI selector. Reviewed optional CGRect/snapshot inference, XCTest query/coordinate/wait APIs, field-specific focus, throwing call sites, closure captures, predicate argument counts and defaulted labels. Hittability is tested on live XCUIElement properties rather than an invented snapshot predicate attribute. Horizontal rows can be live through their hittable content when the container itself is non-hittable; retained empty shells remain rejected. Full gesture paths use interface coordinates; held-source coordinate equality is compared in screen space before mapping its known centre to interface space. Explicit More uses one scoped snapshot, and ordinary post-drag snapshots are retained.
+
+Grepped every class for changed replacement/clear/dismiss/reveal/held-drag APIs. All four held-drag callers supply their real source or explicit canvas intent and propagate errors; other signatures keep their defaults. No test was removed or split in this round. Python inventory confirms 603 test declarations, 14 allowance assignments and all existing sleep/skip sites unchanged, and every original XCTAssert source line retained. All eight changed files are under NibUITests. Required python Scripts/lint.py: **0 errors, 25 warnings**; git diff --check against ff8eeefc passes. Six cluster commits carry the requested exact two-line attribution; no push.
+
+Runtime/compile limits: Windows has no Swift/Objective-C compiler or simulator. Swift compilation, native focus/keyboard stability, custom/popover AX ancestry, actual drag hit-testing, cached heading geometry and new runtimes remain unverified until GitHub Actions. Synchronous XCTest AX calls can exceed outer predicate deadlines; no sleep or allowance compensates for that. Keyboard transition logs are sampled observations and cannot rule out an unobserved between-poll flap. Foreground protection fails conservatively if its identity/geometry cannot be proved. More may rebuild at top; the tests never home it. Safety checks add some queries, so only CI can establish net savings. CustomSize's expected saving remains **20-30 seconds, unmeasured**, against the remeasured 151.340-second baseline; no guaranteed immunity to stalls and no suite-total speedup is claimed. All H15-H17/C8-C10 clusters are complete; none left unstarted or partially committed.
