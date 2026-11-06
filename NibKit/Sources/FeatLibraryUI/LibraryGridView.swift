@@ -633,10 +633,13 @@ struct LibraryListRow: View {
                             .foregroundStyle(row.folderColor)
                     case .emoji(let emoji):
                         NibFolderGlyphView(glyph: .emoji(emoji), color: row.folderColor,
-                                           size: NibMetrics.rowThumbnailWidth - NibSpacing.s)
+                                           size: NibMetrics.rowThumbnailWidth - 2 * NibSpacing.s)
                     }
                 }
+                .padding(NibSpacing.s)
                 .frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
+                .background(NibColor.backgroundSecondary,
+                    in: RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous))
                 .libraryLayoutFrame("row.thumbnail." + row.ref, space: .global)
                 .accessibilityHidden(true)
             }
