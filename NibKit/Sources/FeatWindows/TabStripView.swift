@@ -32,6 +32,14 @@ enum TabStripLayout {
         var hidden: [Int]
         var tabWidth: CGFloat
         var dropletWidth: CGFloat
+        var activeTab: Int? = nil
+        var activeWidth: CGFloat? = nil
+        /// In the smallest single-capsule slot, +N takes the close button's place; Close remains in its menu.
+        var overflowInActiveTab = false
+
+        func width(for index: Int) -> CGFloat {
+            index == activeTab ? (activeWidth ?? tabWidth) : tabWidth
+        }
     }
 
     static func tabWidths(compact: Bool) -> ClosedRange<CGFloat> { compact ? 96...180 : 120...220 }
@@ -72,14 +80,26 @@ enum TabStripLayout {
         // A long title truncates inside the largest capsule instead of hiding the entire strip.
         let minimum = min(widths.upperBound,
                           max(widths.lowerBound, activeTitleWidth > 0 ? activeTitleWidth + NibSpacing.m + NibMetrics.hitTarget : 0))
-        var slots = min(max(0, count), maxTabs, Int(available / minimum))
-        if slots == 0, count > 0, available >= widths.lowerBound { slots = 1 }
+        var slots = min(max(0, count), maxTabs, Int(available / widths.lowerBound))
+        let hasOverflow = slots < count
+        if hasOverflow, slots > 0 {
+            slots = max(1, min(slots, Int(max(0, available - NibMetrics.hitTarget) / widths.lowerBound)))
+        }
         var shown = Array(0..<slots)
         if let active, active >= slots, active < count, slots > 0 { shown[slots - 1] = active }
         let hidden = (0..<max(0, count)).filter { !shown.contains($0) }
-        let tabWidth = slots == 0 ? 0 : min(max(widths.upperBound, minimum), available / CGFloat(slots))
+        let inlineOverflow = hasOverflow && slots == 1 && available < widths.lowerBound + NibMetrics.hitTarget
+        let overflow = hasOverflow && !inlineOverflow && slots > 0 ? NibMetrics.hitTarget : 0
+        let room = max(0, available - overflow)
+        let activeTab = active.flatMap { shown.contains($0) ? $0 : nil } ?? shown.last
+        let activeWidth = slots == 0 ? 0 : min(widths.upperBound,
+            max(minimum, room / CGFloat(slots)), room - CGFloat(slots - 1) * widths.lowerBound)
+        let tabWidth = slots <= 1 ? activeWidth
+            : min(widths.upperBound, max(widths.lowerBound, (room - activeWidth) / CGFloat(slots - 1)))
+        let capsules = slots == 0 ? 0 : activeWidth + CGFloat(slots - 1) * tabWidth
         return Plan(shown: shown, hidden: hidden, tabWidth: tabWidth,
-                    dropletWidth: slots == 0 ? 0 : 2 * inset + CGFloat(slots) * tabWidth)
+                    dropletWidth: slots == 0 ? 0 : 2 * inset + capsules + overflow,
+                    activeTab: activeTab, activeWidth: activeWidth, overflowInActiveTab: inlineOverflow)
     }
 
     static func plan(count: Int, active: Int?, width: CGFloat) -> Plan {
@@ -275,10 +295,15 @@ struct TabStripView: View {
             }
             ForEach(plan.shown, id: \.self) { index in
                 TabCapsule(tab: model.tabs[index], count: model.tabs.count, isSelected: model.selectedIndex == index,
-                           width: plan.tabWidth, model: model)
+                           width: plan.width(for: index), model: model,
+                           overflowCount: plan.overflowInActiveTab && index == plan.activeTab ? plan.hidden.count : 0)
             }
-            if documentPlan == nil, !plan.hidden.isEmpty {
-                overflowMenu(plan.hidden)
+            if !plan.hidden.isEmpty, !plan.overflowInActiveTab {
+                if documentPlan == nil {
+                    overflowMenu(plan.hidden)
+                } else {
+                    DocumentTabsOverflow(model: model, count: plan.hidden.count)
+                }
             }
         }
         .padding(.horizontal, TabStripLayout.inset)
@@ -317,6 +342,7 @@ struct TabCapsule: View {
     let isSelected: Bool
     let width: CGFloat
     let model: TabStripModel
+    var overflowCount = 0
 
     /// Display only: the shell owns the keys. ⌘9 selects the last tab, not the ninth.
     static func shortcutHint(index: Int, count: Int) -> KeyboardShortcut? {
@@ -355,7 +381,9 @@ struct TabCapsule: View {
                 }
             }
             .accessibilityShowsLargeContentViewer { Text(tab.title) }
-            if isSelected {
+            if overflowCount > 0 {
+                DocumentTabsOverflow(model: model, count: overflowCount)
+            } else if isSelected {
                 NibIconButton(.xmark, label: String(localized: "Close Tab"), size: .bar) { model.close(tab) }
                     .frame(width: NibMetrics.hitTarget, height: TabStripLayout.tabHeight)
             }
@@ -566,20 +594,7 @@ struct DocumentTabsMenu: View {
 
     var body: some View {
         Menu {
-            Button(String(localized: "Library")) { model.showLibrary() }
-            ForEach(model.tabs) { tab in
-                Button { model.select(tab.index) } label: {
-                    if tab.index == model.selectedIndex {
-                        Label { Text(tab.title) } icon: { Image(nib: .checkmark) }
-                    } else {
-                        Text(tab.title)
-                    }
-                }
-            }
-            if let active = model.tabs.first(where: { $0.index == model.selectedIndex }) {
-                Divider()
-                TabMenu(items: model.menuItems(active)) { model.run($0, on: active) }
-            }
+            DocumentTabsMenuItems(model: model)
         } label: {
             Image(nib: .templates)
                 .font(NibFont.glyph(.bar))
@@ -613,6 +628,50 @@ struct DocumentTabsMenu: View {
             }
             .allowsHitTesting(false)
         }
+    }
+}
+
+/// Both document entry points expose the same commands and the same complete list of open documents.
+struct DocumentTabsMenuItems: View {
+    @ObservedObject var model: TabStripModel
+
+    var body: some View {
+        Button(String(localized: "Library")) { model.showLibrary() }
+        ForEach(model.tabs) { tab in
+            Button { model.select(tab.index) } label: {
+                if tab.index == model.selectedIndex {
+                    Label { Text(tab.title) } icon: { Image(nib: .checkmark) }
+                } else {
+                    Text(tab.title)
+                }
+            }
+        }
+        if let active = model.tabs.first(where: { $0.index == model.selectedIndex }) {
+            Divider()
+            TabMenu(items: model.menuItems(active)) { model.run($0, on: active) }
+        }
+    }
+}
+
+struct DocumentTabsOverflow: View {
+    @ObservedObject var model: TabStripModel
+    let count: Int
+
+    var body: some View {
+        Menu { DocumentTabsMenuItems(model: model) } label: {
+            Text(String(localized: "+\(count)"))
+                .font(NibFont.button)
+                .foregroundStyle(NibColor.label)
+                .lineLimit(1)
+                .frame(width: NibMetrics.hitTarget, height: TabStripLayout.tabHeight)
+                .contentShape(Rectangle().inset(by: -TabStripLayout.hitOutset))
+        }
+        .menuIndicator(.hidden)
+        .menuStyle(.button)
+        .buttonStyle(NibPressStyle(shape: Capsule()))
+        .frame(width: NibMetrics.hitTarget, height: TabStripLayout.tabHeight)
+        .accessibilityLabel(String(localized: "\(count) more open documents"))
+        .accessibilityIdentifier("windows.tabs.overflow")
     }
 }
 
