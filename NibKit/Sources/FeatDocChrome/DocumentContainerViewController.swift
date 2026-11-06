@@ -956,12 +956,17 @@ struct ChromeRootView: View {
                 .frame(width: layout.editor.width, height: layout.editor.height)
                 .position(x: layout.editor.midX, y: layout.editor.midY)
                 .animation(motion, value: layout.editor)
+                .chromeLayoutProbe("editor", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
             BackdropReader(backdrop: backdrop, inking: inking, overlays: overlays) {
                 NibDropletContainer(inking: inking.state) {
                     overlay(layout, motion: motion)
+                        .chromeLayoutProbe("droplet.content", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
                 }
+                .chromeLayoutProbe("droplet.container", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
             }
+            .chromeLayoutProbe("backdrop", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
         }
+        .chromeLayoutProbe("root.content", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
         .background {
             if reservesPaletteSpace(layout) {
                 ChromeOptionsMeasurement(chrome: chrome, live: live, tool: model.snapshot.tool,
@@ -978,7 +983,8 @@ struct ChromeRootView: View {
         }
         // Settings › Appearance › Liquid (contracts-v2 NibSettings.liquidMode) for the whole container.
         .nibLiquidMode(liquidMode)
-        .frame(width: geometry.size.width, height: geometry.size.height)
+        // A child may exceed its proposal. Never centre that overflow and translate the canvas and chrome.
+        .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
         .ignoresSafeArea(.container)
         .ignoresSafeArea(.keyboard)
         .nibSheet(isPresented: sheetBinding(compact: layout.isCompact)) { sheetContent }
@@ -1068,29 +1074,39 @@ struct ChromeRootView: View {
             ChromeOverlayLayer(model: overlays, inking: inking, region: layout.activeOverlayRegion,
                                keyboardFrame: geometry.keyboardFrame,
                                isPortrait: geometry.size.height >= geometry.size.width)
+                .chromeLayoutProbe("overlays", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
             if let toolbar, showsPalette(layout), paletteCorrection(layout) == nil {
                 // Full height between open sidebars; padded by the safe area the root ignores (see ChromeLayout).
                 toolbar
                     .environment(\.horizontalSizeClass, layout.isCompact ? .compact : .regular)
+                    .chromeLayoutProbe("toolbar.content", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
                     .padding(layout.toolbarInsets)
+                    .chromeLayoutProbe("toolbar.padded", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
                     .frame(width: layout.toolbar.width, height: layout.toolbar.height)
                     .position(x: layout.toolbar.midX, y: layout.toolbar.midY)
                     .animation(motion, value: layout.toolbar)
+                    .chromeLayoutProbe("toolbar.positioned", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
             }
             if !layout.isCompact {
                 // The canvas keeps its viewport while editable floating panels clear the keyboard.
                 let region = ChromeRegion.avoidingKeyboard(geometry.keyboardFrame, in: layout.floatingRegion)
                 FloatingPanelsView(chrome: chrome, state: state, region: region,
                                    size: floatingSize(in: region))
+                    .chromeLayoutProbe("floating.panels", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
             }
             NavBarHost(chrome: chrome, live: live, snapshot: snapshot, layout: layout, sidebarMode: state.mode,
                        openMenu: $openMenu)
+                .chromeLayoutProbe("navigation", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
             ChromePopovers(openMenu: $openMenu, documentTitle: snapshot.title,
                            width: layout.isCompact ? max(0, geometry.size.width - 2 * NibSpacing.xxl) : NibMetrics.popoverWidth,
                            rows: { menuRows($0, compact: layout.isCompact) })
+                .chromeLayoutProbe("popovers", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
             NibFloatingLayer(host: floating)
+                .chromeLayoutProbe("floating.host", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
             ChromeToastLayer(host: floating, frame: layout.toast)
+                .chromeLayoutProbe("toast", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
         }
+        .chromeLayoutProbe("overlay.stack", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
@@ -1098,10 +1114,13 @@ struct ChromeRootView: View {
     private func sidebars(_ layout: ChromeLayout) -> some View {
         if let frame = layout.assistantBottom, let panel = chrome.assistantPanel(kind: model.snapshot.kind) {
             AssistantDockView(chrome: chrome, panel: panel, detent: $state.assistantDetent)
+                .chromeLayoutProbe("assistant.content", window: geometry.size, bottomAssistant: true)
                 .frame(width: frame.width, height: frame.height)
                 .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
                 .droplet("chrome.assistant.bottom", style: .panel)
+                .chromeLayoutProbe("assistant.droplet", window: geometry.size, bottomAssistant: true)
                 .position(x: frame.midX, y: frame.midY)
+                .chromeLayoutProbe("assistant.positioned", window: geometry.size, bottomAssistant: true)
         }
         if let frame = layout.window, let side = windowSide, let content = sidebarContent(side) {
             let frame = panelFrame(frame, id: content.selected.id)
@@ -1111,6 +1130,7 @@ struct ChromeRootView: View {
                 .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
                 .droplet("chrome.sidebar.window", style: .panel)
                 .position(x: frame.midX, y: frame.midY)
+                .chromeLayoutProbe("sidebar.window", window: geometry.size, bottomAssistant: layout.assistantBottom != nil)
         } else if !layout.isCompact {
             ForEach(SidebarSide.allCases, id: \.self) { side in
                 if let frame = (side == .left ? layout.left : layout.right), let content = sidebarContent(side) {
@@ -1121,6 +1141,8 @@ struct ChromeRootView: View {
                         .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
                         .droplet("chrome.sidebar." + side.rawValue, style: .panel)
                         .position(x: frame.midX, y: frame.midY)
+                        .chromeLayoutProbe("sidebar." + side.rawValue, window: geometry.size,
+                                           bottomAssistant: layout.assistantBottom != nil)
                 }
             }
         }
@@ -1250,6 +1272,22 @@ struct ChromeRootView: View {
         // use the presented window's bounds, not the editor's chrome/palette insets.
         .background { NibColor.desk.ignoresSafeArea() }
         .presentationBackground(NibColor.desk)
+    }
+}
+
+private extension View {
+    /// Measure each branch without changing its proposal or adding a layout participant. Release is unchanged.
+    @ViewBuilder
+    func chromeLayoutProbe(_ branch: String, window: CGSize, bottomAssistant: Bool) -> some View {
+        #if DEBUG
+        onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+            let measured = "[Nib QA chrome layout] branch=\(branch) size=\(size)"
+            let context = " window=\(window) bottomAssistant=\(bottomAssistant)"
+            NSLog("%@", measured + context)
+        }
+        #else
+        self
+        #endif
     }
 }
 

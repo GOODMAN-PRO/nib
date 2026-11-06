@@ -56,6 +56,58 @@ final class FeatDocChromeTests: XCTestCase {
         }
     }
 
+    func testRootOverflowKeepsCanvasAndChromeAtTheirOwnOrigins() async throws {
+        for size in [CGSize(width: 1032, height: 1376), CGSize(width: 1376, height: 1032)] {
+            for scheme in [ColorScheme.light, .dark] {
+                let h = Harness(features: [FeatDocChromeFeature.self])
+                let chrome = try makeWindow(h)
+                h.app.ui.panels.register(panel(PanelIDs.assistant, .floating))
+                chrome.state.open(PanelIDs.assistant, at: .right)
+                let geometry = ChromeGeometry()
+                geometry.update(size: size, safeArea: .zero)
+                let editor = UIViewController()
+                let floating = NibFloatingHost()
+                var overflowSize: CGSize = .zero
+                var markerFrame: CGRect = .zero
+                // Reproduce a child that refuses the window proposal by exactly the reported 16 pt.
+                floating.present("test.overflow") {
+                    Color.clear.frame(width: size.width + 16, height: size.height).fixedSize()
+                        .onGeometryChange(for: CGSize.self) { $0.size } action: { overflowSize = $0 }
+                }
+                floating.present("test.marker") {
+                    Color.clear.frame(width: 44, height: 44)
+                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { markerFrame = $0 }
+                        .position(x: 38, y: 38)
+                }
+                let root = ChromeRootView(chrome: chrome, editor: editor, toolbar: nil,
+                    inking: ChromeInkingMirror(session: h.session), backdrop: ChromeBackdrop(),
+                    overlays: ChromeOverlayModel(chrome: chrome, kind: .notebook), floating: floating,
+                    live: ChromeLiveState(chrome: chrome), geometry: geometry, model: ChromeDocumentModel(chrome: chrome))
+                let expectedEditor = root.currentLayout.editor
+                XCTAssertEqual(root.currentLayout.assistantBottom != nil, size.height >= size.width)
+                let host = UIHostingController(rootView: root.environment(\.colorScheme, scheme)
+                    .environment(\.accessibilityReduceMotion, true))
+                host.safeAreaRegions = []
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                try await waitUntil {
+                    host.view.layoutIfNeeded()
+                    return editor.view.window === window && !markerFrame.isEmpty && overflowSize.width > size.width
+                }
+                XCTAssertEqual(overflowSize.width, size.width + 16, accuracy: 0.5)
+                let editorFrame = editor.view.convert(editor.view.bounds, to: window)
+                XCTAssertEqual(editorFrame.minX, expectedEditor.minX, accuracy: 0.5)
+                XCTAssertEqual(editorFrame.minY, expectedEditor.minY, accuracy: 0.5)
+                XCTAssertEqual(editorFrame.width, expectedEditor.width, accuracy: 0.5)
+                XCTAssertEqual(markerFrame.minX, 16, accuracy: 0.5, "overflow must not move chrome's origin")
+                XCTAssertEqual(markerFrame.minY, 16, accuracy: 0.5)
+            }
+        }
+    }
+
     func testTranscriptSidebarUsesProductionPanelFrameWithoutResizingCanvas() throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         let chrome = try makeWindow(h)
