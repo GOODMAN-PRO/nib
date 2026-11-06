@@ -62,6 +62,12 @@ final class QAStateProbe: UIView {
             for (key, value) in session.toolOptions where key.hasPrefix("nib.qa.") {
                 qaFacts[String(key.dropFirst("nib.qa.".count))] = value
             }
+            // What the device offers, so a test that needs a second display can tell "not connected" from "the app
+            // lost its control": the same scene role the shell uses for the presenter display.
+            let externalDisplay = UIApplication.shared.connectedScenes.contains { scene in
+                scene.session.role == .windowExternalDisplayNonInteractive
+            }
+            qaFacts["externalDisplay"] = .bool(externalDisplay)
             let state: JSONValue = [
                 "keyResponder": keyResponder,
                 "keyResponderIsText": keyResponderIsText,
