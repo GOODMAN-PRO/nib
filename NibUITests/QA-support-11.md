@@ -358,3 +358,11 @@ Should unblock NativeDiagram, both Transcript tests and AssistantAttribution. CI
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | Provider-dependent Insert/Selection tests | Native keyboard form field / Provider save shortcut / Insert provider setup | How long did verified field entry take, and was Save realised when Command-S was sent? |
+
+### N9 - Replay contact follows settled page geometry
+
+Confirmed insert-providers-timeouts#2 against the banner's 28-point offset change and CanvasAccessibility: strokes have no individual AX element, while their page has a transformed frame. Record the stroke midpoint relative to that page at drawing time; after recording/replay layouts, reuse settledCanvasPoint's two-read frame/offset/zoom gate and derive the contact from the current page frame. Require it inside the visible page, then retain selectionCount==1, timestamp seek, ink and zoom assertions. Ordinary text/sticky callers retain their clipped-centre behavior. No stale screen fraction, layout offset constant or app workaround. CI must show the two geometry logs separated by banner removal and successful lasso selection. Replay's pixel/closure costs remain subject to the unchanged allowance; no assertion was removed for budget.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| ReplayModesAndSeekFromRealTimestampedInk | Replay recording geometry / Replay settled contact | Did the contact follow the page's current transform after the banner disappeared? |

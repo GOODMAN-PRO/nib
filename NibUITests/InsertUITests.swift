@@ -15,6 +15,7 @@ final class InsertUITests: XCTestCase {
     private var ui: NibUI!
     private var provider: InsertProviderFixture?
     private var resetMicrophonePermission = false
+    private var recordedStrokeAnchor: (page: XCUIElement, point: CGPoint)?
     private let point = CGPoint(x: 0.46, y: 0.65)
     private let end = CGPoint(x: 0.60, y: 0.75)
     private typealias JSON = [String: Any]
@@ -255,13 +256,14 @@ final class InsertUITests: XCTestCase {
     private func canvasText(_ value: String) -> XCUIElement {
         ui.canvas.staticTexts.matching(NSPredicate(format: "value == %@", value)).firstMatch
     }
-    private func settledCanvasPoint(_ target: XCUIElement) throws -> XCUICoordinate {
+    private func settledCanvasPoint(_ target: XCUIElement, at anchor: CGPoint? = nil) throws -> XCUICoordinate {
         var previousFrames: [CGRect]?
         var previousOffset: CGPoint?
         var previousZoom: Double?
         var previousPage: String?
         var visibleFrame = CGRect.zero
         var appFrame = CGRect.zero
+        var fullFrame = CGRect.zero
         do {
             try wait("Canvas item and scroll position must settle after keyboard dismissal") {
                 guard !self.ui.app.keyboards.firstMatch.exists, target.exists,
@@ -284,6 +286,7 @@ final class InsertUITests: XCTestCase {
                       previousFrames == frames, previousOffset == offset,
                       previousZoom == state.zoom, previousPage == page else { return false }
                 visibleFrame = frame
+                fullFrame = frames[0]
                 appFrame = frames[3]
                 return true
             }
@@ -296,8 +299,13 @@ final class InsertUITests: XCTestCase {
             throw NibUI.Failure.message("Cannot establish current canvas item geometry; refusing to tap: " + facts)
         }
         ui.logQA("Insert settled item", "frame=\(visibleFrame) offset=\(String(describing: previousOffset))")
+        let contact = anchor.map { CGPoint(x: fullFrame.minX + fullFrame.width * $0.x,
+                                          y: fullFrame.minY + fullFrame.height * $0.y) }
+            ?? CGPoint(x: visibleFrame.midX, y: visibleFrame.midY)
+        guard visibleFrame.contains(contact) else { throw NibUI.Failure.message("Settled item contact is outside its visible frame") }
+        if anchor != nil { ui.logQA("Replay settled contact", "page=\(fullFrame) point=\(contact) offset=\(String(describing: previousOffset))") }
         return ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
-            dx: visibleFrame.midX - appFrame.minX, dy: visibleFrame.midY - appFrame.minY))
+            dx: contact.x - appFrame.minX, dy: contact.y - appFrame.minY))
     }
     private func selectAt(_ p: CGPoint? = nil, target: XCUIElement? = nil) throws {
         try ui.selectTool("lasso")
@@ -1437,7 +1445,15 @@ final class InsertUITests: XCTestCase {
         }
         if draw {
             let count = try ui.state().strokeCountOnPage
-            try ui.selectTool("pen"); try ui.drawStroke([point, end]); try counts(5, strokes: count + 1)
+            try ui.selectTool("pen")
+            let page = ui.app.otherElements["Page 1 of 4"].firstMatch
+            let frame = page.frame
+            guard !frame.isEmpty, !frame.isInfinite, !frame.isNull else { throw NibUI.Failure.message("Recording requires the page frame") }
+            let midpoint = ui.interfacePoint(CGPoint(x: (point.x + end.x) / 2, y: (point.y + end.y) / 2))
+            recordedStrokeAnchor = (page, CGPoint(x: (midpoint.x - frame.minX) / frame.width,
+                                                  y: (midpoint.y - frame.minY) / frame.height))
+            ui.logQA("Replay recording geometry", "page=\(frame) midpoint=\(midpoint) offset=\(try ui.state().contentOffset)")
+            try ui.drawStroke([point, end]); try counts(5, strokes: count + 1)
         }
         try tap("Stop Recording")
         try wait("Stop must leave recording mode") { !self.visible("Pause Recording") }
@@ -1599,7 +1615,11 @@ final class InsertUITests: XCTestCase {
                              "Reveal must hide future timestamped ink while Static keeps it visible")
         XCTAssertGreaterThan(changedPixels(try XCTUnwrap(rendered["Static"]), try XCTUnwrap(rendered["Spotlight"])), 20,
                              "Spotlight must fade future timestamped ink")
-        try selectAt(CGPoint(x: 0.53, y: 0.70)); try menu("Replay Handwriting")
+        let anchor = try XCTUnwrap(recordedStrokeAnchor, "Timestamped stroke must retain its page-relative contact")
+        try ui.selectTool("lasso")
+        try settledCanvasPoint(anchor.page, at: anchor.point).tap()
+        _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
+        try menu("Replay Handwriting")
         try wait("Replay Handwriting must seek from the stroke timestamp") {
             self.query("Playback position").firstMatch.value as? String != beginning
         }
