@@ -297,10 +297,23 @@ final class NibPageRenderer: PageRenderer {
 
     /// Filter at snapshot time so content added during an await cannot enter a selection image.
     func render(_ request: RenderRequest, including ids: Set<ElementID>?) async throws -> RenderResult {
+        #if DEBUG
+        let requestedAt = ProcessInfo.processInfo.systemUptime
+        let identity = "doc=\(request.doc.raw) page=\(request.page.raw) scale=\(request.scale) region=\(String(describing: request.region))"
+        NSLog("%@", "[Nib QA render] request \(identity)")
+        defer {
+            let ms = (ProcessInfo.processInfo.systemUptime - requestedAt) * 1000
+            NSLog("%@", "[Nib QA render] requestExit totalMs=\(ms) cancelled=\(Task.isCancelled) \(identity)")
+        }
+        #endif
         guard request.scale.isFinite, request.scale > 0 else {
             throw NibError.invalid("scale must be a positive number", path: "$.scale")
         }
         let job = try await snapshot(request, including: ids)
+        #if DEBUG
+        let snapshotMs = (ProcessInfo.processInfo.systemUptime - requestedAt) * 1000
+        NSLog("%@", "[Nib QA render] snapshot elapsedMs=\(snapshotMs) items=\(job.allItems.count) \(identity)")
+        #endif
         let region = try await self.region(for: job)
         return try await produce(job, region: region, scale: request.scale, marks: request.marks)
     }
@@ -498,7 +511,19 @@ final class NibPageRenderer: PageRenderer {
         let cancelled = CancelFlag()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+                #if DEBUG
+                let enqueuedAt = ProcessInfo.processInfo.systemUptime
+                #endif
                 queue.addOperation {
+                    #if DEBUG
+                    let startedAt = ProcessInfo.processInfo.systemUptime
+                    defer {
+                        let waitMs = (startedAt - enqueuedAt) * 1000
+                        let workMs = (ProcessInfo.processInfo.systemUptime - startedAt) * 1000
+                        let kind = String(reflecting: T.self)
+                        NSLog("%@", "[Nib QA render] worker queueMs=\(waitMs) workMs=\(workMs) type=\(kind) cancelled=\(cancelled.isSet)")
+                    }
+                    #endif
                     guard !cancelled.isSet else { return continuation.resume(throwing: CancellationError()) }
                     do {
                         let value = try autoreleasepool { try work() }
@@ -597,9 +622,26 @@ final class NibPageRenderer: PageRenderer {
                 let group = DispatchGroup()
                 for c in coords {
                     group.enter()
+                    #if DEBUG
+                    let enqueuedAt = ProcessInfo.processInfo.systemUptime
+                    #endif
                     queue.addOperation {
                         defer { group.leave() }
+                        #if DEBUG
+                        let startedAt = ProcessInfo.processInfo.systemUptime
+                        var outcome = "cancelled"
+                        defer {
+                            let waitMs = (startedAt - enqueuedAt) * 1000
+                            let renderMs = (ProcessInfo.processInfo.systemUptime - startedAt) * 1000
+                            let identity = "doc=\(job.doc.raw) page=\(job.page.raw) level=\(level) col=\(c.col) row=\(c.row)"
+                            let counts = "items=\(job.allItems.count) tiles=\(coords.count) result=\(outcome)"
+                            NSLog("%@", "[Nib QA render] tile queueMs=\(waitMs) renderMs=\(renderMs) \(identity) \(counts)")
+                        }
+                        #endif
                         guard !cancelled.isSet else { return }
+                        #if DEBUG
+                        outcome = "failed"
+                        #endif
                         autoreleasepool {
                             let rect = TileGrid.rect(c, level: level)
                             if let image = PageCompositor.image(job, region: rect, scale: TileGrid.scale(level: level),
@@ -607,6 +649,9 @@ final class NibPageRenderer: PageRenderer {
                                 self.tiles.insert(image, key: TileCache.key(job.pageKey, variant, level, c),
                                                   page: job.pageKey, rect: rect, generation: job.generation)
                                 done.add(image, at: c)
+                                #if DEBUG
+                                outcome = "image"
+                                #endif
                             }
                         }
                     }

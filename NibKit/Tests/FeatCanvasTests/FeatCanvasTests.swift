@@ -2632,6 +2632,78 @@ final class FeatCanvasTests: XCTestCase {
         }
     }
 
+    func testRenderedCoverageRequiresEverySlotAndPublishesEveryTransition() async throws {
+        let source = ReadinessTileSource()
+        let page = PageTileView(frame: .zero)
+        page.source = source
+        let record = PageRecord(id: Fixtures.boardID, order: "a", size: nil)
+        page.configure(record, pageRect: Rect(x: 0, y: 0, width: 1024, height: 512), paper: .white)
+        var readiness: [Bool] = []
+        page.onRenderStateChange = { [weak page] in readiness.append(page?.hasRenderedCoverage ?? false) }
+        defer { page.reset(); source.finishAll() }
+        XCTAssertFalse(page.hasRenderedCoverage, "idle before coverage is not rendered")
+        page.updateCoverage(visible: Rect(x: 0, y: 0, width: 1024, height: 512), level: 0, bake: true)
+        await waitUntil("two queued tiles") { source.pending.count == 2 }
+        XCTAssertEqual(readiness.last, false)
+        source.finishFirst(success: true)
+        await waitUntil("first bitmap") { page.hasShownContent }
+        XCTAssertFalse(page.hasRenderedCoverage, "one landed tile cannot cover its placeholder sibling")
+        source.finishFirst(success: false)
+        await waitUntil("failed tile exits") { page.isSettled }
+        XCTAssertFalse(page.hasRenderedCoverage, "idle failed slots must not satisfy capture readiness")
+        let landed = try XCTUnwrap(source.lastFinishedRegion)
+        // A failed prefetched tile is not a visible placeholder. Work in flight still blocks readiness.
+        page.updateCoverage(visible: Rect(x: 0, y: 0, width: 1024, height: 512), level: 0, bake: true,
+                            viewport: landed)
+        XCTAssertTrue(page.hasRenderedCoverage)
+        page.updateCoverage(visible: Rect(x: 0, y: 0, width: 1024, height: 512), level: 0, bake: true)
+        XCTAssertFalse(page.hasRenderedCoverage)
+        page.retry()
+        await waitUntil("retry tiles") { source.pending.count == 2 }
+        source.finishAll()
+        await waitUntil("all slots rendered") { page.hasRenderedCoverage }
+        XCTAssertEqual(readiness.last, true)
+        page.invalidate(nil)
+        XCTAssertEqual(readiness.last, false, "replacement work clears readiness synchronously")
+        await waitUntil("replacement tiles") { source.pending.count == 2 }
+        source.finishAll()
+        await waitUntil("replacement complete") { page.hasRenderedCoverage }
+        page.reset()
+        XCTAssertEqual(readiness.last, false, "recycling immediately clears the fact")
+    }
+
+    func testPreviewAloneDoesNotMakeNotebookCoverageReady() async throws {
+        let source = ReadinessTileSource()
+        let page = PageTileView(frame: .zero)
+        page.source = source
+        page.configure(PageRecord(id: Fixtures.page1, order: "a", size: PageSize(512, 512)),
+                       pageRect: Rect(x: 0, y: 0, width: 512, height: 512), paper: .white)
+        defer { page.reset(); source.finishAll() }
+        page.updateCoverage(visible: Rect(x: 0, y: 0, width: 512, height: 512), level: 0, bake: true)
+        await waitUntil("preview and tile") { source.pending.count == 2 }
+        source.finishPreview()
+        await waitUntil("preview shown") { page.hasShownContent }
+        XCTAssertFalse(page.hasRenderedCoverage)
+        source.finishAll()
+        await waitUntil("sharp tile shown") { page.hasRenderedCoverage }
+    }
+
+    func testCanvasReadinessClearsImmediatelyForPageAndDocumentSwitches() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = RecordingRenderer()
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        await waitUntil("canvas readiness") { vc.canvasSettled }
+        h.session.page = Fixtures.page2
+        XCTAssertFalse(vc.canvasSettled, "clear in the publisher, before deferred navigation")
+        await waitUntil("new page readiness") { vc.displayedPage == Fixtures.page2 && vc.canvasSettled }
+        h.session.document = Fixtures.whiteboardID
+        XCTAssertFalse(vc.canvasSettled)
+        vc.canvasRenderStateChanged()
+        XCTAssertFalse(vc.canvasSettled, "late tiles from the old document cannot satisfy the new one")
+        if !NibUITestMode.isEnabled { XCTAssertNil(h.session.toolOptions["nib.qa.canvasSettled"]) }
+    }
+
     func testSuccessfulRerenderClearsFailureWithoutTryAgain() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         h.app.services.renderer = FailingRenderer()
@@ -3088,4 +3160,36 @@ private final class PreviewFailureRenderer: PageRenderer {
     func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { image }
     func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
     func purgeCaches() {}
+}
+
+/// Main-actor tile completions controlled by the readiness tests, always drained at teardown.
+@MainActor
+private final class ReadinessTileSource: PageTileSource {
+    var pending: [(Rect?, CheckedContinuation<CGImage, Error>)] = []
+    var lastFinishedRegion: Rect?
+    func renderTile(page: PageID, region: Rect?, scale: Double) async throws -> CGImage {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CGImage, Error>) in
+            pending.append((region, continuation))
+        }
+    }
+    func placeholderTile(page: PageID, region: Rect, scale: Double) -> CGImage? {
+        FakeRenderer.blank(CGSize(width: 4, height: 4))
+    }
+    func finishFirst(success: Bool) {
+        guard !pending.isEmpty else { return }
+        let request = pending.removeFirst()
+        if success {
+            lastFinishedRegion = request.0
+            request.1.resume(returning: FakeRenderer.blank(CGSize(width: 4, height: 4)))
+        }
+        else { request.1.resume(throwing: NibError(.internalError, "test tile failed")) }
+    }
+    func finishPreview() {
+        guard let index = pending.firstIndex(where: { $0.0 == nil }) else { return }
+        pending.remove(at: index).1.resume(returning: FakeRenderer.blank(CGSize(width: 4, height: 4)))
+    }
+    func finishAll() { while !pending.isEmpty { finishFirst(success: true) } }
+    func pageTileViewDidSettle(_ view: PageTileView) {}
+    func pageTileViewDidRender(_ view: PageTileView) {}
+    func pageTileView(_ view: PageTileView, didFailWith error: Error) {}
 }

@@ -111,6 +111,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         host.controller = self
         hud.canvas = self
         session.editor = self
+        publishCanvasSettled(false)
         loadModel()
     }
 
@@ -239,6 +240,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             scrollViewDidEndZooming(scrollView, with: scrollView.contentView, atScale: scrollView.zoomScale)
         }
         isClosed = true
+        publishCanvasSettled(false)
         host.inputController?.canvasWillClose(host)
         host.inputController = nil
         attachmentHost.detachAll()
@@ -279,6 +281,15 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         inkingObservation = session.inking.observe { [weak self] signal in self?.inkingChanged(signal) }
         // @Published emits before the value changes: read the session on the next turn.
         let main = DispatchQueue.main
+        // These publishers emit before storage: clear immediately using the incoming value.
+        session.$document.dropFirst().sink { [weak self] next in
+            guard let self = self, next != self.documentID else { return }
+            self.publishCanvasSettled(false)
+        }.store(in: &subscriptions)
+        session.$page.dropFirst().sink { [weak self] next in
+            guard let self = self, next != self.displayedPage else { return }
+            self.publishCanvasSettled(false)
+        }.store(in: &subscriptions)
         session.$tool.dropFirst().receive(on: main).sink { [weak self] _ in
             self?.host.syncActiveTool()
             self?.view.setNeedsLayout()
@@ -406,6 +417,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         let size = scrollView.bounds.size
         guard size.width > 0, size.height > 0 else { return }
         let target = pendingPage ?? fittedPage ?? currentPage
+        #if DEBUG
+        if let target = target { beginRenderTiming(target) }
+        #endif
         let newMode = mode(for: target)
         let modeChanged = newMode != mode
         mode = newMode
@@ -878,6 +892,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private(set) var displayedPage: PageID?
 
     private func updateCurrentPage() {
+        defer { canvasRenderStateChanged() }
         var current = centreAnchor()?.page
         if let r = requestedPage {
             if isAnimatingScroll || isShowing(r) { current = r } else { requestedPage = nil }
@@ -1298,6 +1313,10 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             let s = record.size ?? PageSize.a4
             rect = Rect(x: 0, y: 0, width: s.width, height: s.height)
         }
+        #if DEBUG
+        beginRenderTiming(page)
+        #endif
+        pageView.onRenderStateChange = { [weak self] in self?.canvasRenderStateChanged() }
         pageView.source = host
         pageView.configure(record, pageRect: rect, paper: paperColor(record))
         pageView.accessibilityProvider = { [weak self] v in self?.accessibilityElements(for: v) ?? [] }
@@ -1306,6 +1325,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     func documentScrollView(_ view: DocumentScrollView, didRecycle pageView: PageTileView, for page: PageID) {
         host.flushWaitersIfReady(page)
+        canvasRenderStateChanged()
     }
 
     func documentScrollViewScrollPage(_ view: DocumentScrollView, forward: Bool) -> Bool {
@@ -1382,6 +1402,65 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             return c
         }
     }
+
+    private(set) var canvasSettled = false
+
+    private func publishCanvasSettled(_ settled: Bool) {
+        // A retiring controller must not overwrite the replacement editor's fact.
+        guard session.editor === self else { return }
+        canvasSettled = settled
+        guard NibUITestMode.isEnabled else { return }
+        let value = JSONValue.bool(settled)
+        if session.toolOptions["nib.qa.canvasSettled"] != value {
+            session.toolOptions["nib.qa.canvasSettled"] = value
+        }
+    }
+
+    func canvasRenderStateChanged() {
+        guard !isClosed, session.editor === self else { return }
+        #if DEBUG
+        logRenderMilestones()
+        #endif
+        let page = displayedPage.flatMap { scrollView.pageViews[$0] }
+        let matches = session.document == documentID && session.page == displayedPage
+        publishCanvasSettled(matches && !isClosed && !isAnimatingScroll && page?.hasRenderedCoverage == true)
+    }
+
+    #if DEBUG
+    private struct RenderTiming {
+        let layout = ProcessInfo.processInfo.systemUptime
+        var firstTile = false
+        var settled = false
+    }
+    private var renderTimings: [PageID: RenderTiming] = [:]
+
+    private func beginRenderTiming(_ page: PageID) {
+        guard renderTimings[page] == nil else { return }
+        renderTimings[page] = RenderTiming()
+        NSLog("%@", "[Nib QA render] layout doc=\(documentID.raw) page=\(page.raw)")
+    }
+
+    private func logRenderMilestones() {
+        for (page, view) in scrollView.pageViews {
+            guard var timing = renderTimings[page] else { continue }
+            let first = !timing.firstTile && view.landedTileCount > 0
+            let settled = !timing.settled && view.hasRenderedCoverage
+            guard first || settled else { continue }
+            let milliseconds = (ProcessInfo.processInfo.systemUptime - timing.layout) * 1000
+            let items = (try? app.workspace.items(documentID, page: page).count) ?? 0
+            let identity = "doc=\(documentID.raw) page=\(page.raw) items=\(items) tiles=\(view.tileKeys.count)"
+            if first {
+                NSLog("%@", "[Nib QA render] firstTile layoutMs=\(milliseconds) \(identity)")
+                timing.firstTile = true
+            }
+            if settled {
+                NSLog("%@", "[Nib QA render] settled layoutMs=\(milliseconds) \(identity)")
+                timing.settled = true
+            }
+            renderTimings[page] = timing
+        }
+    }
+    #endif
 
     func pageDidSettle(_ page: PageID) {
         if page == displayedPage { hud.setLoading(false) }
