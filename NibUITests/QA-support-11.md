@@ -126,3 +126,15 @@ No Swift build or simulator run is claimed. Reviewer/CI risks: SPI key delivery 
 | Native clear callers | Stall boundary / Native clear HID | Was the next Delete sent through HID, preserving historical stall-log searches? |
 
 Validation: `python Scripts/lint.py` passed with **0 errors, 25 warnings**; `git diff --check` passed. Reviewed changed Swift source, measuredQuery callers and per-test NibUI construction across all test classes, Chrome prefix callers and all ruler-confirmation callers. Compilation, simulator behavior and runtime savings remain for GitHub Actions on macOS. No app files, test assertions, test declarations, sleeps, skips or time allowances are changed.
+
+## Round 11b
+
+Merged integration at b20b2f22 (fast-forward). Read job 11a, Round 11a above, README, all four Round 10 parts, and the full R12 ink-colours, ink-tools and library findings/verdicts. Verifier corrections govern; app-side unknowns remain unknown. Windows has no Swift toolchain or simulator. Only NibUITests changes; no push.
+
+### H6 - horizontal row reveal
+
+Confirmed R12:ink-tools#0 against EraserFilterChips and NibScrollView: Tape starts at x=372.5 beyond the scroller's x=372 edge; its 16 pt cue lane is outside the viewport. Added a separate bounded horizontal helper: resolve the smallest containing ScrollView by the control or a named sibling, compare current target/row frames, drag along x with slow delivery and a 0.4 s endpoint hold, and require centre containment plus hittability. Eight moves maximum; repeated child-position signatures stop a stuck row. Physical frame direction handles either LTR or RTL without assuming which side owns the cue. A centred but covered control fails instead of an invented corrective gesture. Existing vertical reveal is unchanged. I4 will use this helper; CI must show horizontal movement, a visible Tape centre, and no changed chip selection from scrolling.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| EraserFiltersEraseOnlyEnabledPenPencilHighlighterAndTape | Horizontal reveal / Horizontal reveal failed | How many moves and seconds revealed the chip; which row/target geometry failed? |

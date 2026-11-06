@@ -231,6 +231,67 @@ final class NibUI {
         }
     }
 
+    /// Reveal along the row's physical x axis. Frame-directed movement also works in RTL:
+    /// the cue lane is excluded by the scroller frame, wherever the trailing edge lies.
+    func revealInHorizontalRow(_ name: String, type: XCUIElement.ElementType = .button,
+                               in scope: XCUIElement? = nil, containing sibling: String? = nil) throws -> XCUIElement {
+        let started = ProcessInfo.processInfo.systemUptime
+        var moves = 0
+        var outcome = "failed"
+        defer {
+            let seconds = ProcessInfo.processInfo.systemUptime - started
+            logQA("Horizontal reveal", "target=\(name) moves=\(moves) seconds=\(seconds) outcome=\(outcome)")
+        }
+        let root = scope ?? app
+        let anchor = sibling ?? name
+        let rows = root.scrollViews.containing(NSPredicate(format: "label == %@ OR identifier == %@", anchor, anchor))
+        // Choose the innermost scroll view, not its enclosing vertical tool popover.
+        let candidates = rows.allElementsBoundByIndex.prefix(16).filter { hasVisibleFrame($0) }
+        guard let row = candidates.min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else {
+            throw Failure.message("Horizontal row missing for \(name), anchor=\(anchor)")
+        }
+        let target = row.descendants(matching: type).matching(NSPredicate(
+            format: "label == %@ OR identifier == %@", name, name)).firstMatch
+        func nodes(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
+            [node] + node.children.flatMap { nodes($0) }
+        }
+        var seen = Set<String>()
+        var facts = "target=\(name) anchor=\(anchor)"
+        for attempt in 0...8 {
+            guard row.exists, let snapshot = try? measuredSnapshot(row, named: "horizontal row " + anchor) else { break }
+            let viewport = snapshot.frame.intersection(root.frame).intersection(app.windows.firstMatch.frame)
+            guard !viewport.isNull, !viewport.isInfinite, viewport.width > 48, viewport.height > 8 else { break }
+            let children = nodes(snapshot)
+            guard let control = children.first(where: {
+                $0.elementType == type && ($0.label == name || $0.identifier == name)
+            }) else { break }
+            let centre = CGPoint(x: control.frame.midX, y: control.frame.midY)
+            facts = "target=\(name) control=\(control.frame) row=\(snapshot.frame) viewport=\(viewport)"
+            if viewport.insetBy(dx: 2, dy: 2).contains(centre), target.exists && target.isHittable {
+                outcome = "visible"
+                return target
+            }
+            let signature = children.filter { $0.elementType == .button || $0.elementType == .scrollBar }.map {
+                "\($0.identifier)|\($0.label)|\(($0.frame.minX - snapshot.frame.minX).rounded())|\($0.value ?? "")"
+            }.joined(separator: ";")
+            guard attempt < 8, seen.insert(signature).inserted else { break }
+            // An already centred but covered control is not a reason to scroll or tap again.
+            guard centre.x < viewport.minX + 2 || centre.x > viewport.maxX - 2 else { break }
+            let dragLeft = centre.x > viewport.midX
+            let travel = min(viewport.width * 0.6, max(24, abs(centre.x - viewport.midX)))
+            let startX = dragLeft ? viewport.maxX - 12 : viewport.minX + 12
+            let endX = startX + (dragLeft ? -travel : travel)
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            let appFrame = app.frame
+            let start = origin.withOffset(CGVector(dx: startX - appFrame.minX, dy: viewport.midY - appFrame.minY))
+            let end = origin.withOffset(CGVector(dx: endX - appFrame.minX, dy: viewport.midY - appFrame.minY))
+            start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.4)
+            moves += 1
+        }
+        logQA("Horizontal reveal failed", facts)
+        throw Failure.message("Horizontal row must reveal a hittable control: " + facts)
+    }
+
     /// Reveals in the actual list: home only from a proven nonzero scroll position.
     /// Unknown positions scan bottom-first, including plain-Other modal forms.
     /// Existing callers pass lazy firstMatch queries; the closure overload also supports fresh section-scoped queries.
