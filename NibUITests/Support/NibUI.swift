@@ -49,6 +49,7 @@ final class NibUI {
 
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
     enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards, tabsOverflow }
+    enum FormEdge { case top, bottom, nearest }
 
     /// Reject hidden SwiftUI menu copies before asking AX for an activation point (zero frames can raise).
     func hasVisibleFrame(_ element: XCUIElement, in viewport: CGRect? = nil) -> Bool {
@@ -118,15 +119,15 @@ final class NibUI {
 
     func requireControl(_ name: String, type: XCUIElement.ElementType = .any,
                         scroll: Bool = false, timeout: TimeInterval = 3,
-                        in scope: XCUIElement? = nil) throws -> XCUIElement {
+                        in scope: XCUIElement? = nil, edge: FormEdge? = nil) throws -> XCUIElement {
         if let found = findControl(name, type: type, in: scope) { return found }
         if scroll {
             // Virtualized native rows do not exist until their collection view scrolls.
-            revealFormElement(in: scope) {
-                self.findControl(name, type: type, actionable: false, in: scope)
-                    ?? (scope ?? self.app).descendants(matching: type).matching(NSPredicate(
-                        format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
-            }
+            // Preserve the typed editor/control priority once, then reuse the query while scrolling.
+            let revealTarget = findControl(name, type: type, actionable: false, in: scope)
+                ?? (scope ?? app).descendants(matching: type).matching(NSPredicate(
+                    format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
+            revealFormElement(in: scope, edge: edge, named: name, type: type) { revealTarget }
             if let failure = formRevealFailure { throw Failure.message(failure) }
             if let found = findControl(name, type: type, in: scope) { return found }
         }
@@ -179,7 +180,9 @@ final class NibUI {
     func revealFormElement(_ element: XCUIElement) { revealFormElement { element } }
 
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
-    func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
+    func revealFormElement(in form: XCUIElement? = nil, edge: FormEdge? = nil,
+                           named name: String? = nil, type: XCUIElement.ElementType = .any,
+                           target: () -> XCUIElement) {
         formRevealFailure = nil
         let revealStarted = Date()
         var moves = 0
@@ -386,11 +389,12 @@ final class NibUI {
             ancestorClip = (ancestorClip ?? window).intersection(context.clip)
         }
         let initialTop = formTopPosition(firstSnapshot)
-        let homeThenScan = lazySearch && initialTop.atTop == false
+        let homeThenScan = edge == nil && lazySearch && initialTop.atTop == false
         var homing = homeThenScan
         var homeMoves = 0
         let appFrame = app.frame
-        let searchPath = lazySearch ? (homeThenScan ? "proven offset home then scan" : "bottom-first then reverse") : "target-directed"
+        let searchPath = edge.map { "hint \($0) from current offset" }
+            ?? (lazySearch ? (homeThenScan ? "proven offset home then scan" : "bottom-first then reverse") : "target-directed")
         logQA("Form reveal path", "path=\(searchPath) lazy=\(lazySearch) cover=\(coverVisible) OtherForm=\(String(describing: modal?.frame)) top=\(initialTop.evidence) velocity=slow")
         // Homing may consume six moves; preserve sixteen downward scans for a lazy row.
         let moveLimit = lazySearch ? 22 : 16
@@ -409,7 +413,23 @@ final class NibUI {
                 element = list.descendants(matching: identity.elementType).matching(NSPredicate(
                     format: "identifier == %@ AND label == %@", identity.identifier, identity.label)).firstMatch
             } else { element = target() }
-            let targetFrame = element.exists ? element.frame : nil
+            // Named/identified targets are resolved in the one immutable list snapshot, not
+            // through another exists/frame round trip on every move of a virtualized list.
+            func targetNode(_ node: XCUIElementSnapshot) -> XCUIElementSnapshot? {
+                let matches: Bool
+                if let identity {
+                    matches = node.elementType == identity.elementType && node.identifier == identity.identifier
+                        && node.label == identity.label
+                } else if let name {
+                    matches = (type == .any || node.elementType == type)
+                        && (node.identifier == name || node.label == name || node.placeholderValue == name)
+                } else { matches = false }
+                if matches { return node }
+                for child in node.children { if let found = targetNode(child) { return found } }
+                return nil
+            }
+            let targetFrame = name != nil || identity != nil ? targetNode(snapshot)?.frame
+                : (element.exists ? element.frame : nil)
             if let targetFrame, viewport.contains(CGPoint(x: targetFrame.midX, y: targetFrame.midY)),
                element.isHittable { return }
             let top = formTopPosition(snapshot)
@@ -445,7 +465,12 @@ final class NibUI {
                 return
             }
             if !homeThenScan && direction == nil {
-                direction = lazySearch ? false : (targetFrame.map { $0.midY < viewport.midY } ?? false)
+                if let targetFrame { direction = targetFrame.midY < viewport.midY }
+                else if edge == .top { direction = initialTop.atTop == false }
+                else if edge == .nearest {
+                    // Show rows occupy the middle section: from the lower half seek upwards.
+                    direction = initialTop.atTop == false && top.percent.map { $0 > 50 } == true
+                } else { direction = false }
             }
             guard homeThenScan || direction != nil else { return }
             let down = homeThenScan ? homing : (direction == true)
@@ -478,7 +503,7 @@ final class NibUI {
             }
             // Library grids can replace their containers while scrolling. Keep the cheap cached query
             // normally, but reacquire it if that container disappears or its snapshot becomes unavailable.
-            var nextSnapshot: XCUIElementSnapshot? = list.exists ? (try? list.snapshot()) : nil
+            var nextSnapshot: XCUIElementSnapshot? = try? list.snapshot()
             if nextSnapshot == nil, let replacement = liveList() {
                 list = replacement
                 nextSnapshot = try? replacement.snapshot()
@@ -551,7 +576,7 @@ final class NibUI {
 
     /// Read only this list's vertical position, never a nested picker's or a background canvas's.
     /// A rounded zero is conservatively top. Missing values are not evidence of a nonzero offset.
-    private func formTopPosition(_ snapshot: XCUIElementSnapshot) -> (atTop: Bool?, evidence: String) {
+    private func formTopPosition(_ snapshot: XCUIElementSnapshot) -> (atTop: Bool?, evidence: String, percent: Double?) {
         func percentage(_ node: XCUIElementSnapshot) -> Double? {
             guard let value = node.value as? String, value.hasSuffix("%"),
                   let number = Double(value.dropLast().trimmingCharacters(in: .whitespaces)),
@@ -574,14 +599,14 @@ final class NibUI {
         }
         for child in snapshot.children { visit(child) }
         if let position = positions.min() {
-            return (position == 0, "verticalPercent=\(positions) atTop=\(position == 0)")
+            return (position == 0, "verticalPercent=\(positions) atTop=\(position == 0)", position)
         }
         // An instantiated first row above the list proves there is content to scroll back to.
         // A row inside the viewport may be a virtualized later row, so it cannot prove 'top'.
         if let firstRow, firstRow.minY < snapshot.frame.minY - 1 {
-            return (false, "firstRow=\(firstRow) above listTop=\(snapshot.frame.minY)")
+            return (false, "firstRow=\(firstRow) above listTop=\(snapshot.frame.minY)", nil)
         }
-        return (nil, "unknown; firstRow=\(String(describing: firstRow)) list=\(snapshot.frame)")
+        return (nil, "unknown; firstRow=\(String(describing: firstRow)) list=\(snapshot.frame)", nil)
     }
 
     /// Search real row gaps, plain rows, then the leading inset, all below minimumY.

@@ -14,6 +14,7 @@ final class ChromeUITests: XCTestCase {
     private var ui: NibUI!
     private let notebook = "Physics — Motion"
     private var imports: URL?
+    private var customizingToolbar = false
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -77,7 +78,11 @@ final class ChromeUITests: XCTestCase {
         let toolbarButton = ["Hide ", "Show ", "Apply ", "Reset "].contains { name.hasPrefix($0) }
             || name == "Save current layout"
         let kind: XCUIElement.ElementType = type == .any && toolbarButton ? .button : type
-        let found = try ui.requireControl(name, type: kind, scroll: true, timeout: 8)
+        let edge: NibUI.FormEdge?
+        if customizingToolbar && toolbarButton {
+            edge = name.hasPrefix("Hide ") ? .top : (name.hasPrefix("Show ") ? .nearest : .bottom)
+        } else { edge = nil }
+        let found = try ui.requireControl(name, type: kind, scroll: true, timeout: 8, edge: edge)
         guard found.isEnabled else { throw NibUI.Failure.message("Chrome control is not enabled: \(name)") }
         return found
     }
@@ -729,8 +734,8 @@ final class ChromeUITests: XCTestCase {
             $0.strokeCountOnPage == counted.strokeCountOnPage + 1 && $0.undoAvailable
         }
     }
-    private func customize() throws { try more("Customise Toolbar"); try panel("toolbar.customize") }
-    private func doneCustomizing() throws { try tap("sheet.dismiss"); try panel("toolbar.customize", shown: false) }
+    private func customize() throws { try more("Customise Toolbar"); try panel("toolbar.customize"); customizingToolbar = true }
+    private func doneCustomizing() throws { try tap("sheet.dismiss"); try panel("toolbar.customize", shown: false); customizingToolbar = false }
     private func confirmLayoutSave() throws {
         let alert = ui.app.alerts.firstMatch
         let save = try ui.requireControl("cmd.toolbar.saveLayout", type: .button, in: alert)
@@ -843,9 +848,13 @@ final class ChromeUITests: XCTestCase {
         try open(); try customize()
         try tap("Hide Highlighter"); try tap("Show Ruler"); try saveLayout("Retained reset layout")
         try tap("Reset Toolbar"); try tap(action)
-        _ = try reachable(tools ? "Hide Highlighter" : "Show Highlighter")
-        _ = try reachable(accessories ? "Show Ruler" : "Hide Ruler")
         _ = try reachable("Apply Retained reset layout")
+        // Check bottom-to-top, grouping the middle Show rows before the top Hide rows.
+        let expectedRows = [tools ? "Hide Highlighter" : "Show Highlighter",
+                            accessories ? "Show Ruler" : "Hide Ruler"]
+        for name in expectedRows.sorted(by: { $0.hasPrefix("Show ") && !$1.hasPrefix("Show ") }) {
+            _ = try reachable(name)
+        }
         XCTAssertFalse(query("Hide Lasso").firstMatch.exists)
     }
     func testResetWritingToolsPreservesAccessoriesAndSavedLayouts() throws { try reset("Reset Writing Tools", tools: true, accessories: false) }
