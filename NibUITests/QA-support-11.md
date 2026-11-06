@@ -316,3 +316,11 @@ Confirmed pages-drag-photos#2 verdict: two items had system operation zero despi
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | SelectedThumbnailsDragAsOneStackAndUndoTogether | Page stack destination | Was the destination in the image area, well clear of both lifted cells? |
+
+### N2 - Save Style touch diagnostic
+
+Confirmed insert-menus-alerts-forms#3 verdict: touch reached canvas, but window coordinates/presentation state were unknown. Immediately before delivery read Save Style's current frame, log its centre and send that exact point via existing runner touch synthesis. Exposed the existing point overload internally; no gesture implementation change. Original alert/name/style/default assertions remain. This is the verifier's experiment, not a claimed fix. CI must compare Save Style touch and Interface/Touch path conversion with the app's window-touch and prompt-guard logs.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| NamedStyleAndDefaultAffectNewText | Save Style touch | Which fresh frame and exact interface point was sent to the runner? |

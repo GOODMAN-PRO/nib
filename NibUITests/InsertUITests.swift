@@ -129,7 +129,10 @@ final class InsertUITests: XCTestCase {
             if name == "Save Style…" {
                 try stableControl(target, name: name)
                 defer { ui.logQA("Save Style after tap", ui.elementFacts(target, includeOverlaps: true) + " alertExists=\(ui.app.alerts["Save Text Style"].exists)") }
-                target.tap()
+                let frame = target.frame
+                let point = CGPoint(x: frame.midX, y: frame.midY)
+                ui.logQA("Save Style touch", "frame=\(frame) interfacePoint=\(point) route=runner touch SPI")
+                try ui.pressWithoutIdle(at: point, duration: 0.05)
             } else {
                 if name == "Finish Editing" {
                     if self.name.contains("testCopyTextUsesActualSelectedText") {

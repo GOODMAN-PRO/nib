@@ -2832,7 +2832,7 @@ final class NibUI {
         try synthesize(screenPaths: [[start.screenPoint, end.screenPoint]], duration: duration)
     }
 
-    private func pressWithoutIdle(at point: CGPoint, duration: TimeInterval) throws {
+    func pressWithoutIdle(at point: CGPoint, duration: TimeInterval) throws {
         let frame = app.frame
         let screen = app.coordinate(withNormalizedOffset: .zero)
             .withOffset(CGVector(dx: point.x - frame.minX, dy: point.y - frame.minY)).screenPoint
