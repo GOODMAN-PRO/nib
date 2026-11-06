@@ -318,6 +318,10 @@ struct TimeKeeperHistorySection: View, Equatable {
     @State private var showsAll = false
     @State private var expanded: Set<String> = []
 
+    init(records: [TimerRecord]) {
+        self.records = records
+    }
+
     static func == (a: TimeKeeperHistorySection, b: TimeKeeperHistorySection) -> Bool { a.records == b.records }
 
     func visibleRecords(showAll: Bool) -> [TimerRecord] {
