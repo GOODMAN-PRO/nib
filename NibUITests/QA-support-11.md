@@ -76,3 +76,11 @@ Confirmed R12:chrome-timer-ruler#0 correction: merely passing the panel scope do
 | --- | --- | --- |
 | TimerPresetStartsCountdownAndCustomNameAdvances | Form reveal timing / Native form field duration | Did full viewport reveal precede the formerly clipped Timer name focus? |
 
+### C4 - ruler menu row type
+
+Confirmed R12:chrome-timer-ruler#3 verifier's passing-run StaticText evidence and current RulerView UIEditMenu actions. Toolbar-prefix typing is now restricted to Customise Toolbar; rulerMenu resolves top-level rows explicitly as StaticText with a bounded non-scrolling lookup. Options submenu callers retain normal button resolution. Missing menu rows capture evidence before any form drag could dismiss them. Should unblock RulerPaletteAndKeyboardToggleWithoutDocumentItems; CI must tap Hide Ruler StaticText, close the overlay and preserve document invariants. Set Position's race is handled in H2, not attributed to the type mismatch.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Ruler menu callers | Ruler menu row missing | What transient menu tree existed immediately after double-tap if the typed row was absent? |
+

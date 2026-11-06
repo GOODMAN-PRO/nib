@@ -77,7 +77,7 @@ final class ChromeUITests: XCTestCase {
     private func reachable(_ name: String, type: XCUIElement.ElementType = .any) throws -> XCUIElement {
         let toolbarButton = ["Hide ", "Show ", "Apply ", "Reset "].contains { name.hasPrefix($0) }
             || name == "Save current layout"
-        let kind: XCUIElement.ElementType = type == .any && toolbarButton ? .button : type
+        let kind: XCUIElement.ElementType = type == .any && toolbarButton && customizingToolbar ? .button : type
         let edge: NibUI.FormEdge?
         if customizingToolbar && toolbarButton {
             edge = name.hasPrefix("Hide ") ? .top : (name.hasPrefix("Show ") ? .nearest : .bottom)
@@ -1122,7 +1122,17 @@ final class ChromeUITests: XCTestCase {
         try open(); try tap("tool.more"); try tap("cmd.ruler.set")
         XCTAssertTrue(ruler.waitForExistence(timeout: 8), "Ruler must appear on canvas")
     }
-    private func rulerMenu(_ action: String) throws { ruler.doubleTap(); try tap(action) }
+    private func rulerMenu(_ action: String) throws {
+        ruler.doubleTap()
+        do {
+            let row = try ui.requireControl(action, type: .staticText, timeout: 5)
+            guard row.isEnabled else { throw NibUI.Failure.message("Ruler menu row disabled: " + action) }
+            row.tap()
+        } catch {
+            ui.recordDiagnostics("Ruler menu row missing", facts: "action=" + action)
+            throw error
+        }
+    }
     private func confirmRulerAlert(_ title: String) throws {
         try ui.prepareCoveredControl(title)
         let alert = ui.app.alerts.firstMatch
