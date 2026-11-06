@@ -3429,9 +3429,8 @@ final class CollabService: ObservableObject {
         })
         lifecycle.append(center.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil,
                                             queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.startResumeAfterSuspend()
-            }
+            // The call returns its task: discard it, or the closure's result type is no longer Void.
+            MainActor.assumeIsolated { _ = self?.startResumeAfterSuspend() }
         })
     }
 
