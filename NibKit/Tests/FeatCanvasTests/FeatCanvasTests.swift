@@ -19,7 +19,8 @@ final class FeatCanvasTests: XCTestCase {
     /// Opens the editor the feature registered for `doc`'s kind in a window-sized view, laid out.
     @discardableResult
     private func makeCanvas(_ h: Harness, doc: DocumentID = Fixtures.docID, page: PageID? = nil,
-                            input: ((CanvasHostImpl) -> Void)? = nil, size: CGSize? = nil) throws -> CanvasViewController {
+                            input: ((CanvasHostImpl) -> Void)? = nil, size: CGSize? = nil,
+                            fixtureReadiness: Bool? = nil) throws -> CanvasViewController {
         let content = try h.app.workspace.content(doc)
         h.session.document = doc
         h.session.page = page ?? content.livePages.first?.id
@@ -29,6 +30,9 @@ final class FeatCanvasTests: XCTestCase {
         CanvasInputHooks.install = input
         defer { CanvasInputHooks.install = saved }
         let vc = try XCTUnwrap(descriptor.make(doc, h.session, h.app) as? CanvasViewController)
+        #if DEBUG
+        vc.fixtureReadinessForTesting = fixtureReadiness
+        #endif
         vc.loadViewIfNeeded()
         vc.view.frame = CGRect(origin: .zero, size: size ?? windowSize)
         vc.view.setNeedsLayout()
@@ -225,6 +229,9 @@ final class FeatCanvasTests: XCTestCase {
                 let h = Harness(features: [FeatCanvasFeature.self])
                 // Stand in for the toolbar screen without importing another feature's implementation.
                 h.app.ui.screens.toolbarView = { _, _ in AnyView(EmptyView()) }
+                h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                    id: "test.topOptions", title: "Options", icon: "", group: .lasso, order: 0,
+                    owner: "test", toolID: h.session.tool, settings: { _ in AnyView(EmptyView()) }))
                 h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
                 let vc = try makeCanvas(h, page: Fixtures.page2, size: size)
                 defer { vc.closeCanvas() }
@@ -250,7 +257,7 @@ final class FeatCanvasTests: XCTestCase {
                     compact: compact)
                 let pageTop = windowPoint(vc, .zero, Fixtures.page2).y
                 XCTAssertGreaterThanOrEqual(pageTop, paletteRegion.minY + NibMetrics.paletteThickness
-                                            + NibMetrics.barHeight + NibSpacing.m - 0.5)
+                                            + NibSpacing.l + NibMetrics.barHeight + NibSpacing.m - 0.5)
                 XCTAssertEqual(pageTop, vc.scrollView.chromeInsets.top, accuracy: 0.5)
                 XCTAssertEqual(vc.zoom, vc.fitZoom, accuracy: 1e-9)
                 XCTAssertEqual(h.session.page, Fixtures.page2)
@@ -298,7 +305,7 @@ final class FeatCanvasTests: XCTestCase {
                 vc.view.layoutIfNeeded()
                 let region = DropletDockModel.region(size: size, safeArea: EdgeInsets(), compact: true)
                 XCTAssertGreaterThanOrEqual(vc.scrollView.chromeInsets.bottom,
-                    size.height - region.maxY + NibMetrics.paletteThickness + NibMetrics.barHeight + NibSpacing.l,
+                    size.height - region.maxY + NibMetrics.paletteThickness + NibSpacing.l + NibMetrics.barHeight + NibSpacing.l,
                     "both a full options bar and a settings-only chevron reserve the entire arm before measurement")
                 // Apply EditorHost's measured landscape geometry directly so this regression is independent of
                 // the test runner's physical device/orientation. Hosted automatic refits are tested below.
@@ -2629,6 +2636,166 @@ final class FeatCanvasTests: XCTestCase {
         }
     }
 
+    func testRenderedCoverageRequiresEverySlotAndPublishesEveryTransition() async throws {
+        let source = ReadinessTileSource()
+        let page = PageTileView(frame: .zero)
+        page.source = source
+        let record = PageRecord(id: Fixtures.boardID, order: "a", size: nil)
+        page.configure(record, pageRect: Rect(x: 0, y: 0, width: 1024, height: 512), paper: .white)
+        var readiness: [Bool] = []
+        page.onRenderStateChange = { [weak page] in readiness.append(page?.hasRenderedCoverage ?? false) }
+        defer { page.reset(); source.finishAll() }
+        XCTAssertFalse(page.hasRenderedCoverage, "idle before coverage is not rendered")
+        page.updateCoverage(visible: Rect(x: 0, y: 0, width: 1024, height: 512), level: 0, bake: true)
+        await waitUntil("two queued tiles") { source.pending.count == 2 }
+        XCTAssertEqual(readiness.last, false)
+        source.finishFirst(success: true)
+        await waitUntil("first bitmap") { page.hasShownContent }
+        XCTAssertFalse(page.hasRenderedCoverage, "one landed tile cannot cover its placeholder sibling")
+        source.finishFirst(success: false)
+        await waitUntil("failed tile exits") { page.isSettled }
+        XCTAssertFalse(page.hasRenderedCoverage, "idle failed slots must not satisfy capture readiness")
+        let landed = try XCTUnwrap(source.lastFinishedRegion)
+        // A failed prefetched tile is not a visible placeholder. Work in flight still blocks readiness.
+        page.updateCoverage(visible: Rect(x: 0, y: 0, width: 1024, height: 512), level: 0, bake: true,
+                            viewport: landed)
+        XCTAssertTrue(page.hasRenderedCoverage)
+        page.updateCoverage(visible: Rect(x: 0, y: 0, width: 1024, height: 512), level: 0, bake: true)
+        XCTAssertFalse(page.hasRenderedCoverage)
+        page.retry()
+        await waitUntil("retry tiles") { source.pending.count == 2 }
+        source.finishAll()
+        await waitUntil("all slots rendered") { page.hasRenderedCoverage }
+        XCTAssertEqual(readiness.last, true)
+        page.invalidate(nil)
+        XCTAssertEqual(readiness.last, false, "replacement work clears readiness synchronously")
+        await waitUntil("replacement tiles") { source.pending.count == 2 }
+        source.finishAll()
+        await waitUntil("replacement complete") { page.hasRenderedCoverage }
+        page.reset()
+        XCTAssertEqual(readiness.last, false, "recycling immediately clears the fact")
+    }
+
+    func testPreviewAloneDoesNotMakeNotebookCoverageReady() async throws {
+        let source = ReadinessTileSource()
+        let page = PageTileView(frame: .zero)
+        page.source = source
+        page.onRenderStateChange = {} // Observe readiness, as the UI-test controller does.
+        page.configure(PageRecord(id: Fixtures.page1, order: "a", size: PageSize(512, 512)),
+                       pageRect: Rect(x: 0, y: 0, width: 512, height: 512), paper: .white)
+        defer { page.reset(); source.finishAll() }
+        page.updateCoverage(visible: Rect(x: 0, y: 0, width: 512, height: 512), level: 0, bake: true)
+        await waitUntil("preview and tile") { source.pending.count == 2 }
+        source.finishPreview()
+        await waitUntil("preview shown") { page.hasShownContent }
+        XCTAssertFalse(page.hasRenderedCoverage)
+        source.finishAll()
+        await waitUntil("sharp tile shown") { page.hasRenderedCoverage }
+    }
+
+    func testCoverageEvaluatesAndStoresViewportOnlyWithAnObserver() {
+        XCTAssertFalse(NibUITestMode.isEnabled)
+        for world in [false, true] {
+            let source = ReadinessTileSource()
+            let page = PageTileView(frame: .zero)
+            page.source = source
+            let region = Rect(x: 0, y: 0, width: 512, height: 512)
+            page.configure(PageRecord(id: Fixtures.page1, order: "a", size: world ? nil : PageSize(512, 512)),
+                           pageRect: region, paper: .white)
+            defer { page.reset(); source.finishAll() }
+            var evaluations = 0
+            func viewport() -> Rect {
+                evaluations += 1
+                return Rect(x: -10, y: 0, width: 512, height: 512)
+            }
+            page.updateCoverage(visible: region, level: 0, bake: true, viewport: viewport())
+            XCTAssertEqual(evaluations, 0, "even constructing the readiness viewport must be gated")
+            XCTAssertNil(page.visibleCoverage, "neither board nor notebook may store readiness geometry")
+            XCTAssertFalse(page.tileKeys.isEmpty, "ordinary render coverage is still requested")
+            page.onRenderStateChange = {} // UI-test readiness subscriber.
+            page.updateCoverage(visible: region, level: 0, bake: true, viewport: viewport())
+            XCTAssertEqual(evaluations, 1)
+            XCTAssertEqual(page.visibleCoverage?.x, world ? -10 : 0)
+            XCTAssertEqual(page.visibleCoverage?.width, world ? 512 : 502)
+        }
+    }
+
+    func testNormalCanvasNeverEvaluatesOrUpdatesFixtureReadiness() async throws {
+        XCTAssertFalse(NibUITestMode.isEnabled, "package tests must use normal launch arguments")
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = RecordingRenderer()
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        #if DEBUG
+        page.onRenderDiagnosticChange = nil // Exercise the Release tracking path in Debug test jobs too.
+        #endif
+        page.reset()
+        vc.scrollView.updateTiles()
+        await waitUntil("rendered page") { page.hasShownContent && page.isSettled }
+        XCTAssertNil(page.visibleCoverage, "normal scrolling must not store a readiness viewport")
+        XCTAssertFalse(page.hasRenderedCoverage)
+        XCTAssertFalse(vc.fixtureReadinessEnabled)
+        XCTAssertTrue(vc.fixtureSubscriptions.isEmpty)
+        XCTAssertNil(page.onRenderStateChange, "only the separate DEBUG diagnostic may observe normal renders")
+        var evaluations = 0
+        func evaluate() -> Bool { evaluations += 1; return true }
+        vc.publishCanvasSettled(evaluate())
+        vc.canvasRenderStateChanged()
+        XCTAssertEqual(evaluations, 0, "the guard must run before the readiness predicate")
+        XCTAssertFalse(vc.canvasSettled, "a rendered production page must not update fixture state")
+        h.session.page = Fixtures.page2
+        await waitUntil("normal navigation") { vc.displayedPage == Fixtures.page2 }
+        h.session.document = Fixtures.whiteboardID
+        vc.canvasRenderStateChanged()
+        XCTAssertFalse(vc.canvasSettled)
+        XCTAssertNil(h.session.toolOptions["nib.qa.canvasSettled"])
+    }
+
+    #if DEBUG
+    func testRenderTimingsAreRemovedWhenPageViewsAreRecycled() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        XCTAssertFalse(vc.renderTimingPages.isEmpty)
+        XCTAssertEqual(vc.renderTimingPages, Set(vc.scrollView.pageViews.keys))
+        vc.scrollView.recycleAll()
+        XCTAssertTrue(vc.renderTimingPages.isEmpty)
+        vc.scrollView.updateVisiblePages()
+        XCTAssertFalse(vc.renderTimingPages.isEmpty)
+        XCTAssertEqual(vc.renderTimingPages, Set(vc.scrollView.pageViews.keys))
+        vc.closeCanvas()
+        XCTAssertTrue(vc.renderTimingPages.isEmpty)
+    }
+
+    func testCanvasReadinessClearsImmediatelyForPageAndDocumentSwitches() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = RecordingRenderer()
+        let vc = try makeCanvas(h, fixtureReadiness: true)
+        defer { vc.closeCanvas() }
+        XCTAssertEqual(vc.fixtureSubscriptions.count, 2)
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        XCTAssertNotNil(page.onRenderStateChange)
+        await waitUntil("canvas readiness") { vc.canvasSettled }
+        XCTAssertEqual(h.session.toolOptions["nib.qa.canvasSettled"], .bool(true))
+        page.invalidate(nil)
+        XCTAssertFalse(vc.canvasSettled)
+        XCTAssertEqual(h.session.toolOptions["nib.qa.canvasSettled"], .bool(false))
+        await waitUntil("rerender readiness") { vc.canvasSettled }
+        h.session.page = Fixtures.page2
+        XCTAssertFalse(vc.canvasSettled, "clear in the publisher, before deferred navigation")
+        await waitUntil("new page readiness") { vc.displayedPage == Fixtures.page2 && vc.canvasSettled }
+        h.session.document = Fixtures.whiteboardID
+        XCTAssertFalse(vc.canvasSettled)
+        vc.canvasRenderStateChanged()
+        XCTAssertFalse(vc.canvasSettled, "late tiles from the old document cannot satisfy the new one")
+        XCTAssertEqual(h.session.toolOptions["nib.qa.canvasSettled"], .bool(false))
+        vc.closeCanvas()
+        XCTAssertTrue(vc.fixtureSubscriptions.isEmpty)
+    }
+
+    #endif
+
     func testSuccessfulRerenderClearsFailureWithoutTryAgain() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         h.app.services.renderer = FailingRenderer()
@@ -3085,4 +3252,36 @@ private final class PreviewFailureRenderer: PageRenderer {
     func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { image }
     func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
     func purgeCaches() {}
+}
+
+/// Main-actor tile completions controlled by the readiness tests, always drained at teardown.
+@MainActor
+private final class ReadinessTileSource: PageTileSource {
+    var pending: [(Rect?, CheckedContinuation<CGImage, Error>)] = []
+    var lastFinishedRegion: Rect?
+    func renderTile(page: PageID, region: Rect?, scale: Double) async throws -> CGImage {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CGImage, Error>) in
+            pending.append((region, continuation))
+        }
+    }
+    func placeholderTile(page: PageID, region: Rect, scale: Double) -> CGImage? {
+        FakeRenderer.blank(CGSize(width: 4, height: 4))
+    }
+    func finishFirst(success: Bool) {
+        guard !pending.isEmpty else { return }
+        let request = pending.removeFirst()
+        if success {
+            lastFinishedRegion = request.0
+            request.1.resume(returning: FakeRenderer.blank(CGSize(width: 4, height: 4)))
+        }
+        else { request.1.resume(throwing: NibError(.internalError, "test tile failed")) }
+    }
+    func finishPreview() {
+        guard let index = pending.firstIndex(where: { $0.0 == nil }) else { return }
+        pending.remove(at: index).1.resume(returning: FakeRenderer.blank(CGSize(width: 4, height: 4)))
+    }
+    func finishAll() { while !pending.isEmpty { finishFirst(success: true) } }
+    func pageTileViewDidSettle(_ view: PageTileView) {}
+    func pageTileViewDidRender(_ view: PageTileView) {}
+    func pageTileView(_ view: PageTileView, didFailWith error: Error) {}
 }

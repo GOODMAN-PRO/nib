@@ -511,7 +511,7 @@ final class FeatDocChromeTests: XCTestCase {
                         XCTAssertEqual(layout.editor, CGRect(origin: .zero, size: size))
                         XCTAssertEqual(layout.editorInsets.left + layout.editorInsets.right, 0)
                         XCTAssertEqual(layout.editorInsets.top,
-                            layout.bar.maxY + NibSpacing.l + thickness + options.height - 1 + NibSpacing.l)
+                            layout.bar.maxY + NibSpacing.l + thickness + options.height + NibSpacing.l + NibSpacing.l)
                         XCTAssertGreaterThanOrEqual(layout.overlayRegion.minY, layout.editorInsets.top)
                         XCTAssertGreaterThanOrEqual(layout.floatingRegion.minY, layout.editorInsets.top)
                         XCTAssertNil(ChromePalettePolicy.navigatorDockCorrection(dock, layout: layout),
@@ -773,14 +773,14 @@ final class FeatDocChromeTests: XCTestCase {
         let bar = layout.bar
         let toolbar = layout.toolbar
         layout.avoidPalette(NibPaletteDock(edge: .top), thickness: 56, optionsHeight: 44)
-        // Palette starts at 92, ends at 148; its fused options end at 191, then a 16 pt resting gap.
-        XCTAssertEqual(layout.overlayRegion.minY, 207)
-        XCTAssertEqual(layout.floatingRegion.minY, 207)
+        // Palette starts at 92, ends at 148; its separated options end at 208, then a 16 pt resting gap.
+        XCTAssertEqual(layout.overlayRegion.minY, 224)
+        XCTAssertEqual(layout.floatingRegion.minY, 224)
         XCTAssertEqual(layout.bar, bar)
         XCTAssertEqual(layout.toolbar, toolbar)
         layout.avoidPalette(NibPaletteDock(edge: .bottom), thickness: 56, optionsHeight: 44)
-        XCTAssertEqual(layout.overlayRegion.maxY, 683)
-        XCTAssertEqual(layout.floatingRegion.maxY, 683)
+        XCTAssertEqual(layout.overlayRegion.maxY, 666)
+        XCTAssertEqual(layout.floatingRegion.maxY, 666)
     }
 
     func testKeyboardOnlyShortensResultsAndMovesBottomHUDs() {
@@ -884,19 +884,41 @@ final class FeatDocChromeTests: XCTestCase {
                                 optionsSize: CGSize(width: 280, height: 44))
             switch edge {
             case .top:
-                XCTAssertEqual(layout.editorInsets.top, 68 + 56 + 44 - 1 + 16)
+                XCTAssertEqual(layout.editorInsets.top, 68 + 56 + 44 + 16 + 16)
                 XCTAssertEqual(layout.overlayRegion.minY, layout.editorInsets.top)
             case .bottom:
-                XCTAssertEqual(layout.editorInsets.bottom, 16 + 56 + 44 - 1 + 16)
+                XCTAssertEqual(layout.editorInsets.bottom, 16 + 56 + 44 + 16 + 16)
                 XCTAssertEqual(layout.overlayRegion.maxY, size.height - layout.editorInsets.bottom)
             case .leading:
                 XCTAssertEqual(layout.editorInsets.left, 16 + 56 + 16)
-                XCTAssertEqual(layout.overlayRegion.minX, 16 + 56 + 280 - 1 + 16)
+                XCTAssertEqual(layout.overlayRegion.minX, 16 + 56 + 280 + 16 + 16)
             case .trailing:
                 XCTAssertEqual(layout.editorInsets.right, 16 + 56 + 16)
-                XCTAssertEqual(layout.overlayRegion.maxX, size.width - (16 + 56 + 280 - 1 + 16))
+                XCTAssertEqual(layout.overlayRegion.maxX, size.width - (16 + 56 + 280 + 16 + 16))
             }
             XCTAssertEqual(layout.editor.size, size, "content still scrolls under the palette")
+        }
+    }
+
+    func testEveryPaletteDockWithoutOptionsReservesOnlyThePaletteAndPaperGap() {
+        let size = CGSize(width: 1194, height: 834)
+        for edge in NibDock.allCases {
+            var layout = ChromeLayout(size: size, safeArea: .zero, left: nil, right: nil, mode: .sidebar)
+            layout.avoidPalette(NibPaletteDock(edge: edge), thickness: 56, optionsSize: .zero)
+            switch edge {
+            case .top:
+                XCTAssertEqual(layout.editorInsets.top, 68 + 56 + 16)
+                XCTAssertEqual(layout.overlayRegion.minY, 68 + 56 + 16)
+            case .bottom:
+                XCTAssertEqual(layout.editorInsets.bottom, 16 + 56 + 16)
+                XCTAssertEqual(layout.overlayRegion.maxY, size.height - (16 + 56 + 16))
+            case .leading:
+                XCTAssertEqual(layout.editorInsets.left, 16 + 56 + 16)
+                XCTAssertEqual(layout.overlayRegion.minX, 16 + 56 + 16)
+            case .trailing:
+                XCTAssertEqual(layout.editorInsets.right, 16 + 56 + 16)
+                XCTAssertEqual(layout.overlayRegion.maxX, size.width - (16 + 56 + 16))
+            }
         }
     }
 
@@ -920,7 +942,7 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(rightSidebar.editorInsets.right, 16 + 56 + 16,
                        "the sidebar's reserved width is not counted again inside the editor")
         XCTAssertEqual(rightSidebar.overlayRegion.maxX,
-                       rightSidebar.editor.maxX - (16 + 56 + 200 - 1 + 16))
+                       rightSidebar.editor.maxX - (16 + 56 + 200 + 16 + 16))
     }
 
     func testPaletteEligibilityClearsReservationsForTextAndStudyEditors() {
@@ -983,14 +1005,16 @@ final class FeatDocChromeTests: XCTestCase {
         var layout = ChromeLayout(size: CGSize(width: 874, height: 402), safeArea: safe,
                                   left: nil, right: nil, mode: .sidebar, idiom: .phone, verticalSizeClass: .compact)
         layout.avoidPalette(NibPaletteDock(edge: .bottom), thickness: 56, optionsSize: CGSize(width: 280, height: 44))
-        XCTAssertEqual(layout.editorInsets.bottom, 21 + 8 + 56 + 44 - 1 + 16)
+        XCTAssertEqual(layout.editorInsets.bottom, 21 + 8 + 56 + 44 + 16 + 16)
         for compactCanvas in [true, false] {
             let additional = EditorHost.additionalInsets(layout.editorInsets, system: safe,
                                                           canvas: true, compactCanvas: compactCanvas)
             let bottom = additional.bottom + safe.bottom + (compactCanvas ? 80 : 16)
             XCTAssertEqual(bottom, layout.editorInsets.bottom)
             let top = additional.top + safe.top + 64
-            XCTAssertGreaterThan(layout.editor.height - top - bottom, 180)
+            // The intentional 16 pt separation replaces a 1 pt overlap: 17 pt more reservation.
+            // Assert the exact remaining viewport so neither clearance nor double-counting can drift.
+            XCTAssertEqual(layout.editor.height - top - bottom, 177)
             XCTAssertEqual(additional.left, 0)
             XCTAssertEqual(additional.right, 0)
         }
