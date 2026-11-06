@@ -170,7 +170,8 @@ enum DropletContainerMeasurement {
 }
 
 #if DEBUG
-/// Only this leaf observes per-frame geometry; tracing must not invalidate the container.
+/// Only this leaf observes per-frame geometry; tracing must not invalidate the container. It reads cluster
+/// frames only: asking the field for a node by name would create that node in every container of a DEBUG build.
 private struct NibSearchContainerProbe: View {
     let field: DropletField
     let trace: NibSearchContainerTrace
@@ -179,12 +180,6 @@ private struct NibSearchContainerProbe: View {
         Color.clear
             .onChange(of: field.clusters.map(\.frame), initial: true) { old, new in
                 trace.write("cluster frames", old: old, new: new)
-            }
-            .onChange(of: field.node("searchui.libraryField").presentation, initial: true) { old, new in
-                trace.presentation("field rest/body", old: old, new: new)
-            }
-            .onChange(of: field.node("searchui.libraryResults").presentation, initial: true) { old, new in
-                trace.presentation("results rest/body", old: old, new: new)
             }
     }
 }
@@ -196,11 +191,6 @@ private final class NibSearchContainerTrace {
         count += 1
         let message = "[Nib QA search layout] \(name) #\(count) old=\(old) new=\(new)"
         NSLog("%@", message)
-    }
-    func presentation(_ name: String, old: DropletPresentation, new: DropletPresentation) {
-        let before = "rest=\(old.restSize) body=\(old.bodySize) offset=\(old.bodyOffset)"
-        let after = "rest=\(new.restSize) body=\(new.bodySize) offset=\(new.bodyOffset)"
-        write(name, old: before, new: after)
     }
 }
 #endif
