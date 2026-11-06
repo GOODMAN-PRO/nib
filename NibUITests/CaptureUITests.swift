@@ -29,33 +29,38 @@ final class CaptureUITests: XCTestCase {
     /// Waits for one explicit appearance/orientation fixture, keeping each capture scenario within its own allowance.
     private func variants(scenario: NibUI.FixtureScenario = .standard,
                           _ body: () throws -> Void) {
-        ui = NibUI()
-        ui.logIdleSelectors(for: String(describing: type(of: self)))
-        do {
-            ui.app.launchArguments = ["-NibUITestFixture", "-NibUITestScenario", scenario.rawValue,
-                                      "-NibUITestAppearance", appearance,
-                                      "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
-            ui.app.launch()
-            try ui.handleAuthorizationAlerts()
-            _ = try ui.waitForState(timeout: 120) { $0.screen == "library" }
-            try ui.handleAuthorizationAlerts()
-            let requested: UIDeviceOrientation = orientation == "portrait" ? .portrait : .landscapeLeft
-            let frame = ui.app.windows.firstMatch.frame
-            let sceneAgrees = orientation == "portrait" ? frame.height > frame.width : frame.width > frame.height
-            if XCUIDevice.shared.orientation != requested || !sceneAgrees { XCUIDevice.shared.orientation = requested }
-            try wait("The scene must reach \(orientation)") {
-                let frame = self.ui.app.windows.firstMatch.frame
-                return self.orientation == "portrait" ? frame.height > frame.width : frame.width > frame.height
-            }
-            try ui.establishFullScreen()
-            ui.prepareLaunchKeyRoute()
-            try body()
-        } catch {
+        do { try runVariant(scenario: scenario, body) }
+        catch {
             let reason = "\(name) / \(appearance) / \(orientation): \(error)"
             attach(XCTAttachment(string: reason + "\n\n" + ui.app.debugDescription), name: "unreachable-\(name)")
             attach(XCTAttachment(screenshot: XCUIScreen.main.screenshot()), name: "diagnostic-\(name)")
             XCTFail(reason)
         }
+    }
+
+    /// Throwing entry point lets only the four presentation tests propagate XCTSkip.
+    private func runVariant(scenario: NibUI.FixtureScenario = .standard,
+                            _ body: () throws -> Void) throws {
+        ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
+        ui.app.launchArguments = ["-NibUITestFixture", "-NibUITestScenario", scenario.rawValue,
+                                  "-NibUITestAppearance", appearance,
+                                  "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        ui.app.launch()
+        try ui.handleAuthorizationAlerts()
+        _ = try ui.waitForState(timeout: 120) { $0.screen == "library" }
+        try ui.handleAuthorizationAlerts()
+        let requested: UIDeviceOrientation = orientation == "portrait" ? .portrait : .landscapeLeft
+        let frame = ui.app.windows.firstMatch.frame
+        let sceneAgrees = orientation == "portrait" ? frame.height > frame.width : frame.width > frame.height
+        if XCUIDevice.shared.orientation != requested || !sceneAgrees { XCUIDevice.shared.orientation = requested }
+        try wait("The scene must reach \(orientation)") {
+            let frame = self.ui.app.windows.firstMatch.frame
+            return self.orientation == "portrait" ? frame.height > frame.width : frame.width > frame.height
+        }
+        try ui.establishFullScreen()
+        ui.prepareLaunchKeyRoute()
+        try body()
     }
 
     private func attach(_ attachment: XCTAttachment, name: String) {
@@ -522,12 +527,21 @@ final class CaptureUITests: XCTestCase {
     }
 
     /// Waits for the named capture surface and attaches it after the state predicate succeeds.
-    private func capture21Presentation() {
-        variants {
+    private func capture21Presentation() throws {
+        try runVariant {
             try self.openNotebook()
             try self.tap("Share and Export")
-            // Production exposes this only with an external display. Do not simulate one
-            // or relabel the ordinary canvas as presentation when a lane lacks a display.
+            let share = self.ui.app.scrollViews["Share and Export"].firstMatch
+            try self.wait("Share and Export must open its menu") { share.exists && share.buttons.firstMatch.exists }
+            let externalDisplay = try XCTUnwrap(try self.ui.qaFact("externalDisplay") as? Bool,
+                                                "QA fact externalDisplay must be Boolean")
+            if !externalDisplay {
+                let presenter = self.query("Presenter Page").firstMatch
+                XCTAssertFalse(presenter.exists, "Presenter Page must not be offered without an external display")
+                guard !presenter.exists else { throw NibUI.Failure.message("Unexpected Presenter Page without an external display") }
+                self.ui.recordDiagnostics("Presentation device-only prerequisite", includeHierarchy: false)
+                throw XCTSkip("Device-only: external display is missing; verified here: Share and Export opens and does not offer Presenter Page")
+            }
             try self.tap("Presenter Page", scroll: true)
             _ = try self.require("Stop Presenting")
             try self.documentCapture(30, "presentation-mode")
@@ -677,10 +691,10 @@ final class CaptureUITests: XCTestCase {
     func test20StudySessionLightLandscape() { appearance = "light"; orientation = "landscape"; capture20StudySession() }
     func test20StudySessionDarkPortrait() { appearance = "dark"; orientation = "portrait"; capture20StudySession() }
     func test20StudySessionDarkLandscape() { appearance = "dark"; orientation = "landscape"; capture20StudySession() }
-    func test21Presentation() { appearance = "light"; orientation = "portrait"; capture21Presentation() }
-    func test21PresentationLightLandscape() { appearance = "light"; orientation = "landscape"; capture21Presentation() }
-    func test21PresentationDarkPortrait() { appearance = "dark"; orientation = "portrait"; capture21Presentation() }
-    func test21PresentationDarkLandscape() { appearance = "dark"; orientation = "landscape"; capture21Presentation() }
+    func test21Presentation() throws { appearance = "light"; orientation = "portrait"; try capture21Presentation() }
+    func test21PresentationLightLandscape() throws { appearance = "light"; orientation = "landscape"; try capture21Presentation() }
+    func test21PresentationDarkPortrait() throws { appearance = "dark"; orientation = "portrait"; try capture21Presentation() }
+    func test21PresentationDarkLandscape() throws { appearance = "dark"; orientation = "landscape"; try capture21Presentation() }
     func test22ThreeDocumentTabs() { appearance = "light"; orientation = "portrait"; capture22ThreeDocumentTabs() }
     func test22ThreeDocumentTabsLightLandscape() { appearance = "light"; orientation = "landscape"; capture22ThreeDocumentTabs() }
     func test22ThreeDocumentTabsDarkPortrait() { appearance = "dark"; orientation = "portrait"; capture22ThreeDocumentTabs() }

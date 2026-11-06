@@ -42,3 +42,7 @@ These seven tests fail on any unmet simulator prerequisite, then use an observab
 | Test | Capability | What CI verifies | What remains for a device |
 | --- | --- | --- | --- |
 | PagesUITests.testDragPagesBetweenWindowsCopiesIntoDestination | System window controls for two Nib scenes side by side | Open in New Window adds a probe-bearing scene showing the source document | Arrange windows, drag pages, verify destination copies and unchanged source |
+| CaptureUITests.test21Presentation | qa.externalDisplay | Share and Export opens; Presenter Page is absent | Presenter Page, Stop Presenting and presentation capture |
+| CaptureUITests.test21PresentationLightLandscape | qa.externalDisplay | Same checks in light landscape | Same presentation route in light landscape |
+| CaptureUITests.test21PresentationDarkPortrait | qa.externalDisplay | Same checks in dark portrait | Same presentation route in dark portrait |
+| CaptureUITests.test21PresentationDarkLandscape | qa.externalDisplay | Same checks in dark landscape | Same presentation route in dark landscape |

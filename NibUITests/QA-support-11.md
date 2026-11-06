@@ -390,3 +390,7 @@ Confirmed selection#3: Vision returned IH; the screenshot showed a hairline H cr
 ### P4 - two-window capability boundary
 
 Confirmed pages-drag-photos#1. Retain Open in New Window and the original sidebar readiness check; additionally require more probe-bearing windows than before and a source-document probe, using lenient per-window JSON. Only then query existing systemWindowControls and skip when absent, before Pages/Split View preparation. With controls, the complete two-window drag and copy/source assertions remain. Added the device-only coverage table and a lenient qaFact accessor for the remaining capability tests; missing facts throw explicitly. CI must report a skip after proven second-scene creation, never a pass for cross-window transfer.
+
+### D1 - external-display captures
+
+Confirmed current QAStateProbe publishes qa.externalDisplay from the connected external-display scene role and Presenter Page is capability-gated. The four presentation methods use a throwing variant entry point so XCTest receives XCTSkip; ordinary variants keep their existing diagnostic/XCTFail wrapper. Require the actual Share and Export menu with content, read the lenient Boolean fact, assert Presenter Page absent and only then skip when false. A missing/malformed fact or unexpected control fails. When true, the original Presenter Page, Stop Presenting and capture route remains. CI must count four device-only skips with the prerequisite screenshot; a device must deliver the original captures.
