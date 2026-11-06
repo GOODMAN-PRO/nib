@@ -93,10 +93,13 @@ final class CanvasUITests: XCTestCase {
         let name = label == "Rename" && !ui.app.buttons["Rename"].exists ? "pencil" : label
         let target = try ui.requireControl(name, type: .button, timeout: 8)
         try ui.tapWithoutIdle(target)
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+        let dismissed: () -> Bool = { [self] in
             !target.exists && !ui.app.buttons["cmd.page.duplicate"].exists
-        }, object: nil)
-        guard XCTWaiter.wait(for: [gone], timeout: 10) == .completed else {
+        }
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in dismissed() }, object: nil)
+        // The deadline bounds a menu that stays open. One existence query took 8 s while the rename alert and the
+        // keyboard came up (run 42163879315), so the only evaluation ended after the deadline: ask once more.
+        guard XCTWaiter.wait(for: [gone], timeout: 10) == .completed || dismissed() else {
             throw NibUI.Failure.message("Board context menu did not dismiss after \(label)")
         }
     }
@@ -151,9 +154,12 @@ final class CanvasUITests: XCTestCase {
         let count = try ui.state().pageCount
         if shortcut { try key("g", [.command, .option]) { try self.ui.waitForState { $0.openPanels.contains("pages.goToPage") } } }
         else { try more("Go to Page…") }
+        // The native field carries the placeholder "Page"; its accessibility label "Page number or title" sits on the
+        // SwiftUI wrapper. Run 42163879315 matched neither with label and placeholder swapped: accept both names
+        // in every attribute.
+        let names = ["Page number or title", "Page"]
         let field = ui.app.textFields.matching(NSPredicate(
-            format: "identifier == %@ OR label == %@ OR placeholderValue == %@",
-            "Page number or title", "Page", "Page number or title")).firstMatch
+            format: "identifier IN %@ OR label IN %@ OR placeholderValue IN %@", names, names, names)).firstMatch
         guard ui.measuredQuery("Go to Page typed field", { field.waitForExistence(timeout: 8) }) else {
             throw NibUI.Failure.message("Go to Page native field missing")
         }
