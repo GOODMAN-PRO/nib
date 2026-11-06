@@ -150,3 +150,17 @@ Should unblock all three More legs. Next CI must retain all assertions, finish e
 | Tests | Log prefix | Question answered |
 | --- | --- | --- |
 | Three More tests / shared reveal callers | Form reveal path / Form reveal timing / More scoped row (existing) | Was the cached cover retained, was Show Tools bottom-directed, and how many moves/seconds did reveal cost? |
+
+### K4 - seeded tabs, overflow and setting split
+
+Confirmed R13:chrome-still-failing#3 and holds=true: about 43 seconds enabling tabs plus 57 seconds of eight library opens, keys t=136.86-157.09, then timeout during the second settings visit at t=180; full flow estimated 275 seconds. Current UITestFixture executes settings.set editing.showTabs=true and doc.open newTab in notebook/Chrome tab 2...9 order, then AppDelegate returns to the library. The seed-time selection comment does not override that final startup state. Current DocumentTabsOverflow exposes windows.tabs.overflow, label N more open documents, renders +N, and uses the same complete DocumentTabsMenuItems as windows.tabs.menu.
+
+Both tests opt into tabsOverflow, assert the library/no-document startup and nine-open-documents control, then open Physics from the library before document actions. The original test retains overflow and Command-1...8/9; the new DocumentEditingHidesAndShowsOpenTabs retains off/absent Tabs, Command-1 while hidden, on/Tabs/Chrome tab 9 and exact document identity. Added the +N control's positive hidden count, active-tab visibility bound, exact accessibility label and complete menu-title inventory; hidden tabs also require the +N control absent.
+
+Decision: the probe does not publish ordered tab IDs. To preserve the original exact identity comparisons (rather than substitute title-only keyboard checks), the keyboard test first selects the already-open tabs through Tabs and records their IDs, then runs the original key comparisons. This adds menu traversal but removes setting-on and all eight library round trips. No notebooks are created/opened from library for those eight tabs. Nine distinct IDs are additionally required. All original assertions remain across the split; the last-tab identity in the settings test is established independently through its menu before hiding.
+
+Should unblock TabsOverflowAndKeyboardOneThroughEightAndNineLast and the new setting test. Next CI must show nine ordered fixture tabs, usable +N leading to all nine names, each exact key destination, Tabs and +N absent when disabled, and restored last-tab navigation. App logs must include showTabs=false shown=false. The fixture removes the diagnosed ~100-second setup; conservative identity-oracle menu traversal adds ~50-70 seconds back, so estimate ~110-150 seconds for overflow/keys and ~120-150 seconds for hide/show, versus ~275 unsplit. These are unmeasured; no allowance grows.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| Both tabs tests | Existing Requested chord / App key log; named fixture and overflow assertions | Were all seeded destinations usable, did each chord reach the independently observed document ID, and did tab visibility track the setting? |

@@ -24,8 +24,9 @@ final class ChromeUITests: XCTestCase {
             self?.ui.logQA("Chrome interruption", self?.ui.elementFacts(element) ?? "test released")
             return false
         }
-        let scenario: NibUI.FixtureScenario = name.contains("testTabsOverflowAndKeyboardOneThroughEightAndNineLast")
-            ? .tabsOverflow : .standard
+        let tabsScenario = name.contains("testTabsOverflowAndKeyboardOneThroughEightAndNineLast")
+            || name.contains("testDocumentEditingHidesAndShowsOpenTabs")
+        let scenario: NibUI.FixtureScenario = tabsScenario ? .tabsOverflow : .standard
         try ui.launchFixture(scenario: scenario)
         ui.logQA("Typed probe estimate", "Chrome toolbar/More rows use buttons; baseline Any probes ~0.99s vs present typed ~0.16s. Potential 50-70s/layout test, unmeasured; modal typed queries may remain slow.")
     }
@@ -906,34 +907,60 @@ final class ChromeUITests: XCTestCase {
         try ui.tapCommand("window.showLibrary"); try open("Concept map")
         return (first, try ui.state())
     }
+    private func openSeededTabs() throws -> String {
+        let launched = try ui.state()
+        XCTAssertEqual(launched.fixtureScenario, "tabsOverflow", "Missing tabsOverflow fixture scenario")
+        XCTAssertEqual(launched.screen, "library")
+        XCTAssertNil(launched.document, "The fixture opens tabs but returns to the library")
+        try open() // Editing settings and document chrome need an active document.
+        let tabs = try reachable("windows.tabs.menu", type: .button)
+        XCTAssertEqual(tabs.value as? String, "9 open documents")
+        return try XCTUnwrap(ui.state().document)
+    }
+
     func testTabsOverflowAndKeyboardOneThroughEightAndNineLast() throws {
-        func openFixtureTab(_ title: String) throws {
-            let card = ui.app.buttons.matching(identifier: "cmd.doc.open").matching(NSPredicate(
-                format: "label == %@ OR label BEGINSWITH %@", title, title + ",")).firstMatch
-            if !card.exists || !card.isHittable {
-                ui.revealFormElement { card }
-                if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
-            }
-            try open(title)
+        let first = try openSeededTabs()
+        let overflow = try reachable("windows.tabs.overflow", type: .button)
+        let hidden = try XCTUnwrap(Int(overflow.label.components(separatedBy: " ").first ?? ""))
+        XCTAssertGreaterThan(hidden, 0, "Nine tabs must overflow the document strip")
+        XCTAssertLessThan(hidden, 9, "The active document must remain visible in the strip")
+        XCTAssertEqual(overflow.label, "\(hidden) more open documents")
+        overflow.tap()
+        // The +N entry point must expose the same complete list as Tabs, not just hidden tabs.
+        for title in [notebook] + (2...9).map({ "Chrome tab \($0)" }) {
+            _ = try require(title)
         }
-        try openFixtureTab(notebook); try showTabs(true)
-        var documents = [try XCTUnwrap(ui.state().document)]
+        try tap(notebook)
+        _ = try ui.waitForState { $0.document == first }
+        var documents = [first]
+        // Resolve independent identity oracles through the already-open tabs, never library round trips.
+        // Titles alone would weaken the original exact document-ID checks for Command-1...9.
         for index in 2...9 {
-            try ui.tapCommand("window.showLibrary")
-            try openFixtureTab("Chrome tab \(index)")
-            documents.append(try XCTUnwrap(ui.state().document))
+            try tap("windows.tabs.menu"); try tap("Chrome tab \(index)")
+            let previous = documents.last
+            let selected = try ui.waitForState { $0.screen == "document" && $0.document != previous }
+            documents.append(try XCTUnwrap(selected.document))
         }
+        XCTAssertEqual(Set(documents).count, 9, "Fixture tabs must identify nine distinct documents")
         try tap("Tabs"); try tap(notebook)
         _ = try ui.waitForState { $0.document == documents[0] }
         for index in 1...8 {
             try key(String(index), .command) { _ = try self.ui.waitForState { $0.document == documents[index - 1] } }
         }
         try key("9", .command) { _ = try self.ui.waitForState { $0.document == documents[8] } }
+    }
+
+    func testDocumentEditingHidesAndShowsOpenTabs() throws {
+        let first = try openSeededTabs()
+        try tap("Tabs"); try tap("Chrome tab 9")
+        let last = try ui.waitForState { $0.screen == "document" && $0.document != first }
+        let documents = [first, try XCTUnwrap(last.document)]
         try showTabs(false)
         XCTAssertFalse(query("Tabs").firstMatch.exists)
+        XCTAssertFalse(ui.app.buttons["windows.tabs.overflow"].exists)
         try key("1", .command) { _ = try self.ui.waitForState { $0.document == documents[0] } }
         try showTabs(true); try tap("Tabs"); try tap("Chrome tab 9")
-        _ = try ui.waitForState { $0.document == documents[8] }
+        _ = try ui.waitForState { $0.document == documents[1] }
     }
     func testSwitchTabRestoresPageZoomToolAndSavedInk() throws {
         try open(); try showTabs(true)
