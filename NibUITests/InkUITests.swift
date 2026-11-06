@@ -946,8 +946,9 @@ final class InkUITests: XCTestCase {
         try fillColourSlots()
         // CONTRACTS KeyCommandRouting: notebook-specific preset keys beat the unrestricted pencil key 2.
         for index in indices {
-            try ui.chord(index == 9 ? "0" : String(index + 1), []) { }
-            try wait("Digit key must select colour slot \(index + 1)") { self.swatches[index].isSelected }
+            try ui.chord(index == 9 ? "0" : String(index + 1), []) {
+                try self.wait("Digit key must select colour slot \(index + 1)") { self.swatches[index].isSelected }
+            }
             XCTAssertEqual(try ui.state().tool, "pen", "Preset arbitration must not unexpectedly select pencil")
             let before = try ui.state(), blank = try raster()
             try draw(); _ = try visibleInk(after: blank); try undo(to: before)
@@ -1315,8 +1316,9 @@ final class InkUITests: XCTestCase {
     }
 
     func testDrawShapeRecognisesOnLiftAndKeepsUnrecognisedInk() throws {
-        try ui.chord("d", []) { }
-        _ = try ui.waitForState { $0.tool == "drawShape" }
+        try ui.chord("d", []) {
+            _ = try self.ui.waitForState { $0.tool == "drawShape" }
+        }
         try settings("drawShape")
         try toggle("Draw and Hold", to: true); try toggle("Require Hold to Snap", to: false); closePopover()
         let before = try ui.state()
@@ -1390,25 +1392,40 @@ final class InkUITests: XCTestCase {
 
     func testKeyboardToolWidthColourUndoAndRedoActions() throws {
         try ui.selectTool("lasso")
-        try ui.chord("p", []) { }
-        _ = try ui.waitForState { $0.tool == "pen" }
+        try ui.chord("p", []) {
+            _ = try self.ui.waitForState { $0.tool == "pen" }
+        }
         let before = try ui.state(); try draw()
-        try ui.chord("z", .command) { }
-        _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage && $0.redoAvailable }
-        try ui.chord("z", [.command, .shift]) { }
-        _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 && !$0.redoAvailable }
-        try ui.chord("h", []) { }
-        _ = try ui.waitForState { $0.tool == "highlighter" }
+        try ui.chord("z", .command) {
+            _ = try self.ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage && $0.redoAvailable }
+        }
+        try ui.chord("z", [.command, .shift]) {
+            _ = try self.ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 && !$0.redoAvailable }
+        }
+        try ui.chord("h", []) {
+            _ = try self.ui.waitForState { $0.tool == "highlighter" }
+        }
         try width(1)
-        try ui.chord("]", []) { }
+        try ui.chord("]", []) {
+            try self.wait("Width key must select Thickness 2") {
+                (try? self.control("Thickness 2", type: .button).isSelected) == true
+            }
+        }
         XCTAssertTrue(try control("Thickness 2", type: .button).isSelected)
-        try ui.chord("[", []) { }
+        try ui.chord("[", []) {
+            try self.wait("Width key must select Thickness 1") {
+                (try? self.control("Thickness 1", type: .button).isSelected) == true
+            }
+        }
         XCTAssertTrue(try control("Thickness 1", type: .button).isSelected)
-        try ui.chord("3", []) { }
+        try ui.chord("3", []) {
+            try self.wait("Digit key must select colour slot 3") { self.swatches[2].isSelected }
+        }
         XCTAssertTrue(swatches[2].isSelected)
         try draw()
-        try ui.chord("e", []) { }
-        _ = try ui.waitForState { $0.tool == "eraser" }
+        try ui.chord("e", []) {
+            _ = try self.ui.waitForState { $0.tool == "eraser" }
+        }
     }
 
     func testTwoFingerUndoAndThreeFingerRedoDoubleTaps() throws {
@@ -1485,8 +1502,9 @@ final class InkUITests: XCTestCase {
         try assertNoNewInk(before); try draw()
         try ui.chord("p", [.control, .command]) { _ = try self.control("Pencil palette") }
         _ = try control("Pencil palette")
-        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
-        try wait("Escape dismisses the Pencil palette") { !self.ui.app.otherElements["Pencil palette"].exists }
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) {
+            try self.wait("Escape dismisses the Pencil palette") { !self.ui.app.otherElements["Pencil palette"].exists }
+        }
     }
 
     func testSettingsKeyboardShortcutOpensInkPreferences() throws {

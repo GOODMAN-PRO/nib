@@ -46,6 +46,23 @@ final class NibUI {
     var diagnoseKeyDelivery = false
     var diagnoseStateReads = false
     private var slowTreeLogged = false
+    private var previousKey: (name: String, uptime: TimeInterval)?
+    private var previousActivity = "fixture setup"
+
+    /// Explicit runner action boundaries, not an inferred XCTest activity stack. No AX query.
+    func noteActivity(_ name: String) { previousActivity = name }
+
+    private func noteKeyDelivery(_ name: String) {
+        previousKey = (name, ProcessInfo.processInfo.systemUptime)
+        noteActivity(name)
+    }
+
+    private func keyContext() -> String {
+        let now = ProcessInfo.processInfo.systemUptime
+        let key = previousKey?.name ?? "none recorded"
+        let elapsed = previousKey.map { String(now - $0.uptime) } ?? "unavailable"
+        return "deliveryUptime=\(now) previousKey=\(key) secondsSincePreviousKey=\(elapsed) previousActivity=\(previousActivity)"
+    }
     var canvas: XCUIElement { app.scrollViews["nib.canvas"].firstMatch }
 
     /// Instrument synchronous AX calls without changing their result or adding a retry.
@@ -1344,7 +1361,10 @@ final class NibUI {
             let deliveryBefore = chordProbeSnapshot()
             let logBeforeDelivery = deliveryBefore.state?.keyLog ?? focused.keyLog ?? []
             logQA("Key before delivery", "route=hardware typeKey key=\(key) modifiers=\(modifiers.rawValue) keyboardExists=\(app.keyboards.firstMatch.exists) " + deliveryBefore.facts)
-            try hardwareKey(key, modifiers)
+            let precedingActivity = previousActivity
+            try openHardwareKeyRoute()
+            let precedingContext = keyContext() + " precedingAction=" + precedingActivity
+            try sendHardwareKey(key, modifiers)
             // The app's own account of the key (window press, responder, command run) goes into the test log
             // for passing and failing chords alike.
             defer {
@@ -1364,6 +1384,7 @@ final class NibUI {
                         + deliveryBefore.facts + "\nafter failed postcondition: " + deliveryAfter.facts)
                     if after.keyResponderIsText == false {
                         let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
+                        logQA("Chord lost context", precedingContext)
                         logQA("Chord undelivered retry", "key=\(key) modifiers=\(modifiers.rawValue) keyboards=\(keyboards) " + deliveryAfter.facts)
                         try sendHardwareKey(key, modifiers)
                         do { try postcondition(); return }
@@ -1378,6 +1399,7 @@ final class NibUI {
                 if let current = try? state(), current.keyResponderIsText != true,
                    let observed = missingChordModifiers(key, modifiers, before: logBeforeDelivery,
                                                         after: current.keyLog ?? []) {
+                    logQA("Chord lost context", precedingContext)
                     logQA("Chord modifier loss retry", "key=\(key) requested=\(modifiers.rawValue) observed=\(observed)")
                     try sendHardwareKey(key, modifiers)
                     do { try postcondition(); return }
@@ -1601,6 +1623,7 @@ final class NibUI {
     }
 
     private func sendHIDKey(_ usage: UInt) throws {
+        noteKeyDelivery("HID usage \(usage)")
         try XCTContext.runActivity(named: "Hardware key HID usage \(usage)") { _ in
             let done = XCTestExpectation(description: "HID key delivered")
             var failure: Error?
@@ -1628,6 +1651,7 @@ final class NibUI {
     }
 
     private func sendTypedKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags) throws {
+        noteKeyDelivery("typed key \(key) modifiers=\(modifiers.rawValue)")
         try XCTContext.runActivity(named: "Hardware key \(key), modifiers \(modifiers.rawValue)") { activity in
             let route = XCTAttachment(string: "route=NibTouchPaths key=\(key) modifiers=\(modifiers.rawValue); SPI route is in runner log")
             route.lifetime = .keepAlways; activity.add(route)
@@ -2315,6 +2339,7 @@ final class NibUI {
                     if diagnoseKeyDelivery { logQA("Key after delivery", "key=\(key) probe=\(String(describing: probe.value))") }
                 }
                 logQA("Stall boundary", "native typeKey key=\(key) modifiers=\(modifiers.rawValue)")
+                noteKeyDelivery("native key \(key) modifiers=\(modifiers.rawValue)")
                 field.typeKey(key == XCUIKeyboardKey.return.rawValue ? "\n" : key, modifierFlags: modifiers)
             }
         }
@@ -2362,7 +2387,10 @@ final class NibUI {
     /// XCUIElement.typeText, this never invokes XCTest's default interruption handler.
     /// Route 3 types the complete string (including shifted punctuation and Unicode).
     func typeNativeText(_ text: String, in field: XCUIElement) throws {
-        guard app.alerts.firstMatch.exists else { field.typeText(text); return }
+        guard app.alerts.firstMatch.exists else {
+            noteKeyDelivery("native text characters=\(text.count)")
+            field.typeText(text); return
+        }
         logQA("Native alert text", "route=runner text SPI characters=\(text.count)")
         if text == "\n" { try sendHIDKey(0x28); return }
         try focusedText(text)
@@ -2370,6 +2398,7 @@ final class NibUI {
 
     /// Caller has established the focused field; exact text is verified by the caller.
     func focusedText(_ text: String) throws {
+        noteKeyDelivery("focused text characters=\(text.count)")
         let delivered = XCTestExpectation(description: "Alert text delivered")
         var failure: Error?
         NibTouchPaths.sendKey(text, modifiers: 0, route: 3) { error in
@@ -2516,6 +2545,7 @@ final class NibUI {
     }
 
     func openDocument(_ title: String) throws {
+        noteActivity("open document " + title)
         _ = try waitForState { $0.screen == "library" }
         let document = app.buttons.matching(identifier: "cmd.doc.open")
             .matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", title, title + ",")).firstMatch
@@ -2563,6 +2593,7 @@ final class NibUI {
     }
 
     func tapCommand(_ id: String, diagnostics: Bool = false) throws {
+        noteActivity("tap command " + id)
         try tapControl("cmd." + id, overflow: ["menu.more", "tool.more"], diagnostics: diagnostics)
     }
 
@@ -2592,6 +2623,7 @@ final class NibUI {
     }
 
     func selectTool(_ id: String, scopedOverflow: Bool = false) throws {
+        noteActivity("select tool " + id)
         // Reselecting toggles its options strip (or settings for a tool without a strip).
         if try state().tool != id { try tapControl("tool." + id, overflow: ["tool.more"], scopedOverflow: scopedOverflow) }
         _ = try waitForState { $0.tool == id }
@@ -2681,7 +2713,8 @@ final class NibUI {
     /// The first attachment is emitted before touching AX so an idle stall still leaves a precise last-started action.
     @discardableResult
     func timedAction<T>(_ name: String, action: () throws -> T) rethrows -> T {
-        try XCTContext.runActivity(named: name) { activity in
+        noteActivity(name)
+        return try XCTContext.runActivity(named: name) { activity in
             let started = ProcessInfo.processInfo.systemUptime
             let start = XCTAttachment(string: "start uptime=\(started) wall=\(Date())")
             start.name = "action-start"; start.lifetime = .keepAlways; activity.add(start)
@@ -2731,6 +2764,7 @@ final class NibUI {
     /// Two points use the public coordinate press-and-drag API. Longer polylines keep one finger down using
     /// XCTest's event synthesizer (test runner only); no commands or app-side gesture injection are used.
     func drawStroke(_ path: [CGPoint], duration: TimeInterval = 0.35) throws {
+        noteActivity("draw stroke")
         guard path.count >= 2 else { throw Failure.message("A stroke needs at least two points") }
         if path.count == 2 {
             let start = coordinate(path[0]), end = coordinate(path[1])

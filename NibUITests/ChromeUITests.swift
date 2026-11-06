@@ -88,22 +88,28 @@ final class ChromeUITests: XCTestCase {
     }
 
     private func tap(_ name: String, type: XCUIElement.ElementType = .any) throws {
+        ui.noteActivity("Chrome tap " + name)
         let toolMenu = ui.app.scrollViews["More tools"].firstMatch
         let selectsTool = name != "tool.more" && (name.hasPrefix("tool.") || name.hasPrefix("cmd.") || name == "Templates")
         let closesToolMenu = selectsTool && toolMenu.exists
         try reachable(name, type: type).tap()
         if closesToolMenu { try ui.waitForMenuClosed(toolMenu, named: "More tools after " + name) }
     }
-    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = []) throws {
+    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = [],
+                     verifying postcondition: () throws -> Void = {}) throws {
         if try ui.state().keyResponderIsText == true {
             let field = ui.app.descendants(matching: .any).matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
             try ui.nativeKey(value, modifiers, in: field)
+            try postcondition()
         } else {
-            try ui.chord(value, modifiers) { } // The immediately following caller assertion verifies the action.
+            try ui.chord(value, modifiers, verifying: postcondition)
         }
     }
-    private func escape() throws { try key(XCUIKeyboardKey.escape.rawValue) }
+    private func escape(verifying postcondition: () throws -> Void = {}) throws {
+        try key(XCUIKeyboardKey.escape.rawValue, verifying: postcondition)
+    }
     private func outside() {
+        ui.noteActivity("Chrome outside tap")
         guard let snapshot = try? ui.app.snapshot() else { XCTFail("Outside tap needs live geometry"); return }
         let canvas = ui.canvas.frame
         func obstructions(_ node: XCUIElementSnapshot) -> [CGRect] {
@@ -150,6 +156,7 @@ final class ChromeUITests: XCTestCase {
         try selectMoreRow(action)
     }
     private func selectMoreRow(_ action: String) throws {
+        ui.noteActivity("Chrome More row " + action)
         let menu = ui.app.scrollViews["More"].firstMatch
         XCTAssertTrue(menu.waitForExistence(timeout: 8), "More must expose its own row container")
         let row = try ui.requireControl(action, type: .button, scroll: true, timeout: 8, in: menu)
@@ -194,6 +201,7 @@ final class ChromeUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 12) { $0.strokeCountOnPage == before.strokeCountOnPage + 1 && $0.undoAvailable }
     }
     private func replace(_ name: String, _ text: String) throws {
+        ui.noteActivity("Chrome replace " + name)
         try ui.fillNativeForm([(name, text)])
     }
 
@@ -335,8 +343,8 @@ final class ChromeUITests: XCTestCase {
         // DESIGN §14.9 transfers the droplet into the header, which has its own Close.
         try tap("Close Assistant"); try panel("aichat.panel", shown: false)
         try ui.chord("j", .command) { try self.panel("aichat.panel") }
-        try escape(); try panel("aichat.panel", shown: false)
-        try sameContent(before); try key("p"); try draw()
+        try escape() { try self.panel("aichat.panel", shown: false) }
+        try sameContent(before); try key("p") { _ = try self.ui.waitForState { $0.tool == "pen" } }; try draw()
     }
 
     func testRegisteredSidebarPanelsAndCloseButton() throws {
@@ -356,7 +364,7 @@ final class ChromeUITests: XCTestCase {
         try menu("title", "Rename"); try replace("Title", "Discard this draft")
         try tap("sheet.dismiss"); try panel("chrome.rename", shown: false)
         XCTAssertTrue(query("menu.title").firstMatch.label.contains(notebook))
-        try menu("title", "Rename"); try escape(); try panel("chrome.rename", shown: false)
+        try menu("title", "Rename"); try escape() { try self.panel("chrome.rename", shown: false) }
         try sameContent(before); try ui.selectTool("pen"); try draw()
     }
 
@@ -487,8 +495,7 @@ final class ChromeUITests: XCTestCase {
         let field = ui.app.textViews[editor]
         XCTAssertTrue(field.waitForExistence(timeout: 10), "Selected tool must open its text editor")
         field.typeText("Chrome accessory text")
-        try escape()
-        _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 && $0.undoAvailable }
+        try escape() { _ = try self.ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 && $0.undoAvailable } }
         try ui.tapCommand("edit.undo")
         _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage }
     }
@@ -664,8 +671,8 @@ final class ChromeUITests: XCTestCase {
         try open(); let before = try ui.state()
         try more("Hide Tools")
         try wait("Hide Tools must remove tools and options") { !self.query("tool.pen").firstMatch.exists && !self.query("menu.toolSettings").firstMatch.exists }
-        try key("w"); _ = try reachable("tool.pen")
-        try key("w"); try wait("W must hide palette") { !self.query("tool.pen").firstMatch.exists }
+        try key("w") { _ = try self.reachable("tool.pen") }
+        try key("w") { try self.wait("W must hide palette") { !self.query("tool.pen").firstMatch.exists } }
         try tap("Show Tools"); _ = try reachable("tool.pen")
         try ui.twoFingerScroll(from: CGPoint(x: 0.12, y: 0.35), to: CGPoint(x: 0.12, y: 0.75))
         try more("Hide Tools"); try more("Show Tools"); _ = try reachable("menu.toolSettings")
@@ -878,7 +885,7 @@ final class ChromeUITests: XCTestCase {
     }
     private func newNotebook(_ title: String) throws {
         let old = try ui.state().document
-        try key("n", [.command, .option])
+        try key("n", [.command, .option]) { _ = try self.require("Title") }
         try replace("Title", title)
         try tap("No cover"); try ui.tapCommand("doc.create")
         _ = try ui.waitForState { $0.screen == "document" && $0.document != old }
@@ -908,13 +915,12 @@ final class ChromeUITests: XCTestCase {
         try tap("Tabs"); try tap(notebook)
         _ = try ui.waitForState { $0.document == documents[0] }
         for index in 1...8 {
-            try key(String(index), .command)
-            _ = try ui.waitForState { $0.document == documents[index - 1] }
+            try key(String(index), .command) { _ = try self.ui.waitForState { $0.document == documents[index - 1] } }
         }
-        try key("9", .command); _ = try ui.waitForState { $0.document == documents[8] }
+        try key("9", .command) { _ = try self.ui.waitForState { $0.document == documents[8] } }
         try showTabs(false)
         XCTAssertFalse(query("Tabs").firstMatch.exists)
-        try key("1", .command); _ = try ui.waitForState { $0.document == documents[0] }
+        try key("1", .command) { _ = try self.ui.waitForState { $0.document == documents[0] } }
         try showTabs(true); try tap("Tabs"); try tap("Chrome tab 9")
         _ = try ui.waitForState { $0.document == documents[8] }
     }
@@ -926,8 +932,10 @@ final class ChromeUITests: XCTestCase {
         let first = try ui.state()
         try ui.tapCommand("window.showLibrary"); try open("Concept map")
         try ui.selectTool("highlighter"); let board = try ui.state()
-        try key("1", .command)
-        let restored = try ui.waitForState { $0.document == first.document && $0.page == first.page }
+        try key("1", .command) {
+            _ = try self.ui.waitForState { $0.document == first.document && $0.page == first.page }
+        }
+        let restored = try ui.state()
         XCTAssertEqual(restored.strokeCountOnPage, first.strokeCountOnPage)
         XCTAssertEqual(restored.tool, first.tool)
         XCTAssertEqual(restored.zoom, first.zoom, accuracy: 0.05)
@@ -956,21 +964,22 @@ final class ChromeUITests: XCTestCase {
         let (first, second) = try secondTab()
         try menu("title", "Close Other Tabs")
         XCTAssertEqual(try ui.state().document, second.document)
-        try key("w", .command)
-        _ = try ui.waitForState { $0.screen == "library" && $0.document == nil }
+        try key("w", .command) { _ = try self.ui.waitForState { $0.screen == "library" && $0.document == nil } }
         try open(); XCTAssertEqual(try ui.state().document, first.document)
     }
     func testNewWindowKeyboardOpensIndependentScene() throws {
         try open(); let before = try ui.state()
-        try key("n", .command)
-        try wait("Command-N must open an independent library scene", timeout: 20) {
-            self.ui.app.descendants(matching: .any).matching(identifier: "nib.qa.state").allElementsBoundByIndex.contains {
-                guard let value = $0.value as? String, let data = value.data(using: .utf8),
-                      let state = try? JSONDecoder().decode(QAState.self, from: data) else { return false }
-                return state.screen == "library"
+        try key("n", .command) {
+            try self.wait("Command-N must open an independent library scene", timeout: 20) {
+                self.ui.app.descendants(matching: .any).matching(identifier: "nib.qa.state").allElementsBoundByIndex.contains {
+                    guard let value = $0.value as? String, let data = value.data(using: .utf8),
+                          let state = try? JSONDecoder().decode(QAState.self, from: data) else { return false }
+                    return state.screen == "library"
+                }
             }
         }
         // OS window switching is a real gesture; the document scene must remain in the app switcher.
+        ui.noteActivity("Chrome background and activate")
         XCUIDevice.shared.press(.home); ui.app.activate()
         let probes = ui.app.descendants(matching: .any).matching(identifier: "nib.qa.state").allElementsBoundByIndex
         XCTAssertFalse(probes.isEmpty)
@@ -995,11 +1004,11 @@ final class ChromeUITests: XCTestCase {
         try ui.selectTool("pen"); try draw(); let saved = try ui.state()
         try ui.tapCommand("window.showLibrary"); try open("Concept map")
         let board = try ui.state()
+        ui.noteActivity("Chrome background and activate")
         XCUIDevice.shared.press(.home); ui.app.activate()
         _ = try ui.waitForState { $0.document == board.document && $0.page == board.page }
-        try key("1", .command)
-        _ = try ui.waitForState { $0.document == saved.document && $0.page == saved.page && $0.strokeCountOnPage == saved.strokeCountOnPage }
-        try key("9", .command); _ = try ui.waitForState { $0.document == board.document }
+        try key("1", .command) { _ = try self.ui.waitForState { $0.document == saved.document && $0.page == saved.page && $0.strokeCountOnPage == saved.strokeCountOnPage } }
+        try key("9", .command) { _ = try self.ui.waitForState { $0.document == board.document } }
     }
 
     // view.setReadOnly
@@ -1013,26 +1022,24 @@ final class ChromeUITests: XCTestCase {
     }
     func testReadOnlyKeyboardToggleRestoresEditing() throws {
         try open(); let before = try ui.state()
-        try key("r", [.command, .option])
-        try wait("Option-Command-R must retract editing tools") { !self.query("tool.pen").firstMatch.exists }
+        try key("r", [.command, .option]) { try self.wait("Option-Command-R must retract editing tools") { !self.query("tool.pen").firstMatch.exists } }
         try ui.drawStroke([CGPoint(x: 0.4, y: 0.65), CGPoint(x: 0.6, y: 0.69)])
         try sameContent(before)
-        try key("r", [.command, .option]); try ui.selectTool("pen"); try draw()
+        try key("r", [.command, .option]) { _ = try self.reachable("tool.pen") }; try ui.selectTool("pen"); try draw()
     }
 
     // layer.panel/setActive/setVisible/rename
     private func layers(useShortcut: Bool = true) throws {
         try open(); try editing("Layers"); try toggle("Layers", to: true); try closeEditing()
-        if useShortcut { try key("l", [.command, .option]) }
-        else { try more("Layers") }
-        try panel("layers")
+        if useShortcut { try key("l", [.command, .option]) { try self.panel("layers") } }
+        else { try more("Layers"); try panel("layers") }
     }
     func testLayersSettingMenuAndShortcutReflectFiveLayers() throws {
         try layers(useShortcut: false)
         for number in 1...5 { _ = try require("Layer \(number)") }
         XCTAssertTrue(try require("Layer 1").isSelected)
         try tap("cmd.panel.close"); try panel("layers", shown: false)
-        try key("l", [.command, .option]); try panel("layers")
+        try key("l", [.command, .option]) { try self.panel("layers") }
         try tap("cmd.panel.close")
         try editing("Layers"); try toggle("Layers", to: false); try closeEditing()
         try tap("menu.more"); XCTAssertFalse(query("Layers").firstMatch.exists)
@@ -1070,12 +1077,12 @@ final class ChromeUITests: XCTestCase {
         try layers(); try tap("Layer 2"); try tap("cmd.panel.close")
         try ui.selectTool("pen"); try draw(); let before = try ui.state()
         let visible = ui.canvas.screenshot().pngRepresentation
-        try key("l", [.command, .option]); try tap("Hide Layer 2")
+        try key("l", [.command, .option]) { try self.panel("layers") }; try tap("Hide Layer 2")
         XCTAssertTrue((try require("Layer 2").value as? String ?? "").contains("Hidden"))
         try tap("cmd.panel.close")
         XCTAssertNotEqual(ui.canvas.screenshot().pngRepresentation, visible, "Hidden-layer ink must disappear from viewer")
         try sameContent(before)
-        try key("l", [.command, .option]); try tap("Show Layer 2")
+        try key("l", [.command, .option]) { try self.panel("layers") }; try tap("Show Layer 2")
         XCTAssertFalse((try require("Layer 2").value as? String ?? "").contains("Hidden"))
         try tap("cmd.panel.close"); try sameContent(before)
     }
@@ -1086,8 +1093,8 @@ final class ChromeUITests: XCTestCase {
         try replace("Layer name", "Chrome annotations"); try tap("Rename")
         XCTAssertEqual(try require("Chrome annotations").value as? String, oldValue)
         try sameContent(before, history: false)
-        try key("z", .command); _ = try require("Layer 1")
-        try key("z", [.command, .shift]); _ = try require("Chrome annotations")
+        try key("z", .command) { _ = try self.require("Layer 1") }
+        try key("z", [.command, .shift]) { _ = try self.require("Chrome annotations") }
     }
 
     // laser; laser.setMode
@@ -1097,8 +1104,8 @@ final class ChromeUITests: XCTestCase {
         _ = try ui.waitForState { $0.tool == "laser" }
         try ui.drawStroke([CGPoint(x: 0.4, y: 0.65), CGPoint(x: 0.6, y: 0.7)])
         try sameContent(before)
-        try key("p"); _ = try ui.waitForState { $0.tool == "pen" }
-        try key("l"); _ = try ui.waitForState { $0.tool == "laser" }
+        try key("p") { _ = try self.ui.waitForState { $0.tool == "pen" } }
+        try key("l") { _ = try self.ui.waitForState { $0.tool == "laser" } }
         ui.coordinate(CGPoint(x: 0.5, y: 0.6)).press(forDuration: 0.4)
         try sameContent(before)
     }
@@ -1182,8 +1189,9 @@ final class ChromeUITests: XCTestCase {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("cmd.ruler.set")
         XCTAssertTrue(ruler.waitForExistence(timeout: 8))
-        try key("r"); try wait("R must hide ruler and angle HUD") { !self.ruler.exists }
-        try key("r"); XCTAssertTrue(ruler.waitForExistence(timeout: 8))
+        try key("r") { try self.wait("R must hide ruler and angle HUD") { !self.ruler.exists } }
+        try key("r") { try self.wait("R must show ruler", timeout: 8) { self.ruler.exists } }
+        XCTAssertTrue(ruler.waitForExistence(timeout: 8))
         try rulerMenu("Hide Ruler"); try wait("Hide Ruler must remove overlay") { !self.ruler.exists }
         try sameContent(before)
     }
@@ -1258,7 +1266,7 @@ final class ChromeUITests: XCTestCase {
         if try !ui.state().openPanels.contains("timekeeper") {
             // K opens the idle panel. During a session K toggles the bar; its clock opens details.
             if clockValue.exists { clockValue.tap() }
-            else { try key("k") }
+            else { try key("k") { try self.panel("timekeeper") } }
         }
         try panel("timekeeper")
     }
@@ -1282,12 +1290,11 @@ final class ChromeUITests: XCTestCase {
     func testTimeKeeperPaletteAndKeyboardToggleRetainActiveCountdown() throws {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("cmd.timer.control"); try panel("timekeeper")
-        try key("k"); try panel("timekeeper", shown: false)
+        try key("k") { try self.panel("timekeeper", shown: false) }
         try timer()
         let first = clockValue.label
         try tap("Hide Time Keeper")
-        try key("k")
-        try wait("Restored timer must still advance") { self.clockValue.exists && self.clockValue.label != first }
+        try key("k") { try self.wait("Restored timer must still advance") { self.clockValue.exists && self.clockValue.label != first } }
         try sameContent(before)
     }
     func testTimerPresetStartsCountdownAndCustomNameAdvances() throws {
@@ -1317,7 +1324,7 @@ final class ChromeUITests: XCTestCase {
         let paused = clockValue.label
         let stable = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in self.clockValue.label != paused }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [stable], timeout: 2), .timedOut, "Paused countdown must stop advancing")
-        try key("k", [.command, .shift]); _ = try require("Pause")
+        try key("k", [.command, .shift]) { _ = try self.require("Pause") }
         try wait("Resume must advance countdown") { self.clockValue.label != paused }
         try tap("Stop and Save"); try timeKeeper()
         _ = try reachable("Chrome countdown")
@@ -1510,8 +1517,7 @@ final class ChromeUITests: XCTestCase {
         try importTextPDF(); let before = try ui.state(); try selectPDFText(); try pdfAction("Copy")
         _ = try ui.waitForState { ($0.clipboardChangeCount ?? 0) > (before.clipboardChangeCount ?? 0) }
         try menu("title", "Rename")
-        let field = try reachable("Title"); field.tap(); try key("a", .command); try key("v", .command)
-        try wait("PDF Copy must put the selected text on the real pasteboard") { (field.value as? String ?? "").contains("Velocity") }
+        let field = try reachable("Title"); field.tap(); try key("a", .command); try key("v", .command) { try self.wait("PDF Copy must put the selected text on the real pasteboard") { (field.value as? String ?? "").contains("Velocity") } }
         try tap("sheet.dismiss"); try sameContent(before)
     }
     func testPDFDefineOpensDictionaryForSelectedText() throws {
