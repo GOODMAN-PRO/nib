@@ -20,6 +20,7 @@ struct SearchViewport: Equatable {
     var availableHeight: CGFloat
     /// The visible part of the host, expressed in the host's own coordinates.
     var visibleBounds: CGRect
+    var columnTop: CGFloat = 0
 
     func differs(from old: SearchViewport?, scale: CGFloat) -> Bool {
         guard let old else { return true }
@@ -28,6 +29,7 @@ struct SearchViewport: Equatable {
         return SearchLayoutMeasurement.changed(oldWindow, window, scale: scale)
             || SearchLayoutMeasurement.changed(old.visibleBounds, visibleBounds, scale: scale)
             || abs(old.availableHeight - availableHeight) > 1 / max(1, scale)
+            || abs(old.columnTop - columnTop) > 1 / max(1, scale)
     }
 
     static var idealHeight: CGFloat {
@@ -56,10 +58,25 @@ struct SearchViewport: Equatable {
         let bounds = hostBounds.intersection(localColumn)
         return bounds.isEmpty ? .zero : bounds
     }
-    static func resultsHeight(availableHeight: CGFloat, reservesNavigation: Bool) -> CGFloat {
-        max(0, min(NibMetrics.searchResultsMaxHeight,
+    /// ChromeOverlayGeometry stacks the centred match HUD above colliding bottom HUDs using
+    /// their measured widths, not ChromeLayout's sidebar docking breakpoint. Read that final
+    /// placement: the counter's distance from the usable bottom includes every occupied row.
+    static func navigationRows(counterAvailableHeight: CGFloat) -> Int {
+        let row = NibMetrics.hitTarget + NibMetrics.minimumRestingGap
+        return max(1, Int(ceil((counterAvailableHeight + NibMetrics.minimumRestingGap) / row)))
+    }
+    func navigationRows(counterTop: CGFloat?) -> Int {
+        guard let counterTop else { return 2 }
+        // Use the panel's keyboard boundary, even if a floating keyboard intersects the
+        // results but not the narrower counter. Both positions are in window coordinates.
+        return Self.navigationRows(counterAvailableHeight: columnTop + availableHeight - counterTop)
+    }
+    static func resultsHeight(availableHeight: CGFloat, reservesNavigation: Bool,
+                              navigationRows: Int = 2) -> CGFloat {
+        let reserve = CGFloat(max(0, navigationRows)) * (NibMetrics.hitTarget + NibMetrics.minimumRestingGap)
+        return max(0, min(NibMetrics.searchResultsMaxHeight,
             availableHeight - NibMetrics.barHeight - NibMetrics.minimumRestingGap
-                - (reservesNavigation ? navigationReserve : 0)))
+                - (reservesNavigation ? reserve : 0)))
     }
     static func measure(windowBounds: CGRect, safeArea: UIEdgeInsets, frame: CGRect,
                         keyboard: CGRect?) -> SearchViewport {
@@ -69,13 +86,17 @@ struct SearchViewport: Equatable {
         }
         let visible = windowBounds.intersection(frame)
         return SearchViewport(windowSize: windowBounds.size, availableHeight: max(0, bottom - frame.minY),
-            visibleBounds: visible.isEmpty ? .zero : visible.offsetBy(dx: -frame.minX, dy: -frame.minY))
+            visibleBounds: visible.isEmpty ? .zero : visible.offsetBy(dx: -frame.minX, dy: -frame.minY),
+            columnTop: frame.minY)
     }
 }
 
 /// Uses this view's window (never the main screen), including Stage Manager and floating keyboards.
 @MainActor
 struct SearchViewportReader: UIViewRepresentable {
+    // A moved ancestor need not resize the sensor. Supplying its SwiftUI position makes
+    // updateUIView schedule another window-coordinate measurement after HUD placement.
+    var layoutPosition: CGPoint = .zero
     var onChange: (SearchViewport) -> Void
     func makeUIView(context: Context) -> Sensor { Sensor(onChange: onChange) }
     func updateUIView(_ view: Sensor, context: Context) { view.onChange = onChange; view.setNeedsLayout() }
@@ -152,7 +173,8 @@ struct DocumentSearchPanel: View {
             let width = SearchViewport.panelWidth(availableWidth: geometry.size.width,
                 windowSize: viewport?.windowSize)
             let height = SearchViewport.resultsHeight(availableHeight: min(geometry.size.height,
-                viewport?.availableHeight ?? geometry.size.height), reservesNavigation: true)
+                viewport?.availableHeight ?? geometry.size.height), reservesNavigation: true,
+                navigationRows: viewport?.navigationRows(counterTop: state.navigationCounterTop) ?? 2)
             VStack(spacing: NibMetrics.minimumRestingGap) {
                 DocumentSearchField(app: app, session: session, state: state)
                 SearchResults(app: app, session: session, state: state)
@@ -238,6 +260,18 @@ struct SearchCounter: View {
         Group {
             if usesHUD {
                 NibHUDGroup(id: "searchui.matchCounter") { controls }
+                    .background {
+                        GeometryReader { geometry in
+                            SearchViewportReader(layoutPosition: geometry.frame(in: .global).origin) { viewport in
+                                if state.navigationCounterTop != viewport.columnTop {
+                                    state.navigationCounterTop = viewport.columnTop
+                                }
+                            }
+                        }
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                    }
+                    .onDisappear { state.navigationCounterTop = nil }
             } else {
                 HStack(spacing: NibSpacing.s) { controls }
                     .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget)

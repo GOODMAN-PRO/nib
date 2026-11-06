@@ -1347,6 +1347,42 @@ final class FeatSearchUITests: XCTestCase {
         XCTAssertTrue(closed, "Cancel dismisses even with an empty query")
     }
 
+    func testResultsHideOrphanHeadingAndRestoreItWhenFirstRowScrollsIntoView() async throws {
+        executionTimeAllowance = 60
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let state = SearchState()
+        state.query = "Hello"
+        state.matches = [hit(kind: "title"), hit()]
+        var headings: Set<SearchGroup> = []
+        let results = SearchResults(app: h.app, session: h.session, state: state)
+            .onPreferenceChange(SearchVisibleGroupHeadings.self) { headings = $0 }
+        let host = UIHostingController(rootView: results)
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 560, height: 240))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        host.view.layoutIfNeeded()
+        for _ in 0..<50 {
+            if headings.contains(.titles) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(headings.contains(.titles))
+        XCTAssertFalse(headings.contains(.typed), "Typed Notes must not appear without its first result")
+        let list = try XCTUnwrap(searchDescendants(UIScrollView.self, in: host.view)
+            .first { $0.bounds.height > NibMetrics.hitTarget * 2 })
+        let bottom = max(0, list.contentSize.height - list.bounds.height + list.adjustedContentInset.bottom)
+        list.setContentOffset(CGPoint(x: 0, y: bottom), animated: false)
+        host.view.layoutIfNeeded()
+        for _ in 0..<50 {
+            if headings.contains(.typed) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(headings.contains(.typed), "The heading must return when scrolling reveals its complete row")
+        XCTAssertEqual(state.visibleMatches.count, 2, "Clipping a heading must not remove a result")
+    }
+
     func testFilterHeaderStaysInsetWhenResultsScrollInShortKeyboardRegion() async throws {
         let h = Harness(features: [FeatSearchUIFeature.self])
         let state = SearchState()

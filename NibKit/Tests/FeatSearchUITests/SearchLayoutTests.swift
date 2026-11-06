@@ -3,11 +3,97 @@ import SwiftUI
 import UIKit
 import Combine
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatSearchUI
 
 @MainActor
 final class SearchLayoutTests: XCTestCase {
+    func testSearchHeightReservesOneRowForSideBySideHUDsAndTwoForStackedHUDs() {
+        // The chrome host places these measured 40 pt HUDs 16 pt apart when their
+        // widths collide. Its final placement, including a narrowed sidebar region,
+        // is authoritative even when the full window is in landscape.
+        let oneRow = SearchViewport.navigationRows(counterAvailableHeight: NibMetrics.hudHeight)
+        let twoRows = SearchViewport.navigationRows(counterAvailableHeight:
+            2 * NibMetrics.hudHeight + NibMetrics.minimumRestingGap)
+        XCTAssertEqual(oneRow, 1)
+        XCTAssertEqual(twoRows, 2)
+        XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 419, reservesNavigation: true,
+            navigationRows: oneRow), 299)
+        XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 419, reservesNavigation: true,
+            navigationRows: twoRows), 239)
+        for rows in [oneRow, twoRows] {
+            XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 419, reservesNavigation: false,
+                navigationRows: rows), 359, "Library search must not reserve HUD space")
+            XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 100, reservesNavigation: true,
+                navigationRows: rows), 0)
+            XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 2000, reservesNavigation: true,
+                navigationRows: rows), 600)
+        }
+    }
+
+    func testGroupHeadingWaitsForItsWholeFirstRowAndReappearsAfterScrolling() {
+        let viewport = CGRect(x: 0, y: 0, width: 560, height: 160)
+        // Heading at 120, 20 pt high, a 16 pt gap, then a 60 pt first result.
+        let group = CGRect(x: 16, y: 120, width: 528, height: 96)
+        XCTAssertFalse(SearchGroupHeadingVisibility.isVisible(groupStart: group, viewport: viewport))
+        XCTAssertFalse(SearchGroupHeadingVisibility.isVisible(groupStart: group.offsetBy(dx: 0, dy: -55),
+            viewport: viewport), "A partially clipped first row must not leave an orphan heading")
+        XCTAssertTrue(SearchGroupHeadingVisibility.isVisible(groupStart: group.offsetBy(dx: 0, dy: -56),
+            viewport: viewport), "Scrolling the first row fully into view restores its heading")
+        XCTAssertTrue(SearchGroupHeadingVisibility.isVisible(groupStart: group,
+            viewport: CGRect(x: 0, y: 0, width: 560, height: 216)))
+        XCTAssertFalse(SearchGroupHeadingVisibility.isVisible(groupStart: group, viewport: .zero))
+    }
+
+    func testNavigationReserveUsesThePanelsKeyboardBoundaryAndWindowCoordinates() {
+        let viewport = SearchViewport.measure(windowBounds: CGRect(x: 0, y: 0, width: 1366, height: 1024),
+            safeArea: .zero, frame: CGRect(x: 16, y: 100, width: 560, height: 800),
+            keyboard: CGRect(x: 500, y: 535, width: 400, height: 300))
+        XCTAssertEqual(viewport.columnTop, 100)
+        XCTAssertEqual(viewport.availableHeight, 419)
+        XCTAssertEqual(viewport.navigationRows(counterTop: nil), 2, "Keep both rows until the host reports its layout")
+        XCTAssertEqual(viewport.navigationRows(counterTop: 479), 1)
+        XCTAssertEqual(viewport.navigationRows(counterTop: 423), 2,
+            "A floating keyboard or sidebar may stack HUDs inside the same landscape window")
+    }
+
+    func testCounterReportsTheRowsActuallyPlacedByItsHost() async throws {
+        executionTimeAllowance = 60
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let state = SearchState()
+        let size = CGSize(width: 1000, height: 1000)
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        let counter = SearchCounter(app: h.app, session: h.session, state: state)
+        func view(lift: CGFloat) -> some View {
+            counter.position(x: size.width / 2,
+                y: size.height - NibMetrics.chromeInset - NibMetrics.hudHeight / 2 - lift)
+        }
+        let host = UIHostingController(rootView: view(lift: 0))
+        host.safeAreaRegions = []
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        for rows in [1, 2, 1] {
+            let lift = CGFloat(rows - 1) * (NibMetrics.hudHeight + NibMetrics.minimumRestingGap)
+            let expectedTop = size.height - NibMetrics.chromeInset - NibMetrics.hudHeight - lift
+            host.rootView = view(lift: lift)
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            for _ in 0..<50 {
+                if let top = state.navigationCounterTop, abs(top - expectedTop) < 1 { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let top = try XCTUnwrap(state.navigationCounterTop)
+            XCTAssertEqual(top, expectedTop, accuracy: 1)
+            let viewport = SearchViewport(windowSize: size, availableHeight: size.height - NibMetrics.chromeInset,
+                visibleBounds: window.bounds)
+            XCTAssertEqual(viewport.navigationRows(counterTop: top), rows,
+                "The same wide window may stack HUDs when its usable column narrows")
+        }
+    }
+
     func testBoundsIgnoreOnePixelNoiseButRetainAccumulatedMovementAndRemoval() {
         let original = CGRect(x: 16, y: 62, width: 358, height: 738)
         var retained: CGRect? = original

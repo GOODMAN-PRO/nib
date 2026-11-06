@@ -197,6 +197,8 @@ final class SearchState: ObservableObject {
     @Published var isPresented = false
     @Published var instant = false
     @Published var focusGeneration = 0
+    // Conservative until the chrome host has placed the match HUD beside or above the page HUD.
+    @Published var navigationCounterTop: CGFloat?
     var generation = 0
     var cursor: String?
     var seenCursors = Set<String>()
