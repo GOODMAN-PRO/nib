@@ -26,6 +26,15 @@ public final class NibFloatingHost {
     /// The layer's own view and its origin in the container, for converting UIKit rects.
     @ObservationIgnored weak var referenceView: UIView?
     @ObservationIgnored var layerOrigin: CGPoint = .zero
+    #if DEBUG
+    @ObservationIgnored private var searchLayoutLogCount = 0
+    func noteSearchLayout<T>(_ name: String, old: T, new: T) {
+        guard searchLayoutLogCount < 40 else { return }
+        searchLayoutLogCount += 1
+        let message = "[Nib QA search layout] floating \(name) #\(searchLayoutLogCount) old=\(old) new=\(new)"
+        NSLog("%@", message)
+    }
+    #endif
 
     public init() {}
 
@@ -54,6 +63,9 @@ public final class NibFloatingHost {
     /// A bud source at `rect` in container coordinates (`NibLiquid.space`), so `NibBudPopover(source: id)` can grow
     /// out of a point on the page or a UIKit control.
     public func setAnchor(_ id: String, rect: CGRect) {
+        #if DEBUG
+        if anchors[id] != rect { noteSearchLayout("anchor \(id)", old: anchors[id], new: Optional(rect)) }
+        #endif
         if anchors[id] != rect { anchors[id] = rect }
     }
 
@@ -114,14 +126,23 @@ public struct NibFloatingLayer: View {
                 Color.clear
                     .onAppear {
                         let origin = proxy.frame(in: NibLiquid.space).origin
+                        #if DEBUG
+                        host.noteSearchLayout("origin", old: host.layerOrigin, new: origin)
+                        #endif
                         if NibGeometry.isFinite(origin) { host.layerOrigin = origin }
                     }
                     .onChange(of: proxy.frame(in: NibLiquid.space).origin) { _, origin in
+                        #if DEBUG
+                        host.noteSearchLayout("origin", old: host.layerOrigin, new: origin)
+                        #endif
                         if NibGeometry.isFinite(origin) { host.layerOrigin = origin }
                     }
             }
         }
         .onChange(of: host.anchors, initial: true) { _, anchors in
+            #if DEBUG
+            host.noteSearchLayout("field anchors", old: field?.worldAnchors, new: Optional(anchors))
+            #endif
             for (id, rect) in anchors { field?.setWorldAnchor(id, rect) }
         }
     }
@@ -135,12 +156,20 @@ struct FloatingReference: UIViewRepresentable {
         let view = CoordinateReferenceView()
         view.isUserInteractionEnabled = false
         view.backgroundColor = .clear
+        #if DEBUG
+        host.noteSearchLayout("reference", old: host.referenceView.map { ObjectIdentifier($0) }, new: Optional(ObjectIdentifier(view)))
+        #endif
         host.referenceView = view
         return view
     }
 
     func updateUIView(_ view: UIView, context: Context) {
         view.isUserInteractionEnabled = false
+        #if DEBUG
+        if host.referenceView !== view {
+            host.noteSearchLayout("reference", old: host.referenceView.map { ObjectIdentifier($0) }, new: Optional(ObjectIdentifier(view)))
+        }
+        #endif
         if host.referenceView !== view { host.referenceView = view }
     }
 }

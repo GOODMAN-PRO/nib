@@ -71,6 +71,7 @@ public enum FeatSearchUIFeature: NibFeature {
             }, makeView: { context in
                 AnyView(LibrarySearchFloatingContent(app: context.app, session: context.session,
                     state: SearchRuntime.from(context.app).state(context.session), belowBars: true)
+                    .id(ObjectIdentifier(context.session))
                     .frame(idealHeight: SearchViewport.idealHeight, maxHeight: SearchViewport.idealHeight))
             }))
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(id: "searchui.document", owner: id, placement: .top,

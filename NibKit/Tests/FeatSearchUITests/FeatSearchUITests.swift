@@ -1054,7 +1054,51 @@ final class FeatSearchUITests: XCTestCase {
         }
     }
 
-    func testCompactLibrarySearchUsesTheSameSixteenPointGutterAsTheGrid() async throws {
+    func testCompactSearchLayout01Content390() async throws {
+        executionTimeAllowance = 60
+        try await assertCompactSearchLayout(layer: .content, width: 390)
+    }
+
+    func testCompactSearchLayout01Content600() async throws {
+        executionTimeAllowance = 60
+        try await assertCompactSearchLayout(layer: .content, width: 600)
+    }
+
+    func testCompactSearchLayout02FloatingLayer390() async throws {
+        executionTimeAllowance = 60
+        try await assertCompactSearchLayout(layer: .floating, width: 390)
+    }
+
+    func testCompactSearchLayout02FloatingLayer600() async throws {
+        executionTimeAllowance = 60
+        try await assertCompactSearchLayout(layer: .floating, width: 600)
+    }
+
+    func testCompactSearchLayout03DropletContainer390() async throws {
+        executionTimeAllowance = 60
+        try await assertCompactSearchLayout(layer: .container, width: 390)
+    }
+
+    func testCompactSearchLayout03DropletContainer600() async throws {
+        executionTimeAllowance = 60
+        try await assertCompactSearchLayout(layer: .container, width: 600)
+    }
+
+    func testCompactSearchLayout04LiquidOff390() async throws {
+        executionTimeAllowance = 60
+        try await assertCompactSearchLayout(layer: .off, width: 390)
+    }
+
+    func testCompactSearchLayout04LiquidOff600() async throws {
+        executionTimeAllowance = 60
+        try await assertCompactSearchLayout(layer: .off, width: 600)
+    }
+
+    private enum CompactSearchLayer: String {
+        case content, floating, container, off
+    }
+
+    private func assertCompactSearchLayout(layer: CompactSearchLayer, width: CGFloat) async throws {
         let h = Harness(features: [FeatSearchUIFeature.self])
         let state = SearchState()
         state.scope = "lib"
@@ -1062,53 +1106,64 @@ final class FeatSearchUITests: XCTestCase {
         state.matches = [hit()]
         state.isPresented = true
         state.instant = true
-        // Liquid Off changes these shared design switches when its container appears.
         let reduced = NibMotion.forcesReduced
         let haptics = NibHaptics.isEnabled
         defer { NibMotion.forcesReduced = reduced; NibHaptics.isEnabled = haptics }
-        for width in [CGFloat(390), CGFloat(600)] {
-            let floating = NibFloatingHost()
-            floating.present("searchui.library") {
-                LibrarySearchFloatingContent(app: h.app, session: h.session, state: state)
+        // Each width/layer has its own XCTest watchdog. A main-actor deadline cannot stop
+        // synchronous layout. Exercise both appearances and both orientations at each rung.
+        for scheme in [ColorScheme.light, .dark] {
+            for height in [CGFloat(834), 320] {
+                let search = LibrarySearchFloatingContent(app: h.app, session: h.session, state: state)
+                let floating = NibFloatingHost()
+                floating.present("searchui.library") { search }
+                let root: AnyView
+                switch layer {
+                case .content: root = AnyView(search)
+                case .floating: root = AnyView(NibFloatingLayer(host: floating))
+                case .container: root = AnyView(NibDropletContainer { NibFloatingLayer(host: floating) })
+                case .off:
+                    root = AnyView(NibDropletContainer { NibFloatingLayer(host: floating) }.nibLiquidMode(.off))
+                }
+                let view = root
                     .environment(\.horizontalSizeClass, .compact)
+                    .environment(\.colorScheme, scheme)
+                    .frame(width: width, height: height)
+                    .ignoresSafeArea(.container)
+                let context = "layer=\(layer.rawValue) width=\(width) height=\(height) scheme=\(scheme)"
+                #if DEBUG
+                NSLog("%@", "[Nib QA search layout] install " + context)
+                #endif
+                let host = UIHostingController(rootView: view)
+                let window = UIWindow(frame: CGRect(x: 0, y: 0, width: width, height: height))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                #if DEBUG
+                NSLog("%@", "[Nib QA search layout] installed " + context + " safeArea=\(window.safeAreaInsets)")
+                #endif
+                let deadline = Date().addingTimeInterval(2)
+                var frame: CGRect?
+                var stableSamples = 0
+                while Date() < deadline && stableSamples < 3 {
+                    try await Task.sleep(for: .milliseconds(20))
+                    let results = searchDescendants(UIScrollView.self, in: host.view)
+                        .max { $0.bounds.height < $1.bounds.height }
+                    let next = results.map { $0.convert($0.bounds, to: window) }
+                    let fits = next.map {
+                        $0.height > NibMetrics.barHeight && abs($0.minX - NibSpacing.l) <= 1
+                            && abs($0.maxX - (width - NibSpacing.l)) <= 1
+                    } ?? false
+                    stableSamples = fits && next == frame ? stableSamples + 1 : 0
+                    frame = next
+                }
+                let diagnostic = context + " results=\(String(describing: frame)) stableSamples=\(stableSamples)"
+                XCTAssertGreaterThanOrEqual(stableSamples, 3, "Search layout must settle within two seconds; " + diagnostic)
+                let measured = try XCTUnwrap(frame, diagnostic)
+                // Preserve BOTH grid-gutter assertions on the full stack (and every earlier rung).
+                XCTAssertEqual(measured.minX, NibSpacing.l, accuracy: 1, diagnostic)
+                XCTAssertEqual(measured.maxX, width - NibSpacing.l, accuracy: 1, diagnostic)
             }
-            // Exercise the shell's bounded floating host. The earlier timeout has no captured
-            // layout stack proving a blur-padding loop; a deadline cannot interrupt synchronous
-            // SwiftUI layout. The separate production sizing regression checks proposal isolation.
-            let view = NibDropletContainer { NibFloatingLayer(host: floating) }
-                .nibLiquidMode(.off)
-                .frame(width: width, height: 834)
-                .ignoresSafeArea()
-            let host = UIHostingController(rootView: view)
-            host.safeAreaRegions = []
-            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: width, height: 834))
-            window.rootViewController = host
-            window.isHidden = false
-            defer { window.isHidden = true; window.rootViewController = nil }
-            host.view.frame = window.bounds
-            func scrolls(_ view: UIView) -> [UIScrollView] {
-                ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap(scrolls)
-            }
-            let deadline = Date().addingTimeInterval(2)
-            var frame: CGRect?
-            var stableSamples = 0
-            // Let UIKit perform layout on its normal turns, not a synchronous layoutIfNeeded loop.
-            while Date() < deadline && stableSamples < 3 {
-                try await Task.sleep(for: .milliseconds(20))
-                let results = scrolls(host.view).max { $0.bounds.height < $1.bounds.height }
-                let next = results.map { $0.convert($0.bounds, to: window) }
-                let fits = next.map {
-                    $0.height > NibMetrics.barHeight && abs($0.minX - NibSpacing.l) <= 1
-                        && abs($0.maxX - (width - NibSpacing.l)) <= 1
-                } ?? false
-                stableSamples = fits && next == frame ? stableSamples + 1 : 0
-                frame = next
-            }
-            let diagnostic = "width=\(width), window=\(window.bounds), results=\(String(describing: frame)), stableSamples=\(stableSamples)"
-            XCTAssertGreaterThanOrEqual(stableSamples, 3, "Search layout must settle within two seconds; " + diagnostic)
-            let measured = try XCTUnwrap(frame, diagnostic)
-            XCTAssertEqual(measured.minX, NibSpacing.l, accuracy: 1, diagnostic)
-            XCTAssertEqual(measured.maxX, width - NibSpacing.l, accuracy: 1, diagnostic)
         }
     }
 

@@ -117,6 +117,7 @@ struct LibrarySearchOverlay: View {
             LibrarySearchView(app: app, session: session, state: state)
         } else {
             LibrarySearchFloatingContent(app: app, session: session, state: state)
+                .id(ObjectIdentifier(session))
         }
     }
 }
@@ -146,25 +147,36 @@ struct LibrarySearchViewportLayout: Layout {
 @MainActor
 struct LibrarySearchFloatingContent: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.displayScale) private var displayScale
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
     @State private var viewport: SearchViewport?
     @State private var libraryContentBounds: CGRect?
+    @StateObject private var contentBoundsSource: LibrarySearchBoundsSource
+    #if DEBUG
+    @State private var layoutTrace = SearchLayoutTrace()
+    #endif
     var belowBars = false
 
-    private var contentBoundsPublisher: AnyPublisher<CGRect?, Never>? {
-        let bounds = app.services.get("libraryui.searchContentBounds",
-            as: (@MainActor (EditorSession) -> AnyPublisher<CGRect?, Never>).self)
-        return bounds?(session)
+    init(app: NibApp, session: EditorSession, state: SearchState, belowBars: Bool = false) {
+        self.app = app
+        self.session = session
+        self.state = state
+        self.belowBars = belowBars
+        _contentBoundsSource = StateObject(wrappedValue: LibrarySearchBoundsSource(app: app, session: session))
     }
 
     var body: some View {
         LibrarySearchViewportLayout {
             content
         }
-        .onReceive(contentBoundsPublisher ?? Just<CGRect?>(nil).eraseToAnyPublisher()) { bounds in
-            if libraryContentBounds != bounds { libraryContentBounds = bounds }
+        .onReceive(contentBoundsSource.publisher) { bounds in
+            guard SearchLayoutMeasurement.changed(libraryContentBounds, bounds, scale: displayScale) else { return }
+            #if DEBUG
+            layoutTrace.write("library column", old: libraryContentBounds, new: bounds)
+            #endif
+            libraryContentBounds = bounds
         }
     }
 
@@ -200,12 +212,18 @@ struct LibrarySearchFloatingContent: View {
                     .nibChromeTypeCap()
                     .droplet("searchui.libraryField", style: .bar)
                     .budsFrom("library.controls", isPresented: presentationBinding, instant: state.instant)
+                    #if DEBUG
+                    .background(layoutDiagnostic("library field rest frame"))
+                    #endif
                     SearchResults(app: app, session: session, state: state)
                         .frame(width: width)
                         .frame(height: height, alignment: .top)
                         .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
                         .droplet("searchui.libraryResults", style: .panel)
                         .budsFrom("searchui.libraryField", isPresented: presentationBinding, instant: state.instant)
+                        #if DEBUG
+                        .background(layoutDiagnostic("library results rest frame"))
+                        #endif
                 }
                 .frame(width: width)
                 .padding(.top, top)
@@ -215,13 +233,35 @@ struct LibrarySearchFloatingContent: View {
             .frame(width: bounds.width, height: bounds.height, alignment: .top)
             .position(x: bounds.midX, y: bounds.midY)
             .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
+            #if DEBUG
+            .onChange(of: geometry.frame(in: .global), initial: true) { old, new in
+                layoutTrace.write("library proposed global frame", old: old, new: new)
+            }
+            #endif
             .background {
-                SearchViewportReader { viewport = $0 }
+                SearchViewportReader { next in
+                    guard next.differs(from: viewport, scale: displayScale) else { return }
+                    #if DEBUG
+                    layoutTrace.write("library viewport", old: viewport, new: Optional(next))
+                    #endif
+                    viewport = next
+                }
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
         }
     }
+    #if DEBUG
+    private func layoutDiagnostic(_ name: String) -> some View {
+        GeometryReader { proxy in
+            Color.clear.onChange(of: proxy.frame(in: NibLiquid.space), initial: true) { old, new in
+                layoutTrace.write(name, old: old, new: new)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+    #endif
     private var presentationBinding: Binding<Bool> {
         Binding(get: { state.isPresented }, set: { if !$0 { close() } })
     }
@@ -229,6 +269,32 @@ struct LibrarySearchFloatingContent: View {
         app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "close": true], session: session)
     }
 }
+
+/// StateObject retains the erased publisher (and its upstream identity) across body evaluations.
+/// Rebuilding the library's @Published/removeDuplicates chain would replay its initial value.
+@MainActor
+final class LibrarySearchBoundsSource: ObservableObject {
+    let publisher: AnyPublisher<CGRect?, Never>
+
+    init(app: NibApp, session: EditorSession) {
+        let bounds = app.services.get("libraryui.searchContentBounds",
+            as: (@MainActor (EditorSession) -> AnyPublisher<CGRect?, Never>).self)
+        publisher = bounds?(session) ?? Just<CGRect?>(nil).eraseToAnyPublisher()
+    }
+}
+
+#if DEBUG
+/// A reference counter, deliberately not observable: tracing cannot invalidate layout.
+final class SearchLayoutTrace {
+    private var count = 0
+    func write<T>(_ name: String, old: T, new: T) {
+        guard count < 40 else { return }
+        count += 1
+        let message = "[Nib QA search layout] \(name) #\(count) old=\(old) new=\(new)"
+        NSLog("%@", message)
+    }
+}
+#endif
 
 @MainActor
 func searchBinding(app: NibApp, session: EditorSession, state: SearchState) -> Binding<String> {
@@ -262,6 +328,9 @@ struct SearchResults: View {
     let session: EditorSession
     @ObservedObject var state: SearchState
     @State private var overflows = false
+    #if DEBUG
+    @State private var layoutTrace = SearchLayoutTrace()
+    #endif
     private var showsContinuation: Bool {
         overflows
     }
@@ -351,7 +420,13 @@ struct SearchResults: View {
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
                 }
-                .onPreferenceChange(SearchContinuationVisible.self) { overflows = $0 }
+                .onPreferenceChange(SearchContinuationVisible.self) { next in
+                    guard overflows != next else { return }
+                    #if DEBUG
+                    layoutTrace.write("results continuation", old: overflows, new: next)
+                    #endif
+                    overflows = next
+                }
                 .scrollBounceBehavior(.basedOnSize)
                 .scrollIndicators(.visible)
                 .nibFadeBottomEdge(showsContinuation ? NibSpacing.l : 0)
