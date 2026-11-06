@@ -378,3 +378,11 @@ Confirmed insert-providers-timeouts#3/#4: Sticky completed all assertions in 190
 ### N11 - scoped image queries, undiagnosed stall
 
 Confirmed insert-providers-timeouts#5 verdict: slow AX bursts consumed about 62 of 205 seconds; no evidence identifies host versus app. ImagePaste opts into scoped tool-overflow lookup inside More tools and Paste lookup inside Insert Image (current ImageMenuController uses NibPopoverPanel with that title). All persistence/aspect/asset assertions remain. Other selectTool/image callers retain defaults. This reduces tree exposure, not a proven stall cure. CI now samples the app after eight seconds of log silence (at most once per 150 seconds); the next run must correlate samples and existing slow query logs before assigning a cause.
+
+### S3 - unambiguous HI source
+
+Confirmed selection#3: Vision returned IH; the screenshot showed a hairline H crossbar and hooked I. Keep four strokes and both exact HI assertions. Enlarge the pair vertically, reduce the gap, retrace the H crossbar with a small parallel offset in one stroke, and draw a straight I with top/bottom serifs in one continuous stroke. Added direct recognised-string logs alongside existing geometry evidence. This is the requested input experiment, not a claim to fix Vision ordering; the renderer is not mirrored. CI must recognise HI before neaten, retain HI afterwards and pass exact Undo/source checks. If still unstable, an app-owned deterministic recogniser requires a separate decision; no assertion relaxation here.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| NeatenHandwritingChangesInkAndUndoRestoresMeaningfulSource | Neaten recognised source / Neaten recognised result | What text did Vision expose before and after neaten with the clearer four-stroke pair? |

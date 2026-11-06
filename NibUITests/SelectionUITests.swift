@@ -918,15 +918,22 @@ final class SelectionUITests: XCTestCase {
                 return CGPoint(x: x, y: y)
             }
         }
+        let crossbar = roundedStroke(CGPoint(x: 0.405, y: 0.633), CGPoint(x: 0.43, y: 0.630),
+                                     CGPoint(x: 0.46, y: 0.630), CGPoint(x: 0.49, y: 0.627))
+        // Retrace a nearby parallel line in the same stroke for a visible H crossbar.
+        let weightedCrossbar = crossbar + crossbar.reversed().map { CGPoint(x: $0.x, y: $0.y + 0.003) }
+        // One continuous I stroke: top serif, return to its centre, straight stem,
+        // then both halves of the bottom serif. No curved hook or extra stroke count.
+        var serifI = [CGPoint(x: 0.53, y: 0.52), CGPoint(x: 0.58, y: 0.52), CGPoint(x: 0.555, y: 0.52)]
+        serifI.append(contentsOf: roundedStroke(CGPoint(x: 0.555, y: 0.52), CGPoint(x: 0.555, y: 0.60),
+                                               CGPoint(x: 0.555, y: 0.67), CGPoint(x: 0.555, y: 0.75)))
+        serifI.append(contentsOf: [CGPoint(x: 0.53, y: 0.75), CGPoint(x: 0.58, y: 0.75)])
         let sourcePaths = [
-            roundedStroke(CGPoint(x: 0.415, y: 0.54), CGPoint(x: 0.403, y: 0.58),
-                          CGPoint(x: 0.413, y: 0.68), CGPoint(x: 0.41, y: 0.72)),
-            roundedStroke(CGPoint(x: 0.487, y: 0.54), CGPoint(x: 0.477, y: 0.59),
-                          CGPoint(x: 0.488, y: 0.68), CGPoint(x: 0.48, y: 0.72)),
-            roundedStroke(CGPoint(x: 0.40, y: 0.627), CGPoint(x: 0.43, y: 0.617),
-                          CGPoint(x: 0.47, y: 0.622), CGPoint(x: 0.50, y: 0.62)),
-            roundedStroke(CGPoint(x: 0.565, y: 0.54), CGPoint(x: 0.59, y: 0.535),
-                          CGPoint(x: 0.565, y: 0.715), CGPoint(x: 0.59, y: 0.72))
+            roundedStroke(CGPoint(x: 0.405, y: 0.52), CGPoint(x: 0.402, y: 0.59),
+                          CGPoint(x: 0.407, y: 0.68), CGPoint(x: 0.405, y: 0.75)),
+            roundedStroke(CGPoint(x: 0.49, y: 0.52), CGPoint(x: 0.487, y: 0.59),
+                          CGPoint(x: 0.493, y: 0.68), CGPoint(x: 0.49, y: 0.75)),
+            weightedCrossbar, serifI
         ]
         for path in sourcePaths { try draw(path) }
         try clear(); let source = try pixels(), before = try ui.state()
@@ -935,6 +942,7 @@ final class SelectionUITests: XCTestCase {
         let sourceItems = try copiedItems()
         try menu("Convert", "Text")
         let sourceRecognition = try control("Recognised text")
+        ui.logQA("Neaten recognised source", String(describing: sourceRecognition.value))
         ui.recordDiagnostics("Neaten source recognition and stroke geometry", facts: "recognition=\(String(describing: sourceRecognition.value)); records=\(sourceItems)", includeHierarchy: false)
         do {
             defer {
@@ -954,6 +962,7 @@ final class SelectionUITests: XCTestCase {
         let restyledItems = try copiedItems()
         try menu("Convert", "Text")
         let recognised = try control("Recognised text")
+        ui.logQA("Neaten recognised result", String(describing: recognised.value))
         ui.recordDiagnostics("Neaten result recognition and stroke geometry", facts: "recognition=\(String(describing: recognised.value)); records=\(restyledItems)", includeHierarchy: false)
         try wait("Restyled HI must retain its recognised meaning", timeout: 30) {
             let text = (recognised.value as? String ?? "").uppercased().filter { $0.isLetter }
