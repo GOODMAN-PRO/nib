@@ -561,13 +561,13 @@ struct ExportPopover: View {
     let sourceRect: CGRect?
     let updateSourceRect: @MainActor () -> CGRect?
     let instant: Bool
-    @Environment(DropletField.self) private var field: DropletField?
-    @State private var presented = false
-    @State private var hasMeasuredContent = false
+    @State private var presented = true
     @State private var currentSourceRect: CGRect?
-    // Lay out the closed bud first, then reveal it at its measured options/actions height.
-    // Placement caps this request to the unobstructed room above or below the source.
-    @State private var heightCap: CGFloat = 880
+    // The options and the pinned actions report their height and the popover asks for that much; the placement
+    // caps the request to the room beside the source. It opens at the ordinary cap and takes the measured height
+    // in its first layout, the way a scrolling panel takes its content height.
+    // ponytail: no hidden first pass; add one only if the first frame is seen to jump on a device.
+    @State private var heightCap: CGFloat = NibMetrics.popoverMaxHeight
     var body: some View {
         ZStack {
             // Capture outside touches before they reach the canvas.
@@ -577,13 +577,10 @@ struct ExportPopover: View {
                 let bounds = geometry.frame(in: NibLiquid.space)
                 // The floating layer may attach after the command runs. Keep the options
                 // visible while its UIKit reference view becomes available.
-                NibBudPopover(id: "exportui.popover", source: source, isPresented: budPresented, title: title,
+                NibBudPopover(id: "exportui.popover", source: source, isPresented: $presented, title: title,
                               sourceRect: currentSourceRect ?? sourceRect,
                               fallbackSourceRect: Self.fallbackAnchor(in: bounds), instant: instant,
                               onClose: close, scrollsContent: false, heightCap: heightCap) { contents }
-                    .opacity(hasMeasuredContent ? 1 : 0)
-                    .allowsHitTesting(hasMeasuredContent)
-                    .accessibilityHidden(!hasMeasuredContent)
                     .onGeometryChange(for: CGRect.self) { _ in bounds } action: { _ in
                         currentSourceRect = updateSourceRect()
                     }
@@ -594,12 +591,6 @@ struct ExportPopover: View {
             // Buds also close through Escape and VoiceOver, so release the outside-touch shield.
             if !value { close() }
         }
-    }
-    private var budPresented: Binding<Bool> {
-        // Without a field, a closed bud omits its content entirely. Keep that fallback
-        // laid out under the opacity gate so it can report its first measurement too.
-        Binding(get: { presented || (!hasMeasuredContent && field == nil) },
-                set: { presented = $0 })
     }
     static func fallbackAnchor(in bounds: CGRect) -> CGRect {
         CGRect(x: bounds.maxX - NibMetrics.chromeInset - NibMetrics.hitTarget,
@@ -613,10 +604,6 @@ struct ExportPopover: View {
                          // The panel reserves a close-button header, its gap and two content insets.
                          let requested = ceil(height + NibMetrics.hitTarget + NibSpacing.m + 2 * NibSpacing.l)
                          if abs(heightCap - requested) > 0.5 { heightCap = requested }
-                         if !hasMeasuredContent {
-                             hasMeasuredContent = true
-                             presented = true
-                         }
                      })
     }
     private func close() { host.dismiss("exportui.dialog"); host.removeAnchor("exportui.source") }

@@ -1088,9 +1088,12 @@ struct NewNotebookSheet: View {
         guard let windowSize else {
             return CGSize(width: NibMetrics.newDocumentSheetSize.width, height: preferredHeight)
         }
+        // Portrait takes the room it is offered, up to 1000 pt, and is never shorter than the landscape rule gives
+        // (a short Stage Manager or Split View window keeps the 2 x 20 pt margin it had).
+        let standard = min(preferredHeight, windowSize.height - NibSpacing.xl * 2)
         let height = !compact && windowSize.height > windowSize.width
-            ? min(windowSize.height - 4 * NibSpacing.xxl, 1000)
-            : min(preferredHeight, windowSize.height - NibSpacing.xl * 2)
+            ? max(standard, min(windowSize.height - 4 * NibSpacing.xxl, 1000))
+            : standard
         return CGSize(width: min(NibMetrics.newDocumentSheetSize.width, windowSize.width - NibSpacing.xl * 2),
                       height: max(0, height))
     }
