@@ -168,3 +168,13 @@ Confirmed R12:ink-colours#0 and correction against the raw test drag and PresetR
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | RearrangeColoursDragPersistsOrderAndActiveColour | System drag contact | Did the held system drag run before the unchanged order wait? |
+
+### I2 - close the picker through its real control or safe outside geometry
+
+Confirmed R12:ink-colours#1 and correction: the (24,24) fallback produced UIStatusBarTapAction; an earlier full tree did expose close at approximately (738,250). closeColourPicker now searches app-level close/Done buttons within the current picker surface before falling back. Outside candidates are beyond every popover's 8 pt inflation, at least 60 pt below the window/region top and 24 pt from other edges. The selected point remains logged and picker disappearance remains mandatory. Should unblock HighlighterCustomColourPersistsAndDrawsTranslucentInk and later closes in CustomColourValidHexUpdatesSlotAndInvalidHexIsRejected. CI must show the own close control or a safe point, no status-bar action, and actual picker disappearance. Outside-dismissability remains unproven.
+
+R12:ink-colours#2's holds=false correction is retained: the picker was hosted, never ready and invalidated, but the dismissal time/cause is unknown. waitForColourSliders still requires the picker and its Sliders; no warm-up or retry. The other job's [Nib QA picker] presenting-chain/lifecycle logs must explain any repeat of **Remote colour picker and Sliders must be ready**. No test workaround for a picker torn down by the host.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Custom/system colour-picker tests | Colour picker controls / Colour picker dismissal | Which own close control or safe outside point was used, with which surface frames? |

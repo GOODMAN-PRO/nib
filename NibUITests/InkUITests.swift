@@ -287,12 +287,18 @@ final class InkUITests: XCTestCase {
             }
             ui.logQA("Colour picker controls", controls(snapshot).joined(separator: "\n"))
         }
-        let close = surface.buttons.matching(NSPredicate(format: "label ==[c] 'close'")).firstMatch
-        let done = surface.buttons.matching(NSPredicate(format: "label ==[c] 'done'")).firstMatch
+        // Remote picker snapshots can omit a close button that the app-level tree exposes.
+        // Match its frame to this picker surface so background chrome cannot win.
+        let closes = ui.app.buttons.matching(NSPredicate(format: "label ==[c] 'close'"))
+        let dones = ui.app.buttons.matching(NSPredicate(format: "label ==[c] 'done'"))
         var dismissal: XCUIElement?
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            if close.exists && close.isHittable { dismissal = close; return true }
-            if done.exists && done.isHittable { dismissal = done; return true }
+            let panel = surface.frame
+            for query in [closes, dones] {
+                if let button = query.allElementsBoundByIndex.prefix(16).first(where: {
+                    panel.contains($0.frame) && $0.isEnabled && $0.isHittable
+                }) { dismissal = button; return true }
+            }
             return false
         }, object: nil)
         let foundControl = XCTWaiter.wait(for: [ready], timeout: isPopover ? 2 : 8) == .completed
@@ -311,16 +317,21 @@ final class InkUITests: XCTestCase {
             }
             let regionFrame = region.frame.intersection(window)
             guard !regionFrame.isNull, !regionFrame.isInfinite,
-                  regionFrame.width > 48, regionFrame.height > 48 else {
+                  regionFrame.width > 48, regionFrame.height > 84 else {
                 throw NibUI.Failure.message("Colour popover has no visible dismissal region")
             }
             let surfaces = ui.app.popovers.allElementsBoundByIndex.map(\.frame) + [panel]
-            let points = [CGPoint(x: regionFrame.minX + 24, y: regionFrame.minY + 24),
-                          CGPoint(x: regionFrame.maxX - 24, y: regionFrame.minY + 24),
+            let safeTop = max(regionFrame.minY + 60, window.minY + 60)
+            let middleY = max(safeTop, regionFrame.midY)
+            let points = [CGPoint(x: regionFrame.minX + 24, y: middleY),
+                          CGPoint(x: regionFrame.maxX - 24, y: middleY),
                           CGPoint(x: regionFrame.minX + 24, y: regionFrame.maxY - 24),
-                          CGPoint(x: regionFrame.maxX - 24, y: regionFrame.maxY - 24)]
+                          CGPoint(x: regionFrame.maxX - 24, y: regionFrame.maxY - 24),
+                          CGPoint(x: regionFrame.midX, y: safeTop)]
             guard let point = points.first(where: { point in
-                regionFrame.contains(point) && !surfaces.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
+                point.y >= safeTop && point.y <= regionFrame.maxY - 24
+                    && point.x >= regionFrame.minX + 24 && point.x <= regionFrame.maxX - 24
+                    && !surfaces.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
             }) else {
                 throw NibUI.Failure.message("Colour popover has no outside dismissal point")
             }
