@@ -24,7 +24,8 @@ final class FeatDocChromeTests: XCTestCase {
         let input = NavBarModel.Input(
             doc: Fixtures.docID, kind: .notebook, page: Fixtures.page1, readOnly: false, bookmarked: false, tool: "pen",
             hasSidebar: false, sidebarVisible: false, assistantPanel: PanelIDs.assistant, assistantOpen: false,
-            registered: [status], commandExists: { _ in true }, hasMenu: { _ in true })
+            registered: [status], commandExists: { _ in true }, hasMenu: { _ in true },
+            statusContext: ChromeContext(app: h.app, session: h.session, kind: .notebook, isCompact: true))
         let items = NavBarModel.split(NavBarModel.build(input), compact: true)
         var frames: [String: CGRect] = [:]
         let bar = NavBarView(chrome: chrome, items: items, title: "Physics", kind: .notebook,
@@ -52,6 +53,58 @@ final class FeatDocChromeTests: XCTestCase {
             let hit = try XCTUnwrap(window.hitTest(CGPoint(x: frame.midX, y: frame.midY), with: nil), id)
             XCTAssertTrue(hit === host.view || hit.isDescendant(of: host.view), "\(id) reaches the hosted control")
             XCTAssertTrue((items.leading + items.trailing).first { $0.id == id }?.isEnabled == true)
+        }
+    }
+
+    func testRootOverflowKeepsCanvasAndChromeAtTheirOwnOrigins() async throws {
+        for size in [CGSize(width: 1032, height: 1376), CGSize(width: 1376, height: 1032)] {
+            for scheme in [ColorScheme.light, .dark] {
+                let h = Harness(features: [FeatDocChromeFeature.self])
+                let chrome = try makeWindow(h)
+                h.app.ui.panels.register(panel(PanelIDs.assistant, .floating))
+                chrome.state.open(PanelIDs.assistant, at: .right)
+                let geometry = ChromeGeometry()
+                geometry.update(size: size, safeArea: .zero)
+                let editor = UIViewController()
+                let floating = NibFloatingHost()
+                var overflowSize: CGSize = .zero
+                var markerFrame: CGRect = .zero
+                // Reproduce a child that refuses the window proposal by exactly the reported 16 pt.
+                floating.present("test.overflow") {
+                    Color.clear.frame(width: size.width + 16, height: size.height).fixedSize()
+                        .onGeometryChange(for: CGSize.self) { $0.size } action: { overflowSize = $0 }
+                }
+                floating.present("test.marker") {
+                    Color.clear.frame(width: 44, height: 44)
+                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { markerFrame = $0 }
+                        .position(x: 38, y: 38)
+                }
+                let root = ChromeRootView(chrome: chrome, editor: editor, toolbar: nil,
+                    inking: ChromeInkingMirror(session: h.session), backdrop: ChromeBackdrop(),
+                    overlays: ChromeOverlayModel(chrome: chrome, kind: .notebook), floating: floating,
+                    live: ChromeLiveState(chrome: chrome), geometry: geometry, model: ChromeDocumentModel(chrome: chrome))
+                let expectedEditor = root.currentLayout.editor
+                XCTAssertEqual(root.currentLayout.assistantBottom != nil, size.height >= size.width)
+                let host = UIHostingController(rootView: root.environment(\.colorScheme, scheme)
+                    .environment(\.accessibilityReduceMotion, true))
+                host.safeAreaRegions = []
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                try await waitUntil {
+                    host.view.layoutIfNeeded()
+                    return editor.view.window === window && !markerFrame.isEmpty && overflowSize.width > size.width
+                }
+                XCTAssertEqual(overflowSize.width, size.width + 16, accuracy: 0.5)
+                let editorFrame = editor.view.convert(editor.view.bounds, to: window)
+                XCTAssertEqual(editorFrame.minX, expectedEditor.minX, accuracy: 0.5)
+                XCTAssertEqual(editorFrame.minY, expectedEditor.minY, accuracy: 0.5)
+                XCTAssertEqual(editorFrame.width, expectedEditor.width, accuracy: 0.5)
+                XCTAssertEqual(markerFrame.minX, 16, accuracy: 0.5, "overflow must not move chrome's origin")
+                XCTAssertEqual(markerFrame.minY, 16, accuracy: 0.5)
+            }
         }
     }
 
@@ -1675,6 +1728,7 @@ final class FeatDocChromeTests: XCTestCase {
     }
 
     func testAfterTitleStatusesKeepTheirSlotOnCompactWidth() {
+        let h = Harness(features: [FeatDocChromeFeature.self])
         var bridge = ToolbarItemDescriptor(id: "bridge", title: "Client", icon: "circle",
                                            group: .navLeading, order: 40, owner: "test")
         bridge.navSlot = .afterTitle
@@ -1691,7 +1745,8 @@ final class FeatDocChromeTests: XCTestCase {
         let input = NavBarModel.Input(
             doc: Fixtures.docID, kind: .notebook, page: Fixtures.page1, readOnly: false, bookmarked: false, tool: "pen",
             hasSidebar: false, sidebarVisible: false, assistantPanel: nil, assistantOpen: false,
-            registered: [bridge, regularOnly, legacy, presence], commandExists: { _ in false }, hasMenu: { _ in false })
+            registered: [bridge, regularOnly, legacy, presence], commandExists: { _ in false }, hasMenu: { _ in false },
+            statusContext: ChromeContext(app: h.app, session: h.session, kind: .notebook))
         let regular = NavBarModel.build(input)
         XCTAssertEqual(regular.afterTitle.map(\.id), ["presence", "bridge", "regularOnly"])
         XCTAssertTrue(regular.trailing.contains { $0.id == "legacy" })
@@ -1700,6 +1755,42 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(compact.afterTitle.map(\.id), ["presence", "bridge"])
         XCTAssertFalse(compact.overflow.contains { $0.id == "bridge" || $0.id == "presence" })
         XCTAssertTrue(compact.overflow.contains { $0.id == "legacy" })
+    }
+
+    func testAfterTitleStatusVisibilityChangesBuiltItemsWithStableBridgeAndTabsIDs() throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let snapshot = ChromeDocumentModel(chrome: chrome).snapshot
+        // These descriptors reproduce both providers' view-or-nil contract without importing feature modules.
+        for id in ["bridgeui.status", "windows.tabs.menu"] {
+            var visible = false
+            var contexts: [ChromeContext] = []
+            var descriptor = ToolbarItemDescriptor(id: id, title: "Status", icon: "circle",
+                group: .navLeading, order: 40, owner: "test")
+            descriptor.navSlot = .afterTitle
+            descriptor.compactStatus = { context in
+                contexts.append(context)
+                return visible ? AnyView(Text("Status")) : nil
+            }
+            h.app.ui.toolbar.register(descriptor)
+            for compact in [false, true] {
+                let hidden = chrome.navItems(snapshot: snapshot, compact: compact)
+                XCTAssertFalse(hidden.afterTitle.contains { $0.id == id })
+                visible = true
+                let shown = chrome.navItems(snapshot: snapshot, compact: compact)
+                XCTAssertTrue(shown.afterTitle.contains { $0.id == id })
+                XCTAssertNotEqual(shown, hidden, "visibility must invalidate the bar despite the unchanged id")
+                visible = false
+                let hiddenAgain = chrome.navItems(snapshot: snapshot, compact: compact)
+                XCTAssertEqual(hiddenAgain, hidden)
+                XCTAssertEqual(contexts.count, 3, "each build must re-evaluate the provider")
+                XCTAssertTrue(contexts.allSatisfy {
+                    $0.session === chrome.session && $0.kind == snapshot.kind && $0.isCompact == compact
+                })
+                contexts.removeAll()
+            }
+            h.app.ui.toolbar.unregister(id: id)
+        }
     }
 
     func testNavItemsShowTheLiveStateOfFeatureItems() {

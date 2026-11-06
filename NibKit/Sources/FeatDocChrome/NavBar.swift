@@ -90,6 +90,8 @@ enum NavBarModel {
         var hasMenu: @MainActor (MenuLocation) -> Bool
         /// The window the live state of registered items is evaluated for (nil: their static values).
         var session: EditorSession? = nil
+        /// Resolve status visibility before SwiftUI compares the bar's value, in this window and width.
+        var statusContext: ChromeContext? = nil
     }
 
     static func build(_ input: Input) -> NavBarItems {
@@ -172,8 +174,9 @@ enum NavBarModel {
                                 action: .menu(.more)))
 
         let byOrder: (NavItem, NavItem) -> Bool = { ($0.order, $0.id) < ($1.order, $1.id) }
-        let afterTitle = statuses.sorted { ($0.order, $0.id) < ($1.order, $1.id) }.map {
-            NavStatusItem(id: $0.id, showsInCompactWidth: $0.showsInCompactWidth)
+        let afterTitle = statuses.sorted { ($0.order, $0.id) < ($1.order, $1.id) }.compactMap { descriptor -> NavStatusItem? in
+            guard let context = input.statusContext, descriptor.compactStatus?(context) != nil else { return nil }
+            return NavStatusItem(id: descriptor.id, showsInCompactWidth: descriptor.showsInCompactWidth)
         }
         let all = (leading + trailing).sorted(by: byOrder)
         // §14.9: opening the assistant transfers its drop to NibPanelHeader. Remove the resting control
