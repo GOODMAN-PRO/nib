@@ -354,10 +354,12 @@ final class TimeKeeper: ObservableObject {
         app?.ui.setNeedsChromeUpdate()
     }
 
-    private func store(_ record: TimerRecord) {
-        guard let json = try? JSONValue.from(record) else { return }
+    @discardableResult
+    fileprivate func store(_ record: TimerRecord) -> Bool {
+        guard let json = try? JSONValue.from(record) else { return false }
         settings.setJSON(Keys.history + record.id, json)
         history = loadHistory()
+        return true
     }
 
     func refreshStored() {
@@ -509,6 +511,39 @@ final class TimeKeeper: ObservableObject {
         })
         alert.addAction(UIAlertAction(title: String(localized: "Keep Session"), style: .cancel))
         navigator.presentModal(alert)
+    }
+}
+
+/// Deterministic history prerequisites, confined to the disposable UI-test library. This is not a user command.
+@MainActor
+public enum TimerHistoryFixture {
+    public static func seed(app: NibApp, doc: DocumentID, title: String) throws {
+        guard NibUITestMode.isEnabled, NibUITestMode.scenario == .timerHistory else { return }
+        try seed(app: app, doc: doc, title: title, isEnabled: NibUITestMode.isEnabled,
+                 scenario: NibUITestMode.scenario)
+    }
+
+    /// Internal seam: test both guards without changing process arguments or exposing a production override.
+    static func seed(app: NibApp, doc: DocumentID, title: String,
+                     isEnabled: Bool, scenario: NibUITestScenario) throws {
+        guard isEnabled, scenario == .timerHistory else { return }
+        guard let keeper = app.services.get(TimeKeeper.serviceKey, as: TimeKeeper.self) else {
+            throw NibError.unavailable("Time Keeper is required for the timerHistory fixture")
+        }
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        for (index, name) in scenario.timerHistoryNames.enumerated() {
+            let elapsed = (index + 1) * 60
+            let start = base.addingTimeInterval(Double(index * 60))
+            // Stable fixture-only IDs make a repeated seed replace its own records, never duplicate them.
+            let id = "UITIMERHISTORY\(index + 1)"
+            var engine = TimerEngine.timer(seconds: elapsed * 2, label: name, at: start, id: id,
+                                           doc: NodeRef.document(doc).description, docTitle: title)
+            // Stop and Save can end a paused timer. Paused time is excluded from the elapsed duration.
+            engine.pause(at: start.addingTimeInterval(Double(elapsed)))
+            guard let record = engine.record(endingAt: start.addingTimeInterval(600)), keeper.store(record) else {
+                throw NibError.invalid("Could not save the timerHistory fixture session: " + name)
+            }
+        }
     }
 }
 

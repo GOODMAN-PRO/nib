@@ -318,7 +318,15 @@ struct TimeKeeperHistorySection: View, Equatable {
     @State private var showsAll = false
     @State private var expanded: Set<String> = []
 
+    init(records: [TimerRecord]) {
+        self.records = records
+    }
+
     static func == (a: TimeKeeperHistorySection, b: TimeKeeperHistorySection) -> Bool { a.records == b.records }
+
+    func visibleRecords(showAll: Bool) -> [TimerRecord] {
+        showAll ? records : Array(records.prefix(Self.collapsedCount))
+    }
 
     var body: some View {
         NibInspectorSection(String(localized: "History"), action: toggleAction) {
@@ -328,7 +336,7 @@ struct TimeKeeperHistorySection: View, Equatable {
                     .foregroundStyle(NibColor.labelSecondary)
             }
             LazyVStack(alignment: .leading, spacing: NibSpacing.s) {
-                ForEach(showsAll ? records : Array(records.prefix(Self.collapsedCount))) { record in
+                ForEach(visibleRecords(showAll: showsAll)) { record in
                     TimeKeeperHistoryRow(record: record, expanded: expanded.contains(record.id)) {
                         if expanded.contains(record.id) { expanded.remove(record.id) } else { expanded.insert(record.id) }
                     }

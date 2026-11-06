@@ -32,6 +32,22 @@ final class CanvasFixtureTests: XCTestCase {
         }
     }
 
+    func testTimerHistoryRequiresOptInAndNamesExactlySixSessions() {
+        let scenario = NibUITestScenario.parse(["-NibUITestFixture", "-NibUITestScenario", "timerHistory"])
+        XCTAssertEqual(scenario, .timerHistory)
+        XCTAssertEqual(scenario.timerHistoryNames,
+                       ["Chrome history 1", "Chrome history 2", "Chrome history 3",
+                        "Chrome history 4", "Chrome history 5", "Chrome history 6"])
+        XCTAssertEqual(scenario.notebookPageCount, 4)
+        for other in NibUITestScenario.allCases where other != .timerHistory {
+            XCTAssertTrue(other.timerHistoryNames.isEmpty)
+        }
+        let production = NibUITestScenario.parse(["-NibUITestScenario", "timerHistory"])
+        XCTAssertEqual(production, .standard)
+        XCTAssertTrue(production.timerHistoryNames.isEmpty)
+        XCTAssertEqual(NibUITestScenario.parse(["-NibUITestFixture", "-NibUITestScenario", "TimerHistory"]), .standard)
+    }
+
     func testTabsOverflowSeedsVisibleOrderedTabsAndRestoresTheFixtureNotebook() throws {
         let scenario = NibUITestScenario.parse(["-NibUITestFixture", "-NibUITestScenario", "tabsOverflow"])
         XCTAssertEqual(scenario.overflowTabTitles, (2...9).map { "Chrome tab \($0)" })
