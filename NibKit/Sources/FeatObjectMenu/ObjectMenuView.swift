@@ -167,6 +167,8 @@ enum ObjectMenuPlacement {
     /// Bound per-frame projection work, even on pages with thousands of strokes. Cache the nearest neighbours
     /// in page space when content changes; uniform zoom and pan preserve their distance ordering.
     static let obstacleLimit = 64
+    /// Pages with more live and deleted records than this skip the neighbour scan (see `rebuild`).
+    static let obstacleScanLimit = 4_000
 
     static func nearestObstacles<S: Sequence>(_ bounds: S, selection: CGRect) -> [CGRect] where S.Element == CGRect {
         var nearest: [(bounds: CGRect, distance: CGFloat)] = []

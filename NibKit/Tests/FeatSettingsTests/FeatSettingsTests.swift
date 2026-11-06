@@ -906,25 +906,23 @@ private func settingsDraftSnapshot(field: UITextField?, model: SettingsDraftMode
     "field=\(String(reflecting: field?.text)), model=\(String(reflecting: model?.password)), responder=\(field?.isFirstResponder ?? false)"
 }
 
-/// Exercise UIKit's text-input path and SwiftUI's delegate callback. Assigning `text` and sending
-/// editingChanged alone may leave SecureField's binding untouched on iOS 26. Request focus when
-/// the host permits it; the binding assertions below diagnose a scene-less input failure separately.
+/// A draft is what the page's own model holds. The package tests run without an app (UIApp is nil), where the
+/// system text-input path cannot be driven: making the field first responder and inserting text there ended these
+/// tests with an internal keyboard error, "InvalidTransition" (package run 42136488283). Set the model, as a
+/// typed character does through the binding, and wait for SwiftUI to bring the visible field up to date.
 @MainActor
 private func enterSettingsDraft(_ text: String, field: UITextField, model: SettingsDraftModel) async throws {
     let before = settingsDraftSnapshot(field: field, model: model)
-    _ = field.becomeFirstResponder()
-    field.selectedTextRange = field.textRange(from: field.beginningOfDocument, to: field.endOfDocument)
-    field.insertText(text)
-    field.sendActions(for: .editingChanged)
-    field.delegate?.textFieldDidChangeSelection?(field)
+    model.password = text
     let deadline = Date().addingTimeInterval(2)
-    while model.password != text && Date() < deadline {
+    while field.text != text && Date() < deadline {
+        field.window?.layoutIfNeeded()
         try await Task.sleep(for: .milliseconds(10))
     }
     let diagnostic = "draft input before=\(before); after=\(settingsDraftSnapshot(field: field, model: model))"
-    XCTAssertEqual(field.text, text, diagnostic)
     XCTAssertEqual(model.password, text, diagnostic)
-    // Stop here if input failed: a resize assertion must never misreport an unentered draft as state loss.
+    XCTAssertEqual(field.text, text, diagnostic)
+    // Stop here if the field did not follow: a resize assertion must never misreport an unentered draft as state loss.
     guard field.text == text, model.password == text else { throw SettingsDraftInputError.bindingDidNotUpdate }
 }
 

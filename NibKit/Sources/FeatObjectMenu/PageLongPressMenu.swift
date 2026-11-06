@@ -376,16 +376,20 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         model.show(entries, context: context, facts: facts, header: PageMenus.header(facts, app: app))
         let selected = Set(facts.items.map(\.id))
         // ponytail: one linear pass per rebuild over the page's cached items (`allItems` hands out the cached array;
-        // `items` would first build a filtered copy of the whole page), keeping the 64 nearest neighbours.
-        // A spatial index is the upgrade when pages outgrow a linear pass.
+        // `items` would first build a filtered copy of the whole page), keeping the 64 nearest neighbours. Measured
+        // in package run 42136488283 (Debug): 57 to 66 ms for 20,010 items, about 3 microseconds an item. Above
+        // `obstacleScanLimit` items the bar is therefore placed without looking at its neighbours, as it was before
+        // it learned to avoid them. A spatial index of item bounds is the upgrade when such pages must avoid too.
         #if DEBUG
         let scanStart = CFAbsoluteTimeGetCurrent()
         #endif
         let pageItems = (try? app.workspace.allItems(facts.doc, page: facts.page)) ?? []
-        let neighbours = pageItems.lazy.filter {
-            !$0.deleted && !selected.contains($0.id) && !session.hiddenLayers.contains($0.layer)
-        }.map { app.content.hitBounds(for: $0).cg }
-        obstacleBounds = ObjectMenuPlacement.nearestObstacles(neighbours, selection: facts.bounds.cg)
+        if pageItems.count <= ObjectMenuPlacement.obstacleScanLimit {
+            let neighbours = pageItems.lazy.filter {
+                !$0.deleted && !selected.contains($0.id) && !session.hiddenLayers.contains($0.layer)
+            }.map { app.content.hitBounds(for: $0).cg }
+            obstacleBounds = ObjectMenuPlacement.nearestObstacles(neighbours, selection: facts.bounds.cg)
+        }
         #if DEBUG
         let scanMs = String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - scanStart) * 1000)
         NSLog("%@", "[Nib QA menu] obstacle scan items=\(pageItems.count) kept=\(obstacleBounds.count) ms=\(scanMs)")

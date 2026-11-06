@@ -1383,6 +1383,8 @@ final class FeatObjectMenuTests: XCTestCase {
             XCTAssertTrue(attachment.model.isShown)
         }
         XCTAssertLessThan(best, budget * 4, "the cold menu took \(Int(best * 1000)) ms")
+        XCTAssertGreaterThan(written.count, ObjectMenuPlacement.obstacleScanLimit)
+        XCTAssertTrue(attachment.model.obstacles.isEmpty, "A page this dense places the bar without the neighbour scan")
     }
 
     func testTheMenuStaysVisibleWhileThePageMoves() async throws {
