@@ -2,7 +2,7 @@ import XCTest
 import SwiftUI
 import UIKit
 import NibContracts
-import NibDesign
+@testable import NibDesign
 import NibTesting
 @testable import FeatSearchUI
 
@@ -1167,6 +1167,116 @@ final class FeatSearchUITests: XCTestCase {
         }
     }
 
+    func testLibraryFieldAlignsContentAndOwnsOnlyThePillSurface() async throws {
+        executionTimeAllowance = 60
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let reduced = NibMotion.forcesReduced
+        let haptics = NibHaptics.isEnabled
+        NibMotion.forcesReduced = true
+        NibHaptics.isEnabled = false
+        defer { NibMotion.forcesReduced = reduced; NibHaptics.isEnabled = haptics }
+        for scheme in [ColorScheme.light, .dark] {
+            for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+                for mode in [NibLiquidMode.full, .off] {
+                    let state = SearchState()
+                    state.scope = "lib"
+                    state.query = "Hello"
+                    state.matches = [hit()]
+                    state.isPresented = true
+                    state.instant = true
+                    var frames: [String: CGRect] = [:]
+                    var field: DropletField?
+                    let root = NibDropletContainer {
+                        ZStack {
+                            LibrarySearchFloatingContent(app: h.app, session: h.session, state: state)
+                            SearchTestFieldProbe { field = $0 }
+                        }
+                    }
+                    .nibLiquidMode(mode)
+                    .environment(\.horizontalSizeClass, .regular)
+                    .environment(\.colorScheme, scheme)
+                    .environment(\.dynamicTypeSize, .large)
+                    .environment(\.accessibilityReduceMotion, true)
+                    .environment(\.searchLayoutDiagnostics, true)
+                    .onPreferenceChange(SearchLayoutFrames.self) { frames = $0 }
+                    let host = UIHostingController(rootView: root)
+                    host.safeAreaRegions = []
+                    let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                    window.rootViewController = host
+                    window.isHidden = false
+                    defer { window.isHidden = true; window.rootViewController = nil }
+                    host.view.frame = window.bounds
+                    var previous: [CGRect] = []
+                    var stableSamples = 0
+                    for _ in 0..<50 {
+                        host.view.setNeedsLayout()
+                        host.view.layoutIfNeeded()
+                        try await Task.sleep(for: .milliseconds(20))
+                        let sample = [frames["library.input"], frames["library.close"], frames["filter.all"],
+                            frames["heading.typed"], frames["firstRow.typed"],
+                            field?.visualFrame("searchui.libraryField"), field?.visualFrame("searchui.libraryResults")]
+                            .compactMap { $0 }
+                        stableSamples = sample.count == 7 && sample == previous ? stableSamples + 1 : 0
+                        previous = sample
+                        if stableSamples >= 3 { break }
+                    }
+                    let context = "\(scheme) \(size) \(mode)"
+                    XCTAssertGreaterThanOrEqual(stableSamples, 3, context)
+                    let liquid = try XCTUnwrap(field, context)
+                    let pill = try XCTUnwrap(liquid.visualFrame("searchui.libraryField"), context)
+                    let panel = try XCTUnwrap(liquid.visualFrame("searchui.libraryResults"), context)
+                    let input = try XCTUnwrap(frames["library.input"], context)
+                    let close = try XCTUnwrap(frames["library.close"], context)
+                    XCTAssertEqual(panel.minX, NibMetrics.libraryGutter, accuracy: 1, context)
+                    XCTAssertEqual(panel.maxX, size.width - NibMetrics.libraryGutter, accuracy: 1, context)
+                    for key in ["filter.all", "heading.typed", "firstRow.typed"] {
+                        let content = try XCTUnwrap(frames[key], key + context)
+                        XCTAssertEqual(pill.minX, content.minX, accuracy: 1, key + context)
+                    }
+                    XCTAssertEqual(pill.minX, panel.minX + NibSpacing.l, accuracy: 1, context)
+                    XCTAssertEqual(pill.minX, input.minX, accuracy: 1, context)
+                    XCTAssertEqual(pill.maxX, input.maxX, accuracy: 1, context)
+                    XCTAssertEqual(pill.height, input.height, accuracy: 1, context)
+                    XCTAssertLessThan(pill.maxX, close.minX, "Glass must end before the separate close control; " + context)
+                    // Inspect the actual registered surfaces, not a test-built facsimile.
+                    let entries = Mirror(reflecting: liquid).children.first { $0.label == "entries" }?.value
+                        as? [String: DropletField.Entry]
+                    XCTAssertEqual(Set(try XCTUnwrap(entries).keys),
+                        Set(["searchui.libraryField", "searchui.libraryResults"]), context)
+                    XCTAssertEqual(entries?["searchui.libraryField"]?.style, .bar, context)
+                    XCTAssertEqual(entries?["searchui.libraryField"]?.bud?.source, "library.controls", context)
+                    if mode == .off {
+                        // Off mode is compositor-independent. Locate actual painted disc pixels,
+                        // rather than equating the 44 pt accessibility target with its visible edge.
+                        host.view.layer.displayIfNeeded()
+                        let format = UIGraphicsImageRendererFormat()
+                        format.scale = 1
+                        let image = UIGraphicsImageRenderer(size: size, format: format).image { renderer in
+                            host.view.layer.render(in: renderer.cgContext)
+                        }
+                        let backdrop = try XCTUnwrap(NibSnapshot.pixel(image,
+                            at: CGPoint(x: panel.maxX, y: close.minY - 2)))
+                        var disc = CGRect.null
+                        for y in Int(ceil(close.minY))..<Int(floor(close.maxY)) {
+                            for x in Int(ceil(close.minX))..<Int(floor(close.maxX)) {
+                                let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
+                                let delta = max(abs(Int(pixel.r) - Int(backdrop.r)),
+                                    max(abs(Int(pixel.g) - Int(backdrop.g)), abs(Int(pixel.b) - Int(backdrop.b))))
+                                if delta > 4 {
+                                    disc = disc.union(CGRect(x: CGFloat(x), y: CGFloat(y), width: 1, height: 1))
+                                }
+                            }
+                        }
+                        XCTAssertFalse(disc.isNull, context)
+                        XCTAssertEqual(disc.width, 30, accuracy: 2, context)
+                        XCTAssertEqual(disc.height, 30, accuracy: 2, context)
+                        XCTAssertEqual(disc.maxX, panel.maxX, accuracy: 1, context)
+                    }
+                }
+            }
+        }
+    }
+
     func testLibraryWithoutFloatingHostKeepsBackdropInsteadOfOpeningCover() async throws {
         let h = Harness(features: [FeatSearchUIFeature.self])
         installDependencies(h, hits: [])
@@ -1354,24 +1464,41 @@ final class FeatSearchUITests: XCTestCase {
         state.query = "Hello"
         state.matches = [hit(kind: "title"), hit()]
         var headings: Set<SearchGroup> = []
+        var frames: [String: CGRect] = [:]
         let results = SearchResults(app: h.app, session: h.session, state: state)
             .onPreferenceChange(SearchVisibleGroupHeadings.self) { headings = $0 }
+            .environment(\.searchLayoutDiagnostics, true)
+            .onPreferenceChange(SearchLayoutFrames.self) { frames = $0 }
         let host = UIHostingController(rootView: results)
         host.safeAreaRegions = []
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 560, height: 240))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 560, height: 800))
         window.rootViewController = host
         window.isHidden = false
         defer { window.isHidden = true; window.rootViewController = nil }
         host.view.frame = window.bounds
         host.view.layoutIfNeeded()
         for _ in 0..<50 {
-            if headings.contains(.titles) { break }
+            if headings.contains(.titles), headings.contains(.typed), frames["group.typed"] != nil { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let first = try XCTUnwrap(frames["group.titles"])
+        let second = try XCTUnwrap(frames["group.typed"])
+        XCTAssertTrue(headings.contains(.typed), "Start with both complete groups visible")
+        // Derive clipping from the real heading/row fonts and filter header. Leave half
+        // the second block below the window instead of assuming a 240 pt device region.
+        window.frame.size.height = first.maxY + second.height / 2
+        host.view.frame = window.bounds
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+        for _ in 0..<50 {
+            if headings.contains(.titles), !headings.contains(.typed) { break }
             try await Task.sleep(for: .milliseconds(20))
         }
         XCTAssertTrue(headings.contains(.titles))
         XCTAssertFalse(headings.contains(.typed), "Typed Notes must not appear without its first result")
         let list = try XCTUnwrap(searchDescendants(UIScrollView.self, in: host.view)
-            .first { $0.bounds.height > NibMetrics.hitTarget * 2 })
+            .first { $0.contentSize.height > $0.bounds.height + 1
+                && $0.contentSize.width <= $0.bounds.width + 1 })
         let bottom = max(0, list.contentSize.height - list.bounds.height + list.adjustedContentInset.bottom)
         list.setContentOffset(CGPoint(x: 0, y: bottom), animated: false)
         host.view.layoutIfNeeded()
@@ -1473,6 +1600,26 @@ final class FeatSearchUITests: XCTestCase {
                 add(attachment)
             } else { XCTFail("Document search snapshot did not render") }
         }
+    }
+}
+
+@MainActor
+private struct SearchTestFieldProbe: View {
+    @Environment(DropletField.self) private var field: DropletField?
+    let capture: (DropletField) -> Void
+
+    private var ready: Bool {
+        guard let field else { return false }
+        return ["searchui.libraryField", "searchui.libraryResults"].allSatisfy {
+            field.node($0).presentation.isDrawn
+        }
+    }
+
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .onChange(of: ready, initial: true) { _, ready in
+                if ready, let field { capture(field) }
+            }
     }
 }
 

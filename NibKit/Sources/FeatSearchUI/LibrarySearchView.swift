@@ -206,9 +206,11 @@ struct LibrarySearchFloatingContent: View {
                         // The pill is the only glass surface; the close control stays outside it.
                         SearchInput(app: app, session: session, state: state, style: .onDroplet)
                             .frame(minWidth: 0, maxWidth: .infinity)
+                            .searchLayoutFrame("library.input")
                             .droplet("searchui.libraryField", style: .bar)
                             .budsFrom("library.controls", isPresented: presentationBinding, instant: state.instant)
                         NibIconButton(.xmark, label: String(localized: "Close search"), size: .round, action: close)
+                            .searchLayoutFrame("library.close")
                             // NibIconButton.round draws a 30 pt disc inside its 44 pt target.
                             .offset(x: (NibMetrics.hitTarget - 30) / 2)
                     }
@@ -459,12 +461,15 @@ struct SearchResults: View {
             // preserves scroll extent and every result's id, including scrollTo targets.
             VStack(alignment: .leading, spacing: NibSpacing.l) {
                 Text(group.title).font(NibFont.headline).accessibilityAddTraits(.isHeader)
+                    .searchLayoutFrame("heading." + group.rawValue)
                     .opacity(visibleGroupHeadings.contains(group) ? 1 : 0)
                     .accessibilityHidden(!visibleGroupHeadings.contains(group))
                 SearchResultRow(app: app, session: session, state: state, hit: first)
+                    .searchLayoutFrame("firstRow." + group.rawValue)
                     .id(first.id)
             }
             .anchorPreference(key: SearchGroupStartBounds.self, value: .bounds) { [group: $0] }
+            .searchLayoutFrame("group." + group.rawValue)
             ForEach(Array(hits.dropFirst())) { hit in
                 SearchResultRow(app: app, session: session, state: state, hit: hit)
                     .id(hit.id)
@@ -551,6 +556,7 @@ struct SearchFilterHeader: View {
                         app.perform(CommandIDs.searchOpen,
                             ["scope": .string(state.scope), "filter": .string(filter.rawValue)], session: session)
                     })
+                    .searchLayoutFrame("filter." + filter.rawValue)
                 }
             }
             .frame(minHeight: NibMetrics.hitTarget)
@@ -678,4 +684,48 @@ func highlighted(_ snippet: String, query: String) -> AttributedString {
         }
     }
     return text
+}
+
+// Opt-in observations for hosted regression tests. No measurement is consumed by
+// production state or layout: the host proposal remains the only sizing input.
+struct SearchLayoutFrames: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private struct SearchLayoutDiagnosticsKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var searchLayoutDiagnostics: Bool {
+        get { self[SearchLayoutDiagnosticsKey.self] }
+        set { self[SearchLayoutDiagnosticsKey.self] = newValue }
+    }
+}
+
+extension View {
+    func searchLayoutFrame(_ id: String) -> some View {
+        modifier(SearchLayoutFrame(id: id))
+    }
+}
+
+private struct SearchLayoutFrame: ViewModifier {
+    @Environment(\.searchLayoutDiagnostics) private var enabled
+    let id: String
+
+    func body(content: Content) -> some View {
+        content.background {
+            if enabled {
+                GeometryReader { geometry in
+                    Color.clear.preference(key: SearchLayoutFrames.self,
+                        value: [id: geometry.frame(in: .global)])
+                }
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
+        }
+    }
 }

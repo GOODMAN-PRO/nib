@@ -263,6 +263,7 @@ struct SearchCounter: View {
                     .background {
                         GeometryReader { geometry in
                             SearchViewportReader(layoutPosition: geometry.frame(in: .global).origin) { viewport in
+                                guard state.isPresented else { return }
                                 if state.navigationCounterTop != viewport.columnTop {
                                     state.navigationCounterTop = viewport.columnTop
                                 }
@@ -271,7 +272,6 @@ struct SearchCounter: View {
                         .allowsHitTesting(false)
                         .accessibilityHidden(true)
                     }
-                    .onDisappear { state.navigationCounterTop = nil }
             } else {
                 HStack(spacing: NibSpacing.s) { controls }
                     .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget)

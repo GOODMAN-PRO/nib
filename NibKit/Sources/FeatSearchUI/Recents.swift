@@ -194,10 +194,14 @@ final class SearchState: ObservableObject {
     @Published var refreshPending = false
     @Published var error: String?
     @Published var progress: IndexProgressPayload?
-    @Published var isPresented = false
+    @Published var isPresented = false {
+        didSet {
+            if !isPresented { navigationCounterTop = nil }
+        }
+    }
     @Published var instant = false
     @Published var focusGeneration = 0
-    // Conservative until the chrome host has placed the match HUD beside or above the page HUD.
+    // Conservative until chrome places the HUD; retain through no-hit queries until search closes.
     @Published var navigationCounterTop: CGFloat?
     var generation = 0
     var cursor: String?

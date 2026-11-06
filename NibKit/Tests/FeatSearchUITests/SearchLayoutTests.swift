@@ -62,6 +62,7 @@ final class SearchLayoutTests: XCTestCase {
         executionTimeAllowance = 60
         let h = Harness(features: [FeatSearchUIFeature.self])
         let state = SearchState()
+        state.isPresented = true
         let size = CGSize(width: 1000, height: 1000)
         let window = UIWindow(frame: CGRect(origin: .zero, size: size))
         let counter = SearchCounter(app: h.app, session: h.session, state: state)
@@ -77,10 +78,17 @@ final class SearchLayoutTests: XCTestCase {
         host.view.frame = window.bounds
         for rows in [1, 2, 1] {
             let lift = CGFloat(rows - 1) * (NibMetrics.hudHeight + NibMetrics.minimumRestingGap)
-            let expectedTop = size.height - NibMetrics.chromeInset - NibMetrics.hudHeight - lift
             host.rootView = view(lift: lift)
             host.view.setNeedsLayout()
             host.view.layoutIfNeeded()
+            func sensors(in view: UIView) -> [SearchViewportReader.Sensor] {
+                ((view as? SearchViewportReader.Sensor).map { [$0] } ?? [])
+                    + view.subviews.flatMap { sensors(in: $0) }
+            }
+            let sensor = try XCTUnwrap(sensors(in: host.view).first)
+            XCTAssertGreaterThan(sensor.bounds.height, 0)
+            let centre = size.height - NibMetrics.chromeInset - NibMetrics.hudHeight / 2 - lift
+            let expectedTop = centre - sensor.bounds.height / 2
             for _ in 0..<50 {
                 if let top = state.navigationCounterTop, abs(top - expectedTop) < 1 { break }
                 try await Task.sleep(for: .milliseconds(20))
@@ -92,6 +100,40 @@ final class SearchLayoutTests: XCTestCase {
             XCTAssertEqual(viewport.navigationRows(counterTop: top), rows,
                 "The same wide window may stack HUDs when its usable column narrows")
         }
+    }
+
+    func testCounterPlacementSurvivesNoHitsAndResetsWhenSearchCloses() async throws {
+        executionTimeAllowance = 60
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let state = SearchState()
+        state.isPresented = true
+        let counter = SearchCounter(app: h.app, session: h.session, state: state)
+        let host = UIHostingController(rootView: AnyView(counter))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1000, height: 1000))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        host.view.layoutIfNeeded()
+        for _ in 0..<50 {
+            if state.navigationCounterTop != nil { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let placedTop = try XCTUnwrap(state.navigationCounterTop)
+        // The chrome descriptor removes this overlay when no matches are visible.
+        host.rootView = AnyView(EmptyView())
+        host.view.layoutIfNeeded()
+        for _ in 0..<10 { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertEqual(state.navigationCounterTop, placedTop,
+            "A temporary no-hit query must not restore the conservative two-row reserve")
+        host.rootView = AnyView(counter)
+        host.view.layoutIfNeeded()
+        state.isPresented = false
+        for _ in 0..<10 { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertNil(state.navigationCounterTop, "Every dismissal path resets the next presentation")
+        state.isPresented = true
+        XCTAssertNil(state.navigationCounterTop)
     }
 
     func testBoundsIgnoreOnePixelNoiseButRetainAccumulatedMovementAndRemoval() {
