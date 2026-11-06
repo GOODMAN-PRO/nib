@@ -718,10 +718,28 @@ final class ChromeUITests: XCTestCase {
     func testPageScrollCollapsesOptionsAndChoosingToolRestoresThem() throws {
         try open(); try ui.selectTool("pen"); let before = try ui.state()
         _ = try reachable("menu.toolSettings")
-        try ui.twoFingerScroll(from: CGPoint(x: 0.12, y: 0.75), to: CGPoint(x: 0.12, y: 0.45), holdAtEnd: true)
-        _ = try ui.waitForState { abs($0.contentOffset.y - before.contentOffset.y) > 20 }
-        try wait("Page scrolling must collapse the secondary options bar") {
-            !self.query("menu.toolSettings").firstMatch.exists
+        do {
+            let start = CGPoint(x: 0.12, y: 0.75), end = CGPoint(x: 0.12, y: 0.45)
+            let frame = ui.canvas.frame
+            let startPoint = CGPoint(x: frame.minX + start.x * frame.width, y: frame.minY + start.y * frame.height)
+            let endPoint = CGPoint(x: frame.minX + end.x * frame.width, y: frame.minY + end.y * frame.height)
+            let scrollBefore = try ui.state()
+            let geometry = "normalizedStart=\(start) normalizedEnd=\(end) interfaceStart=\(startPoint) interfaceEnd=\(endPoint) canvas=\(frame) holdAtEnd=true"
+            ui.logQA("Page scroll boundary", "phase=before wall=\(Date()) " + geometry
+                + " contentOffset=(\(scrollBefore.contentOffset.x),\(scrollBefore.contentOffset.y)) page=\(String(describing: scrollBefore.page))")
+            defer {
+                if let after = try? ui.state() {
+                    ui.logQA("Page scroll boundary", "phase=after-fold-wait wall=\(Date()) " + geometry
+                        + " contentOffset=(\(after.contentOffset.x),\(after.contentOffset.y)) page=\(String(describing: after.page))")
+                } else {
+                    ui.logQA("Page scroll boundary", "phase=after-fold-wait wall=\(Date()) contentOffset=unavailable " + geometry)
+                }
+            }
+            try ui.twoFingerScroll(from: start, to: end, holdAtEnd: true)
+            _ = try ui.waitForState { abs($0.contentOffset.y - before.contentOffset.y) > 20 }
+            try wait("Page scrolling must collapse the secondary options bar") {
+                !self.query("menu.toolSettings").firstMatch.exists
+            }
         }
         try ui.selectTool("highlighter"); _ = try reachable("menu.toolSettings")
         try settings("highlighter")

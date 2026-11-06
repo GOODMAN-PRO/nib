@@ -177,3 +177,15 @@ Should unblock live saving and the formerly unreachable six-record expansion tai
 | --- | --- | --- |
 | Both timer history tests | Timer history row | Which exact session name was paired with which document/duration/date subtitle? |
 | Seeded history test setup | Missing timerHistory fixture scenario (failure) | Did the companion app actually recognise the scenario rather than silently launch standard? |
+
+### K6 - page-scroll evidence without a speculative gesture fix
+
+Confirmed R13:chrome-still-failing#0 with holds=false correction: the options strip survived the held-release gesture at offset y=578 and the page changed; the proposed clipped-rect/publish-cadence cause and shorter-scroll cure were not proven. Current ToolbarView.canvasDidScroll reads the canvas UIScrollView contentOffset and logs [Nib QA toolbar] scroll moved/travel/samePage/offset/zoom. Its remaining guards are app-owned and are not declared runtime-proven here.
+
+Kept PageScrollCollapsesOptionsAndChoosingToolRestoresThem, its exact normalized two-finger start/end, held release, offset-change/fold waits, original-page identity and all later tool/ink/Undo assertions. Added before and after-fold-wait logs with wall times, normalized/interface endpoints, canvas frame, page and contentOffset. The after log runs on failure as well as success, before any later tool selection; unavailable probe data is explicit. No shorter scroll or allowance change.
+
+Should make the repaired app's T-109 test readable against its own scroll lines; no test-side behavioral fix is claimed. Next CI must show the strip folding under the same gesture and then all preserved assertions, including original page identity. If the page still changes, that remains a genuine failure; logs now expose the geometry rather than disguising it.
+
+| Tests | Log prefix | Question answered |
+| --- | --- | --- |
+| PageScrollCollapsesOptionsAndChoosingToolRestoresThem | Page scroll boundary | What exact endpoints and canvas frame were used, and how did the actual offset/page change before the fold wait finished or failed? |
